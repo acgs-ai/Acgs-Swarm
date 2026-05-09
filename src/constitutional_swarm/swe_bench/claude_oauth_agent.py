@@ -30,6 +30,7 @@ Usage
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -130,6 +131,15 @@ def _read_oauth_token(
     return token
 
 
+def _load_anthropic_module() -> Any:
+    try:
+        return importlib.import_module("anthropic")
+    except ImportError as exc:
+        raise ImportError(
+            "anthropic package is required. Install with `pip install anthropic`."
+        ) from exc
+
+
 class ClaudeOAuthSWEBenchAgent(SWEBenchAgent):
     """SWEBenchAgent that uses Claude Code's OAuth session for auth.
 
@@ -174,15 +184,10 @@ class ClaudeOAuthSWEBenchAgent(SWEBenchAgent):
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise ImportError(
-                "anthropic package is required. Install with `pip install anthropic`."
-            ) from exc
-
         path = Path(cred_path) if cred_path else None
         token = _read_oauth_token(path)
+        anthropic = _load_anthropic_module()
+        self._anthropic = anthropic
         self._client = anthropic.Anthropic(auth_token=token)
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_kwargs: dict[str, Any] = dict(extra_kwargs or {})
@@ -203,7 +208,7 @@ class ClaudeOAuthSWEBenchAgent(SWEBenchAgent):
         )
 
     def _generate_patch(self, task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        import anthropic
+        anthropic = self._anthropic
 
         prompt = self._build_prompt(task)
         stats: dict[str, Any] = {

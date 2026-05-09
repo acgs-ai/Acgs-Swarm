@@ -22,6 +22,33 @@ from constitutional_swarm.swe_bench.claude_oauth_agent import (
 )
 
 
+class _FakeAPIStatusError(Exception):
+    def __init__(self, *, message: str, response: object, body: object) -> None:
+        super().__init__(message)
+        self.message = message
+        self.response = response
+        self.body = body
+        self.status_code = getattr(response, "status_code", None)
+
+
+class _FakeAPIConnectionError(Exception):
+    pass
+
+
+class _FakeAPITimeoutError(Exception):
+    pass
+
+
+def _fake_anthropic_module(*, client: MagicMock | None = None) -> SimpleNamespace:
+    mock_client = client or MagicMock()
+    return SimpleNamespace(
+        Anthropic=MagicMock(return_value=mock_client),
+        APIStatusError=_FakeAPIStatusError,
+        APIConnectionError=_FakeAPIConnectionError,
+        APITimeoutError=_FakeAPITimeoutError,
+    )
+
+
 def _write_creds(
     tmp_path: Path,
     *,
@@ -116,15 +143,23 @@ def test_read_oauth_token_no_expiry_field(tmp_path: Path) -> None:
 
 def test_agent_constructs_with_valid_creds(tmp_path: Path) -> None:
     cred = _write_creds(tmp_path)
-    with patch("anthropic.Anthropic") as mock_cls:
+    fake_module = _fake_anthropic_module()
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
         agent = ClaudeOAuthSWEBenchAgent(cred_path=cred)
         assert agent._model == "claude-sonnet-4-6"
-        mock_cls.assert_called_once_with(auth_token="sk-ant-oat01-fake")
+        fake_module.Anthropic.assert_called_once_with(auth_token="sk-ant-oat01-fake")
 
 
 def test_agent_constructs_with_custom_model(tmp_path: Path) -> None:
     cred = _write_creds(tmp_path)
-    with patch("anthropic.Anthropic"):
+    fake_module = _fake_anthropic_module()
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
         agent = ClaudeOAuthSWEBenchAgent(cred_path=cred, model="claude-opus-4-7")
         assert agent._model == "claude-opus-4-7"
 
@@ -136,6 +171,16 @@ def test_agent_propagates_credential_error(tmp_path: Path) -> None:
         ClaudeOAuthSWEBenchAgent(cred_path=missing)
 
 
+def test_agent_requires_anthropic_after_creds_validate(tmp_path: Path) -> None:
+    cred = _write_creds(tmp_path)
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        side_effect=ImportError("anthropic package is required"),
+    ):
+        with pytest.raises(ImportError, match="anthropic package is required"):
+            ClaudeOAuthSWEBenchAgent(cred_path=cred)
+
+
 def test_agent_generate_patch_dispatches_via_oauth_client(tmp_path: Path) -> None:
     cred = _write_creds(tmp_path, access_token="real-oauth-tok")
     diff_body = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
@@ -144,11 +189,13 @@ def test_agent_generate_patch_dispatches_via_oauth_client(tmp_path: Path) -> Non
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
         stop_reason="end_turn",
     )
-    with patch("anthropic.Anthropic") as mock_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
-        mock_cls.return_value = mock_client
-
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = fake_response
+    fake_module = _fake_anthropic_module(client=mock_client)
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
         agent = ClaudeOAuthSWEBenchAgent(cred_path=cred)
         patch_text, stats = agent._generate_patch({
             "instance_id": "x",
@@ -162,25 +209,26 @@ def test_agent_generate_patch_dispatches_via_oauth_client(tmp_path: Path) -> Non
     assert stats["model"] == "claude-sonnet-4-6"
     assert stats["auth"] == "oauth"
     assert stats["input_tokens"] == 10
-    mock_cls.assert_called_once_with(auth_token="real-oauth-tok")
+    fake_module.Anthropic.assert_called_once_with(auth_token="real-oauth-tok")
     call_kwargs = mock_client.messages.create.call_args.kwargs
     assert call_kwargs["model"] == "claude-sonnet-4-6"
 
 
 def test_agent_generate_patch_handles_api_status_error(tmp_path: Path) -> None:
-    import anthropic
     cred = _write_creds(tmp_path)
-    with patch("anthropic.Anthropic") as mock_cls:
-        mock_client = MagicMock()
-        fake_response = MagicMock(status_code=401, headers={})
-        err = anthropic.APIStatusError(
-            message="invalid token",
-            response=fake_response,
-            body=None,
-        )
-        mock_client.messages.create.side_effect = err
-        mock_cls.return_value = mock_client
-
+    mock_client = MagicMock()
+    fake_response = MagicMock(status_code=401, headers={})
+    err = _FakeAPIStatusError(
+        message="invalid token",
+        response=fake_response,
+        body=None,
+    )
+    mock_client.messages.create.side_effect = err
+    fake_module = _fake_anthropic_module(client=mock_client)
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
         agent = ClaudeOAuthSWEBenchAgent(cred_path=cred)
         patch_text, stats = agent._generate_patch({
             "instance_id": "x",
@@ -192,6 +240,49 @@ def test_agent_generate_patch_handles_api_status_error(tmp_path: Path) -> None:
     assert patch_text == ""
     assert stats["error"] == "api_status_401"
     assert "invalid token" in stats["stderr_tail"]
+
+
+def test_agent_generate_patch_handles_connection_error(tmp_path: Path) -> None:
+    cred = _write_creds(tmp_path)
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = _FakeAPIConnectionError("network down")
+    fake_module = _fake_anthropic_module(client=mock_client)
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
+        agent = ClaudeOAuthSWEBenchAgent(cred_path=cred)
+        patch_text, stats = agent._generate_patch({
+            "instance_id": "x",
+            "repo": "x/x",
+            "base_commit": "0",
+            "FAIL_TO_PASS": [],
+            "problem_statement": "p",
+        })
+    assert patch_text == ""
+    assert stats["error"] == "connection_error"
+    assert "network down" in stats["stderr_tail"]
+
+
+def test_agent_generate_patch_handles_timeout(tmp_path: Path) -> None:
+    cred = _write_creds(tmp_path)
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = _FakeAPITimeoutError()
+    fake_module = _fake_anthropic_module(client=mock_client)
+    with patch(
+        "constitutional_swarm.swe_bench.claude_oauth_agent._load_anthropic_module",
+        return_value=fake_module,
+    ):
+        agent = ClaudeOAuthSWEBenchAgent(cred_path=cred, timeout_s=12.0)
+        patch_text, stats = agent._generate_patch({
+            "instance_id": "x",
+            "repo": "x/x",
+            "base_commit": "0",
+            "FAIL_TO_PASS": [],
+            "problem_statement": "p",
+        })
+    assert patch_text == ""
+    assert stats["error"] == "timeout"
 
 
 # ── _extract_diff: prose prefix handling (shared with claude_agent) ────────────
