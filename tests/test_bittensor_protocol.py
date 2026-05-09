@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("bittensor", reason="bittensor not installed — skip protocol tests")
 pytestmark = pytest.mark.bittensor
 
-from constitutional_swarm.bittensor import (  # noqa: I001
+from constitutional_swarm.bittensor import (  # noqa: E402, I001
     ConstitutionalMiner,
     ConstitutionalValidator,
     DeliberationSynapse,

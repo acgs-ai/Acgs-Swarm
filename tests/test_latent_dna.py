@@ -14,8 +14,8 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-import torch.nn as nn
-from torch import Tensor
+import torch.nn as nn  # noqa: E402
+from torch import Tensor  # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Minimal model stub (no transformers required)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-from torch import Tensor
+from torch import Tensor  # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers

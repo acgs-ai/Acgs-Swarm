@@ -22,7 +22,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from constitutional_swarm.latent_dna import _BODESHook
+from constitutional_swarm.latent_dna import _BODESHook  # noqa: E402
 
 
 def _random_unit(dim: int, seed: int) -> torch.Tensor:

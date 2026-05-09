@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import importlib
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("torch")
+
+from scripts.reproduce_paper_claims import (  # noqa: E402
+    ICLR_UNMAPPED_IDS,
+    NDSS_UNMAPPED_IDS,
+    collect_evidence,
+    summary,
+)
 
 calibrate_sigma = importlib.import_module("constitutional_swarm.swarm_ode").calibrate_sigma
 
@@ -174,15 +183,6 @@ def test_claim_map_has_no_unmapped_or_xfail_rows() -> None:
     assert "| unmapped |" not in claim_map
     assert "| mapped-xfail |" not in claim_map
     assert "Reproducibility Gaps" not in claim_map
-import subprocess
-import sys
-
-from scripts.reproduce_paper_claims import (
-    ICLR_UNMAPPED_IDS,
-    NDSS_UNMAPPED_IDS,
-    collect_evidence,
-    summary,
-)
 
 
 def test_remaining_claim_registry_covers_all_previous_unmapped_claims() -> None:
