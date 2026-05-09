@@ -36,6 +36,21 @@ transport = ["websockets>=12.0"]
 research = ["torch>=2.0", "transformers>=4.40"]
 # deprecated alias — use research instead
 latent = ["constitutional-swarm[research]"]
+# semantic: cross-encoder role-drift detection (option-c hardening)
+# Adds a 4th detection channel via sentence-transformers' CrossEncoder over
+# MCFS_ROLE_CONSTITUTION canonical phrases. Bi-encoder cosine was tested and
+# rejected: no separation window between synonym attacks and lexical-overlap
+# benign payloads (calibration in
+# .omc/autoresearch/monotonic-mas-coordination/runs/run-adversarial-2026-05-08-postfix).
+# Cross-encoder takes the (payload, anchor) pair as input and disambiguates
+# intent direction natively. Default model BAAI/bge-reranker-base (~280MB,
+# Apache-2.0). Optional; detect_role degrades to current behavior if not installed.
+semantic = ["sentence-transformers>=2.5"]
+# vertex: Claude on Google Cloud Vertex AI for SWE-bench agents.
+# Routes the SWEBenchAgent through AnthropicVertex (same Messages API surface)
+# so runs use ADC instead of a direct Anthropic API key. Auth via
+# `gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS.
+vertex = ["anthropic[vertex]>=0.84", "google-cloud-aiplatform>=1.50"]
 
 [project.scripts]
 acgs-swarm = "constitutional_swarm.governed_handoff:main"

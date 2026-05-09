@@ -12,6 +12,7 @@ build/
 .omx/
 .codex
 .worktrees/
+.venv/
 papers/*/main.pdf
 
 # Local secrets
@@ -23,6 +24,7 @@ papers/*/main.pdf
 .agents/skills/braintrust/
 .bt/config.json
 .bt/skills/
+.claude/settings.local.json
 
 # Session-generated artifacts — not distribution content
 *-report.md
