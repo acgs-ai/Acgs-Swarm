@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import random
 import tempfile
 
 import pytest
@@ -528,8 +529,6 @@ class TestEmissionEvolver:
 # ===========================================================================
 # Phase 4: Extended Evolutionary System Tests (25+)
 # ===========================================================================
-
-import random
 
 
 class TestEmissionGenomeExtended:

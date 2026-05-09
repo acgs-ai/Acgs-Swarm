@@ -9,19 +9,22 @@ from __future__ import annotations
 import pytest
 
 pytestmark = pytest.mark.bittensor
-from constitutional_swarm.bittensor.miner import (
+from constitutional_swarm.bittensor.miner import (  # noqa: E402
     ConstitutionalMiner,
     ConstitutionMismatchError,
     DNAPreCheckFailedError,
 )
-from constitutional_swarm.bittensor.protocol import (
+from constitutional_swarm.bittensor.protocol import (  # noqa: E402
     EscalationType,
     MinerConfig,
     MinerTier,
     ValidatorConfig,
 )
-from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
-from constitutional_swarm.bittensor.validator import ConstitutionalValidator, UnknownMinerError
+from constitutional_swarm.bittensor.subnet_owner import SubnetOwner  # noqa: E402
+from constitutional_swarm.bittensor.validator import (  # noqa: E402
+    ConstitutionalValidator,
+    UnknownMinerError,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures

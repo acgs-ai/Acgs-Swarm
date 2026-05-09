@@ -12,11 +12,13 @@ Modules covered:
 from __future__ import annotations
 
 import time
+from unittest.mock import MagicMock
 
 import pytest
 from constitutional_swarm.bittensor.came_coordinator import (
     CAMECoordinator,
     CAMECoordinatorConfig,
+    CAMECycleResult,
 )
 from constitutional_swarm.bittensor.emission_calculator import (
     MinerEmissionInput,
@@ -35,6 +37,11 @@ from constitutional_swarm.federated_bridge import (
     AgentCredential,
     CredentialStatus,
     FederatedConstitutionBridge,
+)
+from constitutional_swarm.mac_acgs_loop import (
+    MacAcgsConfig,
+    MacAcgsLoop,
+    PipelineEventType,
 )
 
 try:
@@ -585,18 +592,6 @@ class TestCAMECoordinator:
 
 # ========================== MacAcgsLoop Tests =============================
 # Full integration of CAME → DebateResolver → ConstitutionUpdate pipeline.
-
-
-from unittest.mock import MagicMock
-
-from constitutional_swarm.bittensor.came_coordinator import (
-    CAMECycleResult,
-)
-from constitutional_swarm.mac_acgs_loop import (
-    MacAcgsConfig,
-    MacAcgsLoop,
-    PipelineEventType,
-)
 
 
 def _make_came_mock(rules: list[str] | None = None) -> MagicMock:
