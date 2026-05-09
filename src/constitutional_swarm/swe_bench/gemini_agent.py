@@ -14,8 +14,9 @@ newer family becomes available.
 
 Requirements
 ------------
-- ``pip install "constitutional-swarm[vertex]"`` (installs google-genai
-  + google-cloud-aiplatform).
+- ``pip install "constitutional-swarm[gemini]"`` (installs google-genai).
+  The ``vertex`` extra installs Anthropic-on-Vertex and does NOT include
+  google-genai; the two extras are independent.
 - ADC: ``gcloud auth application-default login`` OR
   ``GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json``.
 - Vertex AI Gemini quota provisioned in the target GCP project (default
@@ -85,7 +86,7 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
         except ImportError as exc:
             raise ImportError(
                 "google-genai is required. Install with "
-                "`pip install \"constitutional-swarm[vertex]\"`."
+                '`pip install "constitutional-swarm[gemini]"`.'
             ) from exc
         self._client = genai.Client(
             vertexai=True,

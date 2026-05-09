@@ -28,12 +28,14 @@ intentional — keeps token spend transparent and pause-friendly.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,34 @@ def _results_path(run_id: str) -> Path:
 
 def _summary_path(run_id: str) -> Path:
     return _run_dir(run_id) / "summary.json"
+
+
+@contextlib.contextmanager
+def _run_lock(run_id: str) -> Iterator[None]:
+    """Coarse exclusive file lock for the entire run scope.
+
+    Serializes parallel invocations on the same ``--run-id`` so that
+    ``_attempted_ids`` -> ``agent.solve`` -> ``_append_result`` is atomic
+    across processes. Without this, two invocations can read the same
+    snapshot of ``results.jsonl``, claim the same ``instance_id``, and
+    both pay for the model call before either write lands.
+
+    Two parallel invocations queue (the second blocks on flock). That
+    matches the documented "manually-paced exploration" UX — each
+    invocation is one task.
+    """
+    run_dir = _run_dir(run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir / ".run.lock"
+    fp = lock_path.open("a")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+    finally:
+        fp.close()
 
 
 def _attempted_ids(run_id: str) -> set[str]:
@@ -166,13 +196,19 @@ def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> 
             except json.JSONDecodeError:
                 continue
 
-    total = len(records)
-    succeeded = sum(1 for r in records if r.get("success"))
-    errored = sum(1 for r in records if r.get("error"))
-    in_tok = sum(r.get("input_tokens", 0) or 0 for r in records)
-    out_tok = sum(r.get("output_tokens", 0) or 0 for r in records)
-    cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in records)
-    durations = [r.get("elapsed_s") for r in records if r.get("elapsed_s") is not None]
+    # Filter to logical attempts only. Best-of-K writes k+1 rows per task:
+    # k candidate audit rows (is_winner=False) plus 1 winner row (is_winner=True
+    # — duplicates the chosen candidate's content). Single-mode rows have no
+    # is_winner field. Counting raw rows would inflate totals/cost on mixed-
+    # mode reuse; filter is_winner=False so summary reflects logical attempts.
+    logical = [r for r in records if r.get("is_winner") is not False]
+    total = len(logical)
+    succeeded = sum(1 for r in logical if r.get("success"))
+    errored = sum(1 for r in logical if r.get("error"))
+    in_tok = sum(r.get("input_tokens", 0) or 0 for r in logical)
+    out_tok = sum(r.get("output_tokens", 0) or 0 for r in logical)
+    cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in logical)
+    durations = [r.get("elapsed_s") for r in logical if r.get("elapsed_s") is not None]
 
     summary = {
         "run_id": run_id,
@@ -187,7 +223,7 @@ def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> 
         "output_tokens_total": out_tok,
         "est_cost_usd_total": round(cost, 6),
         "mean_duration_s": (sum(durations) / len(durations)) if durations else 0.0,
-        "instance_ids": [r.get("instance_id") for r in records],
+        "instance_ids": [r.get("instance_id") for r in logical],
     }
     _summary_path(run_id).write_text(json.dumps(summary, indent=2))
     return summary
@@ -298,39 +334,40 @@ def run_one(
     governed: bool = False,
 ) -> dict[str, Any]:
     """Run exactly one instance and return the per-instance record."""
-    if instance_id:
-        task = _load_specific_task(instance_id, dataset=dataset, split=split)
-        if task is None:
-            raise ValueError(f"instance_id {instance_id!r} not found in {dataset}/{split}")
-    else:
-        task = _load_next_task(run_id, dataset=dataset, split=split)
-        if task is None:
-            raise RuntimeError(
-                f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
-            )
+    with _run_lock(run_id):
+        if instance_id:
+            task = _load_specific_task(instance_id, dataset=dataset, split=split)
+            if task is None:
+                raise ValueError(f"instance_id {instance_id!r} not found in {dataset}/{split}")
+        else:
+            task = _load_next_task(run_id, dataset=dataset, split=split)
+            if task is None:
+                raise RuntimeError(
+                    f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
+                )
 
-    log.info("Running instance %s (provider=%s, model=%s, governed=%s)",
-             task["instance_id"], provider, model, governed)
-    agent = _build_agent(
-        provider=provider,
-        model=model,
-        project_id=project_id,
-        region=region,
-        timeout_s=timeout_s,
-        max_new_tokens=max_new_tokens,
-        governed=governed,
-    )
-    t0 = time.time()
-    result = agent.solve(task)
-    elapsed = time.time() - t0
+        log.info("Running instance %s (provider=%s, model=%s, governed=%s)",
+                 task["instance_id"], provider, model, governed)
+        agent = _build_agent(
+            provider=provider,
+            model=model,
+            project_id=project_id,
+            region=region,
+            timeout_s=timeout_s,
+            max_new_tokens=max_new_tokens,
+            governed=governed,
+        )
+        t0 = time.time()
+        result = agent.solve(task)
+        elapsed = time.time() - t0
 
-    record = _record_from_solve(task=task, result=result, model=model, elapsed_s=elapsed)
-    record["provider"] = provider
-    _append_result(run_id, record)
-    _save_patch(run_id, task["instance_id"], result.patch)
-    summary = _recompute_summary(run_id, model=model, dataset=dataset, split=split)
-    _print_tally(record, summary)
-    return record
+        record = _record_from_solve(task=task, result=result, model=model, elapsed_s=elapsed)
+        record["provider"] = provider
+        _append_result(run_id, record)
+        _save_patch(run_id, task["instance_id"], result.patch)
+        summary = _recompute_summary(run_id, model=model, dataset=dataset, split=split)
+        _print_tally(record, summary)
+        return record
 
 
 def run_swarm_batch(
@@ -363,113 +400,113 @@ def run_swarm_batch(
     if k < 1:
         raise ValueError("--swarm-k must be >= 1")
 
-    # Collect k next-un-attempted tasks.
-    attempted = _attempted_ids(run_id)
-    from datasets import load_dataset
+    with _run_lock(run_id):
+        attempted = _attempted_ids(run_id)
+        from datasets import load_dataset
 
-    tasks: list[dict[str, Any]] = []
-    ds = load_dataset(dataset, split=split, streaming=True)
-    for raw in ds:
-        if raw["instance_id"] in attempted:
-            continue
-        tasks.append(_normalize_task(raw))
-        if len(tasks) >= k:
-            break
-    if not tasks:
-        raise RuntimeError(
-            f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
-        )
-    if len(tasks) < k:
-        log.warning("Only %d un-attempted instances left; running with k=%d", len(tasks), len(tasks))
-        k = len(tasks)
+        tasks: list[dict[str, Any]] = []
+        ds = load_dataset(dataset, split=split, streaming=True)
+        for raw in ds:
+            if raw["instance_id"] in attempted:
+                continue
+            tasks.append(_normalize_task(raw))
+            if len(tasks) >= k:
+                break
+        if not tasks:
+            raise RuntimeError(
+                f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
+            )
+        if len(tasks) < k:
+            log.warning("Only %d un-attempted instances left; running with k=%d", len(tasks), len(tasks))
+            k = len(tasks)
 
-    # Build k agents via the chosen provider. If `models` is given, each
-    # agent uses one model from the roster (heterogeneous swarm); k overrides
-    # by replicating with model-cycling.
-    roster: list[str]
-    if models:
-        roster = [models[i % len(models)] for i in range(k)]
-    else:
-        roster = [model] * k
-    log.info("Agent roster: %s (governed=%s)", roster, governed)
-    agents = [
-        _build_agent(
-            provider=provider,
-            model=roster[i],
-            project_id=project_id,
-            region=region,
-            timeout_s=timeout_s,
-            max_new_tokens=max_new_tokens,
-            governed=governed,
-        )
-        for i in range(k)
-    ]
-    coord = SwarmCoordinator(agents)
-    batch_id = f"batch-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}"
-    log.info("Swarm batch %s: %d agents x %d tasks (model=%s)", batch_id, k, len(tasks), model)
+        # Build k agents via the chosen provider. If `models` is given, each
+        # agent uses one model from the roster (heterogeneous swarm); k overrides
+        # by replicating with model-cycling.
+        roster: list[str]
+        if models:
+            roster = [models[i % len(models)] for i in range(k)]
+        else:
+            roster = [model] * k
+        log.info("Agent roster: %s (governed=%s)", roster, governed)
+        agents = [
+            _build_agent(
+                provider=provider,
+                model=roster[i],
+                project_id=project_id,
+                region=region,
+                timeout_s=timeout_s,
+                max_new_tokens=max_new_tokens,
+                governed=governed,
+            )
+            for i in range(k)
+        ]
+        coord = SwarmCoordinator(agents)
+        batch_id = f"batch-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}"
+        log.info("Swarm batch %s: %d agents x %d tasks (model=%s)", batch_id, k, len(tasks), model)
 
-    # Round-robin: task j -> agent j % k. Track elapsed per-instance via timing wrapper.
-    timings: list[float] = []
-    original_solves = [a.solve for a in agents]
+        # Round-robin: task j -> agent j % k. Track elapsed per-instance via timing wrapper.
+        timings: list[float] = []
+        original_solves = [a.solve for a in agents]
 
-    def _wrap(agent_idx: int):
-        original = original_solves[agent_idx]
-        def wrapped(task):
-            t0 = time.time()
-            r = original(task)
-            timings.append((agent_idx, task["instance_id"], time.time() - t0))
-            return r
-        return wrapped
+        def _wrap(agent_idx: int):
+            original = original_solves[agent_idx]
+            def wrapped(task):
+                t0 = time.time()
+                r = original(task)
+                timings.append((agent_idx, task["instance_id"], time.time() - t0))
+                return r
+            return wrapped
 
-    for i, agent in enumerate(agents):
-        agent.solve = _wrap(i)  # type: ignore[method-assign]
+        for i, agent in enumerate(agents):
+            agent.solve = _wrap(i)  # type: ignore[method-assign]
 
-    t_batch = time.time()
-    aggregate = coord.run_in_memory(tasks)
-    batch_elapsed = time.time() - t_batch
+        t_batch = time.time()
+        aggregate = coord.run_in_memory(tasks)
+        batch_elapsed = time.time() - t_batch
 
-    # Build a per-instance lookup of timings.
-    elapsed_by_iid = {iid: dt for (_, iid, dt) in timings}
+        # Build a per-instance lookup of timings.
+        elapsed_by_iid = {iid: dt for (_, iid, dt) in timings}
 
-    records: list[dict[str, Any]] = []
-    for j, task in enumerate(tasks):
-        result = aggregate["patches"][j]
-        # Round-robin assignment: task j -> agent (j % k) -> roster[j % k].
-        agent_idx = j % k
-        record = _record_from_solve(
-            task=task,
-            result=result,
-            model=roster[agent_idx],
-            elapsed_s=elapsed_by_iid.get(task["instance_id"], 0.0),
-            batch_id=batch_id,
-            agent_index=agent_idx,
-        )
-        record["provider"] = provider
-        records.append(record)
-        _append_result(run_id, record)
-        _save_patch(run_id, task["instance_id"], result.patch)
+        records: list[dict[str, Any]] = []
+        for j, task in enumerate(tasks):
+            result = aggregate["patches"][j]
+            # Round-robin assignment: task j -> agent (j % k) -> roster[j % k].
+            agent_idx = j % k
+            record = _record_from_solve(
+                task=task,
+                result=result,
+                model=roster[agent_idx],
+                elapsed_s=elapsed_by_iid.get(task["instance_id"], 0.0),
+                batch_id=batch_id,
+                agent_index=agent_idx,
+            )
+            record["provider"] = provider
+            records.append(record)
+            _append_result(run_id, record)
+            _save_patch(run_id, task["instance_id"], result.patch)
 
-    summary = _recompute_summary(run_id, model=model, dataset=dataset, split=split)
+        summary = _recompute_summary(run_id, model=model, dataset=dataset, split=split)
 
-    print("=" * 60)
-    print(f"Swarm batch {batch_id} ({k} agents, model={model}, dataset={dataset}):")
-    print(f"  CRDT size: {aggregate['crdt_size']}  resolved: {aggregate['resolved']}/{aggregate['total']}  "
-          f"resolve_rate: {aggregate['resolve_rate']:.3f}")
-    print(f"  governed_count: {aggregate['governed_count']}  mean_intervention: {aggregate['mean_intervention']:.3f}")
-    print(f"  batch wall time: {batch_elapsed:.1f}s")
-    print("-" * 60)
-    for r in records:
-        print(f"  agent#{r['agent_index']}: {r['instance_id']}  "
-              f"success={r['success']}  patch={r['patch_length']}  "
-              f"in/out={r['input_tokens']}/{r['output_tokens']}  "
-              f"${r['est_cost_usd']:.4f}  {r['elapsed_s']}s")
-    print("-" * 60)
-    print(f"Run {summary['run_id']!r} totals (model={summary['model']}):")
-    print(f"  attempted={summary['total']}  succeeded={summary['succeeded']}  "
-          f"errored={summary['errored']}  rate={summary['success_rate']:.3f}")
-    print(f"  est_total_cost=${summary['est_cost_usd_total']:.4f}")
-    print("=" * 60)
-    return records
+        print("=" * 60)
+        print(f"Swarm batch {batch_id} ({k} agents, model={model}, dataset={dataset}):")
+        print(f"  CRDT size: {aggregate['crdt_size']}  resolved: {aggregate['resolved']}/{aggregate['total']}  "
+              f"resolve_rate: {aggregate['resolve_rate']:.3f}")
+        print(f"  governed_count: {aggregate['governed_count']}  mean_intervention: {aggregate['mean_intervention']:.3f}")
+        print(f"  batch wall time: {batch_elapsed:.1f}s")
+        print("-" * 60)
+        for r in records:
+            print(f"  agent#{r['agent_index']}: {r['instance_id']}  "
+                  f"success={r['success']}  patch={r['patch_length']}  "
+                  f"in/out={r['input_tokens']}/{r['output_tokens']}  "
+                  f"${r['est_cost_usd']:.4f}  {r['elapsed_s']}s")
+        print("-" * 60)
+        print(f"Run {summary['run_id']!r} totals (model={summary['model']}):")
+        print(f"  attempted={summary['total']}  succeeded={summary['succeeded']}  "
+              f"errored={summary['errored']}  rate={summary['success_rate']:.3f}")
+        print(f"  est_total_cost=${summary['est_cost_usd_total']:.4f}")
+        print("=" * 60)
+        return records
 
 
 def run_best_of_k_batch(
@@ -510,168 +547,169 @@ def run_best_of_k_batch(
     if picker not in PICKERS:
         raise ValueError(f"Unknown picker {picker!r}; choose from {sorted(PICKERS)}")
 
-    # Pull ONE next-un-attempted task. We compare against the WINNER records
-    # (is_winner=True) so a previous best-of-K invocation on the same instance
-    # marks it as attempted.
-    attempted = _attempted_winner_ids(run_id)
-    from datasets import load_dataset
+    with _run_lock(run_id):
+        # Pull ONE next-un-attempted task. We compare against the WINNER records
+        # (is_winner=True) so a previous best-of-K invocation on the same instance
+        # marks it as attempted.
+        attempted = _attempted_winner_ids(run_id)
+        from datasets import load_dataset
 
-    task: dict[str, Any] | None = None
-    ds = load_dataset(dataset, split=split, streaming=True)
-    for raw in ds:
-        if raw["instance_id"] in attempted:
-            continue
-        task = _normalize_task(raw)
-        break
-    if task is None:
-        raise RuntimeError(
-            f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
+        task: dict[str, Any] | None = None
+        ds = load_dataset(dataset, split=split, streaming=True)
+        for raw in ds:
+            if raw["instance_id"] in attempted:
+                continue
+            task = _normalize_task(raw)
+            break
+        if task is None:
+            raise RuntimeError(
+                f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
+            )
+
+        # Build agent roster (heterogeneous if --models given).
+        if models:
+            roster = [models[i % len(models)] for i in range(k)]
+        else:
+            roster = [model] * k
+
+        log.info(
+            "Best-of-%d on %s: roster=%s, picker=%s, governed=%s",
+            k, task["instance_id"], roster, picker, governed,
+        )
+        agents = [
+            _build_agent(
+                provider=provider,
+                model=roster[i],
+                project_id=project_id,
+                region=region,
+                timeout_s=timeout_s,
+                max_new_tokens=max_new_tokens,
+                governed=governed,
+            )
+            for i in range(k)
+        ]
+
+        # Run all k agents on the SAME task, sequentially.
+        batch_id = f"bok-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}-{picker}"
+        candidates: list[Any] = []
+        elapsed_per_agent: list[float] = []
+        for i, agent in enumerate(agents):
+            t0 = time.time()
+            result = agent.solve(task)
+            elapsed_per_agent.append(time.time() - t0)
+            candidates.append(result)
+
+        # Picker selection.
+        picker_fn = PICKERS[picker]
+        if needs_dna(picker):
+            from constitutional_swarm.dna import AgentDNA
+            from constitutional_swarm.eval.monotonic_mas.detectors.mcfs_constitution import (
+                MCFS_ROLE_CONSTITUTION,
+            )
+            dna = AgentDNA(
+                constitution=MCFS_ROLE_CONSTITUTION,
+                agent_id="picker-judge",
+                strict=False,
+                risk_scoring=True,
+            )
+            winner_idx, picker_reason = picker_fn(candidates, dna)
+        else:
+            winner_idx, picker_reason = picker_fn(candidates)
+
+        # Persist k candidate records.
+        cand_records: list[dict[str, Any]] = []
+        for i, result in enumerate(candidates):
+            rec = _record_from_solve(
+                task=task,
+                result=result,
+                model=roster[i],
+                elapsed_s=elapsed_per_agent[i],
+                batch_id=batch_id,
+                agent_index=i,
+            )
+            rec["provider"] = provider
+            rec["mode"] = "best-of-k"
+            rec["picker"] = picker
+            rec["is_winner"] = False
+            rec["candidate_count"] = k
+            cand_records.append(rec)
+            _append_result(run_id, rec)
+            # Per-candidate patch file for audit.
+            if result.patch:
+                patch_dir = _run_dir(run_id) / "patches"
+                patch_dir.mkdir(parents=True, exist_ok=True)
+                (patch_dir / f"{task['instance_id']}.agent{i}.diff").write_text(result.patch)
+
+        # Build winner record.
+        if winner_idx < 0:
+            # No winner — entire batch failed. Synthesize a marker record.
+            winner_rec = {
+                "instance_id": task["instance_id"],
+                "repo": task["repo"],
+                "base_commit": task["base_commit"],
+                "model": "<best-of-k-no-winner>",
+                "auth": cand_records[0].get("auth") if cand_records else "unknown",
+                "batch_id": batch_id,
+                "agent_index": -1,
+                "success": False,
+                "patch_length": 0,
+                "input_tokens": sum(r["input_tokens"] for r in cand_records),
+                "output_tokens": sum(r["output_tokens"] for r in cand_records),
+                "stop_reason": None,
+                "raw_length": None,
+                "elapsed_s": round(sum(elapsed_per_agent), 3),
+                "est_cost_usd": round(sum(r["est_cost_usd"] for r in cand_records), 6),
+                "error": "no_valid_candidate",
+                "stderr_tail": picker_reason,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "provider": provider,
+                "mode": "best-of-k",
+                "picker": picker,
+                "picker_reason": picker_reason,
+                "is_winner": True,
+                "candidate_count": k,
+            }
+        else:
+            # Winner = clone of the chosen candidate, re-tagged.
+            winner_rec = dict(cand_records[winner_idx])
+            winner_rec["is_winner"] = True
+            winner_rec["picker_reason"] = picker_reason
+            # Cost includes ALL k candidate calls (you paid for them; only one
+            # contributes to the resolve rate).
+            winner_rec["est_cost_usd"] = round(
+                sum(r["est_cost_usd"] for r in cand_records), 6
+            )
+            winner_rec["input_tokens"] = sum(r["input_tokens"] for r in cand_records)
+            winner_rec["output_tokens"] = sum(r["output_tokens"] for r in cand_records)
+            winner_rec["elapsed_s"] = round(sum(elapsed_per_agent), 3)
+        _append_result(run_id, winner_rec)
+
+        # The winner's patch is the canonical instance patch.
+        if winner_idx >= 0 and candidates[winner_idx].patch:
+            _save_patch(run_id, task["instance_id"], candidates[winner_idx].patch)
+
+        summary = _recompute_summary_winners(
+            run_id, model=model, dataset=dataset, split=split
         )
 
-    # Build agent roster (heterogeneous if --models given).
-    if models:
-        roster = [models[i % len(models)] for i in range(k)]
-    else:
-        roster = [model] * k
-
-    log.info(
-        "Best-of-%d on %s: roster=%s, picker=%s, governed=%s",
-        k, task["instance_id"], roster, picker, governed,
-    )
-    agents = [
-        _build_agent(
-            provider=provider,
-            model=roster[i],
-            project_id=project_id,
-            region=region,
-            timeout_s=timeout_s,
-            max_new_tokens=max_new_tokens,
-            governed=governed,
-        )
-        for i in range(k)
-    ]
-
-    # Run all k agents on the SAME task, sequentially.
-    batch_id = f"bok-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}-{picker}"
-    candidates: list[Any] = []
-    elapsed_per_agent: list[float] = []
-    for i, agent in enumerate(agents):
-        t0 = time.time()
-        result = agent.solve(task)
-        elapsed_per_agent.append(time.time() - t0)
-        candidates.append(result)
-
-    # Picker selection.
-    picker_fn = PICKERS[picker]
-    if needs_dna(picker):
-        from constitutional_swarm.dna import AgentDNA
-        from constitutional_swarm.eval.monotonic_mas.detectors.mcfs_constitution import (
-            MCFS_ROLE_CONSTITUTION,
-        )
-        dna = AgentDNA(
-            constitution=MCFS_ROLE_CONSTITUTION,
-            agent_id="picker-judge",
-            strict=False,
-            risk_scoring=True,
-        )
-        winner_idx, picker_reason = picker_fn(candidates, dna)
-    else:
-        winner_idx, picker_reason = picker_fn(candidates)
-
-    # Persist k candidate records.
-    cand_records: list[dict[str, Any]] = []
-    for i, result in enumerate(candidates):
-        rec = _record_from_solve(
-            task=task,
-            result=result,
-            model=roster[i],
-            elapsed_s=elapsed_per_agent[i],
-            batch_id=batch_id,
-            agent_index=i,
-        )
-        rec["provider"] = provider
-        rec["mode"] = "best-of-k"
-        rec["picker"] = picker
-        rec["is_winner"] = False
-        rec["candidate_count"] = k
-        cand_records.append(rec)
-        _append_result(run_id, rec)
-        # Per-candidate patch file for audit.
-        if result.patch:
-            patch_dir = _run_dir(run_id) / "patches"
-            patch_dir.mkdir(parents=True, exist_ok=True)
-            (patch_dir / f"{task['instance_id']}.agent{i}.diff").write_text(result.patch)
-
-    # Build winner record.
-    if winner_idx < 0:
-        # No winner — entire batch failed. Synthesize a marker record.
-        winner_rec = {
-            "instance_id": task["instance_id"],
-            "repo": task["repo"],
-            "base_commit": task["base_commit"],
-            "model": "<best-of-k-no-winner>",
-            "auth": cand_records[0].get("auth") if cand_records else "unknown",
-            "batch_id": batch_id,
-            "agent_index": -1,
-            "success": False,
-            "patch_length": 0,
-            "input_tokens": sum(r["input_tokens"] for r in cand_records),
-            "output_tokens": sum(r["output_tokens"] for r in cand_records),
-            "stop_reason": None,
-            "raw_length": None,
-            "elapsed_s": round(sum(elapsed_per_agent), 3),
-            "est_cost_usd": round(sum(r["est_cost_usd"] for r in cand_records), 6),
-            "error": "no_valid_candidate",
-            "stderr_tail": picker_reason,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "provider": provider,
-            "mode": "best-of-k",
-            "picker": picker,
-            "picker_reason": picker_reason,
-            "is_winner": True,
-            "candidate_count": k,
-        }
-    else:
-        # Winner = clone of the chosen candidate, re-tagged.
-        winner_rec = dict(cand_records[winner_idx])
-        winner_rec["is_winner"] = True
-        winner_rec["picker_reason"] = picker_reason
-        # Cost includes ALL k candidate calls (you paid for them; only one
-        # contributes to the resolve rate).
-        winner_rec["est_cost_usd"] = round(
-            sum(r["est_cost_usd"] for r in cand_records), 6
-        )
-        winner_rec["input_tokens"] = sum(r["input_tokens"] for r in cand_records)
-        winner_rec["output_tokens"] = sum(r["output_tokens"] for r in cand_records)
-        winner_rec["elapsed_s"] = round(sum(elapsed_per_agent), 3)
-    _append_result(run_id, winner_rec)
-
-    # The winner's patch is the canonical instance patch.
-    if winner_idx >= 0 and candidates[winner_idx].patch:
-        _save_patch(run_id, task["instance_id"], candidates[winner_idx].patch)
-
-    summary = _recompute_summary_winners(
-        run_id, model=model, dataset=dataset, split=split
-    )
-
-    print("=" * 60)
-    print(f"Best-of-{k} on {task['instance_id']}  (picker={picker})")
-    print(f"  picker_reason: {picker_reason}")
-    print(f"  total wall: {sum(elapsed_per_agent):.1f}s  cost: ${winner_rec['est_cost_usd']:.4f}")
-    print("-" * 60)
-    for i, rec in enumerate(cand_records):
-        marker = "★" if i == winner_idx else " "
-        print(f"  {marker} agent#{i} ({roster[i]}): "
-              f"success={rec['success']} patch={rec['patch_length']} "
-              f"in/out={rec['input_tokens']}/{rec['output_tokens']} "
-              f"${rec['est_cost_usd']:.4f} {rec['elapsed_s']}s")
-    print("-" * 60)
-    print(f"Run {summary['run_id']!r} winners-only:")
-    print(f"  attempted={summary['total']}  succeeded={summary['succeeded']}  "
-          f"errored={summary['errored']}  rate={summary['success_rate']:.3f}")
-    print(f"  est_total_cost=${summary['est_cost_usd_total']:.4f}")
-    print("=" * 60)
-    return winner_rec
+        print("=" * 60)
+        print(f"Best-of-{k} on {task['instance_id']}  (picker={picker})")
+        print(f"  picker_reason: {picker_reason}")
+        print(f"  total wall: {sum(elapsed_per_agent):.1f}s  cost: ${winner_rec['est_cost_usd']:.4f}")
+        print("-" * 60)
+        for i, rec in enumerate(cand_records):
+            marker = "★" if i == winner_idx else " "
+            print(f"  {marker} agent#{i} ({roster[i]}): "
+                  f"success={rec['success']} patch={rec['patch_length']} "
+                  f"in/out={rec['input_tokens']}/{rec['output_tokens']} "
+                  f"${rec['est_cost_usd']:.4f} {rec['elapsed_s']}s")
+        print("-" * 60)
+        print(f"Run {summary['run_id']!r} winners-only:")
+        print(f"  attempted={summary['total']}  succeeded={summary['succeeded']}  "
+              f"errored={summary['errored']}  rate={summary['success_rate']:.3f}")
+        print(f"  est_total_cost=${summary['est_cost_usd_total']:.4f}")
+        print("=" * 60)
+        return winner_rec
 
 
 def _attempted_winner_ids(run_id: str) -> set[str]:

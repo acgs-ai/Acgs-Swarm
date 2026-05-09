@@ -51,6 +51,11 @@ semantic = ["sentence-transformers>=2.5"]
 # so runs use ADC instead of a direct Anthropic API key. Auth via
 # `gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS.
 vertex = ["anthropic[vertex]>=0.84", "google-cloud-aiplatform>=1.50"]
+# gemini: GeminiSWEBenchAgent uses the unified google-genai SDK (Vertex via
+# vertexai=True). Distinct from the vertex extra above (which is Anthropic-on-
+# Vertex, no genai SDK). Install both extras when running heterogeneous
+# Claude+Gemini swarms via run_one_by_one --models.
+gemini = ["google-genai>=0.3"]
 
 [project.scripts]
 acgs-swarm = "constitutional_swarm.governed_handoff:main"
