@@ -1,70 +1,69 @@
-"""ClaudeSWEBenchAgent — SWEBenchAgent backed by the Anthropic Messages API.
+"""VertexClaudeSWEBenchAgent — SWEBenchAgent backed by Claude on Vertex AI.
 
-Wires :class:`SWEBenchAgent._generate_patch()` to ``anthropic.Anthropic``
-so Claude (e.g. ``claude-sonnet-4-5``) produces unified diffs for
-SWE-bench-shaped tasks.
+Wires :class:`SWEBenchAgent._generate_patch()` to ``anthropic.AnthropicVertex``
+so Claude (e.g. ``claude-sonnet-4-6``) routes through Google Cloud Vertex AI
+instead of the direct Anthropic Messages API. The wire format is the same
+(Messages API); the only differences vs the direct path are:
+
+- Constructor takes ``project_id`` + ``region`` (no API key).
+- Auth uses Application Default Credentials (``gcloud auth
+  application-default login``), Workload Identity, or
+  ``GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json``.
+- ``model`` is part of the URL on Vertex; the SDK still accepts it as a
+  kwarg and forwards it correctly.
 
 Requirements
 ------------
-- ``anthropic>=0.84`` installed (``pip install anthropic``)
-- ``ANTHROPIC_API_KEY`` set in the environment (or pass ``api_key`` kwarg)
+- ``pip install "anthropic[vertex]" google-cloud-aiplatform``
+- A GCP project with Anthropic models enabled (Vertex AI Model Garden →
+  search "Claude" → request access if needed).
+- ADC configured: ``gcloud auth application-default login`` (interactive
+  user creds) OR ``GOOGLE_APPLICATION_CREDENTIALS`` pointing at a service
+  account JSON.
 
 Usage
 -----
->>> agent = ClaudeSWEBenchAgent(model="claude-sonnet-4-5", timeout_s=180)
->>> result = agent.solve(task)   # task dict from load_instances()
+>>> agent = VertexClaudeSWEBenchAgent(
+...     project_id="my-gcp-project",
+...     region="global",
+...     model="claude-sonnet-4-6",
+... )
+>>> result = agent.solve(task)
 """
 
 from __future__ import annotations
 
 import logging
-import re
+import os
 from typing import Any
 
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
+from constitutional_swarm.swe_bench.claude_agent import (
+    _PROMPT_TEMPLATE,
+    _extract_diff,
+)
 
 _log = logging.getLogger(__name__)
 
-# Match the START of an applyable unified diff. We require a file header
-# (`diff --git`, `--- a/`, or `+++ b/`) — `@@` hunks alone are NOT applyable
-# because git apply needs to know which file to patch. Keeping `@@` here
-# meant LLMs that emitted hunks-only output (e.g. continuing from a prior
-# agent's truncated context) produced "successful" but unapplyable patches.
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/)")
 
-_PROMPT_TEMPLATE = """\
-You are solving a SWE-bench task. Produce a unified diff that fixes the bug.
-
-Output rules:
-- Reply with ONLY the unified diff, no prose, no code fences, no explanation.
-- Use standard ``--- a/<path>`` and ``+++ b/<path>`` headers.
-- Paths must be relative to the repository root.
-- Do not modify tests unless the task explicitly requires it.
-
-Instance: {instance_id}
-Repository: {repo}
-Base commit: {base_commit}
-
-Tests that should flip from FAIL to PASS:
-{fail_to_pass}
-
-Problem statement:
-{problem_statement}
-
-{hints_section}Produce the patch now."""
-
-
-class ClaudeSWEBenchAgent(SWEBenchAgent):
-    """SWEBenchAgent that delegates patch generation to the Anthropic Messages API.
+class VertexClaudeSWEBenchAgent(SWEBenchAgent):
+    """SWEBenchAgent that delegates patch generation to Claude on Vertex AI.
 
     Parameters
     ----------
+    project_id:
+        GCP project ID. Falls back to ``GOOGLE_CLOUD_PROJECT`` then
+        ``ANTHROPIC_VERTEX_PROJECT_ID`` env vars.
+    region:
+        Vertex region. ``"global"`` (default) is recommended — dynamic
+        routing, max availability, no pricing premium. Use a specific
+        region (``"us-east5"``, ``"europe-west1"``) for data-residency
+        requirements.
     model:
-        Anthropic model identifier. Defaults to ``claude-sonnet-4-5``.
-    api_key:
-        Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
+        Vertex model ID. Defaults to ``claude-sonnet-4-6``. Must be a
+        model available in your project's enabled regions.
     timeout_s:
-        Hard timeout passed to the HTTP client; also recorded in ``SWEPatch``.
+        Hard timeout passed to the HTTP client; recorded in ``SWEPatch``.
     max_new_tokens:
         Maximum tokens for the completion (``max_tokens`` in the API).
     system_prompt:
@@ -73,7 +72,8 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
         Additional kwargs forwarded to ``client.messages.create()``.
     """
 
-    _DEFAULT_MODEL = "claude-sonnet-4-5"
+    _DEFAULT_MODEL = "claude-sonnet-4-6"
+    _DEFAULT_REGION = "global"
     _DEFAULT_SYSTEM = (
         "You are an expert software engineer. "
         "When asked to fix a bug, output only the unified diff — "
@@ -83,8 +83,9 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
     def __init__(
         self,
         *,
+        project_id: str | None = None,
+        region: str | None = None,
         model: str | None = None,
-        api_key: str | None = None,
         timeout_s: float = 180.0,
         max_new_tokens: int = 2048,
         system_prompt: str | None = None,
@@ -92,6 +93,18 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
         **kwargs: Any,
     ) -> None:
         self._model = model or self._DEFAULT_MODEL
+        self._region = region or self._DEFAULT_REGION
+        self._project_id = (
+            project_id
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+        )
+        if not self._project_id:
+            raise ValueError(
+                "project_id is required. Pass it explicitly or set "
+                "GOOGLE_CLOUD_PROJECT / ANTHROPIC_VERTEX_PROJECT_ID."
+            )
+
         super().__init__(
             model_name=self._model,
             timeout_s=timeout_s,
@@ -99,18 +112,18 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
             **kwargs,
         )
         try:
-            import anthropic
+            from anthropic import AnthropicVertex
         except ImportError as exc:
             raise ImportError(
-                "anthropic package is required. Install with `pip install anthropic`."
+                "anthropic[vertex] is required. Install with "
+                "`pip install \"anthropic[vertex]\" google-cloud-aiplatform`."
             ) from exc
-        self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+        self._client = AnthropicVertex(
+            project_id=self._project_id,
+            region=self._region,
+        )
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_kwargs: dict[str, Any] = dict(extra_kwargs or {})
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _build_prompt(self, task: dict[str, Any]) -> str:
         fail_to_pass = task.get("FAIL_TO_PASS") or []
@@ -133,6 +146,8 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
         prompt = self._build_prompt(task)
         stats: dict[str, Any] = {
             "model": self._model,
+            "region": self._region,
+            "project_id": self._project_id,
             "intervention_rate": 0.0,
         }
         try:
@@ -144,17 +159,17 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
                 **self._extra_kwargs,
             )
         except anthropic.APIStatusError as exc:
-            _log.warning("Anthropic API error %s: %s", exc.status_code, exc.message)
+            _log.warning("Vertex API error %s: %s", exc.status_code, exc.message)
             stats["error"] = f"api_status_{exc.status_code}"
             stats["stderr_tail"] = str(exc.message)[:500]
             return "", stats
         except anthropic.APIConnectionError as exc:
-            _log.warning("Anthropic connection error: %s", exc)
+            _log.warning("Vertex connection error: %s", exc)
             stats["error"] = "connection_error"
             stats["stderr_tail"] = str(exc)[:500]
             return "", stats
         except anthropic.APITimeoutError:
-            _log.warning("Anthropic request timed out after %.0fs", self.timeout_s)
+            _log.warning("Vertex request timed out after %.0fs", self.timeout_s)
             stats["error"] = "timeout"
             return "", stats
 
@@ -173,28 +188,4 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
         return patch, stats
 
 
-def _extract_diff(text: str) -> str:
-    """Extract a unified diff from *text*, stripping markdown code fences and prose prefix.
-
-    Cuts from the first occurrence of a unified-diff marker (``diff --git``,
-    ``--- a/``, ``+++ b/``, or ``@@ ``). Prose preceding that marker is
-    discarded so the result is patch-applyable by ``git apply``.
-    """
-    if not text:
-        return ""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    m = _DIFF_MARKER.search(stripped)
-    if not m:
-        return ""
-    diff_only = stripped[m.start():]
-    return diff_only + ("\n" if not diff_only.endswith("\n") else "")
-
-
-__all__ = ["ClaudeSWEBenchAgent"]
+__all__ = ["VertexClaudeSWEBenchAgent"]
