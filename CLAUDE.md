@@ -24,13 +24,13 @@ python -m pytest tests/ --import-mode=importlib
 ## Commands
 
 ```bash
-# Lint (53 pre-existing errors in latent_dna.py — suppress RUF002/RUF003 for Greek chars)
+# Lint (clean — CI matrix uses pure ruff defaults via isolated checkout)
 python -m ruff check src/
 
 # Format
 python -m ruff format src/
 
-# Test (1019 tests, 2 xfailed — Birkhoff collapse, expected)
+# Test (CI: 1503 passed [dev], 1652 passed + 2 xfailed [research] — Birkhoff collapse, expected)
 python -m pytest tests/ --import-mode=importlib -q
 
 # Test WebSocket transport (requires extra)
