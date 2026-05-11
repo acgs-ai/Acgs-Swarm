@@ -24,6 +24,7 @@ papers/*/main.pdf
 .agents/skills/braintrust/
 .bt/config.json
 .bt/skills/
+.claude/
 .claude/settings.local.json
 
 # Session-generated artifacts — not distribution content
