@@ -56,6 +56,23 @@ vertex = ["anthropic[vertex]>=0.84", "google-cloud-aiplatform>=1.50"]
 # Vertex, no genai SDK). Install both extras when running heterogeneous
 # Claude+Gemini swarms via run_one_by_one --models.
 gemini = ["google-genai>=0.3"]
+# langgraph: LangChain/LangGraph agent runtime adapter. LangGraph is the outer
+# message-passing shell wrapping the MCFS math kernel — graphs express multi-agent
+# topologies (supervisor / network / handoff) while AgentDNA.validate, MerkleCRDT,
+# swarm_ode, and evolution_log stay authoritative. See docs/langgraph_runtime.md.
+langgraph = [
+  "langgraph>=1.1.10,<1.2",
+  "langgraph-checkpoint>=3.0.1",
+  "langgraph-prebuilt>=1.0.5",
+  "langchain>=1.0,<2.0",
+  "langchain-core>=1.0,<2.0",
+  "langchain-anthropic>=1.0",
+]
+# langgraph-swarm: optional handoff topology via langgraph-swarm. Pair with [langgraph].
+langgraph-swarm = [
+  "constitutional-swarm[langgraph]",
+  "langgraph-swarm>=0.1.0",
+]
 
 [project.scripts]
 acgs-swarm = "constitutional_swarm.governed_handoff:main"
