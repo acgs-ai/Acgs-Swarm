@@ -56,9 +56,14 @@ def serialize_for_crdt(state: SwarmGraphState) -> str:
     """Canonical JSON serialization for MerkleCRDT.append payload.
 
     Drops ``messages`` (LangChain BaseMessage objects aren't JSON-safe and
-    aren't part of the auditable artifact contract).
+    aren't part of the auditable artifact contract) and any ``_``-prefixed
+    private keys (graph-local scratch state must not leak into the auditable
+    artifact — see ``append_crdt_node`` contract in ``nodes.py``).
     """
-    safe = {k: v for k, v in state.items() if k != "messages"}
+    safe = {
+        k: v for k, v in state.items()
+        if k != "messages" and not str(k).startswith("_")
+    }
     return json.dumps(safe, sort_keys=True, separators=(",", ":"))
 
 
