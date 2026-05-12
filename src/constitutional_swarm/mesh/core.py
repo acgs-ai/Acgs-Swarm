@@ -669,8 +669,11 @@ class ConstitutionalMesh:
         for peer_id in assignment.peers:
             try:
                 self.validate_and_vote(assignment.assignment_id, peer_id)
-            except AssignmentSettledError:
+            except (AssignmentSettledError, RecoveredAssignmentError):
                 break
+            with self._lock:
+                if assignment.assignment_id in self._final_results:
+                    break
         result = self.get_result(assignment.assignment_id)
         if result.quorum_met and not result.settled:
             return self.settle(assignment.assignment_id)
