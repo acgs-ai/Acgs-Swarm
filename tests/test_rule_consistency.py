@@ -19,6 +19,7 @@ Minimum acceptable threshold: 70% (per SNCA paper baseline).
 
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import Any
 
@@ -35,9 +36,23 @@ except ImportError:
 # Constitution fixtures
 # ---------------------------------------------------------------------------
 
-AUTORESEARCH_YAML = (
+AUTORESEARCH_CONSTITUTION_ENV = "ACGS_AUTORESEARCH_CONSTITUTION"
+DEFAULT_AUTORESEARCH_YAML = (
     pathlib.Path(__file__).parent.parent.parent.parent / "autoresearch" / "constitution.yaml"
 )
+
+
+def _autoresearch_yaml_path() -> pathlib.Path:
+    """Resolve the optional autoresearch constitution fixture path.
+
+    Default test runs still skip cleanly when the parent-workspace fixture is
+    absent, but CI/operators can point the SNCA audit at a real constitution
+    with ``ACGS_AUTORESEARCH_CONSTITUTION=/path/to/constitution.yaml``.
+    """
+    configured = os.environ.get(AUTORESEARCH_CONSTITUTION_ENV)
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    return DEFAULT_AUTORESEARCH_YAML
 
 
 def _load_engine_and_rules(yaml_path: pathlib.Path | str) -> tuple[Any, list[dict]]:
@@ -77,12 +92,25 @@ def _is_blocked(engine: Any, prompt: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def test_autoresearch_yaml_path_uses_default_when_env_unset(monkeypatch) -> None:
+    monkeypatch.delenv(AUTORESEARCH_CONSTITUTION_ENV, raising=False)
+
+    assert _autoresearch_yaml_path() == DEFAULT_AUTORESEARCH_YAML
+
+
+def test_autoresearch_yaml_path_uses_env_override(tmp_path, monkeypatch) -> None:
+    override = tmp_path / "constitution.yaml"
+    monkeypatch.setenv(AUTORESEARCH_CONSTITUTION_ENV, str(override))
+
+    assert _autoresearch_yaml_path() == override
+
+
 class TestAbsoluteRuleConsistency:
     """SNCA Absolute contract: critical-severity rules MUST block all keywords."""
 
     def test_critical_rules_block_direct_keyword_match(self) -> None:
         """Every keyword in a critical rule must trigger a block."""
-        engine, rules = _load_engine_and_rules(AUTORESEARCH_YAML)
+        engine, rules = _load_engine_and_rules(_autoresearch_yaml_path())
         critical_rules = [r for r in rules if r["severity"] == "critical"]
 
         if not critical_rules:
@@ -102,7 +130,7 @@ class TestAbsoluteRuleConsistency:
 
     def test_critical_rules_block_embedded_keyword(self) -> None:
         """Keywords embedded in realistic sentences must still trigger blocks."""
-        engine, rules = _load_engine_and_rules(AUTORESEARCH_YAML)
+        engine, rules = _load_engine_and_rules(_autoresearch_yaml_path())
         critical_rules = [r for r in rules if r["severity"] == "critical"]
 
         failures: list[dict] = []
@@ -137,7 +165,7 @@ class TestConditionalRuleConsistency:
 
     def test_high_severity_rules_block_at_least_one_keyword(self) -> None:
         """Each high-severity rule must block at least one of its own keywords."""
-        engine, rules = _load_engine_and_rules(AUTORESEARCH_YAML)
+        engine, rules = _load_engine_and_rules(_autoresearch_yaml_path())
         high_rules = [r for r in rules if r["severity"] == "high" and r["keywords"]]
 
         if not high_rules:
@@ -173,7 +201,7 @@ class TestRuleConsistencyMetrics:
 
         Minimum threshold: 70% per SNCA paper baseline.
         """
-        engine, rules = _load_engine_and_rules(AUTORESEARCH_YAML)
+        engine, rules = _load_engine_and_rules(_autoresearch_yaml_path())
         rules_with_keywords = [r for r in rules if r["keywords"]]
 
         if not rules_with_keywords:
@@ -195,7 +223,7 @@ class TestRuleConsistencyMetrics:
 
     def test_no_rule_has_empty_keywords_and_critical_severity(self) -> None:
         """Critical rules without keywords are unverifiable — flag them."""
-        _, rules = _load_engine_and_rules(AUTORESEARCH_YAML)
+        _, rules = _load_engine_and_rules(_autoresearch_yaml_path())
         unverifiable = [r["id"] for r in rules if r["severity"] == "critical" and not r["keywords"]]
         # Allow up to 2 — some critical rules are pattern-only
         assert len(unverifiable) <= 2, (
