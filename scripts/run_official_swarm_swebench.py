@@ -148,7 +148,10 @@ def render_markdown_bundle(bundle: dict[str, object]) -> str:
             "",
             "## Per-instance comparison",
             "",
-            "| Severity | Instance | Repo | Local stage | Local resolved | Official status | Disagreement |",
+            (
+                "| Severity | Instance | Repo | Local stage | Local resolved | "
+                "Official status | Disagreement |"
+            ),
             "|---|---|---|---|---:|---|---|",
         ]
     )
@@ -156,7 +159,10 @@ def render_markdown_bundle(bundle: dict[str, object]) -> str:
     for row in rows:
         severity_label, _severity_key = disagreement_severity(row.get("disagreement"))
         lines.append(
-            "| {severity} | `{instance}` | `{repo}` | `{stage}` | `{local_resolved}` | `{official_status}` | `{disagreement}` |".format(
+            (
+                "| {severity} | `{instance}` | `{repo}` | `{stage}` | "
+                "`{local_resolved}` | `{official_status}` | `{disagreement}` |"
+            ).format(
                 severity=severity_label,
                 instance=row.get("instance_id", ""),
                 repo=row.get("repo", ""),
@@ -335,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jsonl", type=Path, default=None)
     parser.add_argument("--dataset", default="princeton-nlp/SWE-bench_Lite")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--backend", choices=["codex", "claude"], default="codex")
+    parser.add_argument("--backend", choices=["codex", "claude", "mini"], default="codex")
     parser.add_argument("--agents", type=int, default=2)
     parser.add_argument("--mode", choices=["in-memory", "gossip"], default="in-memory")
     parser.add_argument("--gossip-rounds", type=int, default=5)
@@ -365,13 +371,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--final-report-output",
         type=Path,
         default=None,
-        help="Optional path for a combined bundle summarizing local swarm output and official harness results.",
+        help=(
+            "Optional path for a combined bundle summarizing local swarm output "
+            "and official harness results."
+        ),
     )
     parser.add_argument(
         "--final-report-markdown-output",
         type=Path,
         default=None,
-        help="Optional path for a markdown version of the final report bundle with emoji-tagged severity.",
+        help=(
+            "Optional path for a markdown version of the final report bundle "
+            "with emoji-tagged severity."
+        ),
     )
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -411,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         swarm_output=swarm_output,
         predictions_output=predictions_output,
     )
-    subprocess.run(swarm_cmd, check=True, cwd=_REPO_ROOT)  # noqa: S603
+    subprocess.run(swarm_cmd, check=True, cwd=_REPO_ROOT)
 
     eval_cmd = build_official_eval_command(
         predictions_path=predictions_output,
@@ -425,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         namespace=args.namespace,
         report_dir=args.report_dir,
     )
-    subprocess.run(eval_cmd, check=True, cwd=_REPO_ROOT)  # noqa: S603
+    subprocess.run(eval_cmd, check=True, cwd=_REPO_ROOT)
     official_report_path = _REPO_ROOT / get_official_report_path(predictions_output, args.run_id)
     write_final_report_bundle(
         swarm_output_path=swarm_output,

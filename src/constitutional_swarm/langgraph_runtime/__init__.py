@@ -12,12 +12,14 @@ from __future__ import annotations
 
 try:
     import langgraph as _langgraph  # noqa: F401
+
     HAS_LANGGRAPH = True
 except ImportError:
     HAS_LANGGRAPH = False
 
 try:
     import langgraph_swarm as _langgraph_swarm  # noqa: F401
+
     HAS_LANGGRAPH_SWARM = True
 except ImportError:
     HAS_LANGGRAPH_SWARM = False

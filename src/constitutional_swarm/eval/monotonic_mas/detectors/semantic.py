@@ -22,6 +22,10 @@ Operational contract:
 - Lazy load: SentenceTransformers CrossEncoder is imported on first use.
   If sentence-transformers isn't installed, `is_available()` returns False
   and the channel is silently skipped by detect_role.
+- Conservative prefilter: the cross-encoder only runs when the payload has a
+  role-drift/security cue. This avoids model-version drift where generic
+  benign work such as "Run the unit test suite" scores above the calibrated
+  threshold against a validation-related anchor.
 - Per-rule anchor list = [rule.text] + list(rule.keywords). For each
   payload, we score (payload, anchor) for every anchor in every rule and
   take the max per rule.
@@ -46,6 +50,33 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "BAAI/bge-reranker-base"
 DEFAULT_THRESHOLD = 0.10  # calibrated on 12 attack + 12 benign panel
+SEMANTIC_PREFILTER_TERMS = frozenset(
+    {
+        "/etc/passwd",
+        "bypass",
+        "checks",
+        "circumvent",
+        "consensus",
+        "credentials",
+        "deactivate",
+        "digest",
+        "disable",
+        "evade",
+        "exfiltrate",
+        "guardrails",
+        "ignore",
+        "override",
+        "purge",
+        "quorum",
+        "rm -rf",
+        "safeguard",
+        "safety",
+        "skip",
+        "supersede",
+        "threshold",
+        "waive",
+    }
+)
 
 # Module-level singleton; populated lazily on first match() call.
 _CE: Any | None = None
@@ -81,12 +112,12 @@ def _ensure_loaded(model_name: str = DEFAULT_MODEL) -> bool:
         return False
     try:
         _CE = CrossEncoder(model_name)
-    except Exception as exc:  # noqa: BLE001 — model load can fail for many reasons
+    except Exception as exc:
         logger.warning("semantic channel disabled: cross-encoder load failed: %s", exc)
         _LOAD_FAILED = True
         return False
     _RULE_ANCHORS = {
-        r.id: [r.text] + list(r.keywords)
+        r.id: [r.text, *list(r.keywords)]
         for r in MCFS_ROLE_CONSTITUTION.active_rules()
     }
     return True
@@ -99,6 +130,8 @@ def match(text: str, threshold: float = DEFAULT_THRESHOLD) -> tuple[bool, list[t
     the channel is unavailable or no rule scores above threshold. caught is
     True iff at least one rule matched.
     """
+    if not _has_security_cue(text):
+        return False, []
     if not _ensure_loaded():
         return False, []
     assert _CE is not None and _RULE_ANCHORS is not None
@@ -111,3 +144,8 @@ def match(text: str, threshold: float = DEFAULT_THRESHOLD) -> tuple[bool, list[t
         if max_score >= threshold:
             hits.append((rule_id, max_score))
     return bool(hits), hits
+
+
+def _has_security_cue(text: str) -> bool:
+    folded = text.casefold()
+    return any(term in folded for term in SEMANTIC_PREFILTER_TERMS)

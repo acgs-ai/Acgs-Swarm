@@ -18,5 +18,13 @@ from __future__ import annotations
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, SWEPatch
 from constitutional_swarm.swe_bench.codex_agent import CodexSWEBenchAgent
 from constitutional_swarm.swe_bench.harness import SWEBenchHarness
+from constitutional_swarm.swe_bench.mini_swe_agent import MiniSWEBenchAgent, MiniSweBenchRunner
 
-__all__ = ["CodexSWEBenchAgent", "SWEBenchAgent", "SWEBenchHarness", "SWEPatch"]
+__all__ = [
+    "CodexSWEBenchAgent",
+    "MiniSWEBenchAgent",
+    "MiniSweBenchRunner",
+    "SWEBenchAgent",
+    "SWEBenchHarness",
+    "SWEPatch",
+]

@@ -328,7 +328,18 @@ MCFS-style modules and evaluation scaffolds. APIs may change.
 - `swarm_ode` — projected RK4 continuous-time trust dynamics
 - `merkle_crdt` — content-addressed DAG artifact store (SHA-256 CIDs, set-union merge)
 - `gossip_protocol` — WebSocket gossip transport for `MerkleCRDT` (requires `[transport]`)
-- `swe_bench/` — evaluation scaffold: `SWEBenchAgent`, `SWEBenchHarness`, `SwarmCoordinator`
+- `swe_bench/` — evaluation scaffold: `SWEBenchAgent`, `SWEBenchHarness`, `SwarmCoordinator`, optional `MiniSWEBenchAgent`, and recovery-plane reporting helpers
+
+
+The SWE-Bench scaffold is an evaluation surface, not the stable runtime core.
+`scripts/run_swe_bench_swarm_lite.py` supports `--backend codex` (default),
+`--backend claude`, and optional `--backend mini` for an externally installed
+mini-swe-agent CLI. The mini backend is a pluggable `SWEBenchAgent` worker /
+recovery target; it does not replace `SwarmCoordinator`, CRDT/gossip settlement,
+or constitutional voting. Recovery classification lives in
+`constitutional_swarm.swe_bench.recovery_orchestrator` and preserves baseline
+rows separately from recovery attempts and recovered summaries. See
+`docs/internal/swebench_swarm_backend_and_recovery.md` for operator details.
 
 ## Trust dynamics: baseline and current direction
 

@@ -94,3 +94,11 @@ markers = [
   "e2e: marks end-to-end tests requiring live external services",
   "security: marks security regression tests (one test per audit finding — report auto-generated)"
 ]
+
+# uv workspace dev resolver: when developing inside the govern-zone
+# monorepo, resolve `acgs-lite` from `packages/acgs-lite` rather than PyPI.
+# Published wheel metadata (the `dependencies` array above) is unchanged —
+# external consumers still pin via `acgs-lite>=2.8.1` from PyPI.
+# See docs/PLAN-MONOREPO.md §5 Phase 3.
+[tool.uv.sources]
+acgs-lite = { workspace = true }

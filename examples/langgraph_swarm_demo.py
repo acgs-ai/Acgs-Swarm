@@ -64,6 +64,44 @@ def _fallback_run_langgraph(
     return SwarmCoordinator(agents).run_in_memory(tasks)
 
 
+def _make_graph_factory(agent_id: str):
+    """Build a tiny deterministic LangGraph factory for the demo.
+
+    The real runtime wires provider/model nodes inside this factory. For the
+    checkout demo we keep it local and deterministic so it runs without API
+    keys while still exercising ``LangGraphSWEBenchAgent`` through a compiled
+    graph.
+    """
+
+    def _factory():
+        from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
+
+        def generate_node(state: dict[str, Any]) -> dict[str, Any]:
+            task_id = state.get("task_id") or state.get("instance_id") or "unknown"
+            patch = (
+                "--- a/file.py\n"
+                "+++ b/file.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                f"+fix-by-{agent_id}-for-{task_id}\n"
+            )
+            return {
+                "patch": patch,
+                "intervention_rate": 0.0,
+                "violations": [],
+                "constitutional_hash": "",
+                "settled": False,
+            }
+
+        builder = StateGraph(dict)
+        builder.add_node("generate", generate_node)
+        builder.add_edge(START, "generate")
+        builder.add_edge("generate", END)
+        return builder.compile()
+
+    return _factory
+
+
 def _build_agents() -> list[SWEBenchAgent]:
     """Build three agents.
 
@@ -86,7 +124,13 @@ def _build_agents() -> list[SWEBenchAgent]:
                     f"+fix-by-a{i}\n"
                 ]
             )
-            agents.append(LangGraphSWEBenchAgent(llm=llm, model_name=f"langgraph-a{i}"))
+            agents.append(
+                LangGraphSWEBenchAgent(
+                    graph_factory=_make_graph_factory(f"a{i}"),
+                    llm=llm,
+                    model_name=f"langgraph-a{i}",
+                )
+            )
         return agents
     except ImportError:
         return [MockSolverAgent(agent_id=f"a{i}") for i in range(3)]
