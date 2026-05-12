@@ -1,4 +1,4 @@
-"""Run a Codex/Claude SWE-bench Lite swarm with local validation.
+"""Run a Codex/Claude/mini-SWE-agent SWE-bench Lite swarm with local validation.
 
 This is the swarm-backed counterpart to ``run_swe_bench_lite.py``:
 
@@ -46,8 +46,9 @@ def _make_agent(
     model: str | None,
     timeout_s: float,
     agent_cls: type[Any],
+    agent_kwargs: dict[str, Any] | None = None,
 ) -> Any:
-    return agent_cls(model=model, timeout_s=timeout_s)
+    return agent_cls(model=model, timeout_s=timeout_s, **(agent_kwargs or {}))
 
 
 def _import_runtime(backend: str) -> dict[str, Any]:
@@ -70,6 +71,10 @@ def _import_runtime(backend: str) -> dict[str, Any]:
             from constitutional_swarm.swe_bench.claude_agent import ClaudeSWEBenchAgent
 
             agent_cls = ClaudeSWEBenchAgent
+        elif backend == "mini":
+            from constitutional_swarm.swe_bench.mini_swe_agent import MiniSWEBenchAgent
+
+            agent_cls = MiniSWEBenchAgent
         else:
             from constitutional_swarm.swe_bench.codex_agent import CodexSWEBenchAgent
 
@@ -91,6 +96,7 @@ def _make_agents(
     timeout_s: float,
     count: int,
     agent_cls: type[Any],
+    agent_kwargs: dict[str, Any] | None = None,
 ) -> list[Any]:
     if count < 1:
         raise ValueError("--agents must be at least 1")
@@ -99,9 +105,27 @@ def _make_agents(
             model=model,
             timeout_s=timeout_s,
             agent_cls=agent_cls,
+            agent_kwargs=agent_kwargs,
         )
         for _ in range(count)
     ]
+
+
+def _backend_agent_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Return backend-specific optional agent kwargs.
+
+    Defaults are empty for Codex/Claude.  The mini backend remains optional and
+    subprocess-backed; these flags only configure the adapter when selected.
+    """
+    if args.backend != "mini":
+        return {}
+    kwargs: dict[str, Any] = {
+        "extra_args": list(args.mini_extra_arg or []),
+        "yolo": bool(args.mini_yolo),
+    }
+    if args.mini_binary is not None:
+        kwargs["mini_binary"] = args.mini_binary
+    return kwargs
 
 
 def _run_swarm(
@@ -279,7 +303,7 @@ def _summarize(
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument(
@@ -293,8 +317,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backend",
         default="codex",
-        choices=["codex", "claude"],
-        help="Agent backend: 'codex' (Codex CLI / GPT) or 'claude' (Anthropic Messages API).",
+        choices=["codex", "claude", "mini"],
+        help=(
+            "Agent backend: 'codex' (Codex CLI / GPT), 'claude' "
+            "(Anthropic Messages API), or 'mini' (external mini-swe-agent CLI)."
+        ),
     )
     parser.add_argument(
         "--agents",
@@ -325,8 +352,28 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Model identifier for the chosen backend. "
-            "codex default: Codex CLI default; claude default: claude-sonnet-4-5."
+            "codex default: Codex CLI default; claude default: claude-sonnet-4-5; "
+            "mini default: mini-swe-agent default."
         ),
+    )
+    parser.add_argument(
+        "--mini-binary",
+        default=None,
+        help="Optional mini-swe-agent CLI path/name when --backend mini is selected.",
+    )
+    parser.add_argument(
+        "--mini-extra-arg",
+        action="append",
+        default=[],
+        help=(
+            "Extra argument to append to each mini-swe-agent invocation. "
+            "Repeat for multiple args; only used with --backend mini."
+        ),
+    )
+    parser.add_argument(
+        "--mini-yolo",
+        action="store_true",
+        help="Opt in to mini-swe-agent no-confirmation mode; only used with --backend mini.",
     )
     parser.add_argument("--agent-timeout", type=float, default=240.0)
     parser.add_argument("--harness-timeout", type=float, default=600.0)
@@ -335,7 +382,10 @@ def main(argv: list[str] | None = None) -> int:
         "--predictions-output",
         type=Path,
         default=None,
-        help="Optional path to write official SWE-bench predictions JSONL converted from the swarm rows.",
+        help=(
+            "Optional path to write official SWE-bench predictions JSONL "
+            "converted from the swarm rows."
+        ),
     )
     parser.add_argument(
         "--env-isolation",
@@ -361,9 +411,18 @@ def main(argv: list[str] | None = None) -> int:
         "--env-fallback-mode",
         default="strict",
         choices=["strict", "report-native-build-blocked"],
-        help="How to report env failures after a patch applies. 'report-native-build-blocked' rewrites native compile/toolchain failures into an explicit blocked stage.",
+        help=(
+            "How to report env failures after a patch applies. "
+            "'report-native-build-blocked' rewrites native compile/toolchain "
+            "failures into an explicit blocked stage."
+        ),
     )
     parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -389,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_s=args.agent_timeout,
         count=args.agents,
         agent_cls=agent_cls,
+        agent_kwargs=_backend_agent_kwargs(args),
     )
     coordinator = SwarmCoordinator(
         agents,

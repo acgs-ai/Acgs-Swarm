@@ -10,6 +10,8 @@ Long-form design and protocol documentation for constitutional-swarm. User-facin
 | File | Description |
 |------|-------------|
 | `maci_dp_protocol.md` | MCFS privacy and MACI (Minimum Anti-Collusion Infrastructure) differential-privacy protocol draft — the privacy story for `private_vote.py`, `privacy_accountant.py`, and federated voting |
+| `internal/swebench_swarm_backend_and_recovery.md` | SWE-Bench swarm backend and recovery-plane operator note for `mini_swe_agent.py`, `recovery_orchestrator.py`, and the runner scripts |
+| `internal/mini_swe_agent_external_baseline.md` | External baseline/control decision record for optional mini-swe-agent integration |
 
 ## For AI Agents
 

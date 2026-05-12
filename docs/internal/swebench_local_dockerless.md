@@ -252,3 +252,16 @@ print(result)
 raise SystemExit(0 if result.resolved else 1)
 PY
 ```
+
+## Current runner note (2026-05-12)
+
+The guarded swarm runner now keeps backend selection explicit:
+
+- `--backend codex` remains the default;
+- `--backend claude` uses the existing Claude adapter;
+- `--backend mini` uses the optional `MiniSWEBenchAgent` subprocess adapter for
+  an installed `mini` / `mini-swe-agent` CLI.
+
+The mini backend is not required for this Docker-less smoke path. It is a
+pluggable patch-generation worker; local harness results and official
+SWE-Bench scores remain separate reporting stages.
