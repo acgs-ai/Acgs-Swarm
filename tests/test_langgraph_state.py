@@ -105,6 +105,30 @@ def test_serialize_for_crdt_strips_messages():
     assert parsed["task_id"] == "abc"
 
 
+def test_serialize_for_crdt_strips_private_keys():
+    """Private keys (``_``-prefixed) must not leak into the auditable artifact.
+
+    Graph nodes use ``_h_next`` and similar scratch fields to thread non-public
+    state between steps. The CRDT payload is the auditable record consumed by
+    downstream verifiers; it must contain only the public state.
+    """
+    state = init_state({"instance_id": "abc"})
+    state["patch"] = "P"
+    state["governed"] = True
+    # Inject scratch fields (e.g. trust matrices, intermediate hashes).
+    state["_h_next"] = "private"  # type: ignore[typeddict-unknown-key]
+    state["_scratch"] = {"internal": True}  # type: ignore[typeddict-unknown-key]
+
+    payload = serialize_for_crdt(state)
+    parsed = json.loads(payload)
+
+    assert "_h_next" not in parsed
+    assert "_scratch" not in parsed
+    # Public fields still pass through.
+    assert parsed["patch"] == "P"
+    assert parsed["governed"] is True
+
+
 def test_swarm_graph_state_allows_partial_dicts():
     """total=False: SwarmGraphState accepts a subset of keys without error."""
     partial: SwarmGraphState = {"task_id": "only-id"}
