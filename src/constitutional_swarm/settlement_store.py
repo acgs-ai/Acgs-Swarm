@@ -393,7 +393,8 @@ class SQLiteSettlementStore:
     def _load_records_from_table(self, table_name: str) -> list[SettlementRecord]:
         if table_name == "mesh_settlements":
             select_with_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash, schema_version, is_recovered
+                SELECT assignment_json, result_json, constitutional_hash,
+                       schema_version, is_recovered
                 FROM mesh_settlements
                 ORDER BY assignment_id
             """
@@ -409,7 +410,8 @@ class SQLiteSettlementStore:
             """
         elif table_name == "pending_settlements":
             select_with_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash, schema_version, is_recovered
+                SELECT assignment_json, result_json, constitutional_hash,
+                       schema_version, is_recovered
                 FROM pending_settlements
                 ORDER BY assignment_id
             """
@@ -442,7 +444,8 @@ class SQLiteSettlementStore:
                 schema_version=int(schema_version),
                 is_recovered=bool(is_recovered),
             )
-            for assignment_json, result_json, constitutional_hash, schema_version, is_recovered in rows
+            for assignment_json, result_json, constitutional_hash, schema_version, is_recovered
+            in rows
         ]
 
     def pending_count(self) -> int:

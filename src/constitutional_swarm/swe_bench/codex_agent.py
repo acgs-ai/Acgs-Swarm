@@ -136,7 +136,7 @@ class CodexSWEBenchAgent(SWEBenchAgent):
             cmd.extend(self.extra_args)
 
             try:
-                proc = subprocess.run(  # noqa: S603 — trusted binary path
+                proc = subprocess.run(
                     cmd,
                     input=prompt,
                     capture_output=True,

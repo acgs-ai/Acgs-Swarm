@@ -73,7 +73,9 @@ def run_replay(corpus_path: str, *, governance_enabled: bool) -> dict[str, Any]:
     # (no suppression). When governance is enabled, every uncaught role-drift
     # action would have been emitted, which is what BODES is designed to
     # prevent — so any non-zero value here means BODES failed.
-    bodes_proxy = counts["role_drift"] - catches["role_drift"] if governance_enabled else counts["role_drift"]
+    bodes_proxy = (
+        counts["role_drift"] - catches["role_drift"] if governance_enabled else counts["role_drift"]
+    )
 
     def _rate(mode: str) -> float:
         return catches[mode] / counts[mode] if counts[mode] > 0 else 0.0

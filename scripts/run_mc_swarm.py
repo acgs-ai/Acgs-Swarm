@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +117,7 @@ def _call_claude(
     env["DISABLE_OMC"] = "1"
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             cmd, input=prompt, capture_output=True, text=True,
             timeout=timeout_s, check=False, env=env,
         )
@@ -231,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     sys.argv = [saved[0]]
     try:
         from constitutional_swarm.swe_bench.local_harness import (
-            LocalSWEBenchHarness, load_instances,
+            LocalSWEBenchHarness,
+            load_instances,
         )
     finally:
         sys.argv = saved
@@ -281,8 +282,10 @@ def main(argv: list[str] | None = None) -> int:
             row = _evaluate_patch(harness, inst, c)
             sc = _score(row)
             per_scores.append(sc)
-            if row.get("applied"): c_applied += 1
-            if row.get("resolved"): c_resolved += 1
+            if row.get("applied"):
+                c_applied += 1
+            if row.get("resolved"):
+                c_resolved += 1
             if sc > best_score:
                 best_score = sc
                 best_row = row
@@ -313,7 +316,8 @@ def main(argv: list[str] | None = None) -> int:
             f"applied={best_row['applied']} resolved={best_row['resolved']} "
             f"winner={winner_idx}/{n} valid={best_row['n_valid_candidates']} "
             f"cand_applied={c_applied} timeouts={best_row['n_timeouts']} "
-            f"F2P={best_row['fail_to_pass_passed']}/{ft} P2P={best_row['pass_to_pass_passed']}/{pt} "
+            f"F2P={best_row['fail_to_pass_passed']}/{ft} "
+            f"P2P={best_row['pass_to_pass_passed']}/{pt} "
             f"dur={best_row['duration_s']:.1f}s",
             flush=True,
         )

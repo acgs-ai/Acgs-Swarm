@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from constitutional_swarm.governed_handoff import (
     PolicyEngine,
     main,

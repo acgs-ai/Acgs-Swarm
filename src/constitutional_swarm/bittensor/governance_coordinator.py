@@ -72,6 +72,7 @@ from acgs_lite import (
     ValidatorPool,
     ValidatorSelector,
 )
+
 from constitutional_swarm.bittensor.authenticity_detector import AuthenticityDetector
 from constitutional_swarm.bittensor.emission_calculator import (
     EmissionCalculator,

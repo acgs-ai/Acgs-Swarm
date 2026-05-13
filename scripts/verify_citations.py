@@ -142,13 +142,13 @@ def _verify_one(c: Citation, timeout: float) -> Citation:
     # GET — try HEAD first for speed, fall back to GET on 4xx before declaring
     # the citation unresolvable.
     def _try(method: str) -> tuple[int | None, bool, str | None]:
-        req = urllib.request.Request(  # noqa: S310 — scheme checked above
+        req = urllib.request.Request(
             c.url,
             method=method,
             headers={"User-Agent": "constitutional-swarm-cite-verify/1.0"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — allowlisted
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, resp.status == 200, None
         except urllib.error.HTTPError as e:
             # 301/302 DOI redirects = valid. 403/429 = publisher anti-bot (DOI

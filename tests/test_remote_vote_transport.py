@@ -9,6 +9,7 @@ from dataclasses import asdict
 from typing import Any
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm import (
     ConstitutionalMesh,
     LocalRemotePeer,
@@ -24,8 +25,6 @@ from constitutional_swarm.remote_vote_transport import (
     encode_remote_vote_response,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from acgs_lite import Constitution
 
 websockets = pytest.importorskip(
     "websockets", reason="websockets not installed — skip remote vote transport tests"
@@ -436,7 +435,8 @@ class TestLocalRemotePeerValidation:
 
 @pytest.mark.asyncio
 async def test_remote_vote_client_connection_timeout_propagates() -> None:
-    """RemoteVoteClient.request_vote() must propagate TimeoutError when the server is unresponsive."""
+    """RemoteVoteClient.request_vote() must propagate TimeoutError when the server is unresponsive.
+    """
     import asyncio
 
     constitution = Constitution.default()

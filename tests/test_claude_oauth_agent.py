@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from constitutional_swarm.swe_bench.claude_oauth_agent import (
     ClaudeOAuthSWEBenchAgent,
     CredentialError,
@@ -64,7 +63,9 @@ def _write_creds(
     section = {
         "accessToken": access_token,
         "refreshToken": "rt-fake",
-        "expiresAt": expires_at_ms if expires_at_ms is not None else int((time.time() + 3600) * 1000),
+        "expiresAt": (
+            expires_at_ms if expires_at_ms is not None else int((time.time() + 3600) * 1000)
+        ),
         "scopes": ["user:inference"],
         "subscriptionType": "max",
         "rateLimitTier": "standard",

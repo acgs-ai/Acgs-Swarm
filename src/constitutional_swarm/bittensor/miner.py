@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from acgs_lite import MACIRole
+
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.bittensor.protocol import MinerConfig, MinerTier
 from constitutional_swarm.bittensor.synapses import DeliberationSynapse, JudgmentSynapse

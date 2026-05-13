@@ -8,9 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from constitutional_swarm import ConstitutionalMesh, ValidationVote
-
 from acgs_lite import Constitution
+from constitutional_swarm import ConstitutionalMesh, ValidationVote
 
 
 def _signed_vote(

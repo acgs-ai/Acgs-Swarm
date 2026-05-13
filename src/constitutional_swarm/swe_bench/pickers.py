@@ -147,8 +147,8 @@ def needs_dna(picker_name: str) -> bool:
 __all__ = [
     "PICKERS",
     "needs_dna",
-    "pick_longest",
     "pick_first_valid",
     "pick_governed_score",
+    "pick_longest",
     "pick_vote",
 ]

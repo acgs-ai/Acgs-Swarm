@@ -32,6 +32,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from acgs_lite import Constitution
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -39,7 +40,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from acgs_lite import Constitution
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.manifold import GovernanceManifold
 from constitutional_swarm.mesh.exceptions import (
@@ -137,7 +137,7 @@ class ConstitutionalMesh:
         self._peers_per_validation = peers_per_validation
         self._quorum = quorum
         # Seeded randomness is only used for deterministic peer assignment in tests/benchmarks.
-        self._rng = random.Random(seed) if seed is not None else random.SystemRandom()  # noqa: S311
+        self._rng = random.Random(seed) if seed is not None else random.SystemRandom()
         self._agents: dict[str, _AgentInfo] = {}
         self._agent_vote_public_keys: dict[str, Ed25519PublicKey] = {}
         self._agent_vote_private_keys: dict[str, Ed25519PrivateKey] = {}
@@ -724,7 +724,8 @@ class ConstitutionalMesh:
             if route is None:
                 raise KeyError(
                     f"No route found for remote peer '{peer_id}'. "
-                    f"Pass peer_routes={{'{peer_id}': (host, port), ...}} to collect_remote_votes()."
+                    f"Pass peer_routes={{'{peer_id}': (host, port), ...}}"
+                    " to collect_remote_votes()."
                 )
             request = self.prepare_remote_vote(assignment_id, peer_id)
             response = await client.request_vote(route[0], route[1], request, timeout=timeout)
@@ -812,7 +813,8 @@ class ConstitutionalMesh:
     ) -> ValidationVote:
         if response.assignment_id != assignment_id:
             raise ValueError(
-                f"Remote vote response assignment mismatch: {response.assignment_id} != {assignment_id}"
+                f"Remote vote response assignment mismatch:"
+                f" {response.assignment_id} != {assignment_id}"
             )
         if response.voter_id != voter_id:
             raise ValueError(
@@ -906,7 +908,8 @@ class ConstitutionalMesh:
             )
             if request.nonce in nonce_cache:
                 raise RemoteVoteReplayError(
-                    f"Remote vote request nonce {request.nonce!r} was already used inside the replay window"
+                    f"Remote vote request nonce {request.nonce!r}"
+                    " was already used inside the replay window"
                 )
             nonce_cache[request.nonce] = current_time
             nonce_cache.move_to_end(request.nonce)
@@ -922,7 +925,8 @@ class ConstitutionalMesh:
     def _assert_assignment_payload_complete(cls, assignment: PeerAssignment) -> None:
         if not cls._content_matches_hash(assignment.content, assignment.content_hash):
             raise ValueError(
-                f"Assignment {assignment.assignment_id} payload is unavailable or does not match its content hash"
+                f"Assignment {assignment.assignment_id} payload is unavailable"
+                " or does not match its content hash"
             )
 
     # -- Stats -------------------------------------------------------------

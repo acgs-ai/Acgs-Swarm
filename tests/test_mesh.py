@@ -9,6 +9,7 @@ import warnings
 from dataclasses import dataclass
 
 import pytest
+from acgs_lite import Constitution, ConstitutionalViolationError, Rule
 from constitutional_swarm import (
     AssignmentSettledError,
     ConstitutionalMesh,
@@ -25,8 +26,6 @@ from constitutional_swarm import (
     ValidationVote,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from acgs_lite import Constitution, ConstitutionalViolationError, Rule
 
 # tests/test_mesh.py must stay stable across the planned mesh package split.
 # A few mesh-specific exception types are not top-level exports yet, so bind

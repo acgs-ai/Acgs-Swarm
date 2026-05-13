@@ -10,15 +10,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from constitutional_swarm.bittensor.governance_coordinator import (
-    CoordinatorConfig,
-    GovernanceCoordinator,
-)
-
 from acgs_lite.constitution.claim_lifecycle import CaseConfig, CaseState
 from acgs_lite.constitution.spot_check import AuditPolicy
 from acgs_lite.constitution.trust_score import TrustConfig, TrustTier
 from acgs_lite.constitution.validator_selection import SelectionPolicy
+from constitutional_swarm.bittensor.governance_coordinator import (
+    CoordinatorConfig,
+    GovernanceCoordinator,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

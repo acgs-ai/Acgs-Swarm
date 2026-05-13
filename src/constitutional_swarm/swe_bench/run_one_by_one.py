@@ -34,8 +34,9 @@ import json
 import logging
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -417,7 +418,11 @@ def run_swarm_batch(
                 f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
             )
         if len(tasks) < k:
-            log.warning("Only %d un-attempted instances left; running with k=%d", len(tasks), len(tasks))
+            log.warning(
+                "Only %d un-attempted instances left; running with k=%d",
+                len(tasks),
+                len(tasks),
+            )
             k = len(tasks)
 
         # Build k agents via the chosen provider. If `models` is given, each
@@ -490,9 +495,15 @@ def run_swarm_batch(
 
         print("=" * 60)
         print(f"Swarm batch {batch_id} ({k} agents, model={model}, dataset={dataset}):")
-        print(f"  CRDT size: {aggregate['crdt_size']}  resolved: {aggregate['resolved']}/{aggregate['total']}  "
-              f"resolve_rate: {aggregate['resolve_rate']:.3f}")
-        print(f"  governed_count: {aggregate['governed_count']}  mean_intervention: {aggregate['mean_intervention']:.3f}")
+        print(
+            f"  CRDT size: {aggregate['crdt_size']}"
+            f"  resolved: {aggregate['resolved']}/{aggregate['total']}"
+            f"  resolve_rate: {aggregate['resolve_rate']:.3f}"
+        )
+        print(
+            f"  governed_count: {aggregate['governed_count']}"
+            f"  mean_intervention: {aggregate['mean_intervention']:.3f}"
+        )
         print(f"  batch wall time: {batch_elapsed:.1f}s")
         print("-" * 60)
         for r in records:
@@ -593,7 +604,7 @@ def run_best_of_k_batch(
         batch_id = f"bok-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}-{picker}"
         candidates: list[Any] = []
         elapsed_per_agent: list[float] = []
-        for i, agent in enumerate(agents):
+        for _, agent in enumerate(agents):
             t0 = time.time()
             result = agent.solve(task)
             elapsed_per_agent.append(time.time() - t0)
@@ -695,7 +706,10 @@ def run_best_of_k_batch(
         print("=" * 60)
         print(f"Best-of-{k} on {task['instance_id']}  (picker={picker})")
         print(f"  picker_reason: {picker_reason}")
-        print(f"  total wall: {sum(elapsed_per_agent):.1f}s  cost: ${winner_rec['est_cost_usd']:.4f}")
+        print(
+            f"  total wall: {sum(elapsed_per_agent):.1f}s"
+            f"  cost: ${winner_rec['est_cost_usd']:.4f}"
+        )
         print("-" * 60)
         for i, rec in enumerate(cand_records):
             marker = "★" if i == winner_idx else " "
@@ -820,8 +834,16 @@ def _print_tally(record: dict[str, Any], summary: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    p.add_argument("--run-id", required=True, help="Run identifier; results aggregate under .omc/swe_bench_runs/<run-id>/")
-    p.add_argument("--model", default="claude-haiku-4-5", help="Model id (default: claude-haiku-4-5; use gemini-2.5-pro for --provider gemini)")
+    p.add_argument(
+        "--run-id",
+        required=True,
+        help="Run identifier; results aggregate under .omc/swe_bench_runs/<run-id>/",
+    )
+    p.add_argument(
+        "--model",
+        default="claude-haiku-4-5",
+        help="Model id (default: claude-haiku-4-5; use gemini-2.5-pro for --provider gemini)",
+    )
     p.add_argument(
         "--models",
         nargs="+",
@@ -833,7 +855,10 @@ def main(argv: list[str] | None = None) -> int:
         "--provider",
         default="oauth",
         choices=["oauth", "vertex-claude", "gemini"],
-        help="Backend: oauth (Claude Code seat), vertex-claude (Anthropic on Vertex), gemini (Vertex Gemini).",
+        help=(
+            "Backend: oauth (Claude Code seat),"
+            " vertex-claude (Anthropic on Vertex), gemini (Vertex Gemini)."
+        ),
     )
     p.add_argument("--project-id", default=None, help="GCP project (vertex-* providers).")
     p.add_argument("--region", default="global", help="Vertex region (default 'global').")
@@ -845,13 +870,20 @@ def main(argv: list[str] | None = None) -> int:
         dest="use_next",
         help="Run the next un-attempted instance in the dataset.",
     )
-    p.add_argument("--instance-id", default=None, help="Run a specific instance by id (overrides --next).")
+    p.add_argument(
+        "--instance-id",
+        default=None,
+        help="Run a specific instance by id (overrides --next).",
+    )
     p.add_argument(
         "--swarm-k",
         type=int,
         default=1,
-        help="Round-robin multi-task batch: k agents on k DIFFERENT tasks (default 1 = single agent). "
-             "NOT a real swarm; results are independent. Use --best-of-k for best-of-K voting.",
+        help=(
+            "Round-robin multi-task batch: k agents on k DIFFERENT tasks"
+            " (default 1 = single agent). NOT a real swarm; results are independent."
+            " Use --best-of-k for best-of-K voting."
+        ),
     )
     p.add_argument(
         "--best-of-k",
@@ -906,7 +938,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.best_of_k > 0 and args.instance_id:
         p.error("--instance-id is incompatible with --best-of-k (pulls next-un-attempted)")
     if args.swarm_k >= 2 and args.instance_id:
-        p.error("--instance-id is incompatible with --swarm-k >= 2 (swarm pulls k next-un-attempted)")
+        p.error(
+            "--instance-id is incompatible with --swarm-k >= 2"
+            " (swarm pulls k next-un-attempted)"
+        )
     if args.swarm_k == 1 and args.best_of_k == 0 and not args.instance_id and not args.use_next:
         p.error("Pass either --next, --instance-id <id>, --swarm-k >= 2, or --best-of-k >= 1")
 
@@ -956,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_new_tokens=args.max_new_tokens,
                 governed=args.governed,
             )
-    except Exception as exc:  # noqa: BLE001 — top-level CLI error path
+    except Exception as exc:
         log.error("run failed: %s: %s", type(exc).__name__, exc)
         return 1
     return 0

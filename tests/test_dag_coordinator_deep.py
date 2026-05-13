@@ -22,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+from acgs_lite import ConstitutionalViolationError
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.capability import Capability, CapabilityRegistry
 from constitutional_swarm.compiler import DAGCompiler, GoalSpec
@@ -33,8 +34,6 @@ from constitutional_swarm.execution import (
     contract_status_from_execution,
 )
 from constitutional_swarm.swarm import SwarmExecutor, TaskDAG, TaskNode
-
-from acgs_lite import ConstitutionalViolationError
 
 # ---------------------------------------------------------------------------
 # 1. TaskDAG — immutability, ready_nodes, error paths, wide parallelism
@@ -96,7 +95,10 @@ class TestTaskDAGReadyNodes:
     """Test ready_nodes() directly."""
 
     def test_ready_nodes_returns_promotable_blocked_nodes(self) -> None:
-        """ready_nodes() returns BLOCKED nodes whose deps are satisfied — candidates for promotion."""
+        """ready_nodes() returns BLOCKED nodes whose deps are satisfied.
+
+        These are candidates for promotion.
+        """
         dag = TaskDAG(goal="test")
         dag = dag.add_node(TaskNode(node_id="A", title="A"))
         dag = dag.add_node(TaskNode(node_id="B", title="B", depends_on=("A",)))

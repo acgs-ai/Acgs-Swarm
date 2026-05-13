@@ -7,7 +7,8 @@ Usage:
     python scripts/benchmark_coverage.py
 
 Output (last line of stdout):
-    {"primary": 91.60, "status": "ok", "sub_scores": {"covered_lines": 7673, "total_lines": 8377, "missing_lines": 704, "tests_exit_code": 0}}
+    {"primary": 91.60, "status": "ok", "sub_scores": {
+        "covered_lines": 7673, "total_lines": 8377, "missing_lines": 704, "tests_exit_code": 0}}
 
 Exit codes:
     0  pytest passed
@@ -54,7 +55,7 @@ def main() -> None:
         *deselect_args,
     ]
 
-    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=False, text=True)  # noqa: S603
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=False, text=True)
 
     if not COVERAGE_OUT.exists():
         print(

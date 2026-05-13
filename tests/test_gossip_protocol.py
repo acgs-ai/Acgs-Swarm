@@ -60,7 +60,7 @@ def test_encode_decode_roundtrip() -> None:
     nodes = [_make_node(payload=f"payload-{i}") for i in range(5)]
     decoded = decode_batch(encode_batch(nodes))
     assert len(decoded) == 5
-    for original, decoded_node in zip(nodes, decoded):
+    for original, decoded_node in zip(nodes, decoded, strict=False):
         assert decoded_node.cid == original.cid
         assert decoded_node.agent_id == original.agent_id
         assert decoded_node.payload == original.payload
@@ -76,6 +76,7 @@ def test_encode_decode_preserves_cid() -> None:
     for original, d in zip(
         sorted(nodes, key=lambda n: n.cid),
         sorted(decoded, key=lambda n: n.cid),
+        strict=False,
     ):
         assert d.cid == original.cid
         assert d.verify_cid(), f"Decoded node {d.cid} failed CID verification"

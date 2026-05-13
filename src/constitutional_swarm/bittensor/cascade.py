@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any
 
 from acgs_lite import Constitution, ConstitutionalViolationError
+
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import ConstitutionalMesh
 

@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 
+from acgs_lite import Constitution
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from acgs_lite import Constitution
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
 from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse

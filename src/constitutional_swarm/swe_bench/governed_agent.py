@@ -102,7 +102,7 @@ class GovernedAgent(SWEBenchAgent):
         # path even if some caller bypasses our solve() override.
         self.wrapper = self  # type: ignore[assignment]
 
-    def solve(self, task: dict[str, Any]) -> SWEPatch:  # noqa: D401 — keep base API
+    def solve(self, task: dict[str, Any]) -> SWEPatch:
         result = self.base.solve(task)
 
         # Defensive: handle empty / errored patches without invoking the validator.

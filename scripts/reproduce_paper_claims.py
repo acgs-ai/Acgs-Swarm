@@ -75,7 +75,7 @@ def _load_ode_modules() -> dict[str, Any] | None:
 def _make_governance(n: int, seed: int) -> Any:
     from constitutional_swarm.manifold import GovernanceManifold
 
-    rng = random.Random(seed)  # noqa: S311 - deterministic benchmark seed
+    rng = random.Random(seed)
     manifold = GovernanceManifold(num_agents=n)
     for i in range(n):
         for j in range(n):
@@ -87,7 +87,7 @@ def _make_governance(n: int, seed: int) -> Any:
 def _make_spectral(n: int, seed: int, *, r: float = RADIUS) -> Any:
     from constitutional_swarm.spectral_sphere import SpectralSphereManifold
 
-    rng = random.Random(seed)  # noqa: S311 - deterministic benchmark seed
+    rng = random.Random(seed)
     manifold = SpectralSphereManifold(num_agents=n, r=r)
     for i in range(n):
         for j in range(n):
@@ -358,7 +358,7 @@ def latency_microbenchmarks(*, iterations: int, n: int, seed: int) -> dict[str, 
     from constitutional_swarm.merkle_crdt import MerkleCRDT
     from constitutional_swarm.spectral_sphere import spectral_sphere_project
 
-    rng = random.Random(seed)  # noqa: S311 - deterministic benchmark seed
+    rng = random.Random(seed)
     matrix = [[rng.uniform(-1.0, 1.0) for _ in range(n)] for _ in range(n)]
 
     def measure(operation: Any) -> float:
@@ -518,7 +518,10 @@ class ClaimEvidence:
 
 
 ICLR_SOURCES = {
-    "ICLR-03": "papers/iclr2027/sections/abstract.tex:17-20; papers/iclr2027/sections/experiments.tex:115-124",
+    "ICLR-03": (
+        "papers/iclr2027/sections/abstract.tex:17-20;"
+        " papers/iclr2027/sections/experiments.tex:115-124"
+    ),
     "ICLR-07": "papers/iclr2027/sections/introduction.tex:63-67",
     "ICLR-08": "papers/iclr2027/sections/experiments.tex:24-27",
     "ICLR-09": "papers/iclr2027/sections/experiments.tex:45-49",
@@ -708,7 +711,10 @@ def _iclr_evidence() -> list[ClaimEvidence]:
                     _dp_sigma(epsilon=1.0, alpha=0.0)
                 ),
             },
-            note="Pins the published DP table and flags that its absolute sigma scale differs from the stated delta=1e-5 Gaussian formula.",
+            note=(
+                "Pins the published DP table and flags that its absolute sigma scale"
+                " differs from the stated delta=1e-5 Gaussian formula."
+            ),
         ),
         _iclr_claim(
             claim_id="ICLR-16",
@@ -945,7 +951,10 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 "expected_failures": 2,
                 "current_suite_has_grown": True,
             },
-            note="Pins the historical Phase 2 launch-gate count while noting the suite has since grown.",
+            note=(
+                "Pins the historical Phase 2 launch-gate count"
+                " while noting the suite has since grown."
+            ),
         ),
     ]
 

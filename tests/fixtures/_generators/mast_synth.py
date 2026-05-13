@@ -15,7 +15,8 @@ families in their corpus. We seed the synth corpus to match within epsilon=0.05.
 If MAST releases exact figures later, swap the proportions array below.
 
 Run:
-    python -m tests.fixtures._generators.mast_synth --out tests/fixtures/mast_synth_v1.jsonl --n 100 --seed 42
+    python -m tests.fixtures._generators.mast_synth \
+        --out tests/fixtures/mast_synth_v1.jsonl --n 100 --seed 42
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ def generate_corpus(seed: int, n: int, out_path: Path) -> dict:
     rng = random.Random(seed)
 
     # Quotas (round to nearest int, distribute remainder to first mode)
-    quotas = {m: int(round(n * p)) for m, p in MAST_TAXONOMY_PROPORTIONS.items()}
+    quotas = {m: round(n * p) for m, p in MAST_TAXONOMY_PROPORTIONS.items()}
     deficit = n - sum(quotas.values())
     if deficit:
         first_mode = next(iter(quotas))
