@@ -365,7 +365,7 @@ async def simulate_gossip_convergence(
     """
     import random
 
-    rng = random.Random(seed)  # noqa: S311 - deterministic simulation seed
+    rng = random.Random(seed)
     agents = [MerkleCRDT(f"agent-{i}") for i in range(n_agents)]
 
     for round_idx in range(n_rounds):

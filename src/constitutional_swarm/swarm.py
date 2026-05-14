@@ -96,7 +96,8 @@ class TaskDAG:
         existing = new_nodes.get(node.node_id)
         if existing is not None:
             raise ValueError(
-                f"Node ID collision for {node.node_id}: {existing.title!r} conflicts with {node.title!r}"
+                f"Node ID collision for {node.node_id}:"
+                f" {existing.title!r} conflicts with {node.title!r}"
             )
         new_nodes[node.node_id] = node
         return TaskDAG(dag_id=self.dag_id, goal=self.goal, nodes=new_nodes)

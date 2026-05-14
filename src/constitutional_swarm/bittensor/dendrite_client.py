@@ -24,6 +24,7 @@ import asyncio
 from typing import Any
 
 from acgs_lite import Constitution
+
 from constitutional_swarm.bittensor.synapse_adapter import (
     HAS_BITTENSOR,
     GovernanceDeliberation,

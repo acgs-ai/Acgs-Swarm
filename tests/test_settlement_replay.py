@@ -1,14 +1,13 @@
 from dataclasses import replace
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm import (
     ConstitutionalMesh,
     JSONLSettlementStore,
     RecoveredAssignmentError,
     SQLiteSettlementStore,
 )
-
-from acgs_lite import Constitution
 
 
 def _jsonl_store(tmp_path):

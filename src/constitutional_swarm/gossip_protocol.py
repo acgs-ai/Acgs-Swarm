@@ -564,7 +564,7 @@ async def simulate_ws_gossip_convergence(
     Returns:
         dict with convergence result, per-node sizes, total artifacts.
     """
-    rng = random.Random(seed)  # noqa: S311 - deterministic simulation seed
+    rng = random.Random(seed)
     nodes = await spin_up_swarm(n_nodes, host=host)
 
     try:

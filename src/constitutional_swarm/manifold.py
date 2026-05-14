@@ -136,7 +136,8 @@ class GovernanceManifold:
         specialization.  See ``test_manifold_degeneration.py`` for the empirical proof
         and ``§3.1`` of the MCFS whitepaper for the theoretical derivation.
 
-        **For production swarms use** :class:`constitutional_swarm.spectral_sphere.SpectralSphereManifold`
+        **For production swarms use**
+        :class:`constitutional_swarm.spectral_sphere.SpectralSphereManifold`
         instead.  It replaces the Birkhoff constraint with a spectral-sphere projection
         that preserves variance in the source-backed regression tests.
 

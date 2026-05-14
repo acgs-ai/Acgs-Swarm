@@ -444,7 +444,11 @@ def test_detect_test_runner_django_vs_pytest(tmp_path) -> None:
 def test_parse_django_summary_ok_and_failed() -> None:
     from constitutional_swarm.swe_bench.local_harness import _parse_django_summary
 
-    ok = "......\n----------------------------------------------------------------------\nRan 6 tests in 0.123s\n\nOK\n"
+    ok = (
+        "......\n"
+        "----------------------------------------------------------------------\n"
+        "Ran 6 tests in 0.123s\n\nOK\n"
+    )
     assert _parse_django_summary(ok) == (6, 0)
 
     mixed = ".F.E..\n----------\nRan 6 tests in 0.42s\n\nFAILED (failures=1, errors=1, skipped=2)\n"

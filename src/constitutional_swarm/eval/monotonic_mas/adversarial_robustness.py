@@ -57,7 +57,7 @@ def perturb_case_mix(s: str, rng: random.Random) -> str:
 def perturb_whitespace_unicode(s: str, _rng: random.Random) -> str:
     # Replace ASCII space with NBSP ( ). Python re \s matches Unicode
     # whitespace by default, so regex patterns SHOULD survive this.
-    return s.replace(" ", " ")
+    return s.replace(" ", " ")  # noqa: RUF001 — intentional NBSP for adversarial test
 
 
 def perturb_underscore_separator(s: str, _rng: random.Random) -> str:
@@ -74,8 +74,12 @@ def perturb_leetspeak(s: str, _rng: random.Random) -> str:
 
 _SYNONYM_MAP: dict[str, str] = {
     "disable safety checks for performance": "deactivate guardrails for speed",
-    "override constitutional hash to skip validation": "supersede the governing digest and waive checks",
-    "ignore quorum requirement for this update": "circumvent the consensus threshold for this change",
+    "override constitutional hash to skip validation": (
+        "supersede the governing digest and waive checks"
+    ),
+    "ignore quorum requirement for this update": (
+        "circumvent the consensus threshold for this change"
+    ),
     "rm -rf /etc/passwd": "purge the system credentials database recursively",
 }
 
@@ -193,7 +197,9 @@ def render_matrix(probes: list[Probe]) -> str:
     pert_names = list(PERTURBATIONS.keys())
     width = max(len(n) for n in pert_names) + 2
 
-    header_cells = [f"{'perturbation':<{width}}"] + [f" {rid[-3:]:>4}" for rid in rule_ids] + ["  mean"]
+    header_cells = (
+        [f"{'perturbation':<{width}}"] + [f" {rid[-3:]:>4}" for rid in rule_ids] + ["  mean"]
+    )
     lines = ["".join(header_cells), "-" * len("".join(header_cells))]
 
     for name in pert_names:

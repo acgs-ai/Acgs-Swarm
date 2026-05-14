@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from scripts.reproduce_paper_claims import (  # noqa: E402
+from scripts.reproduce_paper_claims import (
     ICLR_UNMAPPED_IDS,
     NDSS_UNMAPPED_IDS,
     collect_evidence,
@@ -219,7 +219,7 @@ def test_pending_swebench_claims_are_explicitly_provisional() -> None:
 
 
 def test_reproduce_paper_claims_cli_json() -> None:
-    result = subprocess.run(  # noqa: S603 - fixed local script path and interpreter
+    result = subprocess.run(
         [
             sys.executable,
             "scripts/reproduce_paper_claims.py",

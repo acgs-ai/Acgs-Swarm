@@ -648,7 +648,7 @@ def _run(
     timeout: float = 600.0,
 ) -> tuple[int, str]:
     try:
-        proc = subprocess.run(  # noqa: S603 — commands are constructed from trusted args
+        proc = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd else None,
             input=input_text,

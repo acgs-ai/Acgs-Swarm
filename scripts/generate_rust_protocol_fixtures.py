@@ -16,11 +16,12 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from constitutional_swarm import AgentDNA, RemoteVoteReplayError
-from constitutional_swarm.mesh import MeshProof, RemoteVoteRequest, ValidationVote
-from constitutional_swarm.mesh.core import ConstitutionalMesh
-from constitutional_swarm.mesh.settlement import _compute_merkle_root
-from constitutional_swarm.protocol import (
+from acgs_lite import Constitution  # noqa: E402
+from constitutional_swarm import AgentDNA, RemoteVoteReplayError  # noqa: E402
+from constitutional_swarm.mesh import MeshProof, RemoteVoteRequest, ValidationVote  # noqa: E402
+from constitutional_swarm.mesh.core import ConstitutionalMesh  # noqa: E402
+from constitutional_swarm.mesh.settlement import _compute_merkle_root  # noqa: E402
+from constitutional_swarm.protocol import (  # noqa: E402
     canonical_content_hash,
     canonical_timestamp,
     encode_mesh_proof_v1,
@@ -33,12 +34,13 @@ from constitutional_swarm.protocol import (
     legacy_remote_vote_request_payload_bytes,
     protocol_sha256_hex,
 )
-from constitutional_swarm.settlement_store import JSONLSettlementStore, SettlementRecord
-from constitutional_swarm.spectral_sphere import SpectralSphereManifold
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from acgs_lite import Constitution
+from constitutional_swarm.settlement_store import (  # noqa: E402
+    JSONLSettlementStore,
+    SettlementRecord,
+)
+from constitutional_swarm.spectral_sphere import SpectralSphereManifold  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "tests" / "fixtures" / "rust_protocol"
 

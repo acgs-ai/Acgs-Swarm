@@ -23,7 +23,6 @@ is closed.
 Fitness = mean lift over seeds. Pass = lift >= 0 on every seed (no regression).
 """
 
-# ruff: noqa: S311
 from __future__ import annotations
 
 import argparse
@@ -36,9 +35,9 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from constitutional_swarm.spectral_sphere import SpectralSphereManifold
-from constitutional_swarm.swe_bench.agent import SWEBenchAgent
-from constitutional_swarm.swe_bench.swarm_coordinator import SwarmCoordinator
+from constitutional_swarm.spectral_sphere import SpectralSphereManifold  # noqa: E402
+from constitutional_swarm.swe_bench.agent import SWEBenchAgent  # noqa: E402
+from constitutional_swarm.swe_bench.swarm_coordinator import SwarmCoordinator  # noqa: E402
 
 _DOMAINS = ("django", "numpy", "sympy", "flask")
 

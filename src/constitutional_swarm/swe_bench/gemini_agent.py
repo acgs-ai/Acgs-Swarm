@@ -144,7 +144,7 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
                 contents=[prompt],
                 config=config,
             )
-        except Exception as exc:  # noqa: BLE001 — google-genai exceptions are varied
+        except Exception as exc:
             kind = type(exc).__name__
             msg = str(exc)
             _log.warning("Gemini error %s: %s", kind, msg[:200])

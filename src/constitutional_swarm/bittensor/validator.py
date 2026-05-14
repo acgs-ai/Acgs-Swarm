@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from acgs_lite import Constitution
+
 from constitutional_swarm.bittensor.protocol import (
     TIER_TAO_MULTIPLIER,
     MinerTier,

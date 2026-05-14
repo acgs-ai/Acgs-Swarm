@@ -99,8 +99,8 @@ class SwarmCoordinator:
                 len(row) != len(subset) for row in routing_weights
             ):
                 raise ValueError(
-                    f"routing_weights must be {n_agents}×{len(subset)}, "
-                    f"got {len(routing_weights)}×"
+                    f"routing_weights must be {n_agents}×{len(subset)}, "  # noqa: RUF001 — intentional math notation
+                    f"got {len(routing_weights)}×"  # noqa: RUF001
                     f"{len(routing_weights[0]) if routing_weights else 0}"
                 )
             assignments: list[tuple[SWEBenchAgent, dict[str, Any]]] = []

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from acgs_lite import Constitution
+
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.bittensor.protocol import (
     EscalationType,

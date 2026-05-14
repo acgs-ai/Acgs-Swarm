@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm import (
     AgentDNA,
     ConstitutionalMesh,
@@ -15,8 +16,6 @@ from constitutional_swarm import (
     RemoteVoteClient,
     RemoteVoteServer,
 )
-
-from acgs_lite import Constitution
 
 pytestmark = pytest.mark.contract
 

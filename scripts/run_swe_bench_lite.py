@@ -33,8 +33,8 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from constitutional_swarm.swe_bench.codex_agent import CodexSWEBenchAgent
-from constitutional_swarm.swe_bench.local_harness import (
+from constitutional_swarm.swe_bench.codex_agent import CodexSWEBenchAgent  # noqa: E402
+from constitutional_swarm.swe_bench.local_harness import (  # noqa: E402
     LocalSWEBenchHarness,
     load_instances,
 )
@@ -140,8 +140,10 @@ def main(argv: list[str] | None = None) -> int:
             f"[{i + 1}/{len(instances)}] {row['instance_id']} "
             f"stage={row['stage']} applied={row['applied']} "
             f"resolved={row['resolved']} "
-            f"F2P={row.get('fail_to_pass_passed', 0)}/{row.get('fail_to_pass_passed', 0) + row.get('fail_to_pass_failed', 0)} "
-            f"P2P={row.get('pass_to_pass_passed', 0)}/{row.get('pass_to_pass_passed', 0) + row.get('pass_to_pass_failed', 0)} "
+            f"F2P={row.get('fail_to_pass_passed', 0)}/"
+            f"{row.get('fail_to_pass_passed', 0) + row.get('fail_to_pass_failed', 0)} "
+            f"P2P={row.get('pass_to_pass_passed', 0)}/"
+            f"{row.get('pass_to_pass_passed', 0) + row.get('pass_to_pass_failed', 0)} "
             f"dur={row['duration_s']:.1f}s",
             flush=True,
         )

@@ -20,6 +20,10 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from acgs_lite.constitution.claim_lifecycle import CaseConfig, CaseState
+from acgs_lite.constitution.spot_check import AuditPolicy
+from acgs_lite.constitution.trust_score import TrustConfig
+from acgs_lite.constitution.validator_selection import SelectionPolicy
 from constitutional_swarm.bittensor.governance_coordinator import (
     CoordinatorConfig,
     GovernanceCoordinator,
@@ -35,11 +39,6 @@ from constitutional_swarm.bittensor.protocol import (
 )
 from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
 from constitutional_swarm.bittensor.validator import ConstitutionalValidator
-
-from acgs_lite.constitution.claim_lifecycle import CaseConfig, CaseState
-from acgs_lite.constitution.spot_check import AuditPolicy
-from acgs_lite.constitution.trust_score import TrustConfig
-from acgs_lite.constitution.validator_selection import SelectionPolicy
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -361,9 +360,8 @@ class TestFullStackIntegration:
     @pytest.mark.asyncio
     async def test_dna_violation_blocks_miner(self, constitution_path, coordinator):
         """Miner producing a harmful judgment is blocked by DNA pre-check."""
-        from constitutional_swarm.bittensor.miner import DNAPreCheckFailedError
-
         from acgs_lite import ConstitutionalViolationError
+        from constitutional_swarm.bittensor.miner import DNAPreCheckFailedError
 
         bad_miner = ConstitutionalMiner(
             config=MinerConfig(

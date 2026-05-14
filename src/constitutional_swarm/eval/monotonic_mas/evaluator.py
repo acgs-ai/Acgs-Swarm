@@ -99,7 +99,7 @@ def _try_record(db_path: Path, epoch: int, metric: str, value: float) -> tuple[b
         return False, "deceleration_blocked"
     except DuplicateRecordError:
         return False, "duplicate"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"other:{type(exc).__name__}:{exc}"
 
 

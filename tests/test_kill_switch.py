@@ -5,10 +5,9 @@ from __future__ import annotations
 import threading
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm.dna import AgentDNA, DNADisabledError
 from constitutional_swarm.mesh import ConstitutionalMesh, DuplicateVoteError, MeshHaltedError
-
-from acgs_lite import Constitution
 
 
 def _vote_signature(

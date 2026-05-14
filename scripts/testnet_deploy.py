@@ -147,9 +147,8 @@ def cmd_local(args: argparse.Namespace) -> None:
         print("  Create a constitution.yaml or use the sample in examples/constitution.yaml")
         sys.exit(1)
 
-    from constitutional_swarm.mesh import ConstitutionalMesh
-
     from acgs_lite import Constitution
+    from constitutional_swarm.mesh import ConstitutionalMesh
 
     agents = tuple(f"local-agent-{idx}" for idx in range(5))
     cases = tuple(

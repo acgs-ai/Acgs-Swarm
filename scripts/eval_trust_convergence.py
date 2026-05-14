@@ -39,7 +39,7 @@ _REPO_SRC = Path(__file__).resolve().parent.parent / "src"
 if _REPO_SRC.exists() and str(_REPO_SRC) not in sys.path:
     sys.path.insert(0, str(_REPO_SRC))
 
-from constitutional_swarm.spectral_sphere import SpectralSphereManifold
+from constitutional_swarm.spectral_sphere import SpectralSphereManifold  # noqa: E402
 
 
 def _l2_delta(
@@ -58,7 +58,7 @@ def _variance(matrix: tuple[tuple[float, ...], ...]) -> float:
 
 
 def run(seed: int, agents: int, steps: int, tol: float) -> dict:
-    rng = random.Random(seed)  # noqa: S311
+    rng = random.Random(seed)
     manifold = SpectralSphereManifold(num_agents=agents)
 
     prev: tuple[tuple[float, ...], ...] | None = None
@@ -110,7 +110,10 @@ def main() -> int:
         "--seeds",
         type=str,
         default="42,7,13",
-        help="Comma-separated seeds; score is the mean across seeds (guards against single-seed overfit).",
+        help=(
+            "Comma-separated seeds; score is the mean across seeds"
+            " (guards against single-seed overfit)."
+        ),
     )
     p.add_argument("--seed", type=int, default=None, help="Deprecated; use --seeds.")
     p.add_argument("--agents", type=int, default=8)

@@ -51,8 +51,10 @@ def test_build_swarm_command_includes_predictions_output_and_output_paths(tmp_pa
 def test_build_official_eval_command_uses_instance_ids_from_predictions(tmp_path: Path) -> None:
     predictions_path = tmp_path / "predictions.jsonl"
     predictions_path.write_text(
-        '{"instance_id": "astropy__astropy-12907", "model_patch": "diff", "model_name_or_path": "codex-default"}\n'
-        '{"instance_id": "django__django-10914", "model_patch": "diff", "model_name_or_path": "codex-default"}\n'
+        '{"instance_id": "astropy__astropy-12907", "model_patch": "diff",'
+        ' "model_name_or_path": "codex-default"}\n'
+        '{"instance_id": "django__django-10914", "model_patch": "diff",'
+        ' "model_name_or_path": "codex-default"}\n'
     )
 
     cmd = _MODULE.build_official_eval_command(

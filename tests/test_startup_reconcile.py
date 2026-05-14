@@ -5,14 +5,13 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm import (
     ConstitutionalMesh,
     JSONLSettlementStore,
     ReconciliationReport,
     SettlementRecord,
 )
-
-from acgs_lite import Constitution
 
 
 class _SelectiveFailingSettlementStore:

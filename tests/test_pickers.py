@@ -9,7 +9,6 @@ that empty-file-set patches must lose to bucketed-file patches.
 from __future__ import annotations
 
 import pytest
-
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.eval.monotonic_mas.detectors.mcfs_constitution import (
     MCFS_ROLE_CONSTITUTION,

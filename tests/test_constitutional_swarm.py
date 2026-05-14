@@ -5,6 +5,12 @@ from __future__ import annotations
 import time
 
 import pytest
+from acgs_lite import (
+    Constitution,
+    ConstitutionalViolationError,
+    MACIRole,
+    Rule,
+)
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.capability import Capability, CapabilityRegistry
 from constitutional_swarm.contract import ContractStatus, TaskContract
@@ -12,13 +18,6 @@ from constitutional_swarm.dna import AgentDNA, constitutional_dna
 from constitutional_swarm.execution import ExecutionStatus, WorkReceipt
 from constitutional_swarm.mesh import ConstitutionalMesh
 from constitutional_swarm.swarm import NodeStatus, SwarmExecutor, TaskDAG, TaskNode
-
-from acgs_lite import (
-    Constitution,
-    ConstitutionalViolationError,
-    MACIRole,
-    Rule,
-)
 
 
 def _signed_mesh_vote(
@@ -93,7 +92,7 @@ class TestAgentDNA:
         dna = AgentDNA.default(agent_id="proposer-01", maci_role=MACIRole.PROPOSER)
         assert dna.maci_role == MACIRole.PROPOSER
         # Proposer cannot validate
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 — MACIViolationError from acgs_lite internals
             dna.check_maci("validate")
 
     def test_hash_consistency(self) -> None:

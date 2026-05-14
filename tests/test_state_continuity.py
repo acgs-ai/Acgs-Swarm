@@ -10,9 +10,8 @@ Tests verify:
 
 from __future__ import annotations
 
-from constitutional_swarm import ConstitutionalMesh
-
 from acgs_lite import Constitution
+from constitutional_swarm import ConstitutionalMesh
 
 
 def _mesh_with_manifold(n: int) -> ConstitutionalMesh:

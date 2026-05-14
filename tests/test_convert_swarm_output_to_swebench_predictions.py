@@ -97,7 +97,10 @@ def test_main_writes_jsonl_predictions_file(tmp_path: Path) -> None:
                 "rows": [
                     {
                         "instance_id": "django__django-10914",
-                        "patch": "diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py\n",
+                        "patch": (
+                            "diff --git a/django/conf/global_settings.py"
+                            " b/django/conf/global_settings.py\n"
+                        ),
                         "patch_metadata": {"model": "codex-default"},
                     }
                 ]
@@ -112,7 +115,10 @@ def test_main_writes_jsonl_predictions_file(tmp_path: Path) -> None:
         json.dumps(
             {
                 "instance_id": "django__django-10914",
-                "model_patch": "diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py\n",
+                "model_patch": (
+                    "diff --git a/django/conf/global_settings.py"
+                    " b/django/conf/global_settings.py\n"
+                ),
                 "model_name_or_path": "codex-default",
             }
         )

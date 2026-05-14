@@ -253,8 +253,8 @@ class TestDPNoiseHelpers:
         sigma_low_alpha = calibrate_sigma(r=1.0, residual_alpha=0.1, epsilon=1.0, delta=1e-5)
         sigma_high_alpha = calibrate_sigma(r=1.0, residual_alpha=0.5, epsilon=1.0, delta=1e-5)
         assert sigma_high_alpha < sigma_low_alpha, (
-            f"Higher α should reduce σ: α=0.1 → σ={sigma_low_alpha:.4f}, "
-            f"α=0.5 → σ={sigma_high_alpha:.4f}"
+            f"Higher α should reduce σ: α=0.1 → σ={sigma_low_alpha:.4f}, "  # noqa: RUF001
+            f"α=0.5 → σ={sigma_high_alpha:.4f}"  # noqa: RUF001
         )
 
     def test_add_dp_noise_changes_matrix(self) -> None:

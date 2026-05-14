@@ -548,7 +548,7 @@ class DrandClient:
 
         url = f"{self._base}/{self._chain}/public/{round_spec}"
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:  # noqa: S310
+            with urllib.request.urlopen(url, timeout=self._timeout) as resp:
                 import json
 
                 data = json.loads(resp.read())

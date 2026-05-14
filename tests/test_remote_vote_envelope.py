@@ -7,6 +7,7 @@ from collections import OrderedDict
 from dataclasses import replace
 
 import pytest
+from acgs_lite import Constitution
 from constitutional_swarm import (
     ConstitutionalMesh,
     LocalRemotePeer,
@@ -14,8 +15,6 @@ from constitutional_swarm import (
     RemoteVoteRequest,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from acgs_lite import Constitution
 
 
 def _build_signed_request(

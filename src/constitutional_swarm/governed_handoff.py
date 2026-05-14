@@ -66,7 +66,7 @@ class AuditLogger:
 class ExecutorAdapter(Protocol):
     name: str
 
-    def propose_actions(self, task: "TaskSpec") -> list[Action]:
+    def propose_actions(self, task: TaskSpec) -> list[Action]:
         """Return requested actions; policy gates decide what can run."""
 
 
@@ -265,7 +265,7 @@ class ExternalAgentAdapter:
         if not self._command:
             raise RuntimeError(f"{self.name} adapter is not configured")
         argv = [*shlex.split(self._command), str(task.path)]
-        completed = subprocess.run(  # noqa: S603 - local adapter command from .acgs config
+        completed = subprocess.run(
             argv, check=False, capture_output=True, text=True, timeout=120
         )
         if completed.returncode != 0:
@@ -438,7 +438,7 @@ def replay_hashes(events: list[dict[str, Any]]) -> str:
 
 def run_local_command(command: str, *, cwd: Path) -> dict[str, Any]:
     argv = shlex.split(command)
-    completed = subprocess.run(  # noqa: S603 - command already passed the policy gate
+    completed = subprocess.run(
         argv, cwd=cwd, check=False, capture_output=True, text=True, timeout=120
     )
     return {

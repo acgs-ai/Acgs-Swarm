@@ -86,7 +86,7 @@ def spectral_norm_power_iter(
     if n == 0:
         return 0.0
 
-    rng = random.Random(seed)  # noqa: S311 - deterministic numerical initialization
+    rng = random.Random(seed)
     v = [rng.gauss(0, 1) for _ in range(n)]
     norm_v = _l2_norm(v)
     if norm_v < 1e-12:

@@ -629,7 +629,8 @@ class TestMacAcgsLoopHappyPath:
         """Auto-challenge (severity 0.15) + auto-defend → APPROVED with default threshold 0.6."""
         loop = MacAcgsLoop(came=_make_came_mock(rules=["Rule A", "Rule B"]))
         result = loop.run_cycle([])
-        # With auto-challenge severity=0.15, auto-defend: score = 0.5 - 0.15*0.3 + 0.15 = 0.605 ≥ 0.6
+        # With auto-challenge severity=0.15, auto-defend:
+        # score = 0.5 - 0.15*0.3 + 0.15 = 0.605 >= 0.6
         assert result.proposals_opened == 2
         assert result.proposals_approved == 2
         assert result.proposals_rejected == 0
@@ -1166,7 +1167,7 @@ class TestCAMECoordinatorLogging:
         approach.miner_uid = "miner-1"
 
         # Should NOT raise — the coordinator catches and logs
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 — any exception from _ExplodingGrid is expected
             # Verify the grid DOES raise
             _ExplodingGrid().challenge(approach)
 
