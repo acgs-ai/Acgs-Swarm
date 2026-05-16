@@ -16,6 +16,17 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
+_SYNTHETIC_SCRIPT_PATH = (
+    Path(__file__).resolve().parent.parent / "scripts" / "eval_swe_bench_synthetic.py"
+)
+_SYNTHETIC_SPEC = importlib.util.spec_from_file_location(
+    "eval_swe_bench_synthetic", _SYNTHETIC_SCRIPT_PATH
+)
+assert _SYNTHETIC_SPEC is not None and _SYNTHETIC_SPEC.loader is not None
+_SYNTHETIC_MODULE = importlib.util.module_from_spec(_SYNTHETIC_SPEC)
+sys.modules[_SYNTHETIC_SPEC.name] = _SYNTHETIC_MODULE
+_SYNTHETIC_SPEC.loader.exec_module(_SYNTHETIC_MODULE)
+
 
 def _small_args(tmp_path: Path | None = None):
     parser = _MODULE.build_parser()
@@ -73,6 +84,30 @@ def test_reproducibility_suite_emits_claim_oriented_sections() -> None:
     assert payload["byzantine_rejection"]["accepted_tampered"] == 0
     assert payload["synthetic_swe_bench"]["official_swe_bench_claimed"] is False
     assert payload["latency_microbenchmarks"]["ns_per_operation"]["cid_append"] > 0
+
+
+def test_synthetic_swe_bench_reports_claim_anchor_fields() -> None:
+    payload = _SYNTHETIC_MODULE.summarize_runs(
+        seeds=[42, 7, 13],
+        n_agents=4,
+        n_tasks=64,
+        warmup=8,
+    )
+
+    assert payload["pass"] is True
+    assert payload["official_swebench_claimed"] is False
+    assert payload["official_swe_bench_claimed"] is False
+    assert payload["synthetic_only"] is True
+    assert payload["seeds"] == [42, 7, 13]
+    assert payload["task_count"] == 64
+    assert payload["agent_count"] == 4
+    assert payload["flat_resolve_rate"] >= 0.0
+    assert payload["sinkhorn_crdt_resolve_rate"] > payload["flat_resolve_rate"]
+    assert payload["fedsink_resolve_rate"] > payload["sinkhorn_crdt_resolve_rate"]
+    assert payload["centralized_resolve_rate"] >= payload["fedsink_resolve_rate"]
+    assert payload["flat_routing_diversity_pct"] == 0.0
+    assert payload["fedsink_routing_diversity_pct"] > payload["sinkhorn_crdt_routing_diversity_pct"]
+    assert payload["convergence_rounds"] <= 8
 
 
 def test_trust_variance_benchmark_keeps_birkhoff_and_residual_claims_separate() -> None:

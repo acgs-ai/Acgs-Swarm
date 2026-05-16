@@ -52,8 +52,8 @@ Definition used here: `mapped` means an existing `scripts/` entry or pytest test
 | NDSS-17 | `sections/evaluation.tex:61` | DP accuracy table reports exact theoretical and empirical sigma values with relative error from `0.12%` to `0.23%`. | `scripts/reproduce_paper_claims.py --claim-id NDSS-17` | mapped |
 | NDSS-18 | `sections/evaluation.tex:77` | Empirical noise matches theory within `0.23%`, and at `epsilon=2.0`, residual injection reduces sigma from `1.92` to `1.73`. | `scripts/reproduce_paper_claims.py --claim-id NDSS-18` | mapped |
 | NDSS-19 | `sections/evaluation.tex:86` | Phase 3/4 SWE-bench results are pending. | `scripts/run_swe_bench_swarm_lite.py`; `scripts/run_official_swarm_swebench.py` | mapped |
-| NDSS-20 | `sections/evaluation.tex:115` | Expected SWE-bench outcomes: Sinkhorn-CRDT converges to uniform routing within `10` rounds and FedSink exceeds Sinkhorn-CRDT task success by `15`--`30%`. | `scripts/reproduce_paper_claims.py --claim-id NDSS-20` | mapped |
-| NDSS-21 | `sections/evaluation.tex:130` | SWE-bench placeholder table expects flat routing at `0%`, Sinkhorn-CRDT near `0%`, FedSink routing diversity `>100%`, and `O(log N)` convergence. | `scripts/reproduce_paper_claims.py --claim-id NDSS-21` | mapped |
+| NDSS-20 | `sections/evaluation.tex:115` | Local SWE-bench-shaped synthetic evaluator measures FedSink at `87.0%` resolve rate versus `67.2%` explicit Sinkhorn-CRDT, `34.4%` round-robin, and `32.8%` flat routing, with official SWE-bench explicitly unclaimed. | `scripts/reproduce_paper_claims.py --claim-id NDSS-20`; `scripts/eval_swe_bench_synthetic.py` | mapped |
+| NDSS-21 | `sections/evaluation.tex:130` | Local SWE-bench-shaped synthetic evaluator measures flat routing diversity at `0.0%`, explicit Sinkhorn-CRDT diversity at `69.4%`, FedSink diversity at `97.3%`, and bounded local convergence at `2` rounds. | `scripts/reproduce_paper_claims.py --claim-id NDSS-21`; `scripts/eval_swe_bench_synthetic.py` | mapped |
 | NDSS-22 | `sections/evaluation.tex:142` | Protocol latency table reports `1.2 +/- 0.1 ms` SVD, `<0.1 ms` residual injection, `0.3 +/- 0.05 ms` DP sampling, and `~2.5 ms` total excluding zk-SNARK. | `scripts/reproduce_paper_claims.py --claim-id NDSS-22` | mapped |
 | NDSS-23 | `sections/evaluation.tex:160` | For 10-second tasks the governance overhead is `0.025%`, and at `n=500` SVD scales to approximately `1.2 s`. | `scripts/reproduce_paper_claims.py --claim-id NDSS-23` | mapped |
 | NDSS-24 | `sections/conclusion.tex:55` | Correctness tests for CID integrity, EEC convergence, and DP calibration pass in the Phase 2 suite with `1018` tests and `2` expected failures. | `scripts/reproduce_paper_claims.py --claim-id NDSS-24` | mapped |
@@ -77,7 +77,9 @@ Note: `ICLR-15` is mapped to a table-consistency check, not to a proof that the
 table's absolute sigma scale follows the stated `delta=1e-5` Gaussian formula.
 The harness records the formula-derived sigma alongside the published table so
 future paper revisions can decide whether to adjust the table or the stated
-calibration constants.
+calibration constants. Current decision: keep the paper table as an internally
+consistent calibration table and explicitly label formula-derived sigma as a separate
+reproducibility datum rather than silently treating the two scales as identical.
 
 ## Summary
 
