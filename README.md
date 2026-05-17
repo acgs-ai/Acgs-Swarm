@@ -498,7 +498,7 @@ AGPL-3.0-or-later.
 - [Homepage](https://acgs.ai)
 - [PyPI](https://pypi.org/project/constitutional-swarm/)
 - [Issues](https://github.com/dislovelhl/Acgs-Swarm/issues)
-- [Public v0.1 benchmark kit release](https://github.com/dislovelhl/Acgs-Swarm/releases/tag/acgs-v0.1-benchmark-kit-2026-05-16)
+- [Public v0.1 benchmark kit release](https://github.com/dislovelhl/Acgs-Swarm/releases/tag/acgs-v0.1-benchmark-kit-2026-05-16) — owner-published public-study evidence; external replication is still open
 - [Public rerun request asset](https://github.com/dislovelhl/Acgs-Swarm/releases/download/acgs-v0.1-benchmark-kit-2026-05-16/acgs-public-replication-request.json)
 - [Repo-mirrored request template](docs/public-replication-request.json)
 - [External replication submission template](.github/ISSUE_TEMPLATE/external_replication.yml)
