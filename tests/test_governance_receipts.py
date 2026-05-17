@@ -1149,6 +1149,11 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
+    release_download_base = (
+        "https://github.com/dislovelhl/Acgs-Swarm/releases/download/"
+        "acgs-v0.1-benchmark-kit-2026-05-16"
+    )
+
     output_dir = tmp_path / "submission-package"
     result = subprocess.run(
         [
@@ -1159,11 +1164,11 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
             "--submission-result-bundle",
             str(bundle_path),
             "--submission-result-bundle-url",
-            "https://example.org/result-bundle.json",
+            f"{release_download_base}/result-bundle.json",
             "--submission-replication-metadata-url",
-            "https://example.org/replication_metadata.json",
+            f"{release_download_base}/replication_metadata.json",
             "--submission-commands-transcript-url",
-            "https://example.org/commands-transcript.txt",
+            f"{release_download_base}/commands-transcript.txt",
         ],
         check=False,
         capture_output=True,
@@ -1185,7 +1190,7 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
         "acgs-v0.1-benchmark-kit-2026-05-16"
     )
     assert payload["submission_fields"]["result_bundle_url"] == (
-        "https://example.org/result-bundle.json"
+        f"{release_download_base}/result-bundle.json"
     )
     assert payload["submission_fields"]["scorecard_url"] == (
         "https://zenodo.org/records/987654321/files/acgs-v0-1-scorecard.json"
@@ -1203,9 +1208,9 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
     markdown = (output_dir / "submission.md").read_text()
     assert "# External replication submission" in markdown
     assert "Independent Systems Lab" in markdown
-    assert "https://example.org/result-bundle.json" in markdown
-    assert "https://example.org/replication_metadata.json" in markdown
-    assert "https://example.org/commands-transcript.txt" in markdown
+    assert f"{release_download_base}/result-bundle.json" in markdown
+    assert f"{release_download_base}/replication_metadata.json" in markdown
+    assert f"{release_download_base}/commands-transcript.txt" in markdown
     submission_json = json.loads((output_dir / "submission.json").read_text())
     assert submission_json["schema"] == "acgs-v0.1-external-replication-submission"
     assert submission_json["public_request"]["release_url"] == (
@@ -1231,6 +1236,11 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
+    release_download_base = (
+        "https://github.com/dislovelhl/Acgs-Swarm/releases/download/"
+        "acgs-v0.1-benchmark-kit-2026-05-16"
+    )
+
     output_dir = tmp_path / "submission-package"
     write = subprocess.run(
         [
@@ -1241,11 +1251,11 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
             "--submission-result-bundle",
             str(bundle_path),
             "--submission-result-bundle-url",
-            "https://example.org/result-bundle.json",
+            f"{release_download_base}/result-bundle.json",
             "--submission-replication-metadata-url",
-            "https://example.org/replication_metadata.json",
+            f"{release_download_base}/replication_metadata.json",
             "--submission-commands-transcript-url",
-            "https://example.org/commands-transcript.txt",
+            f"{release_download_base}/commands-transcript.txt",
         ],
         check=False,
         capture_output=True,

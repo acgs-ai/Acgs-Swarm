@@ -208,11 +208,9 @@ class HashCommitmentProver:
 
     def prove(self, statement: ValidityStatement, witness: ValidityWitness) -> bytes:
         try:
-            _choice_valid = witness.choice in BallotChoice
-        except TypeError:
-            _choice_valid = False
-        if not _choice_valid:
-            raise ValueError("witness.choice must be a BallotChoice member")
+            witness_choice = BallotChoice(witness.choice)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("witness.choice must be a BallotChoice member") from exc
         return _digest(
             b"acgs-validity-hashcommit-v1",
             self.scheme_id.encode("ascii"),
@@ -221,7 +219,7 @@ class HashCommitmentProver:
             statement.voter,
             statement.commit,
             statement.nullifier,
-            witness.choice.value.encode("ascii"),
+            witness_choice.value.encode("ascii"),
         )
 
     def verify(self, statement: ValidityStatement, proof: bytes) -> bool:
