@@ -33,4 +33,4 @@ Trust updates can be projected into bounded spaces via:
 - Advanced: optional but practical runtime modules.
 - Research: experimental modules intended for evaluation and iteration.
 
-See [`README.md`](../README.md) maturity tiers and [`docs/roadmap.md`](roadmap.md).
+See maturity tiers in [`README.md`](../README.md) and planning priorities in [`docs/roadmap.md`](roadmap.md).

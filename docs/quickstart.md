@@ -15,17 +15,20 @@ from acgs_lite import Constitution
 from constitutional_swarm import AgentDNA, ConstitutionalMesh
 
 dna = AgentDNA.default(agent_id="worker-1")
-dna.validate("summarize a safe project update")
+validation = dna.validate("summarize a safe project update")
+assert validation.valid
 
+# Start with the default constitution profile, then customize for your domain.
 constitution = Constitution.default()
-mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=2)
+required_votes = 2
+mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=required_votes)
 mesh.register_local_signer("producer", domain="ops")
 mesh.register_local_signer("peer-1", domain="ops")
 mesh.register_local_signer("peer-2", domain="ops")
 mesh.register_local_signer("peer-3", domain="ops")
 
 assignment = mesh.request_validation("producer", "safe content", "artifact-quickstart")
-for voter_id in assignment.peers:
+for voter_id in assignment.peers[:required_votes]:
     mesh.submit_vote(
         assignment.assignment_id,
         voter_id,

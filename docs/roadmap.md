@@ -3,7 +3,7 @@
 This roadmap separates stable runtime hardening from research exploration.
 
 ## Stable core priorities
-- Improve onboarding docs and examples for governed execution and mesh settlement
+- improve onboarding docs and examples for governed execution and mesh settlement
 - Continue API stability for the documented core surface (`AgentDNA`, `ConstitutionalMesh`, `SwarmExecutor`, `TaskDAG`)
 - Expand regression coverage around signed-vote settlement and replay/recovery paths
 

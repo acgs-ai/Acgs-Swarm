@@ -67,19 +67,22 @@ from acgs_lite import Constitution
 from constitutional_swarm import AgentDNA, ConstitutionalMesh
 
 # 1) Local constitutional enforcement
-agent = AgentDNA.default(agent_id="writer-1")
-agent.validate("summarize the meeting notes")
+# Start with default constitutional rules, then load custom rules as needed.
+agent = AgentDNA.default(agent_id="worker-1")
+validation = agent.validate("summarize the meeting notes")
+assert validation.valid
 
 # 2) Peer-validated settlement
 constitution = Constitution.default()
-mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=2)
+required_votes = 2
+mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=required_votes)
 mesh.register_local_signer("producer", domain="writing")
 mesh.register_local_signer("peer-1", domain="writing")
 mesh.register_local_signer("peer-2", domain="writing")
 mesh.register_local_signer("peer-3", domain="writing")
 
 assignment = mesh.request_validation("producer", "safe draft content", "artifact-1")
-for voter_id in assignment.peers:
+for voter_id in assignment.peers[:required_votes]:
     mesh.submit_vote(
         assignment.assignment_id,
         voter_id,

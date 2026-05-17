@@ -24,7 +24,7 @@ Quorum-based settlement governs acceptance/rejection finality.
 ### 3) Transport boundary (optional)
 Remote vote transport introduces network trust boundaries:
 - signer identity and key distribution,
-- transport mode selection,
+- transport mode selection (such as `auto`, `tls`, or `plaintext` modes in transport configuration),
 - replay protections in signed request envelopes.
 
 Use explicit trusted signer configuration for non-local deployments.
