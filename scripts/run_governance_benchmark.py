@@ -451,6 +451,422 @@ def _verify_replication_kit(kit_dir: Path) -> dict[str, object]:
     }
 
 
+def _public_replication_request_template() -> dict[str, object]:
+    request_path = (
+        Path(__file__).resolve().parents[1] / "docs" / "public-replication-request.json"
+    )
+    return json.loads(request_path.read_text())
+
+
+def _render_external_replication_submission_markdown(
+    *,
+    public_request: dict[str, object],
+    bundle_summary: dict[str, object],
+    replication_metadata: ExternalReplicationRecord,
+    result_bundle_url: str,
+    replication_metadata_url: str,
+    commands_transcript_url: str,
+) -> str:
+    independent_group = "acgs" not in replication_metadata.replicating_group.casefold()
+    reviewer_blind = bool(bundle_summary.get("reviewer_count", 0)) >= 2
+    result_bundle_check = (
+        "x" if result_bundle_url and not result_bundle_url.startswith("TODO") else " "
+    )
+    replication_metadata_check = (
+        "x"
+        if replication_metadata_url and not replication_metadata_url.startswith("TODO")
+        else " "
+    )
+    commands_transcript_check = (
+        "x"
+        if commands_transcript_url and not commands_transcript_url.startswith("TODO")
+        else " "
+    )
+    independent_check = "x" if independent_group else " "
+    reviewer_check = "x" if reviewer_blind else " "
+    lines = [
+        "# External replication submission",
+        "",
+        "Use this form to submit a non-ACGS rerun of the public ACGS-Swarm v0.1 "
+        "benchmark kit.",
+        "",
+        "## Replicating group name",
+        replication_metadata.replicating_group,
+        "",
+        "## Independence checks",
+        (
+            f"- [{independent_check}] This rerun was executed outside the "
+            "ACGS-Swarm maintenance team."
+        ),
+        (
+            f"- [{independent_check}] The replicating group is not "
+            "ACGS-maintained and does not reuse hidden ground truth."
+        ),
+        (
+            f"- [{reviewer_check}] The reviewers only saw blinded artifacts, not "
+            "the hidden answer key or condition labels."
+        ),
+        "",
+        "## Rerun summary",
+        replication_metadata.reproduction_notes,
+        "",
+        "## Release URL used",
+        str(public_request["release_url"]),
+        "",
+        "## Public result bundle URL",
+        result_bundle_url,
+        "",
+        "## Public scorecard URL",
+        replication_metadata.scorecard_uri,
+        "",
+        "## Public reviewer cohort manifest URL",
+        replication_metadata.reviewer_cohort_uri,
+        "",
+        "## Public replication metadata URL",
+        replication_metadata_url,
+        "",
+        "## Public replication attestation URL",
+        replication_metadata.attestation_uri,
+        "",
+        "## Public artifact pack URL",
+        replication_metadata.artifact_pack_uri,
+        "",
+        "## Public command transcript URL",
+        commands_transcript_url,
+        "",
+        "## Commands run",
+        "```shell",
+        *[str(command) for command in public_request["verification_commands"]],
+        "```",
+        "",
+        "## Key results",
+        (
+            "incident_count={incident_count}; reviewer_count={reviewer_count}; "
+            "p_value={p_value}; performance_delta={performance_delta}; "
+            "inter_reviewer_agreement={agreement}; acgs_wins={wins}"
+        ).format(
+            incident_count=bundle_summary.get("incident_count"),
+            reviewer_count=bundle_summary.get("reviewer_count"),
+            p_value=bundle_summary.get("p_value_vs_strongest_baseline"),
+            performance_delta=bundle_summary.get(
+                "performance_delta_vs_strongest_baseline"
+            ),
+            agreement=bundle_summary.get("acgs_inter_reviewer_agreement"),
+            wins=bundle_summary.get("acgs_wins"),
+        ),
+        "",
+        "## Public links",
+        f"- release_url: {public_request['release_url']}",
+        f"- issue_url: {public_request['issue_url']}",
+        "",
+        "## Submission checks",
+        (
+            f"- [{result_bundle_check}] I included an immutable/public URL for "
+            "the result bundle."
+        ),
+        (
+            f"- [{replication_metadata_check}] I included an immutable/public "
+            "URL for the replication metadata."
+        ),
+        (
+            f"- [{commands_transcript_check}] I included an immutable/public "
+            "URL for the commands transcript."
+        ),
+        (
+            f"- [{'x' if replication_metadata.completed else ' '}] I understand "
+            "the benchmark is not complete until the independent rerun is "
+            "independently verified."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _write_external_replication_submission_package(
+    output_dir: Path,
+    result_bundle_path: Path,
+    *,
+    result_bundle_url: str | None = None,
+    replication_metadata_url: str | None = None,
+    commands_transcript_url: str | None = None,
+) -> dict[str, object]:
+    public_request = _public_replication_request_template()
+    bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
+    verdict = validate_result_bundle(bundle)
+    if not verdict.valid:
+        return {
+            "output_dir": str(output_dir),
+            "valid": False,
+            "issues": [issue.model_dump(mode="json") for issue in verdict.issues],
+        }
+
+    summary = _result_bundle_summary(bundle)
+    result_bundle_url = result_bundle_url or "TODO-public-result-bundle-url"
+    replication_metadata_url = (
+        replication_metadata_url or "TODO-public-replication-metadata-url"
+    )
+    commands_transcript_url = (
+        commands_transcript_url or "TODO-public-commands-transcript-url"
+    )
+    submission_markdown = _render_external_replication_submission_markdown(
+        public_request=public_request,
+        bundle_summary=summary,
+        replication_metadata=bundle.external_replication,
+        result_bundle_url=result_bundle_url,
+        replication_metadata_url=replication_metadata_url,
+        commands_transcript_url=commands_transcript_url,
+    )
+    submission_fields = {
+        "replicating_group_name": bundle.external_replication.replicating_group,
+        "summary": bundle.external_replication.reproduction_notes,
+        "release_url": public_request["release_url"],
+        "result_bundle_url": result_bundle_url,
+        "scorecard_url": bundle.external_replication.scorecard_uri,
+        "reviewer_cohort_url": bundle.external_replication.reviewer_cohort_uri,
+        "replication_metadata_url": replication_metadata_url,
+        "attestation_url": bundle.external_replication.attestation_uri,
+        "artifact_pack_url": bundle.external_replication.artifact_pack_uri,
+        "commands_transcript_url": commands_transcript_url,
+        "commands": list(public_request["verification_commands"]),
+        "results": {
+            "incident_count": summary["incident_count"],
+            "reviewer_count": summary["reviewer_count"],
+            "p_value_vs_strongest_baseline": summary[
+                "p_value_vs_strongest_baseline"
+            ],
+            "performance_delta_vs_strongest_baseline": summary[
+                "performance_delta_vs_strongest_baseline"
+            ],
+            "acgs_inter_reviewer_agreement": summary["acgs_inter_reviewer_agreement"],
+            "acgs_wins": summary["acgs_wins"],
+            "external_replication_completed": summary[
+                "external_replication_completed"
+            ],
+        },
+    }
+    submission_payload = {
+        "schema": "acgs-v0.1-external-replication-submission",
+        "public_request": public_request,
+        "result_bundle_summary": summary,
+        "replication_metadata": bundle.external_replication.model_dump(mode="json"),
+        "required_public_artifacts": _v0_1_required_public_artifacts(summary),
+        "submission_fields": submission_fields,
+        "validation": verdict.model_dump(mode="json"),
+        "missing_fields": [
+            name
+            for name, value in (
+                ("result_bundle_url", result_bundle_url),
+                ("replication_metadata_url", replication_metadata_url),
+                ("commands_transcript_url", commands_transcript_url),
+            )
+            if value.startswith("TODO")
+        ],
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "submission.json").write_text(
+        json.dumps(submission_payload, indent=2, sort_keys=True)
+    )
+    (output_dir / "submission.md").write_text(submission_markdown)
+    return {
+        "output_dir": str(output_dir),
+        "submission_json": str(output_dir / "submission.json"),
+        "submission_md": str(output_dir / "submission.md"),
+        "valid": verdict.valid,
+        "missing_fields": submission_payload["missing_fields"],
+        "submission_fields": submission_fields,
+        "validation": verdict.model_dump(mode="json"),
+    }
+
+
+def _validate_external_replication_submission_package(
+    submission_path: Path,
+    result_bundle_path: Path,
+    submission_markdown_path: Path | None = None,
+) -> dict[str, object]:
+    if submission_path.is_dir():
+        submission_json_path = submission_path / "submission.json"
+        if submission_markdown_path is None:
+            submission_markdown_path = submission_path / "submission.md"
+    else:
+        submission_json_path = submission_path
+
+    issues: list[dict[str, str]] = []
+    public_request = _public_replication_request_template()
+    bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
+    verdict = validate_result_bundle(bundle)
+    summary = _result_bundle_summary(bundle)
+
+    if not verdict.valid:
+        issues.extend(issue.model_dump(mode="json") for issue in verdict.issues)
+
+    package = json.loads(submission_json_path.read_text())
+    if package.get("schema") != "acgs-v0.1-external-replication-submission":
+        issues.append(
+            {
+                "code": "submission_schema_mismatch",
+                "message": "submission.json has an unexpected schema",
+            }
+        )
+    if package.get("public_request") != public_request:
+        issues.append(
+            {
+                "code": "submission_public_request_mismatch",
+                "message": "submission.json must mirror the public request template",
+            }
+        )
+    if package.get("result_bundle_summary") != summary:
+        issues.append(
+            {
+                "code": "submission_result_bundle_summary_mismatch",
+                "message": "submission.json summary must match the validated result bundle",
+            }
+        )
+    if package.get("replication_metadata") != bundle.external_replication.model_dump(
+        mode="json"
+    ):
+        issues.append(
+            {
+                "code": "submission_replication_metadata_mismatch",
+                "message": (
+                    "submission.json replication_metadata must match the result bundle"
+                ),
+            }
+        )
+    if package.get("required_public_artifacts") != _v0_1_required_public_artifacts(
+        summary
+    ):
+        issues.append(
+            {
+                "code": "submission_required_public_artifacts_mismatch",
+                "message": (
+                    "submission.json required_public_artifacts must match the result bundle"
+                ),
+            }
+        )
+
+    submission_fields = package.get("submission_fields")
+    if not isinstance(submission_fields, dict):
+        issues.append(
+            {
+                "code": "submission_fields_missing",
+                "message": "submission.json must contain a submission_fields object",
+            }
+        )
+        submission_fields = {}
+
+    expected_fields = {
+        "replicating_group_name": bundle.external_replication.replicating_group,
+        "summary": bundle.external_replication.reproduction_notes,
+        "release_url": public_request["release_url"],
+        "scorecard_url": bundle.external_replication.scorecard_uri,
+        "reviewer_cohort_url": bundle.external_replication.reviewer_cohort_uri,
+        "attestation_url": bundle.external_replication.attestation_uri,
+        "artifact_pack_url": bundle.external_replication.artifact_pack_uri,
+        "commands": list(public_request["verification_commands"]),
+        "results": {
+            "incident_count": summary["incident_count"],
+            "reviewer_count": summary["reviewer_count"],
+            "p_value_vs_strongest_baseline": summary[
+                "p_value_vs_strongest_baseline"
+            ],
+            "performance_delta_vs_strongest_baseline": summary[
+                "performance_delta_vs_strongest_baseline"
+            ],
+            "acgs_inter_reviewer_agreement": summary["acgs_inter_reviewer_agreement"],
+            "acgs_wins": summary["acgs_wins"],
+            "external_replication_completed": summary[
+                "external_replication_completed"
+            ],
+        },
+    }
+    for field_name, expected_value in expected_fields.items():
+        if submission_fields.get(field_name) != expected_value:
+            issues.append(
+                {
+                    "code": f"submission_field_{field_name}_mismatch",
+                    "message": f"submission_fields.{field_name} must match the bundle",
+                }
+            )
+
+    for field_name in (
+        "result_bundle_url",
+        "replication_metadata_url",
+        "commands_transcript_url",
+    ):
+        value = str(submission_fields.get(field_name, ""))
+        if not value or value.startswith("TODO"):
+            issues.append(
+                {
+                    "code": f"submission_field_{field_name}_placeholder",
+                    "message": f"submission_fields.{field_name} must be a public URL",
+                }
+            )
+        if value and not is_immutable_external_reference(value):
+            issues.append(
+                {
+                    "code": f"submission_field_{field_name}_not_immutable",
+                    "message": f"submission_fields.{field_name} must be immutable/public",
+                }
+            )
+        if value and is_placeholder_external_reference(value):
+            issues.append(
+                {
+                    "code": f"submission_field_{field_name}_placeholder_reference",
+                    "message": f"submission_fields.{field_name} must not use placeholder URLs",
+                }
+            )
+
+    if package.get("missing_fields") != []:
+        issues.append(
+            {
+                "code": "submission_missing_fields_nonempty",
+                "message": "submission.json missing_fields must be empty",
+            }
+        )
+
+    validation = package.get("validation")
+    if not isinstance(validation, dict) or validation.get("valid") is not True:
+        issues.append(
+            {
+                "code": "submission_validation_failed",
+                "message": "submission.json validation must report valid=true",
+            }
+        )
+
+    if submission_markdown_path is not None:
+        markdown = submission_markdown_path.read_text()
+        for snippet in (
+            "# External replication submission",
+            bundle.external_replication.replicating_group,
+            str(public_request["release_url"]),
+            str(submission_fields.get("result_bundle_url", "")),
+            str(submission_fields.get("replication_metadata_url", "")),
+            str(submission_fields.get("commands_transcript_url", "")),
+        ):
+            if snippet and snippet not in markdown:
+                issues.append(
+                    {
+                        "code": "submission_markdown_mismatch",
+                        "message": (
+                            "submission.md must include the rendered public "
+                            "submission details"
+                        ),
+                    }
+                )
+                break
+
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "submission_json": str(submission_json_path),
+        "submission_md": (
+            str(submission_markdown_path) if submission_markdown_path is not None else None
+        ),
+        "public_request": public_request,
+        "result_bundle_summary": summary,
+    }
+
+
 def _validate_required_public_artifacts_inventory(path: Path) -> dict[str, object]:
     required_names = {
         "public_blind_answer_matrix",
@@ -1826,6 +2242,30 @@ def _v0_1_required_public_artifacts(
     ]
 
 
+def _public_blind_review_data_verified(
+    result_bundle_summary: dict[str, object] | None,
+) -> bool:
+    if result_bundle_summary is None:
+        return False
+    incident_count = int(result_bundle_summary["incident_count"])
+    reviewer_count = int(result_bundle_summary["reviewer_count"])
+    if incident_count < 50 or incident_count > 200:
+        return False
+    if reviewer_count < 2:
+        return False
+    for reference_name in (
+        "answer_matrix_uri",
+        "answer_seal_uri",
+        "reviewer_cohort_uri",
+    ):
+        reference = str(result_bundle_summary.get(reference_name, ""))
+        if not reference or not is_immutable_external_reference(reference):
+            return False
+        if is_placeholder_external_reference(reference):
+            return False
+    return True
+
+
 def _v0_1_completion_audit(bundle_path: Path | None) -> dict[str, object]:
     required_questions = {
         "who_acted",
@@ -2229,10 +2669,35 @@ def _v0_1_completion_audit(bundle_path: Path | None) -> dict[str, object]:
                     ),
                 ],
                 "evidence": (
-                    "local CLI can validate bundle shape and hashes, but cannot prove "
-                    "that referenced reviewer answers came from a real public blind cohort"
+                    {
+                        "incident_count": (
+                            result_bundle_summary.get("incident_count")
+                            if result_bundle_summary is not None
+                            else None
+                        ),
+                        "reviewer_count": (
+                            result_bundle_summary.get("reviewer_count")
+                            if result_bundle_summary is not None
+                            else None
+                        ),
+                        "answer_matrix_uri": (
+                            result_bundle_summary.get("answer_matrix_uri")
+                            if result_bundle_summary is not None
+                            else None
+                        ),
+                        "answer_seal_uri": (
+                            result_bundle_summary.get("answer_seal_uri")
+                            if result_bundle_summary is not None
+                            else None
+                        ),
+                        "reviewer_cohort_uri": (
+                            result_bundle_summary.get("reviewer_cohort_uri")
+                            if result_bundle_summary is not None
+                            else None
+                        ),
+                    }
                 ),
-                "satisfied": False,
+                "satisfied": _public_blind_review_data_verified(result_bundle_summary),
             },
             {
                 "requirement": "non_acgs_external_replication_verified",
@@ -2379,6 +2844,14 @@ def main(argv: list[str] | None = None) -> int:
         help="write coordinator pack, reviewer packet, manifest, and rerun instructions",
     )
     parser.add_argument(
+        "--write-external-replication-submission",
+        type=Path,
+        help=(
+            "write submission.json and submission.md for a validated external "
+            "rerun bundle"
+        ),
+    )
+    parser.add_argument(
         "--verify-replication-kit",
         type=Path,
         help="verify kit_manifest.json checksums and blind reviewer-packet audit",
@@ -2418,6 +2891,33 @@ def main(argv: list[str] | None = None) -> int:
             "emit conservative v0.1 completion audit JSON for a result bundle; "
             "never substitutes for live public-study verification"
         ),
+    )
+    parser.add_argument(
+        "--submission-result-bundle",
+        type=Path,
+        help="result bundle JSON used to render an external replication submission package",
+    )
+    parser.add_argument(
+        "--submission-result-bundle-url",
+        help="public URL for the submitted result bundle",
+    )
+    parser.add_argument(
+        "--validate-external-replication-submission",
+        type=Path,
+        help="validate a rendered external replication submission package",
+    )
+    parser.add_argument(
+        "--submission-package-md",
+        type=Path,
+        help="optional markdown copy of the rendered submission package",
+    )
+    parser.add_argument(
+        "--submission-replication-metadata-url",
+        help="public URL for the submitted replication metadata",
+    )
+    parser.add_argument(
+        "--submission-commands-transcript-url",
+        help="public URL for the submitted commands transcript",
     )
     parser.add_argument(
         "--completion-audit",
@@ -2632,6 +3132,42 @@ def main(argv: list[str] | None = None) -> int:
         result = _write_replication_kit(args.write_replication_kit, args.incident_count)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["reviewer_packet_audit_valid"] else 1
+
+    if args.write_external_replication_submission:
+        missing = [
+            name
+            for name, value in (("--submission-result-bundle", args.submission_result_bundle),)
+            if value is None
+        ]
+        if missing:
+            print(json.dumps({"error": f"missing required args: {', '.join(missing)}"}))
+            return 2
+        result = _write_external_replication_submission_package(
+            args.write_external_replication_submission,
+            args.submission_result_bundle,
+            result_bundle_url=args.submission_result_bundle_url,
+            replication_metadata_url=args.submission_replication_metadata_url,
+            commands_transcript_url=args.submission_commands_transcript_url,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["valid"] else 1
+
+    if args.validate_external_replication_submission:
+        missing = [
+            name
+            for name, value in (("--submission-result-bundle", args.submission_result_bundle),)
+            if value is None
+        ]
+        if missing:
+            print(json.dumps({"error": f"missing required args: {', '.join(missing)}"}))
+            return 2
+        verdict = _validate_external_replication_submission_package(
+            args.validate_external_replication_submission,
+            args.submission_result_bundle,
+            args.submission_package_md,
+        )
+        print(json.dumps(verdict, indent=2, sort_keys=True))
+        return 0 if verdict["valid"] else 1
 
     if args.verify_replication_kit:
         verdict = _verify_replication_kit(args.verify_replication_kit)

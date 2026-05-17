@@ -1135,6 +1135,207 @@ def test_governance_benchmark_runner_verifies_external_replication_kit(tmp_path)
     assert payload["required_public_artifacts"]["artifact_count"] == 5
 
 
+def test_governance_benchmark_runner_writes_external_replication_submission_package(
+    tmp_path,
+) -> None:
+    pack = generate_artifact_pack()
+    bundle = build_result_bundle(
+        protocol=pack.protocol,
+        answers=_full_blind_review_answers(pack.answer_key),
+        p_value_vs_strongest_baseline=0.01,
+        answer_evidence=_complete_answer_evidence(),
+        external_replication=_complete_external_replication_record(),
+    )
+    bundle_path = tmp_path / "result-bundle.json"
+    bundle_path.write_text(bundle.model_dump_json())
+
+    output_dir = tmp_path / "submission-package"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_governance_benchmark.py",
+            "--write-external-replication-submission",
+            str(output_dir),
+            "--submission-result-bundle",
+            str(bundle_path),
+            "--submission-result-bundle-url",
+            "https://example.org/result-bundle.json",
+            "--submission-replication-metadata-url",
+            "https://example.org/replication_metadata.json",
+            "--submission-commands-transcript-url",
+            "https://example.org/commands-transcript.txt",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["valid"] is True
+    assert payload["missing_fields"] == []
+    assert payload["output_dir"] == str(output_dir)
+    assert payload["submission_json"] == str(output_dir / "submission.json")
+    assert payload["submission_md"] == str(output_dir / "submission.md")
+    assert payload["submission_fields"]["replicating_group_name"] == (
+        "Independent Systems Lab"
+    )
+    assert payload["submission_fields"]["release_url"] == (
+        "https://github.com/dislovelhl/Acgs-Swarm/releases/tag/"
+        "acgs-v0.1-benchmark-kit-2026-05-16"
+    )
+    assert payload["submission_fields"]["result_bundle_url"] == (
+        "https://example.org/result-bundle.json"
+    )
+    assert payload["submission_fields"]["scorecard_url"] == (
+        "https://zenodo.org/records/987654321/files/acgs-v0-1-scorecard.json"
+    )
+    assert payload["submission_fields"]["reviewer_cohort_url"] == (
+        "https://zenodo.org/records/987654321/files/acgs-v0-1-reviewer-cohort.json"
+    )
+    assert payload["submission_fields"]["artifact_pack_url"] == (
+        "https://zenodo.org/records/987654321/files/acgs-v0-1-pack.tar.gz"
+    )
+    assert payload["submission_fields"]["commands"][0].startswith(
+        "python scripts/run_governance_benchmark.py --validate-result-bundle"
+    )
+    assert payload["validation"]["valid"] is True
+    markdown = (output_dir / "submission.md").read_text()
+    assert "# External replication submission" in markdown
+    assert "Independent Systems Lab" in markdown
+    assert "https://example.org/result-bundle.json" in markdown
+    assert "https://example.org/replication_metadata.json" in markdown
+    assert "https://example.org/commands-transcript.txt" in markdown
+    submission_json = json.loads((output_dir / "submission.json").read_text())
+    assert submission_json["schema"] == "acgs-v0.1-external-replication-submission"
+    assert submission_json["public_request"]["release_url"] == (
+        "https://github.com/dislovelhl/Acgs-Swarm/releases/tag/"
+        "acgs-v0.1-benchmark-kit-2026-05-16"
+    )
+    assert submission_json["required_public_artifacts"][0]["artifact"] == (
+        "public_blind_answer_matrix"
+    )
+
+
+def test_governance_benchmark_runner_validates_external_replication_submission_package(
+    tmp_path,
+) -> None:
+    pack = generate_artifact_pack()
+    bundle = build_result_bundle(
+        protocol=pack.protocol,
+        answers=_full_blind_review_answers(pack.answer_key),
+        p_value_vs_strongest_baseline=0.01,
+        answer_evidence=_complete_answer_evidence(),
+        external_replication=_complete_external_replication_record(),
+    )
+    bundle_path = tmp_path / "result-bundle.json"
+    bundle_path.write_text(bundle.model_dump_json())
+
+    output_dir = tmp_path / "submission-package"
+    write = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_governance_benchmark.py",
+            "--write-external-replication-submission",
+            str(output_dir),
+            "--submission-result-bundle",
+            str(bundle_path),
+            "--submission-result-bundle-url",
+            "https://example.org/result-bundle.json",
+            "--submission-replication-metadata-url",
+            "https://example.org/replication_metadata.json",
+            "--submission-commands-transcript-url",
+            "https://example.org/commands-transcript.txt",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert write.returncode == 0
+
+    validate = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_governance_benchmark.py",
+            "--validate-external-replication-submission",
+            str(output_dir),
+            "--submission-result-bundle",
+            str(bundle_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert validate.returncode == 0
+    payload = json.loads(validate.stdout)
+    assert payload["valid"] is True
+    assert payload["issues"] == []
+    assert payload["submission_json"] == str(output_dir / "submission.json")
+    assert payload["submission_md"] == str(output_dir / "submission.md")
+    assert payload["result_bundle_summary"]["acgs_wins"] is True
+    assert payload["result_bundle_summary"]["external_replication_completed"] is True
+
+
+def test_governance_benchmark_runner_rejects_placeholder_submission_urls(
+    tmp_path,
+) -> None:
+    pack = generate_artifact_pack()
+    bundle = build_result_bundle(
+        protocol=pack.protocol,
+        answers=_full_blind_review_answers(pack.answer_key),
+        p_value_vs_strongest_baseline=0.01,
+        answer_evidence=_complete_answer_evidence(),
+        external_replication=_complete_external_replication_record(),
+    )
+    bundle_path = tmp_path / "result-bundle.json"
+    bundle_path.write_text(bundle.model_dump_json())
+
+    output_dir = tmp_path / "submission-package"
+    write = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_governance_benchmark.py",
+            "--write-external-replication-submission",
+            str(output_dir),
+            "--submission-result-bundle",
+            str(bundle_path),
+            "--submission-result-bundle-url",
+            "TODO-result-bundle-url",
+            "--submission-replication-metadata-url",
+            "https://example.org/replication_metadata.json",
+            "--submission-commands-transcript-url",
+            "https://example.org/commands-transcript.txt",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert write.returncode == 0
+
+    validate = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_governance_benchmark.py",
+            "--validate-external-replication-submission",
+            str(output_dir),
+            "--submission-result-bundle",
+            str(bundle_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert validate.returncode == 1
+    payload = json.loads(validate.stdout)
+    assert payload["valid"] is False
+    assert any(
+        issue["code"] == "submission_field_result_bundle_url_placeholder"
+        for issue in payload["issues"]
+    )
+
+
 def test_governance_benchmark_runner_rejects_tampered_replication_kit(
     tmp_path,
 ) -> None:
@@ -3444,7 +3645,6 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
     assert "50 to 200 adversarial incidents" in payload["objective"]
     assert payload["local_result_bundle_valid"] is True
     assert payload["blockers"] == [
-        "public_blind_review_data_verified",
         "non_acgs_external_replication_verified",
     ]
     checklist = {item["requirement"]: item for item in payload["checklist"]}
@@ -3514,16 +3714,19 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
         ]
         > 0
     )
-    assert checklist["public_blind_review_data_verified"]["satisfied"] is False
+    assert checklist["public_blind_review_data_verified"]["satisfied"] is True
     assert checklist["public_blind_review_data_verified"]["artifacts"] == [
         "public answer matrix",
         "pre-unblinding answer seal",
         "reviewer cohort manifest",
     ]
-    assert checklist["public_blind_review_data_verified"]["evidence"] == (
-        "local CLI can validate bundle shape and hashes, but cannot prove that "
-        "referenced reviewer answers came from a real public blind cohort"
-    )
+    assert checklist["public_blind_review_data_verified"]["evidence"] == {
+        "incident_count": 50,
+        "reviewer_count": 2,
+        "answer_matrix_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-answers.csv",
+        "answer_seal_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-answer-seal.json",
+        "reviewer_cohort_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-reviewer-cohort.json",
+    }
     assert checklist["non_acgs_external_replication_verified"]["satisfied"] is False
     assert checklist["non_acgs_external_replication_verified"]["artifacts"] == [
         "replication_metadata.json",

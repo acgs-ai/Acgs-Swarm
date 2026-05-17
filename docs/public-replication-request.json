@@ -1,0 +1,36 @@
+{
+  "schema": "acgs-v0.1-public-replication-request",
+  "release_tag": "acgs-v0.1-benchmark-kit-2026-05-16",
+  "release_url": "https://github.com/dislovelhl/Acgs-Swarm/releases/tag/acgs-v0.1-benchmark-kit-2026-05-16",
+  "issue_url": "https://github.com/dislovelhl/Acgs-Swarm/issues/48",
+  "objective": "Independent non-ACGS rerun of the ACGS-Swarm v0.1 benchmark kit",
+  "required_public_assets": [
+    "acgs-v0-1-answers.csv",
+    "acgs-v0-1-answer-seal.json",
+    "acgs-v0-1-reviewer-cohort.json",
+    "acgs-v0-1-scorecard.json",
+    "acgs-v0-1-attestation.json",
+    "result-bundle.json",
+    "replication_metadata.json",
+    "acgs-v0-1-pack.tar.gz",
+    "commands-transcript.txt",
+    "required_public_artifacts.json"
+  ],
+  "rerun_steps": [
+    "Download the release assets from the release URL.",
+    "Rerun the benchmark from the public kit without access to hidden ground truth.",
+    "Validate the result bundle, scorecard, reviewer cohort manifest, replication metadata, and replication attestation.",
+    "Confirm whether the rerun reproduces the ACGS advantage over the strongest baseline.",
+    "Publish the evidence bundle publicly, including hashes and the command transcript."
+  ],
+  "verification_commands": [
+    "python scripts/run_governance_benchmark.py --validate-result-bundle result-bundle.json",
+    "python scripts/run_governance_benchmark.py --validate-scorecard scorecard.json --scorecard-result-bundle result-bundle.json",
+    "python scripts/run_governance_benchmark.py --validate-reviewer-cohort-manifest reviewer_cohort_manifest.json --cohort-result-bundle result-bundle.json",
+    "python scripts/run_governance_benchmark.py --validate-replication-metadata replication_metadata.json",
+    "python scripts/run_governance_benchmark.py --validate-replication-attestation replication_attestation.json --replication-metadata replication_metadata.json --attested-result-bundle result-bundle.json --attested-reviewer-cohort-manifest reviewer_cohort_manifest.json --attested-scorecard scorecard.json --attested-artifact-pack acgs-v0-1-pack.tar.gz --attested-commands-transcript commands-transcript.txt",
+    "python scripts/run_governance_benchmark.py --completion-audit-result-bundle result-bundle.json"
+  ],
+  "expected_public_closure_gate": "non_acgs_external_replication_verified",
+  "submission_request": "Reply on issue #48 with the rerun evidence bundle or a public artifact bundle URL."
+}
