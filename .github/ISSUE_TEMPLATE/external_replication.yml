@@ -1,0 +1,149 @@
+name: External replication submission
+description: Submit a non-ACGS rerun bundle and public evidence for the v0.1 benchmark.
+title: "[Replication]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to submit a non-ACGS rerun of the public ACGS-Swarm v0.1 benchmark kit.
+        Include immutable public URLs for every artifact named below. The completion gate only
+        closes after the rerun bundle is independently verifiable.
+
+  - type: input
+    id: group_name
+    attributes:
+      label: Replicating group name
+      description: Independent organization or group name that ran the rerun.
+      placeholder: Independent Systems Lab
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: independence
+    attributes:
+      label: Independence checks
+      options:
+        - label: This rerun was executed outside the ACGS-Swarm maintenance team.
+          required: true
+        - label: The replicating group is not ACGS-maintained and does not reuse hidden ground truth.
+          required: true
+        - label: The reviewers only saw blinded artifacts, not the hidden answer key or condition labels.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Rerun summary
+      description: Briefly describe what you ran and what happened.
+      placeholder: We downloaded the release, ran the benchmark, validated the bundle, and reproduced the advantage.
+    validations:
+      required: true
+
+  - type: input
+    id: release_url
+    attributes:
+      label: Release URL used
+      description: Public release URL or immutable asset URL used for the rerun.
+      placeholder: https://github.com/dislovelhl/Acgs-Swarm/releases/tag/acgs-v0.1-benchmark-kit-2026-05-16
+    validations:
+      required: true
+
+  - type: input
+    id: result_bundle_url
+    attributes:
+      label: Public result bundle URL
+      placeholder: https://example.org/result-bundle.json
+    validations:
+      required: true
+
+  - type: input
+    id: scorecard_url
+    attributes:
+      label: Public scorecard URL
+      placeholder: https://example.org/scorecard.json
+    validations:
+      required: true
+
+  - type: input
+    id: reviewer_cohort_url
+    attributes:
+      label: Public reviewer cohort manifest URL
+      placeholder: https://example.org/reviewer_cohort_manifest.json
+    validations:
+      required: true
+
+  - type: input
+    id: replication_metadata_url
+    attributes:
+      label: Public replication metadata URL
+      placeholder: https://example.org/replication_metadata.json
+    validations:
+      required: true
+
+  - type: input
+    id: attestation_url
+    attributes:
+      label: Public replication attestation URL
+      placeholder: https://example.org/replication_attestation.json
+    validations:
+      required: true
+
+  - type: input
+    id: artifact_pack_url
+    attributes:
+      label: Public artifact pack URL
+      placeholder: https://example.org/acgs-v0-1-pack.tar.gz
+    validations:
+      required: true
+
+  - type: input
+    id: transcript_url
+    attributes:
+      label: Public command transcript URL
+      placeholder: https://example.org/commands-transcript.txt
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands run
+      description: Paste the exact commands used to validate the rerun.
+      render: shell
+      placeholder: |
+        python scripts/run_governance_benchmark.py --validate-result-bundle result-bundle.json
+        python scripts/run_governance_benchmark.py --validate-scorecard scorecard.json --scorecard-result-bundle result-bundle.json
+        python scripts/run_governance_benchmark.py --validate-reviewer-cohort-manifest reviewer_cohort_manifest.json --cohort-result-bundle result-bundle.json
+        python scripts/run_governance_benchmark.py --validate-replication-metadata replication_metadata.json
+        python scripts/run_governance_benchmark.py --validate-replication-attestation replication_attestation.json --replication-metadata replication_metadata.json --attested-result-bundle result-bundle.json --attested-reviewer-cohort-manifest reviewer_cohort_manifest.json --attested-scorecard scorecard.json --attested-artifact-pack acgs-v0-1-pack.tar.gz --attested-commands-transcript commands-transcript.txt
+        python scripts/run_governance_benchmark.py --completion-audit-result-bundle result-bundle.json
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Key results
+      description: Include incident count, reviewer count, p-value, performance delta, inter-reviewer agreement, and whether ACGS beat the strongest baseline.
+      placeholder: incident_count=50; reviewer_count=2; p_value=0.01; performance_delta=0.0488; inter_reviewer_agreement=1.0; acgs_wins=true
+    validations:
+      required: true
+
+  - type: textarea
+    id: links
+    attributes:
+      label: Public links
+      description: Add any additional public links, such as GitHub releases, issues, discussions, or gists that host the rerun evidence.
+      placeholder: https://...
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I included immutable/public URLs for every artifact needed by the replication attestation.
+          required: true
+        - label: I can publicly verify the rerun evidence without hidden ground truth.
+          required: true
+        - label: I understand the benchmark is not complete until the independent rerun is independently verified.
+          required: true

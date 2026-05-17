@@ -6,8 +6,10 @@ software engineering, medical triage, legal analysis, and autonomous governance 
 a fundamental security question: how do agents maintain a consistent, tamper-evident
 shared state while broadcasting sensitive information over an open peer-to-peer network?
 
-\paragraph{The governance broadcast problem.}
-In constitutional multi-agent systems \cite{bai2022constitutional,acgs2025}, each agent
+\paragraph{The runtime governance broadcast problem.}
+In constitutional multi-agent systems \cite{bai2022constitutional,acgs2025}, governance
+is enforced on runtime paths and routing/tool-authority state, not merely by prompt
+policy.  Each agent
 maintains an internal \emph{trust-routing matrix} $H \in \R^{n \times n}$ encoding its
 confidence in peers' specialized capabilities.  Agents must broadcast updates to $H$
 so that the swarm maintains globally coherent routing.  But broadcasting $H$ in the

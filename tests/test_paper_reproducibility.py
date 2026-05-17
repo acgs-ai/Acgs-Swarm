@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import subprocess
 import sys
@@ -197,9 +198,9 @@ def test_remaining_claim_reproducers_all_pass() -> None:
     report = summary(evidence)
 
     assert report["total"] == 24
-    assert report["passed"] == 22
-    assert report["failed"] == 2
-    assert report["failed_claim_ids"] == ["NDSS-20", "NDSS-21"]
+    assert report["passed"] == 24
+    assert report["failed"] == 0
+    assert report["failed_claim_ids"] == []
 
 
 def test_remaining_claims_carry_external_source_provenance() -> None:
@@ -209,13 +210,17 @@ def test_remaining_claims_carry_external_source_provenance() -> None:
     assert all(item.source for item in evidence)
 
 
-def test_pending_swebench_claims_are_explicitly_provisional() -> None:
+def test_swebench_claims_are_measured_synthetic_non_official() -> None:
     evidence = {item.claim_id: item for item in collect_evidence()}
 
-    assert "PROVISIONAL" in evidence["NDSS-20"].note
-    assert "PROVISIONAL" in evidence["NDSS-21"].note
-    assert not evidence["NDSS-20"].passed
-    assert not evidence["NDSS-21"].passed
+    assert "PROVISIONAL" not in evidence["NDSS-20"].note
+    assert "PROVISIONAL" not in evidence["NDSS-21"].note
+    assert evidence["NDSS-20"].passed
+    assert evidence["NDSS-21"].passed
+    assert evidence["NDSS-20"].measurements["official_swebench_claimed"] is False
+    assert evidence["NDSS-20"].measurements["official_swe_bench_claimed"] is False
+    assert evidence["NDSS-21"].measurements["synthetic_only"] is True
+    assert evidence["NDSS-20"].measurements["fedsink_lift_over_sinkhorn_crdt"] >= 0.15
 
 
 def test_reproduce_paper_claims_cli_json() -> None:
@@ -230,7 +235,30 @@ def test_reproduce_paper_claims_cli_json() -> None:
         text=True,
     )
 
-    assert result.returncode == 1
-    assert '"failed": 2' in result.stdout
-    assert '"failed_claim_ids": [' in result.stdout
+    assert result.returncode == 0
+    assert '"failed": 0' in result.stdout
+    assert '"failed_claim_ids": []' in result.stdout
     assert '"total": 24' in result.stdout
+
+
+def test_claim_map_reproducer_row_matches_live_registry() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/reproduce_paper_claims.py",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    claim_map = _read("docs/internal/claims_map.md")
+
+    assert result.returncode == 0
+    assert payload["summary"]["passed"] == 24
+    assert payload["summary"]["failed"] == 0
+    assert (
+        "| ICLR 2027 + NDSS 2027 | `python scripts/reproduce_paper_claims.py` | 0 | "
+        "24 previously unmapped claims checked; 24 passed. |"
+    ) in claim_map

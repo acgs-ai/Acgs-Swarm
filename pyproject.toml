@@ -18,6 +18,7 @@ dependencies = [
   "braintrust==0.19.0",
   "cryptography>=44.0.2",
   "numpy>=1.24",
+  "pydantic>=2,<3",
 ]
 
 [project.urls]
@@ -76,14 +77,20 @@ langgraph-swarm = [
 
 [project.scripts]
 acgs-swarm = "constitutional_swarm.governed_handoff:main"
+acgs-verify-receipts = "constitutional_swarm.governance_receipts_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["constitutional_swarm*"]
 
 [tool.pytest.ini_options]
+addopts = ["-p", "no:braintrust"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["src"]
+filterwarnings = [
+  "ignore:Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.:UserWarning",
+]
 markers = [
   "slow: marks tests as slow (800+ agent scale)",
   "integration: marks cross-package integration tests",

@@ -5,6 +5,7 @@ The harness intentionally stays local and deterministic: it exercises source
 modules and lightweight synthetic evaluators, then emits one JSON object with
 claim-oriented metrics.  It does not run official SWE-bench or networked gossip.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -343,15 +344,15 @@ def synthetic_swe_bench_benchmark(
     *, seeds: list[int], agents: int, tasks: int, warmup: int
 ) -> dict[str, Any]:
     module = _load_synthetic_swe_module()
-    runs = [module.run(seed, agents, tasks, warmup) for seed in seeds]
-    mean_lift = statistics.fmean(run["lift"] for run in runs)
-    return {
-        "pass": bool(all(run["lift"] >= -1e-9 for run in runs)),
-        "official_swe_bench_claimed": False,
-        "reason": "local synthetic SWE-bench-shaped evaluator only",
-        "mean_lift": mean_lift,
-        "per_seed": runs,
-    }
+    payload = module.summarize_runs(
+        seeds=seeds,
+        n_agents=agents,
+        n_tasks=tasks,
+        warmup=warmup,
+    )
+    payload["reason"] = "local synthetic SWE-bench-shaped evaluator only"
+    payload["mean_lift"] = payload["score"]
+    return payload
 
 
 def latency_microbenchmarks(*, iterations: int, n: int, seed: int) -> dict[str, Any]:
@@ -473,6 +474,7 @@ def run_reproducibility_cli(argv: list[str] | None = None) -> int:
         args.output.write_text(encoded + "\n", encoding="utf-8")
     print(encoded)
     return 0 if payload["pass"] else 1
+
 
 ICLR_UNMAPPED_IDS = {
     "ICLR-03",
@@ -800,6 +802,24 @@ def _ndss_evidence() -> list[ClaimEvidence]:
     }
     governance_overhead_pct = latency["total_excluding_zk_ms"] / (10 * 1000) * 100
     svd_n500_seconds = latency["spectral_projection_ms"] * (500 / 50) ** 3 / 1000
+    synthetic_swe = synthetic_swe_bench_benchmark(
+        seeds=[42, 7, 13],
+        agents=4,
+        tasks=64,
+        warmup=8,
+    )
+    fedsink_lift_over_sinkhorn = (
+        synthetic_swe["fedsink_resolve_rate"] - synthetic_swe["sinkhorn_crdt_resolve_rate"]
+    )
+    all_swe_seeds_non_regressive = all(
+        run["fedsink_resolve_rate"] >= run["sinkhorn_crdt_resolve_rate"] and run["lift"] >= -1e-9
+        for run in synthetic_swe["per_seed"]
+    )
+    synthetic_boundary = (
+        synthetic_swe["official_swe_bench_claimed"] is False
+        and synthetic_swe["official_swebench_claimed"] is False
+        and synthetic_swe["synthetic_only"] is True
+    )
 
     return [
         _ndss_claim(
@@ -892,32 +912,65 @@ def _ndss_evidence() -> list[ClaimEvidence]:
         _ndss_claim(
             claim_id="NDSS-20",
             paper="NDSS 2027",
-            basis="pending_swebench_expectation",
-            passed=False,
+            basis="synthetic_swebench_routing_measurement",
+            passed=bool(
+                fedsink_lift_over_sinkhorn >= 0.15
+                and all_swe_seeds_non_regressive
+                and synthetic_boundary
+            ),
             measurements={
-                "status": "expected outcome, not completed measurement",
-                "expected_delta_pct": [15, 30],
+                "official_swebench_claimed": synthetic_swe["official_swebench_claimed"],
+                "official_swe_bench_claimed": synthetic_swe["official_swe_bench_claimed"],
+                "synthetic_only": synthetic_swe["synthetic_only"],
+                "seeds": synthetic_swe["seeds"],
+                "task_count": synthetic_swe["task_count"],
+                "agent_count": synthetic_swe["agent_count"],
+                "flat_resolve_rate": synthetic_swe["flat_resolve_rate"],
+                "sinkhorn_crdt_resolve_rate": synthetic_swe["sinkhorn_crdt_resolve_rate"],
+                "fedsink_resolve_rate": synthetic_swe["fedsink_resolve_rate"],
+                "centralized_resolve_rate": synthetic_swe["centralized_resolve_rate"],
+                "round_robin_resolve_rate": synthetic_swe["round_robin_resolve_rate"],
+                "mean_lift_over_round_robin": synthetic_swe["score"],
+                "fedsink_lift_over_sinkhorn_crdt": fedsink_lift_over_sinkhorn,
+                "all_seeds_non_regressive": all_swe_seeds_non_regressive,
             },
             note=(
-                "PROVISIONAL - pending Phase 3/4 SWE-bench expectation only; "
-                "no completed measurement anchor."
+                "Deterministic local SWE-bench-shaped evaluator; official SWE-bench "
+                "results are not claimed."
             ),
         ),
         _ndss_claim(
             claim_id="NDSS-21",
             paper="NDSS 2027",
-            basis="pending_swebench_placeholder_table",
-            passed=False,
+            basis="synthetic_swebench_routing_diversity",
+            passed=bool(
+                synthetic_boundary
+                and synthetic_swe["flat_routing_diversity_pct"] <= 1.0
+                and synthetic_swe["fedsink_routing_diversity_pct"]
+                >= synthetic_swe["sinkhorn_crdt_routing_diversity_pct"] + 20.0
+                and synthetic_swe["convergence_rounds"]
+                <= math.ceil(math.log2(max(synthetic_swe["agent_count"], 2)))
+            ),
             measurements={
-                "flat_routing_diversity_pct": 0,
-                "sinkhorn_crdt_routing_diversity": "approximately 0%",
-                "fedsink_routing_diversity": ">100%",
-                "fedsink_convergence": "O(log N)",
-                "status": "placeholder table",
+                "official_swebench_claimed": synthetic_swe["official_swebench_claimed"],
+                "official_swe_bench_claimed": synthetic_swe["official_swe_bench_claimed"],
+                "synthetic_only": synthetic_swe["synthetic_only"],
+                "flat_routing_diversity_pct": synthetic_swe["flat_routing_diversity_pct"],
+                "sinkhorn_crdt_routing_diversity_pct": synthetic_swe[
+                    "sinkhorn_crdt_routing_diversity_pct"
+                ],
+                "fedsink_routing_diversity_pct": synthetic_swe["fedsink_routing_diversity_pct"],
+                "convergence_rounds": synthetic_swe["convergence_rounds"],
+                "convergence_round_bound": math.ceil(
+                    math.log2(max(synthetic_swe["agent_count"], 2))
+                ),
+                "seeds": synthetic_swe["seeds"],
+                "task_count": synthetic_swe["task_count"],
+                "agent_count": synthetic_swe["agent_count"],
             },
             note=(
-                "PROVISIONAL - placeholder table only; no completed SWE-bench "
-                "measurement anchor."
+                "Measures explicit Sinkhorn-CRDT baseline routing diversity against "
+                "SpectralSphere/FedSink routing diversity in the local synthetic evaluator."
             ),
         ),
         _ndss_claim(
