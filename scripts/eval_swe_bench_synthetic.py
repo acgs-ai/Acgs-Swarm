@@ -173,7 +173,6 @@ def _governance_to_routing_weights(
 
 def _warmup_sinkhorn_trust(
     agents: list[_CompetencyAgent],
-    warmup_rng: random.Random,
     *,
     warmup_tasks_per_agent: int,
     collapse_cycles: int = 10,
@@ -257,6 +256,10 @@ def _mean(values: list[float]) -> float:
 
 
 def run(seed: int, n_agents: int, n_tasks: int, warmup: int) -> dict[str, Any]:
+    if warmup < 1:
+        msg = "warmup must be at least 1 task per agent"
+        raise ValueError(msg)
+
     rng_tasks = random.Random(seed)
     rng_agents = random.Random(seed + 1000)
 
@@ -277,7 +280,6 @@ def run(seed: int, n_agents: int, n_tasks: int, warmup: int) -> dict[str, Any]:
     flat_weights = _uniform_routing_weights(n_agents, len(tasks))
     sinkhorn_manifold = _warmup_sinkhorn_trust(
         agents_sinkhorn,
-        random.Random(seed + 5000),
         warmup_tasks_per_agent=warmup,
     )
     sinkhorn_weights = _governance_to_routing_weights(sinkhorn_manifold, tasks, n_agents)
@@ -329,6 +331,10 @@ def summarize_runs(
     n_tasks: int,
     warmup: int,
 ) -> dict[str, Any]:
+    if warmup < 1:
+        msg = "warmup must be at least 1 task per agent"
+        raise ValueError(msg)
+
     runs = [run(seed, n_agents, n_tasks, warmup) for seed in seeds]
     payload = {
         "pass": bool(all(r["lift"] >= -1e-9 for r in runs)),
@@ -364,6 +370,8 @@ def main() -> int:
     p.add_argument("--tasks", type=int, default=64)
     p.add_argument("--warmup", type=int, default=8)
     args = p.parse_args()
+    if args.warmup < 1:
+        p.error("--warmup must be at least 1")
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     print(

@@ -110,6 +110,16 @@ def test_synthetic_swe_bench_reports_claim_anchor_fields() -> None:
     assert payload["convergence_rounds"] <= 8
 
 
+def test_synthetic_swe_bench_rejects_zero_warmup() -> None:
+    with pytest.raises(ValueError, match="warmup must be at least 1"):
+        _SYNTHETIC_MODULE.summarize_runs(
+            seeds=[42],
+            n_agents=4,
+            n_tasks=16,
+            warmup=0,
+        )
+
+
 def test_trust_variance_benchmark_keeps_birkhoff_and_residual_claims_separate() -> None:
     payload = _MODULE.trust_variance_benchmark(seeds=[0], sizes=[10], cycles=[10])
     rows = {(row["manifold"], row["n"]): row for row in payload["rows"]}

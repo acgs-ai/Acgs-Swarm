@@ -3279,6 +3279,43 @@ def test_paired_sign_test_p_value_is_computed_from_matched_answers() -> None:
     assert p_value <= 0.05
 
 
+def test_paired_sign_test_p_value_handles_large_discordant_sets() -> None:
+    answers: list[ReviewerAnswer] = []
+    for index in range(1024):
+        incident_id = f"incident-{index}"
+        answers.append(
+            ReviewerAnswer(
+                incident_id=incident_id,
+                artifact_condition="centralized_structured_logs",
+                reviewer_id="r1",
+                question_id="who_acted",
+                answer="unknown",
+                ground_truth="agent-a",
+                confidence=0.5,
+                elapsed_seconds=60,
+            )
+        )
+        answers.append(
+            ReviewerAnswer(
+                incident_id=incident_id,
+                artifact_condition="acgs_receipts_and_audit_artifacts",
+                reviewer_id="r1",
+                question_id="who_acted",
+                answer="agent-a",
+                ground_truth="agent-a",
+                confidence=0.9,
+                elapsed_seconds=30,
+            )
+        )
+
+    p_value = paired_sign_test_p_value(
+        answers,
+        strongest_baseline="centralized_structured_logs",
+    )
+
+    assert 0.0 < p_value < 1e-300
+
+
 def test_result_bundle_rejects_toy_or_non_external_success_claim() -> None:
     pack = generate_artifact_pack()
     bundle = build_result_bundle(

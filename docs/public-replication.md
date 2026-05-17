@@ -7,7 +7,7 @@ kit and verifying the release artifacts.
 
 - Release: <https://github.com/dislovelhl/Acgs-Swarm/releases/tag/acgs-v0.1-benchmark-kit-2026-05-16>
 - Request asset: <https://github.com/dislovelhl/Acgs-Swarm/releases/download/acgs-v0.1-benchmark-kit-2026-05-16/acgs-public-replication-request.json>
-- Repo-mirrored request template: <docs/public-replication-request.json>
+- Repo-mirrored request template: [docs/public-replication-request.json](public-replication-request.json)
 - Replication issue: <https://github.com/dislovelhl/Acgs-Swarm/issues/48>
 - Replication discussion: <https://github.com/dislovelhl/Acgs-Swarm/discussions/49>
 - Rerun checklist gist: <https://gist.github.com/dislovelhl/cf9f2c1b5c95644d9603098d717fb663>

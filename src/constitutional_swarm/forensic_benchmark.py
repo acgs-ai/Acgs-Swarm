@@ -13,6 +13,7 @@ import random
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from csv import DictWriter
+from decimal import Decimal, localcontext
 from io import StringIO
 from typing import Any, Literal
 
@@ -456,9 +457,12 @@ def paired_sign_test_p_value(
         return 1.0
     if acgs_wins <= baseline_wins:
         return 1.0
-    return sum(math.comb(discordant, k) for k in range(acgs_wins, discordant + 1)) / (
-        2**discordant
-    )
+    tail_count = sum(math.comb(discordant, k) for k in range(acgs_wins, discordant + 1))
+    with localcontext() as ctx:
+        # Keep the intermediate ratio stable for large blind-review matrices
+        # before returning the public float-valued p-value field.
+        ctx.prec = max(28, min(discordant + 10, 5000))
+        return float(Decimal(tail_count) / (Decimal(2) ** discordant))
 
 
 def build_result_bundle(

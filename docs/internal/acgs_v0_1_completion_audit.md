@@ -294,14 +294,14 @@ Fresh public-surface checks from this turn now show a published release:
   there is also a public discussion thread `#49`; however, these public
   instructions do not by themselves satisfy the non-ACGS independent rerun
   requirement.
-- GitHub issue `#48` currently has 7 comments and every comment author is
-  `dislovelhl`; the repo metadata still reports `forks_count=0` and
+- As of the 2026-05-16 public audit snapshot, GitHub issue `#48` only showed
+  owner-authored comments; the repo metadata still reports `forks_count=0` and
   `network_count=0`, so there is still no external replication surface in the
   public trail.
-- GitHub discussion `#49` currently has 3 comments and every comment author is
-  `dislovelhl`; the discussion thread mirrors the release assets and request
-  template but still shows no independent rerun evidence from a non-ACGS
-  group.
+- As of the 2026-05-16 public audit snapshot, GitHub discussion `#49` only
+  showed owner-authored comments; the discussion thread mirrors the release
+  assets and request template but still shows no independent rerun evidence
+  from a non-ACGS group.
 - A fresh web search this turn for the exact release tag and the exact
   benchmark artifact filenames returned no external independent rerun bundle.
 - Fresh GitHub search sweeps for the exact release tag and artifact filenames

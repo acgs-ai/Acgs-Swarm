@@ -949,7 +949,7 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 and synthetic_swe["fedsink_routing_diversity_pct"]
                 >= synthetic_swe["sinkhorn_crdt_routing_diversity_pct"] + 20.0
                 and synthetic_swe["convergence_rounds"]
-                <= math.ceil(math.log2(max(synthetic_swe["task_count"], 2)))
+                <= math.ceil(math.log2(max(synthetic_swe["agent_count"], 2)))
             ),
             measurements={
                 "official_swebench_claimed": synthetic_swe["official_swebench_claimed"],
@@ -961,6 +961,9 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 ],
                 "fedsink_routing_diversity_pct": synthetic_swe["fedsink_routing_diversity_pct"],
                 "convergence_rounds": synthetic_swe["convergence_rounds"],
+                "convergence_round_bound": math.ceil(
+                    math.log2(max(synthetic_swe["agent_count"], 2))
+                ),
                 "seeds": synthetic_swe["seeds"],
                 "task_count": synthetic_swe["task_count"],
                 "agent_count": synthetic_swe["agent_count"],
