@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -70,11 +71,15 @@ def test_build_official_eval_command_uses_instance_ids_from_predictions(tmp_path
         report_dir=tmp_path,
     )
 
-    joined = " ".join(cmd)
-    assert "python -m swebench.harness.run_evaluation" in joined
-    assert "-i astropy__astropy-12907 django__django-10914" in joined
-    assert f"-p {predictions_path}" in joined
-    assert "-id demo-run" in joined
+    assert cmd[:3] == [sys.executable, "-m", "swebench.harness.run_evaluation"]
+
+    instance_arg_index = cmd.index("-i")
+    assert cmd[instance_arg_index + 1 : instance_arg_index + 3] == [
+        "astropy__astropy-12907",
+        "django__django-10914",
+    ]
+    assert cmd[cmd.index("-p") + 1] == str(predictions_path)
+    assert cmd[cmd.index("-id") + 1] == "demo-run"
 
 
 def test_load_instance_ids_fails_for_empty_predictions_file(tmp_path: Path) -> None:
