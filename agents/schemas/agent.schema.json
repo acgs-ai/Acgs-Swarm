@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acgs.ai/schemas/agent.schema.json",
+  "title": "constitutional-swarm agent manifest",
+  "description": "Machine-readable contract for an AI agent role operating in this repo. One file per role: agents/<role>.agent.yaml. Validated by scripts/agent_check.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name", "purpose", "scope", "required_tools",
+    "io_contract", "safety", "execution", "validation", "artifacts"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Role id, matches the filename stem (<name>.agent.yaml)."
+    },
+    "purpose": { "type": "string", "minLength": 12 },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "forbidden"],
+      "properties": {
+        "allowed": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "forbidden": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "required_tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Tool names that MUST exist in tools/registry.yaml."
+    },
+    "io_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputs", "outputs"],
+      "properties": {
+        "inputs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "outputs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "safety": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Hard constraints the agent must not violate."
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string", "description": "Primary command this role runs to do its work." },
+        "working_dir": { "type": "string", "default": "." }
+      }
+    },
+    "validation": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Checks that prove the agent's work is acceptable."
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Expected outputs/deliverables the agent produces."
+    }
+  }
+}

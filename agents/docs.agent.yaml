@@ -1,0 +1,27 @@
+name: docs
+purpose: Keep the repo self-describing — maintain the root understanding docs, registries, and per-directory AGENTS.md files so agents never need hidden knowledge.
+scope:
+  allowed:
+    - "Edit README, ARCHITECTURE, PROJECT_MAP, TOOLS, TASKS, DECISIONS, AGENTS, CONTRIBUTING, BLOCKERS"
+    - "Edit docs/** and per-directory AGENTS.md files"
+    - "Update tools/registry.yaml and agents/*.agent.yaml when commands/roles change"
+  forbidden:
+    - "Do NOT document a command without verifying it runs"
+    - "Do NOT duplicate deep content into root docs — link into docs/ instead"
+required_tools: [agent-check, verify-citations, smoke]
+io_contract:
+  inputs:
+    - "A shipped change, new tool, or new agent role"
+  outputs:
+    - "Updated docs and registries that pass agent-check"
+execution:
+  command: "make agent-check"
+  working_dir: "."
+safety:
+  - "Every documented command must be validated against the real CLI/Makefile"
+  - "Keep the tool registry the single source of truth for commands"
+validation:
+  - "make agent-check passes (schema + doc completeness)"
+  - "Internal doc links resolve"
+artifacts:
+  - "Updated *.md docs and registry files"

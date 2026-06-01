@@ -87,7 +87,10 @@ include = ["constitutional_swarm*"]
 addopts = ["-p", "no:braintrust"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-pythonpath = ["src"]
+# "src" for the package; "." so tests that import scripts.* (e.g.
+# test_governance_receipts, test_protocol_canonicalization) collect when
+# pytest is run from the repo root. See BLOCKERS.md.
+pythonpath = ["src", "."]
 filterwarnings = [
   "ignore:Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.:UserWarning",
 ]

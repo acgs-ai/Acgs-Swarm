@@ -56,3 +56,20 @@ WebSocket gossip tests require `pip install -e ".[transport]"`.
 - Manifold peer selection is wired in `mesh.py:_select_peers()` (trust-weighted sampling + one exploration slot)
 
 <!-- MANUAL: Notes added below this line are preserved on regeneration. -->
+
+## Agent-operability layer
+
+This repo is self-describing and tool-executable. A fresh agent should:
+
+1. Read [`README.md`](README.md) and this file, then [`ARCHITECTURE.md`](ARCHITECTURE.md) + [`PROJECT_MAP.md`](PROJECT_MAP.md).
+2. `make setup` — one-command environment (standalone-safe; uses `uv sync --no-sources`).
+3. Discover tools in [`TOOLS.md`](TOOLS.md) / [`tools/registry.yaml`](tools/registry.yaml).
+4. Select a role from [`agents/`](agents/) (`researcher`, `coder`, `reviewer`, `qa`, `docs`, `release`).
+5. `make verify` — full local gate (lint → agent-check → smoke → test).
+6. `make agent-check` — prove registries + docs are self-consistent.
+7. Produce the role's declared artifacts; record any blocker in [`BLOCKERS.md`](BLOCKERS.md).
+
+Key maps: [`TASKS.md`](TASKS.md) (what to do next) · [`DECISIONS.md`](DECISIONS.md) (why things are the way they are).
+
+> Note: despite the "git submodule" framing above, this checkout is a
+> standalone repository with its own remote. See BLOCKERS.md (B6).

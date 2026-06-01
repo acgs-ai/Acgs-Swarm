@@ -71,7 +71,10 @@ def test_build_official_eval_command_uses_instance_ids_from_predictions(tmp_path
     )
 
     joined = " ".join(cmd)
-    assert "python -m swebench.harness.run_evaluation" in joined
+    # The command is built from sys.executable, whose basename varies by
+    # environment (python / python3 / a full venv path). Assert the module
+    # invocation without coupling to the interpreter name.
+    assert "-m swebench.harness.run_evaluation" in joined
     assert "-i astropy__astropy-12907 django__django-10914" in joined
     assert f"-p {predictions_path}" in joined
     assert "-id demo-run" in joined

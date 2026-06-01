@@ -193,14 +193,23 @@ Choose another tool first when you need:
 | Researchers | [`docs/roadmap.md`](docs/roadmap.md) | [`docs/maci_dp_protocol.md`](docs/maci_dp_protocol.md), [`paper/README.md`](paper/README.md), `docs/internal/*` |
 
 ## Verification commands
-Use available commands in this environment/repo:
+
+This repo is `uv`-managed; prefer the one-command targets (see [`TOOLS.md`](TOOLS.md)):
 
 ```bash
-python -m ruff check .
-python -m ruff format --check .
-python -m pytest tests/ --import-mode=importlib -q
-python -m pytest -m "not slow and not e2e and not research" tests/ --import-mode=importlib -q
-python -m build
+make setup        # create the venv + install dev extras (standalone-safe)
+make verify       # lint -> agent-check -> smoke -> tests
+make agent-check  # validate agent/tool registries + doc completeness
+```
+
+The equivalent raw invocations run through the venv (no global `python`/`pip`/`ruff` is assumed):
+
+```bash
+uv run --no-sync ruff check src/constitutional_swarm/
+uv run --no-sync ruff format --check src/
+uv run --no-sync pytest tests/ --import-mode=importlib -q
+uv run --no-sync pytest -m "not slow and not e2e and not research" tests/ --import-mode=importlib -q
+uv build
 ```
 
 If optional extras are installed, run targeted suites (for example transport or research-marked tests).

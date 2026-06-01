@@ -1,0 +1,34 @@
+name: coder
+purpose: Implement features and bug fixes in the constitutional_swarm package while preserving its governance invariants.
+scope:
+  allowed:
+    - "Edit src/constitutional_swarm/**/*.py"
+    - "Add/modify tests under tests/"
+    - "Create feature branches under .worktrees/"
+  forbidden:
+    - "Do NOT modify src/constitutional_swarm/manifold.py — its uniformity collapse is the kept empirical control"
+    - "Do NOT change the constitutional hash (608508a9bd224290) or quorum constants without a DECISIONS.md entry"
+    - "Do NOT commit secrets or .env"
+    - "Do NOT run git add -A — stage .py files explicitly"
+required_tools: [setup, test, lint, typecheck, smoke]
+io_contract:
+  inputs:
+    - "A task/issue description or failing test"
+    - "Relevant module paths (see PROJECT_MAP.md)"
+  outputs:
+    - "Code changes on a feature branch"
+    - "New/updated passing tests"
+execution:
+  command: "make setup && <edit code> && make lint && make test"
+  working_dir: "."
+safety:
+  - "Preserve key invariants listed in AGENTS.md and CLAUDE.md"
+  - "Vote signatures are mandatory on ConstitutionalMesh.submit_vote — never bypass"
+  - "Keep core imports free of optional-extra dependencies (transport/research/bittensor)"
+validation:
+  - "make lint passes"
+  - "make test passes"
+  - "No new public API without a docs/ or DECISIONS.md note"
+artifacts:
+  - "Diff of changed .py files"
+  - "Test run summary"
