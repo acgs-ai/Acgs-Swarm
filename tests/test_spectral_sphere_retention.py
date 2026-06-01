@@ -210,6 +210,26 @@ def test_interface_update_and_project() -> None:
     assert mat[0][1] != 0.0
 
 
+def test_smoothing_default_tracks_sustained_trust() -> None:
+    """Sustained trust updates must be reflected within O(10) governance cycles.
+
+    Regression (spectral_sphere.py default ``smoothing``): an over-damped EMA
+    default (0.999) accumulated trust at ~0.1% per cycle, so the production
+    manifold — built with defaults in ``mesh/core.py`` and consumed by
+    ``_select_peers`` — stayed near zero across the O(10)-cycle window it exists
+    to win against Birkhoff uniformity collapse. Mirrors the production pattern
+    (``update_trust(+0.1)`` then ``project()`` once per settlement).
+    """
+    m = SpectralSphereManifold(num_agents=4)  # default smoothing
+    for _ in range(30):
+        m.update_trust(from_agent=0, to_agent=1, delta=0.1)
+        m.project()
+    # raw[0][1] == 3.0 (clipped to the unit sphere -> target ~1.0). A correctly
+    # calibrated default reaches a meaningful fraction of the target; the
+    # over-damped 0.999 default stalls near ~0.12.
+    assert m.trust_matrix[0][1] > 0.5
+
+
 def test_compose_size_mismatch_raises() -> None:
     a = SpectralSphereManifold(num_agents=3)
     b = SpectralSphereManifold(num_agents=4)

@@ -306,6 +306,38 @@ class TestTallyFunction:
         assert result.total_valid == 0
         assert any("does not open" in reason for _, reason in result.rejected)
 
+    def test_require_all_revealed_rejects_present_but_invalid_reveal(self):
+        """A present-but-invalid reveal must not satisfy require_all_revealed.
+
+        Regression: the gate checked reveal *presence* keyed by commit digest,
+        not reveal *validity*. A reveal whose .commit matches but does not open
+        the commit (wrong nonce, valid signature) passed the gate, then got
+        silently dropped in the tally loop — so a ballot vanished without the
+        promised MissingRevealError.
+        """
+        sk = _kp()
+        c, _ = build_commit(
+            voter_private_key=sk,
+            voter_secret=b"s1",
+            epoch=EPOCH,
+            subject=SUBJECT,
+            choice=BallotChoice.YEA,
+        )
+        bad_reveal = build_reveal(
+            voter_private_key=sk,
+            commit=c.commit,
+            choice=BallotChoice.YEA,
+            nonce=b"\x00" * 32,  # wrong nonce → won't open, but signature is valid
+        )
+        with pytest.raises(MissingRevealError):
+            tally(
+                [c],
+                [bad_reveal],
+                epoch=EPOCH,
+                subject=SUBJECT,
+                require_all_revealed=True,
+            )
+
 
 # ── Security regression tests ─────────────────────────────────────────────────
 
