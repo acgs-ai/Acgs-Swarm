@@ -1,0 +1,28 @@
+name: qa
+purpose: Validate end-to-end behavior of the governance runtime — run the test suite, exercise the CLIs, and run security/eval harnesses to catch regressions.
+scope:
+  allowed:
+    - "Run the full and marked test suites"
+    - "Exercise acgs-swarm and acgs-verify-receipts CLIs"
+    - "Run security-marked tests and the governance benchmark (offline backend)"
+  forbidden:
+    - "Do NOT run testnet-deploy (mutates on-chain state) without explicit human authorization"
+    - "Do NOT incur paid API spend (live SWE-bench) without an approved budget"
+required_tools: [test, smoke, acgs-swarm, acgs-verify-receipts, run-governance-benchmark, generate-security-report]
+io_contract:
+  inputs:
+    - "A branch or release candidate to validate"
+  outputs:
+    - "Pass/fail report across test, CLI, and security/eval surfaces"
+execution:
+  command: "make test && make smoke"
+  working_dir: "."
+safety:
+  - "Default to offline/deterministic backends; never auto-enable live billing"
+  - "Treat security-marked test failures as release blockers"
+validation:
+  - "make test exits 0"
+  - "Both console CLIs respond to --help"
+  - "Security-marked tests pass (one test per audit finding)"
+artifacts:
+  - "QA report: test summary, CLI checks, security-audit-report.md"

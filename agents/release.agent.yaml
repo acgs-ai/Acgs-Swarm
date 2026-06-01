@@ -1,0 +1,31 @@
+name: release
+purpose: Cut a release — run the full acceptance gate, build/validate the wheel, update the changelog, and tag, without weakening governance invariants.
+scope:
+  allowed:
+    - "Run the full verify gate and package build"
+    - "Update CHANGELOG.md and version in pyproject.toml"
+    - "Create release tags and PRs against main"
+  forbidden:
+    - "Do NOT release with failing security-marked tests"
+    - "Do NOT publish to PyPI without explicit human authorization"
+    - "Do NOT bump version without a CHANGELOG entry"
+required_tools: [verify, test, lint, smoke, acgs-verify-receipts]
+io_contract:
+  inputs:
+    - "A release-candidate branch and target version"
+  outputs:
+    - "A validated wheel/sdist, updated CHANGELOG, and a release tag/PR"
+execution:
+  command: "make verify && uv build"
+  working_dir: "."
+safety:
+  - "Gate on make verify (lint + agent-check + smoke + tests) before any tag"
+  - "Confirm twine check passes on built artifacts"
+  - "Human approval required for the publish step"
+validation:
+  - "make verify exits 0"
+  - "uv build produces a wheel + sdist that pass twine check"
+  - "CHANGELOG.md has an entry for the new version"
+artifacts:
+  - "dist/*.whl and dist/*.tar.gz"
+  - "Updated CHANGELOG.md and release tag"

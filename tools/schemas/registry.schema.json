@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acgs.ai/schemas/tool-registry.schema.json",
+  "title": "constitutional-swarm tool registry",
+  "description": "Machine-readable catalogue of every supported command/CLI/script an agent may execute. Validated by scripts/agent_check.py.",
+  "type": "object",
+  "required": ["version", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "string", "description": "Registry schema/content version." },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/tool" }
+    }
+  },
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "purpose", "command", "inputs", "outputs",
+        "failure_modes", "retry", "validation", "owner_module"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "Stable tool id, referenced by agent manifests' required_tools."
+        },
+        "purpose": { "type": "string", "minLength": 8 },
+        "command": {
+          "type": "string",
+          "minLength": 3,
+          "description": "Exact runnable command (placeholders in <angle-brackets>)."
+        },
+        "env": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "required"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+              "required": { "type": "boolean" },
+              "purpose": { "type": "string" }
+            }
+          }
+        },
+        "inputs": { "type": "array", "items": { "type": "string" } },
+        "outputs": { "type": "array", "items": { "type": "string" } },
+        "failure_modes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "retry": { "type": "string", "description": "Retry/idempotency guidance." },
+        "validation": {
+          "type": "string",
+          "description": "Command or check that proves the tool worked."
+        },
+        "owner_module": {
+          "type": "string",
+          "description": "Source of truth — a module path, script path, or 'Makefile'."
+        },
+        "runbook": { "type": "string", "description": "Optional path to a runbook under tools/runbooks/." }
+      }
+    }
+  }
+}

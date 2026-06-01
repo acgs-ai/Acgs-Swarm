@@ -31,6 +31,7 @@ papers/*/main.pdf
 *-report.md
 SYSTEMIC_IMPROVEMENT.md
 HANDOFF_*.md
+*-command-message*.txt
 
 # Coverage and runtime artifacts
 .coverage

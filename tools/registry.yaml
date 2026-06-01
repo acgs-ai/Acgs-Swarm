@@ -1,0 +1,221 @@
+# constitutional-swarm — tool registry
+#
+# Every command an agent may execute is catalogued here. No supported tool
+# should live only in an undocumented script. Validated against
+# tools/schemas/registry.schema.json by `make agent-check`.
+#
+# Command convention: all tools run through the uv-managed venv. Prefix is
+# `uv run --no-sync` (assumes `make setup` already created the venv). Drop
+# `--no-sync` to let uv sync on demand.
+version: "1.0.0"
+
+tools:
+  # --- Environment lifecycle -------------------------------------------------
+  - name: setup
+    purpose: Create the project virtualenv and install the package with dev extras (standalone-safe).
+    command: make setup
+    env: []
+    inputs:
+      - "EXTRAS (make var, default 'dev transport')"
+    outputs:
+      - ".venv/ populated with locked dependencies"
+    failure_modes:
+      - "uv not installed -> target aborts with install hint"
+      - "network unavailable -> dependency resolution fails"
+    retry: "Idempotent; safe to re-run. Re-resolves against uv.lock."
+    validation: make smoke
+    owner_module: Makefile
+    runbook: tools/runbooks/setup.md
+
+  # --- Quality gates ---------------------------------------------------------
+  - name: test
+    purpose: Run the default pytest suite (excludes slow/network/research/bittensor markers).
+    command: make test
+    env:
+      - { name: ANTHROPIC_API_KEY, required: false, purpose: "Dummy value accepted; live key only for e2e markers (excluded here)." }
+      - { name: OPENAI_API_KEY, required: false, purpose: "Dummy value accepted in unit tests." }
+    inputs:
+      - "TEST_MARKERS (make var) to override selection"
+    outputs:
+      - "pass/fail summary on stdout (non-zero exit on failure)"
+    failure_modes:
+      - "Collection error if repo root not on pythonpath (fixed via pyproject pythonpath=['src','.'])"
+      - "Test failure -> non-zero exit"
+    retry: "Deterministic; re-run after fixing the reported failure."
+    validation: "exit code 0"
+    owner_module: Makefile
+    runbook: tools/runbooks/test.md
+
+  - name: lint
+    purpose: Lint the package source with ruff (the CI lint gate).
+    command: make lint
+    env: []
+    inputs: ["src/constitutional_swarm/"]
+    outputs: ["ruff diagnostics; non-zero exit on violations"]
+    failure_modes:
+      - "Lint violation -> non-zero exit"
+    retry: "Run `make format` to auto-fix, then re-lint."
+    validation: "exit code 0 ('All checks passed!')"
+    owner_module: Makefile
+
+  - name: typecheck
+    purpose: Static-analysis gate. No mypy/pyright configured; ruff lint is used as the static gate.
+    command: make typecheck
+    env: []
+    inputs: ["src/constitutional_swarm/"]
+    outputs: ["ruff diagnostics"]
+    failure_modes:
+      - "No dedicated type checker exists yet (see BLOCKERS.md B3)"
+    retry: "Same as lint."
+    validation: "exit code 0"
+    owner_module: Makefile
+
+  - name: smoke
+    purpose: Fast offline import + CLI sanity check; needs no credentials.
+    command: make smoke
+    env: []
+    inputs: []
+    outputs: ["'import constitutional_swarm OK' and CLI --help confirmations"]
+    failure_modes:
+      - "ImportError if acgs-lite missing -> run `make setup`"
+    retry: "Idempotent."
+    validation: "exit code 0"
+    owner_module: Makefile
+
+  - name: agent-check
+    purpose: Validate agent + tool registries against schema and confirm required docs exist.
+    command: make agent-check
+    env: []
+    inputs: ["agents/*.agent.yaml", "tools/registry.yaml", "required root docs"]
+    outputs: ["PASS/FAIL report per check; non-zero exit on failure"]
+    failure_modes:
+      - "Schema violation in a manifest -> reported with path"
+      - "Missing required doc -> reported"
+    retry: "Idempotent; re-run after fixing reported items."
+    validation: "exit code 0"
+    owner_module: scripts/agent_check.py
+    runbook: tools/runbooks/agent-check.md
+
+  - name: verify
+    purpose: Full local acceptance gate — lint, registry/doc check, smoke, then tests.
+    command: make verify
+    env: []
+    inputs: []
+    outputs: ["aggregate pass/fail"]
+    failure_modes:
+      - "Any sub-gate failure -> non-zero exit at that step"
+    retry: "Fix the failing sub-gate and re-run."
+    validation: "exit code 0 ('OK: verify passed.')"
+    owner_module: Makefile
+
+  # --- Product CLIs (installed console scripts) ------------------------------
+  - name: acgs-swarm
+    purpose: Governed-handoff CLI — run a task through constitutional gates, verify or repack evidence bundles.
+    command: uv run --no-sync acgs-swarm {run --task <task.md> | verify --bundle <bundle.json> | pack --task <id>}
+    env:
+      - { name: ANTHROPIC_API_KEY, required: false, purpose: "Required only when the task uses a live LLM agent." }
+    inputs:
+      - "run: --task <path to task.md>"
+      - "verify: --bundle <path to evidence bundle JSON>"
+      - "pack: --task <audit JSONL task id>"
+    outputs:
+      - "Evidence bundle JSON / verification verdict / exit code"
+    failure_modes:
+      - "Missing --task/--bundle -> argparse error"
+      - "Gate rejection -> non-zero exit with reason"
+    retry: "verify/pack are read-only and idempotent; run mutates audit log — re-run with care."
+    validation: "uv run --no-sync acgs-swarm --help"
+    owner_module: src/constitutional_swarm/governed_handoff.py
+    runbook: tools/runbooks/governed-handoff.md
+
+  - name: acgs-verify-receipts
+    purpose: Verify a governance receipt bundle against its constitutional invariants.
+    command: uv run --no-sync acgs-verify-receipts <bundle.json>
+    env: []
+    inputs: ["<path to receipt bundle JSON>"]
+    outputs: ["verification verdict; non-zero exit on invalid bundle"]
+    failure_modes:
+      - "Malformed bundle -> validation error"
+      - "Missing file -> error"
+    retry: "Read-only and idempotent."
+    validation: "uv run --no-sync acgs-verify-receipts --help"
+    owner_module: src/constitutional_swarm/governance_receipts_cli.py
+
+  # --- Evaluation & research scripts -----------------------------------------
+  - name: reproduce-paper-claims
+    purpose: Emit JSON metrics for local reproduction of the package's empirical paper claims.
+    command: uv run --no-sync python scripts/reproduce_paper_claims.py --seeds 42 --sizes 10,50 --cycles 10,50
+    env: []
+    inputs: ["--seeds, --sizes, --cycles, --ablation-*, --ode-*, --gossip-agents (all defaulted)"]
+    outputs: ["JSON metrics on stdout"]
+    failure_modes:
+      - "research extras (torch) absent -> some paths degrade/skip"
+    retry: "Deterministic given --seeds."
+    validation: "non-empty JSON on stdout, exit 0"
+    owner_module: scripts/reproduce_paper_claims.py
+
+  - name: run-governance-benchmark
+    purpose: Run the constitutional governance benchmark (offline-deterministic backend by default).
+    command: uv run --no-sync python scripts/run_governance_benchmark.py --model-backend offline-deterministic
+    env:
+      - { name: ANTHROPIC_API_KEY, required: false, purpose: "Only for non-offline model backends." }
+    inputs: ["--model-backend (default offline-deterministic)"]
+    outputs: ["benchmark metrics / report artifacts"]
+    failure_modes:
+      - "Live backend selected without API key -> auth error"
+    retry: "Offline backend is deterministic and idempotent."
+    validation: "exit code 0"
+    owner_module: scripts/run_governance_benchmark.py
+
+  - name: verify-citations
+    purpose: Verify that citations in papers/docs resolve (link/DOI check).
+    command: uv run --no-sync python scripts/verify_citations.py --json
+    env: []
+    inputs: ["--root (default cwd), --timeout, --workers, --json"]
+    outputs: ["citation verification results (JSON with --json)"]
+    failure_modes:
+      - "Network timeout -> citation marked unresolved"
+    retry: "Safe to re-run; network-dependent results may vary."
+    validation: "exit code 0"
+    owner_module: scripts/verify_citations.py
+
+  - name: run-swe-bench-lite
+    purpose: Run the SWE-bench Lite evaluation harness against the swarm agent.
+    command: uv run --no-sync python scripts/run_swe_bench_lite.py --limit 10
+    env:
+      - { name: ANTHROPIC_API_KEY, required: true, purpose: "Live LLM agent calls." }
+      - { name: OPENAI_API_KEY, required: false, purpose: "Codex/GPT backend if selected via --model." }
+    inputs: ["--limit, --dataset, --split, --model"]
+    outputs: ["predictions + local validation results"]
+    failure_modes:
+      - "Missing API key -> auth error"
+      - "Dataset download failure -> network error"
+    retry: "Per-instance; re-run with same --limit. Costs real API tokens."
+    validation: "exit code 0 with prediction artifacts written"
+    owner_module: scripts/run_swe_bench_lite.py
+
+  - name: generate-security-report
+    purpose: Generate security-audit-report.md from the security-marked pytest results.
+    command: uv run --no-sync python scripts/generate_security_report.py
+    env: []
+    inputs: ["pytest --json-report output of security-marked tests"]
+    outputs: ["security-audit-report.md"]
+    failure_modes:
+      - "Missing json-report input -> error"
+    retry: "Idempotent; regenerates the report."
+    validation: "report file produced, exit 0"
+    owner_module: scripts/generate_security_report.py
+
+  - name: testnet-deploy
+    purpose: Deploy/register constitutional governance nodes on a Bittensor testnet subnet.
+    command: uv run --no-sync python scripts/testnet_deploy.py <register|miner|validator> --wallet-name <w> --wallet-hotkey <h> ...
+    env: []
+    inputs: ["subcommand + wallet/netuid/port/constitution flags"]
+    outputs: ["on-chain registration / running miner or validator process"]
+    failure_modes:
+      - "bittensor extra not installed -> ImportError (install '.[bittensor]')"
+      - "Insufficient wallet balance / wrong netuid -> chain rejection"
+    retry: "NOT idempotent — touches on-chain state. Confirm wallet/netuid before re-running."
+    validation: "subnet shows the registered hotkey"
+    owner_module: scripts/testnet_deploy.py
+    runbook: tools/runbooks/testnet-deploy.md

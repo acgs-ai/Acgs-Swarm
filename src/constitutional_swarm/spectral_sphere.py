@@ -198,7 +198,7 @@ class SpectralSphereManifold:
         *,
         r: float = 1.0,
         max_power_iter: int = 30,
-        smoothing: float = 0.999,
+        smoothing: float = 0.9,
     ) -> None:
         self._n = num_agents
         self._r = r

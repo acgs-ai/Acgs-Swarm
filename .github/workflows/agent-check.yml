@@ -1,0 +1,41 @@
+name: agent-check
+
+# Proves a fresh agent can enter, understand, and operate the repo:
+# registries validate against schema, cross-references resolve, required
+# understanding docs exist, and the package imports + CLIs respond.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  agent-operability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Create environment (standalone resolution)
+        run: uv sync --no-sources --extra dev --extra transport
+
+      - name: Agent self-check (registries + doc completeness)
+        run: uv run --no-sync python scripts/agent_check.py
+
+      - name: Smoke (import + CLI sanity)
+        run: |
+          uv run --no-sync python -c "import constitutional_swarm; print('import OK')"
+          uv run --no-sync acgs-swarm --help >/dev/null
+          uv run --no-sync acgs-verify-receipts --help >/dev/null
+
+      - name: Lint
+        run: uv run --no-sync ruff check src/constitutional_swarm/

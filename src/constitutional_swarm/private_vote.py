@@ -676,11 +676,6 @@ def tally(
         seen_nullifiers[c.nullifier] = c
         accepted.append(c)
 
-    if require_all_revealed:
-        missing = [c.commit for c in accepted if c.commit not in reveals_by_commit]
-        if missing:
-            raise MissingRevealError(f"{len(missing)} accepted commits have no reveal")
-
     totals: dict[BallotChoice, int] = {ch: 0 for ch in BallotChoice}
     tallied_commits: list[bytes] = []
     for c in accepted:
@@ -703,6 +698,17 @@ def tally(
             continue
         totals[verified_rv.choice] += 1
         tallied_commits.append(c.commit)
+
+    if require_all_revealed:
+        # A commit counts as "revealed" only if it has a *valid* reveal that
+        # opens it — the presence of a malformed or non-opening reveal (which
+        # is dropped in the loop above) does not satisfy the gate.
+        revealed = set(tallied_commits)
+        missing = [c.commit for c in accepted if c.commit not in revealed]
+        if missing:
+            raise MissingRevealError(
+                f"{len(missing)} accepted commits have no valid reveal"
+            )
 
     return PrivateTally(
         epoch=epoch,

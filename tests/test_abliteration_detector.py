@@ -87,6 +87,34 @@ def test_detect_from_weights_absolute_floor_no_reference() -> None:
     assert ad.detect_from_weights(abliterated, r).abliterated is True
 
 
+def test_detect_from_weights_reference_calibration_edges() -> None:
+    r = np.array([1.0, 0.0])
+    reference = {"layer0.W_O": np.array([[1.0], [0.0]])}
+    exactly_at_threshold = {"layer0.W_O": np.array([[1.0], [np.sqrt(15.0)]])}
+
+    report = ad.detect_from_weights(exactly_at_threshold, r, reference=reference)
+
+    assert report.abliterated is False
+    assert report.score == pytest.approx(0.75)
+    assert report.per_layer_energy["layer0.W_O"] == pytest.approx(0.25)
+    assert report.reasons == []
+
+    below_threshold = {"layer0.W_O": np.array([[1.0], [np.sqrt(24.0)]])}
+    assert ad.detect_from_weights(below_threshold, r, reference=reference).abliterated is True
+
+
+def test_detect_from_weights_rejects_unusable_reference() -> None:
+    rng = _rng()
+    r = ad._unit(rng.standard_normal(8))
+    candidate = {"candidate.W_O": rng.standard_normal((8, 8))}
+
+    with pytest.raises(ValueError, match="shares no matrix names"):
+        ad.detect_from_weights(candidate, r, reference={"other.W_O": rng.standard_normal((8, 8))})
+
+    with pytest.raises(ValueError, match="reference refusal energy"):
+        ad.detect_from_weights(candidate, r, reference={"candidate.W_O": np.zeros((8, 8))})
+
+
 def test_detect_from_activations_flags_collapse() -> None:
     rng = _rng()
     r = ad._unit(rng.standard_normal(D_MODEL))
@@ -112,6 +140,25 @@ def test_detect_from_activations_flags_collapse() -> None:
     assert ab_report.reasons
 
 
+def test_detect_from_activations_boundary_and_report_shape() -> None:
+    harmful = np.array([[1.0, 0.0], [1.0, 0.0]])
+    harmless = np.array([[0.0, 0.0], [0.0, 0.0]])
+
+    report = ad.detect_from_activations(
+        harmful,
+        harmless,
+        reference_separation=2.0,
+        ratio_threshold=0.5,
+    )
+
+    assert report.abliterated is False
+    assert report.mode == "activation"
+    assert report.score == pytest.approx(0.5)
+    assert report.separation_ratio == pytest.approx(0.5)
+    assert report.per_layer_energy == {}
+    assert report.reasons == []
+
+
 def test_input_validation() -> None:
     rng = _rng()
     # dimension mismatch
@@ -122,6 +169,16 @@ def test_input_validation() -> None:
         ad.refusal_direction(rng.standard_normal((0, 8)), rng.standard_normal((4, 8)))
     with pytest.raises(ValueError):
         ad.latent_separation(rng.standard_normal((4, 8)), rng.standard_normal((0, 8)))
+    with pytest.raises(ValueError):
+        ad.latent_separation(rng.standard_normal((4, 0)), rng.standard_normal((4, 0)))
+    with pytest.raises(ValueError):
+        bad = rng.standard_normal((4, 8))
+        bad[0, 0] = np.nan
+        ad.refusal_direction(bad, rng.standard_normal((4, 8)))
+    with pytest.raises(ValueError):
+        bad = rng.standard_normal((4, 8))
+        bad[0, 0] = np.inf
+        ad.latent_separation(bad, rng.standard_normal((4, 8)))
     # zero / non-finite directions
     with pytest.raises(ValueError):
         ad._unit(np.zeros(8))
@@ -132,6 +189,16 @@ def test_input_validation() -> None:
     # shape mismatch
     with pytest.raises(ValueError):
         ad.apply_abliteration(rng.standard_normal((8, 8)), rng.standard_normal(16))
+    with pytest.raises(ValueError):
+        ad.apply_abliteration(rng.standard_normal((8, 0)), rng.standard_normal(8))
+    with pytest.raises(ValueError):
+        bad = rng.standard_normal((8, 8))
+        bad[0, 0] = np.nan
+        ad.apply_abliteration(bad, rng.standard_normal(8))
+    with pytest.raises(ValueError):
+        bad = rng.standard_normal((8, 8))
+        bad[0, 0] = np.inf
+        ad.weight_refusal_energy(bad, rng.standard_normal(8))
     # empty / non-positive-threshold weight probes
     with pytest.raises(ValueError):
         ad.detect_from_weights({}, rng.standard_normal(8))
@@ -141,7 +208,15 @@ def test_input_validation() -> None:
         )
     with pytest.raises(ValueError):
         ad.detect_from_weights(
+            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), ratio_threshold=1.1
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_weights(
             {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), abs_floor=0.0
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_weights(
+            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), abs_floor=np.nan
         )
     # non-positive thresholds on the activation probe
     with pytest.raises(ValueError):
@@ -154,6 +229,19 @@ def test_input_validation() -> None:
         ad.detect_from_activations(
             rng.standard_normal((4, 8)),
             rng.standard_normal((4, 8)),
+            reference_separation=np.inf,
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_activations(
+            rng.standard_normal((4, 8)),
+            rng.standard_normal((4, 8)),
             reference_separation=1.0,
             ratio_threshold=0.0,
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_activations(
+            rng.standard_normal((4, 8)),
+            rng.standard_normal((4, 8)),
+            reference_separation=1.0,
+            ratio_threshold=1.1,
         )
