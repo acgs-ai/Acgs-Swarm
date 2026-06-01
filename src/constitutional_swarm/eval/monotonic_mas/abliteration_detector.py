@@ -64,6 +64,14 @@ def _unit(vector: np.ndarray) -> np.ndarray:
     return vector / norm
 
 
+def _require_finite(name: str, array: np.ndarray) -> None:
+    """Raise if ``array`` contains NaN or Inf values."""
+
+    if not np.all(np.isfinite(array)):
+        msg = f"{name} contains NaN or Inf"
+        raise ValueError(msg)
+
+
 def refusal_direction(harmful: np.ndarray, harmless: np.ndarray) -> np.ndarray:
     """Extract a unit refusal direction by difference-of-means.
 
@@ -81,9 +89,14 @@ def refusal_direction(harmful: np.ndarray, harmless: np.ndarray) -> np.ndarray:
     if harmful.shape[0] == 0 or harmless.shape[0] == 0:
         msg = "harmful and harmless activations must not be empty"
         raise ValueError(msg)
+    if harmful.shape[1] == 0 or harmless.shape[1] == 0:
+        msg = "harmful and harmless activation dimension must not be empty"
+        raise ValueError(msg)
     if harmful.shape[1] != harmless.shape[1]:
         msg = f"activation dim mismatch: {harmful.shape[1]} vs {harmless.shape[1]}"
         raise ValueError(msg)
+    _require_finite("harmful activations", harmful)
+    _require_finite("harmless activations", harmless)
     return _unit(harmful.mean(axis=0) - harmless.mean(axis=0))
 
 
@@ -100,6 +113,10 @@ def apply_abliteration(write_matrix: np.ndarray, direction: np.ndarray) -> np.nd
     if matrix.ndim != 2:
         msg = "write_matrix must be a 2D [d_model, d_in] array"
         raise ValueError(msg)
+    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        msg = "write_matrix dimensions must not be empty"
+        raise ValueError(msg)
+    _require_finite("write_matrix", matrix)
     r = _unit(direction)
     if r.shape[0] != matrix.shape[0]:
         msg = f"direction dim {r.shape[0]} != write-matrix output dim {matrix.shape[0]}"
@@ -120,6 +137,10 @@ def weight_refusal_energy(write_matrix: np.ndarray, direction: np.ndarray) -> fl
     if matrix.ndim != 2:
         msg = "write_matrix must be a 2D [d_model, d_in] array"
         raise ValueError(msg)
+    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        msg = "write_matrix dimensions must not be empty"
+        raise ValueError(msg)
+    _require_finite("write_matrix", matrix)
     r = _unit(direction)
     if r.shape[0] != matrix.shape[0]:
         msg = f"direction dim {r.shape[0]} != write-matrix output dim {matrix.shape[0]}"
@@ -146,9 +167,14 @@ def latent_separation(harmful: np.ndarray, harmless: np.ndarray) -> float:
     if harmful.shape[0] == 0 or harmless.shape[0] == 0:
         msg = "harmful and harmless activations must not be empty"
         raise ValueError(msg)
+    if harmful.shape[1] == 0 or harmless.shape[1] == 0:
+        msg = "harmful and harmless activation dimension must not be empty"
+        raise ValueError(msg)
     if harmful.shape[1] != harmless.shape[1]:
         msg = f"activation dim mismatch: {harmful.shape[1]} vs {harmless.shape[1]}"
         raise ValueError(msg)
+    _require_finite("harmful activations", harmful)
+    _require_finite("harmless activations", harmless)
     return float(np.linalg.norm(harmful.mean(axis=0) - harmless.mean(axis=0)))
 
 
@@ -193,11 +219,11 @@ def detect_from_weights(
     if not write_matrices:
         msg = "write_matrices is empty; nothing to probe"
         raise ValueError(msg)
-    if ratio_threshold <= 0.0:
-        msg = "ratio_threshold must be positive"
+    if not 0.0 < ratio_threshold <= 1.0:
+        msg = "ratio_threshold must be in (0, 1]"
         raise ValueError(msg)
-    if abs_floor <= 0.0:
-        msg = "abs_floor must be positive"
+    if not np.isfinite(abs_floor) or abs_floor <= 0.0:
+        msg = "abs_floor must be finite and positive"
         raise ValueError(msg)
     r = _unit(direction)
     per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
@@ -211,7 +237,10 @@ def detect_from_weights(
             if ref_W is None:
                 continue
             ref_energy = weight_refusal_energy(ref_W, r)
-            ratios.append(energy / ref_energy if ref_energy > 0 else 0.0)
+            if ref_energy <= 0.0:
+                msg = f"reference refusal energy for {name!r} must be positive"
+                raise ValueError(msg)
+            ratios.append(energy / ref_energy)
         if not ratios:
             msg = "reference shares no matrix names with write_matrices"
             raise ValueError(msg)
@@ -263,11 +292,11 @@ def detect_from_activations(
     abliteration typically collapses separation by 28-38%, i.e. ratio ~0.62-0.72).
     """
 
-    if reference_separation <= 0.0:
-        msg = "reference_separation must be positive"
+    if not np.isfinite(reference_separation) or reference_separation <= 0.0:
+        msg = "reference_separation must be finite and positive"
         raise ValueError(msg)
-    if ratio_threshold <= 0.0:
-        msg = "ratio_threshold must be positive"
+    if not 0.0 < ratio_threshold <= 1.0:
+        msg = "ratio_threshold must be in (0, 1]"
         raise ValueError(msg)
     candidate = latent_separation(harmful, harmless)
     ratio = candidate / reference_separation
