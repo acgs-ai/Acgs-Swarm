@@ -71,3 +71,29 @@ solely for that status.
   decision, and chain-continuity fields.
 - Any public wording must say "local in-toto/DSSE-shaped profile" unless and
   until a standards-compliant implementation exists.
+
+## Addendum (2026-06-01): DSSE/in-toto projection (non-claim)
+
+`src/constitutional_swarm/governance_receipts_dsse.py` adds a **one-way shape
+projection** of a receipt onto the canonical in-toto Statement v1 and DSSE
+envelope shapes (`to_in_toto_statement`, `to_dsse_envelope`,
+`verify_dsse_envelope`). It exists so external supply-chain tooling can *read*
+ACGS receipts; it is not the "Full in-toto/DSSE compliance" alternative above and
+makes no standards claim. The authoritative artifact remains the
+`GovernanceReceipt`.
+
+Boundary preserved by the projector and its tests:
+
+- The projection carries the same action, policy, role, evidence, decision, and
+  chain-continuity fields the Consequences section requires.
+- DSSE signs the PAE of `(payloadType, body)` — a different pre-image from the
+  receipt's detached signature over `payload_canonical_bytes`. A historical
+  receipt's signature is therefore **never** reused as a DSSE signature: legacy
+  receipts project to an **unsigned** envelope marked for re-verification against
+  the original; new receipts may be signed at projection time via a `DsseSigner`.
+- The projected `profile_version` stays `acgs.local.intoto-dsse-shaped.v0.1`, and
+  a claim-boundary test asserts no "compliant/certified/compliance" wording leaks
+  into the module's public surface.
+
+This addendum does not change the `gap_register.md`
+`GAP-V01-PORTABLE-RECEIPTS` closure status — no new standards claim is made.
