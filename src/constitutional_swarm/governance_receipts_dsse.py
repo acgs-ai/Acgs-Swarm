@@ -145,10 +145,14 @@ def pae(payload_type: str, body: bytes) -> bytes:
 def to_dsse_envelope(receipt: GovernanceReceipt, *, signer: DsseSigner | None = None) -> dict:
     """Project a receipt onto a DSSE envelope.
 
-    With no ``signer`` the envelope is unsigned (``signatures: []``) and carries
-    the :data:`UNSIGNED_PROJECTION_NOTE`. With a ``signer`` the statement bytes
-    are signed over the DSSE PAE with Ed25519. The receipt's own detached
-    signatures are never copied into the envelope (different pre-image).
+    The envelope is strict DSSE -- exactly ``payloadType``/``payload``/``signatures``,
+    no extra top-level keys -- so strict consumers (e.g. cosign) can ingest it.
+    With no ``signer`` the projection is unsigned (``signatures: []``); its
+    unsigned status is surfaced by :func:`verify_dsse_envelope` as
+    ``unsigned_projection`` rather than by an in-envelope marker. With a
+    ``signer`` the statement bytes are signed over the DSSE PAE with Ed25519. The
+    receipt's own detached signatures are never copied into the envelope
+    (different pre-image).
     """
 
     statement = to_in_toto_statement(receipt)
@@ -159,7 +163,6 @@ def to_dsse_envelope(receipt: GovernanceReceipt, *, signer: DsseSigner | None = 
         "signatures": [],
     }
     if signer is None:
-        envelope["_acgs_non_claim"] = UNSIGNED_PROJECTION_NOTE
         return envelope
 
     signature = signer.private_key.sign(pae(DSSE_PAYLOAD_TYPE, body))
@@ -179,7 +182,9 @@ def verify_dsse_envelope(
 ) -> dict:
     """Verify a projected DSSE envelope.
 
-    Returns a structured result with a ``status`` of:
+    Returns a structured result. Every result carries the same keys --
+    ``status`` (str), ``valid`` (bool), ``reason`` (str), ``key_ids`` (list[str])
+    -- so callers can read one shape regardless of outcome. ``status`` is one of:
 
     - ``unsigned_projection`` -- no signatures present (a legacy projection).
     - ``untrusted_key`` -- a signature references a key id not in
@@ -188,27 +193,64 @@ def verify_dsse_envelope(
     - ``valid`` -- every signature verified against a trusted key.
 
     ``trusted_public_keys`` maps key id to a hex-encoded raw Ed25519 public key.
+
+    A ``valid`` result attests only that the envelope's own payload was signed by
+    a trusted key. It does **not** bind that payload to any particular receipt:
+    callers must decode the statement and check ``source_payload_digest`` /
+    ``receipt_id`` against the receipt they expected before trusting it.
     """
 
     signatures = list(envelope.get("signatures") or [])
     if not signatures:
-        return {"status": "unsigned_projection", "valid": False, "note": UNSIGNED_PROJECTION_NOTE}
+        return {
+            "status": "unsigned_projection",
+            "valid": False,
+            "reason": UNSIGNED_PROJECTION_NOTE,
+            "key_ids": [],
+        }
 
     try:
         body = base64.standard_b64decode(str(envelope["payload"]))
         message = pae(str(envelope["payloadType"]), body)
     except (KeyError, ValueError, TypeError) as exc:
-        return {"status": "invalid", "valid": False, "reason": f"malformed envelope: {exc}"}
+        return {
+            "status": "invalid",
+            "valid": False,
+            "reason": f"malformed envelope: {exc}",
+            "key_ids": [],
+        }
 
     for entry in signatures:
+        if not isinstance(entry, Mapping):
+            return {
+                "status": "invalid",
+                "valid": False,
+                "reason": "malformed signature entry",
+                "key_ids": [],
+            }
         key_id = entry.get("keyid", "")
         public_hex = trusted_public_keys.get(key_id)
         if public_hex is None:
-            return {"status": "untrusted_key", "valid": False, "key_id": key_id}
+            return {
+                "status": "untrusted_key",
+                "valid": False,
+                "reason": f"key id {key_id!r} is not trusted",
+                "key_ids": [key_id],
+            }
         try:
             public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
             public_key.verify(base64.standard_b64decode(str(entry["sig"])), message)
         except (InvalidSignature, ValueError, KeyError) as exc:
-            return {"status": "invalid", "valid": False, "key_id": key_id, "reason": str(exc)}
+            return {
+                "status": "invalid",
+                "valid": False,
+                "reason": str(exc),
+                "key_ids": [key_id],
+            }
 
-    return {"status": "valid", "valid": True, "key_ids": [e.get("keyid", "") for e in signatures]}
+    return {
+        "status": "valid",
+        "valid": True,
+        "reason": "",
+        "key_ids": [e.get("keyid", "") for e in signatures],
+    }
