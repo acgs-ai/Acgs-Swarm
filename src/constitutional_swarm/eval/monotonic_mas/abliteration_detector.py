@@ -55,6 +55,9 @@ def _unit(vector: np.ndarray) -> np.ndarray:
 
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm):
+        msg = "vector contains NaN or Inf; cannot normalize"
+        raise ValueError(msg)
     if norm == 0.0:
         msg = "refusal direction is the zero vector; cannot normalize"
         raise ValueError(msg)
@@ -74,6 +77,9 @@ def refusal_direction(harmful: np.ndarray, harmless: np.ndarray) -> np.ndarray:
     harmless = np.asarray(harmless, dtype=np.float64)
     if harmful.ndim != 2 or harmless.ndim != 2:
         msg = "harmful and harmless activations must be 2D [n, d_model] arrays"
+        raise ValueError(msg)
+    if harmful.shape[0] == 0 or harmless.shape[0] == 0:
+        msg = "harmful and harmless activations must not be empty"
         raise ValueError(msg)
     if harmful.shape[1] != harmless.shape[1]:
         msg = f"activation dim mismatch: {harmful.shape[1]} vs {harmless.shape[1]}"
@@ -137,6 +143,9 @@ def latent_separation(harmful: np.ndarray, harmless: np.ndarray) -> float:
     if harmful.ndim != 2 or harmless.ndim != 2:
         msg = "harmful and harmless activations must be 2D [n, d_model] arrays"
         raise ValueError(msg)
+    if harmful.shape[0] == 0 or harmless.shape[0] == 0:
+        msg = "harmful and harmless activations must not be empty"
+        raise ValueError(msg)
     if harmful.shape[1] != harmless.shape[1]:
         msg = f"activation dim mismatch: {harmful.shape[1]} vs {harmless.shape[1]}"
         raise ValueError(msg)
@@ -183,6 +192,12 @@ def detect_from_weights(
 
     if not write_matrices:
         msg = "write_matrices is empty; nothing to probe"
+        raise ValueError(msg)
+    if ratio_threshold <= 0.0:
+        msg = "ratio_threshold must be positive"
+        raise ValueError(msg)
+    if abs_floor <= 0.0:
+        msg = "abs_floor must be positive"
         raise ValueError(msg)
     r = _unit(direction)
     per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
@@ -250,6 +265,9 @@ def detect_from_activations(
 
     if reference_separation <= 0.0:
         msg = "reference_separation must be positive"
+        raise ValueError(msg)
+    if ratio_threshold <= 0.0:
+        msg = "ratio_threshold must be positive"
         raise ValueError(msg)
     candidate = latent_separation(harmful, harmless)
     ratio = candidate / reference_separation

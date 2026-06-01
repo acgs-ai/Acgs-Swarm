@@ -114,17 +114,46 @@ def test_detect_from_activations_flags_collapse() -> None:
 
 def test_input_validation() -> None:
     rng = _rng()
+    # dimension mismatch
     with pytest.raises(ValueError):
         ad.refusal_direction(rng.standard_normal((4, 8)), rng.standard_normal((4, 16)))
+    # empty activation arrays -> would otherwise produce NaN means
+    with pytest.raises(ValueError):
+        ad.refusal_direction(rng.standard_normal((0, 8)), rng.standard_normal((4, 8)))
+    with pytest.raises(ValueError):
+        ad.latent_separation(rng.standard_normal((4, 8)), rng.standard_normal((0, 8)))
+    # zero / non-finite directions
     with pytest.raises(ValueError):
         ad._unit(np.zeros(8))
     with pytest.raises(ValueError):
+        ad._unit(np.array([np.nan, 1.0]))
+    with pytest.raises(ValueError):
+        ad._unit(np.array([np.inf, 1.0]))
+    # shape mismatch
+    with pytest.raises(ValueError):
         ad.apply_abliteration(rng.standard_normal((8, 8)), rng.standard_normal(16))
+    # empty / non-positive-threshold weight probes
     with pytest.raises(ValueError):
         ad.detect_from_weights({}, rng.standard_normal(8))
+    with pytest.raises(ValueError):
+        ad.detect_from_weights(
+            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), ratio_threshold=-0.1
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_weights(
+            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), abs_floor=0.0
+        )
+    # non-positive thresholds on the activation probe
     with pytest.raises(ValueError):
         ad.detect_from_activations(
             rng.standard_normal((4, 8)),
             rng.standard_normal((4, 8)),
             reference_separation=0.0,
+        )
+    with pytest.raises(ValueError):
+        ad.detect_from_activations(
+            rng.standard_normal((4, 8)),
+            rng.standard_normal((4, 8)),
+            reference_separation=1.0,
+            ratio_threshold=0.0,
         )
