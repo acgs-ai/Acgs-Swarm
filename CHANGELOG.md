@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+- Agent-operability layer: a `Makefile` with one-command targets (`setup`, `dev`,
+  `test`, `lint`, `typecheck`, `smoke`, `verify`, `agent-check`); a tool registry
+  (`tools/registry.yaml` + JSON schema + runbooks) and agent registry
+  (`agents/*.agent.yaml` + schema) for `researcher`/`coder`/`reviewer`/`qa`/`docs`/`release`;
+  a `scripts/agent_check.py` self-validation gate wired into a new
+  `agent-check` CI workflow; root entry-point docs (`ARCHITECTURE`, `PROJECT_MAP`,
+  `TOOLS`, `TASKS`, `DECISIONS`, `BLOCKERS`); and `.env.example`.
+- Standalone setup path documented (`uv sync --no-sources`) so a non-monorepo
+  checkout resolves `acgs-lite` from PyPI.
+
+### Fixed
+- `SpectralSphereManifold` default `smoothing` lowered from `0.999` to `0.9`. The
+  over-damped default retained 99.9% of stale state per projection, so the
+  production trust manifold (built with defaults in `mesh/core.py`, consumed by
+  `_select_peers`) accumulated trust at ~0.1% per cycle and stayed near zero
+  within the O(10)-cycle window it exists to win against Birkhoff uniformity
+  collapse. Restores responsiveness while keeping noise-damping hysteresis.
+- `private_vote.tally(..., require_all_revealed=True)` now gates on reveal
+  *validity*, not mere presence. A present-but-invalid reveal (correct commit
+  digest, wrong nonce) previously bypassed the gate and the ballot was silently
+  dropped instead of raising `MissingRevealError`.
+- pytest `pythonpath` now includes the repo root so tests importing `scripts.*`
+  collect when run from the project root; interpreter-agnostic assertion in the
+  official SWE-bench command test (`sys.executable` may be `python3`).
+
 ## [1.0.0] - 2026-04-23
 
 ### Added

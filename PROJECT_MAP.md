@@ -28,6 +28,7 @@ Folder-by-folder guide. For the runtime view see
 | `mesh/` | `ConstitutionalMesh` — peer validation, signed votes, settlement. |
 | `settlement_store.py` | Durable JSONL / SQLite settlement evidence. |
 | `governance_receipts.py`, `governance_receipts_cli.py` | Canonicalized receipts + `acgs-verify-receipts`. |
+| `governance_receipts_dsse.py` | DSSE/in-toto projector for governance receipts. |
 | `governed_handoff.py` | `acgs-swarm` CLI — governed task handoff (run/verify/pack). |
 | `quorum_certificate.py`, `validator_set.py`, `contract.py`, `capability.py` | Quorum, validator selection, contracts, capabilities. |
 

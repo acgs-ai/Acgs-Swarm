@@ -6,8 +6,9 @@ Working roadmap and next actions. Strategic direction lives in
 
 ## Recently completed
 
-- **Abliteration detector** for swarm-node trust (`eval/monotonic_mas/abliteration_detector.py`) — added, input-validation hardened, edge-case coverage, threat model documented (`docs/internal/abliteration_threat_model.md`).
-- **Agent-operability layer** (this change): Makefile one-command targets, `.env.example`, tool registry (`tools/`), agent registry (`agents/`), `scripts/agent_check.py`, `agent-check` CI, and the root understanding docs (ARCHITECTURE / PROJECT_MAP / TOOLS / TASKS / DECISIONS / BLOCKERS).
+- **Abliteration detector** for swarm-node trust (`eval/monotonic_mas/abliteration_detector.py`) — added, input-validation hardened, edge-case coverage, threat model documented (`docs/internal/abliteration_threat_model.md`). Merged via #56.
+- **DSSE/in-toto receipt projector** (`governance_receipts_dsse.py`) — merged via #55.
+- **Agent-operability layer + correctness fixes** (PR #57): Makefile one-command targets, `.env.example`, tool registry (`tools/`), agent registry (`agents/`), `scripts/agent_check.py`, `agent-check` CI, the root understanding docs; plus two fixes — `SpectralSphereManifold` smoothing default `0.999→0.9` and `private_vote` reveal-validity gate — and onboarding-blocker fixes (B4/B5/B7).
 
 ## Active direction (from `docs/roadmap.md`)
 
@@ -28,8 +29,8 @@ Working roadmap and next actions. Strategic direction lives in
 
 ## Recommended next tasks for an incoming agent
 
-1. **Resolve open blockers** — see [`BLOCKERS.md`](BLOCKERS.md). Highest value: add a dedicated type checker (B3) and align README verification commands with the Makefile (B4).
-2. **Land the current branch** — `feat/abliteration-detector`; run `make verify` and open a PR (see [`CONTRIBUTING.md`](CONTRIBUTING.md)).
+1. **Resolve open blockers** — see [`BLOCKERS.md`](BLOCKERS.md). Highest value: add a dedicated type checker (B3, still open) and clarify the standalone-vs-submodule framing (B6, still open).
+2. **Add DSSE receipts to the tool registry** — `governance_receipts_dsse.py` (merged via #55) is not yet represented in `tools/registry.yaml`; add an entry and any runbook.
 3. **Backfill registry coverage** — audit `scripts/` and ensure every operator-facing script has a `tools/registry.yaml` entry.
 4. **Expand settlement/replay regression tests** (stable-core priority above).
 
