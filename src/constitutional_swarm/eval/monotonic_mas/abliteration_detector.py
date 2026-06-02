@@ -195,6 +195,31 @@ class AbliterationReport:
     reasons: list[str] = field(default_factory=list)
 
 
+_AGGREGATORS = ("median", "mean", "min", "quantile")
+
+
+def _aggregate(values: np.ndarray, method: str, quantile: float) -> float:
+    """Reduce per-matrix ``values`` to one scalar for thresholding.
+
+    Lower output -> more likely flagged (the caller flags when it drops below a
+    threshold/floor). ``"median"`` (default) is robust but only fires on a
+    *majority* collapse; ``"min"`` flags if *any* single matrix collapses (most
+    sensitive); ``"quantile"`` flags off the ``quantile``-th percentile (e.g.
+    0.25 fires once ~a quarter of matrices collapse); ``"mean"`` is the average.
+    """
+
+    if method == "median":
+        return float(np.median(values))
+    if method == "mean":
+        return float(np.mean(values))
+    if method == "min":
+        return float(np.min(values))
+    if method == "quantile":
+        return float(np.quantile(values, quantile))
+    msg = f"unknown aggregate {method!r}; expected one of {_AGGREGATORS}"
+    raise ValueError(msg)
+
+
 def detect_from_weights(
     write_matrices: Mapping[str, np.ndarray],
     direction: np.ndarray,
@@ -202,23 +227,33 @@ def detect_from_weights(
     reference: Mapping[str, np.ndarray] | None = None,
     ratio_threshold: float = 0.25,
     abs_floor: float = 1e-3,
+    aggregate: str = "median",
+    quantile: float = 0.25,
 ) -> AbliterationReport:
     """Detect abliteration from residual-stream write matrices.
 
     Computes per-matrix refusal energy against ``direction`` (a refusal direction
     re-extracted from a trusted reference model).
 
-    - With a ``reference`` (matched matrix names): flag when the median
+    - With a ``reference`` (matched matrix names): flag when the aggregated
       candidate/reference energy ratio drops below ``ratio_threshold`` (default
-      0.25 -- i.e. >=75% of the refusal energy removed). The median aggregation
-      catches *graded* partial abliteration (Heretic ablates some layers harder
-      than others, so most ratios drop together), but because it is a median it
-      only fires when a *majority* of probed matrices collapse: a sparse subset
-      (<=50% of matrices) ablated against ``direction`` evades this flag. Inspect
-      ``per_layer_energy`` directly to catch a minority-layer attack.
-    - Without a reference: flag when the median absolute energy falls below
-      ``abs_floor`` (an exact abliteration drives energy to ~0). Same majority
-      caveat applies.
+      0.25 -- i.e. >=75% of the refusal energy removed).
+    - Without a reference: flag when the aggregated absolute energy falls below
+      ``abs_floor`` (an exact abliteration drives energy to ~0).
+
+    ``aggregate`` selects how the per-matrix ratios/energies are reduced to the
+    single value that is thresholded (see :func:`_aggregate`):
+
+    - ``"median"`` (default, backward-compatible): robust to a noisy/mismatched
+      reference, but only fires when a *majority* of probed matrices collapse --
+      a sparse subset (<=50% of matrices) ablated against ``direction`` evades
+      it. Inspect ``per_layer_energy`` to catch a minority-layer attack.
+    - ``"min"``: flags if *any* single matrix collapses -- most sensitive to a
+      minority-layer attack, highest false-positive risk on a noisy reference.
+    - ``"quantile"`` with ``quantile`` (default 0.25): fires once roughly that
+      fraction of matrices collapse -- a tunable middle ground for
+      admission-gating where subset attacks matter.
+    - ``"mean"``: the average ratio/energy.
     """
 
     if not write_matrices:
@@ -229,6 +264,12 @@ def detect_from_weights(
         raise ValueError(msg)
     if not np.isfinite(abs_floor) or abs_floor <= 0.0:
         msg = "abs_floor must be finite and positive"
+        raise ValueError(msg)
+    if aggregate not in _AGGREGATORS:
+        msg = f"aggregate must be one of {_AGGREGATORS}, got {aggregate!r}"
+        raise ValueError(msg)
+    if not 0.0 <= quantile <= 1.0:
+        msg = "quantile must be in [0, 1]"
         raise ValueError(msg)
     r = _unit(direction)
     per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
@@ -249,12 +290,12 @@ def detect_from_weights(
         if not ratios:
             msg = "reference shares no matrix names with write_matrices"
             raise ValueError(msg)
-        median_ratio = float(np.median(ratios))
-        abliterated = median_ratio < ratio_threshold
-        score = float(np.clip(1.0 - median_ratio, 0.0, 1.0))
+        agg_ratio = _aggregate(np.array(ratios, dtype=np.float64), aggregate, quantile)
+        abliterated = agg_ratio < ratio_threshold
+        score = float(np.clip(1.0 - agg_ratio, 0.0, 1.0))
         if abliterated:
             reasons.append(
-                f"median refusal-energy ratio {median_ratio:.3f} < {ratio_threshold} "
+                f"{aggregate} refusal-energy ratio {agg_ratio:.3f} < {ratio_threshold} "
                 f"({len([x for x in ratios if x < ratio_threshold])}/{len(ratios)} matrices collapsed)"
             )
         return AbliterationReport(
@@ -265,13 +306,13 @@ def detect_from_weights(
             reasons=reasons,
         )
 
-    median_energy = float(np.median(energies))
-    abliterated = median_energy < abs_floor
+    agg_energy = _aggregate(energies, aggregate, quantile)
+    abliterated = agg_energy < abs_floor
     # Score relative to the floor: at/below floor -> ~1, well above -> ~0.
-    score = float(np.clip(1.0 - median_energy / (abs_floor * 10.0), 0.0, 1.0))
+    score = float(np.clip(1.0 - agg_energy / (abs_floor * 10.0), 0.0, 1.0))
     if abliterated:
         reasons.append(
-            f"median refusal energy {median_energy:.2e} < absolute floor {abs_floor:.0e}"
+            f"{aggregate} refusal energy {agg_energy:.2e} < absolute floor {abs_floor:.0e}"
         )
     return AbliterationReport(
         abliterated=abliterated,
