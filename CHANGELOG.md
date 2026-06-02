@@ -7,6 +7,19 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Abliteration-aware quorum admission: `node_admission.AbliterationAdmissionGate`
+  screens candidate validators' residual-stream write matrices with the
+  abliteration detector and feeds the rejected agent ids into
+  `CommitteeSelector.select(exclude=...)`, so an abliterated model cannot be
+  sampled into a committee. Defaults to the `min` aggregation preset (flags if any
+  single write matrix collapses), closing the minority-subset evasion the `median`
+  default misses. `screen()` returns per-agent `AbliterationReport`s for the
+  down-weight-instead-of-exclude alternative; `select_admissible()` is a one-call
+  screen-then-select wrapper supporting the fault-domain-independent path.
+  Exported as `AbliterationAdmissionGate` / `AdmissionDecision`.
+- `detect_from_weights` gained a configurable `aggregate` parameter
+  (`"median"` default | `"mean"` | `"min"` | `"quantile"` with a `quantile` knob)
+  so callers can trade robustness for minority-subset sensitivity.
 - Agent-operability layer: a `Makefile` with one-command targets (`setup`, `dev`,
   `test`, `lint`, `typecheck`, `smoke`, `verify`, `agent-check`); a tool registry
   (`tools/registry.yaml` + JSON schema + runbooks) and agent registry

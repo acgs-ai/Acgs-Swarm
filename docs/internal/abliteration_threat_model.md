@@ -74,7 +74,11 @@ reference/adversarial fixtures.
 
 - **Integrate** the detector into mesh node-admission / trust weighting (exclude or
   down-weight flagged agents from quorum). Requires runtime activations/weights →
-  `research` extra + a model.
+  `research` extra + a model. *(Shipped: `node_admission.AbliterationAdmissionGate`
+  screens candidate write matrices with the `min` preset and feeds the rejected ids
+  into `CommitteeSelector.select(exclude=...)`, so an abliterated node cannot be
+  sampled into a committee. The gate also exposes per-agent reports for the
+  down-weight alternative.)*
 - **Harden steering**: orthogonalize the `violation_subspace` basis against `r̂` so
   governance steering survives abliteration (arXiv:2603.24543 mitigation).
 - **Defense-in-depth at training time** (for trusted nodes): extended-refusal
