@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 
 import numpy as np
 
@@ -62,9 +63,12 @@ class AdmissionDecision:
         return frozenset(self.rejected)
 
 
+_Candidate = TypeVar("_Candidate")
+
+
 def _partition(
-    candidates: Mapping[str, object],
-    evaluate: Callable[[object], AbliterationReport],
+    candidates: Mapping[str, _Candidate],
+    evaluate: Callable[[_Candidate], AbliterationReport],
 ) -> AdmissionDecision:
     """Run ``evaluate`` on each candidate payload and partition the agent ids.
 

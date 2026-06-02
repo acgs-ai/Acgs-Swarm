@@ -49,9 +49,8 @@ lint: ## Lint the package with ruff (CI gate)
 format: ## Auto-format with ruff
 	$(UV) run --no-sync ruff format src/ scripts/
 
-typecheck: ## Static checks. No mypy/pyright is configured (see BLOCKERS.md B3); ruff lint is the available static gate.
-	@echo "No dedicated type checker is configured; running ruff lint as the static-analysis gate."
-	$(UV) run --no-sync ruff check src/constitutional_swarm/
+typecheck: ## Static type-check with mypy (config + adoption baseline in pyproject.toml [tool.mypy]).
+	$(UV) run --no-sync mypy
 
 smoke: ## Fast import + CLI sanity check (no network, no API keys)
 	$(UV) run --no-sync python -c "import constitutional_swarm; print('import constitutional_swarm OK')"
@@ -61,7 +60,7 @@ smoke: ## Fast import + CLI sanity check (no network, no API keys)
 agent-check: ## Validate agent/tool registries + doc completeness (no install required)
 	$(UV) run --no-sync python scripts/agent_check.py
 
-verify: lint agent-check smoke test ## Full local gate: lint -> registry/doc check -> smoke -> tests
+verify: lint typecheck agent-check smoke test ## Full local gate: lint -> typecheck -> registry/doc check -> smoke -> tests
 	@echo "OK: verify passed."
 
 clean: ## Remove caches and build artifacts

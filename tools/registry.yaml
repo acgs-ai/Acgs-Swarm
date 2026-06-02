@@ -59,7 +59,7 @@ tools:
     owner_module: Makefile
 
   - name: typecheck
-    purpose: Static-analysis gate. No mypy/pyright configured; ruff lint is used as the static gate.
+    purpose: Static type-check with mypy (config + adoption baseline in pyproject.toml [tool.mypy]).
     command: make typecheck
     env: []
     inputs: ["src/constitutional_swarm/"]

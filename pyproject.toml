@@ -30,7 +30,7 @@ Changelog = "https://github.com/dislovelhl/Acgs-Swarm/releases"
 PyPI = "https://pypi.org/project/constitutional-swarm/"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4", "mypy>=1.11"]
 bittensor = ["bittensor>=7.0"]
 transport = ["websockets>=12.0"]
 # research: MCFS research stack (latent DNA steering, swarm ODE dynamics)
@@ -82,6 +82,51 @@ acgs-verify-receipts = "constitutional_swarm.governance_receipts_cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["constitutional_swarm*"]
+
+[tool.mypy]
+# Static type-check gate (BLOCKERS.md B3). Runs via `make typecheck` and the
+# `typecheck` CI job. Third-party deps (acgs-lite, braintrust, torch,
+# transformers, bittensor, langgraph, websockets, ...) ship no stubs, so missing
+# imports are ignored rather than annotated.
+python_version = "3.11"
+files = ["src/constitutional_swarm"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+# NB: warn_unused_ignores is intentionally OFF — many `# type: ignore`s are only
+# unused when an optional extra (transport/research/...) is absent, so enabling
+# it would flip-flop the gate by environment.
+# Adoption baseline: the modules below still have pre-existing type errors and
+# are allowed to fail while they are tightened incrementally. Everything NOT
+# listed here is checked and must stay clean — new code (e.g. node_admission)
+# is type-checked from day one and protected against regressions. Graduate a
+# module by deleting its entry once it passes. See BLOCKERS.md B3.
+[[tool.mypy.overrides]]
+# Optional-dependency-gated subpackages: types resolve against extras that are
+# not installed in the typecheck environment ([bittensor], [langgraph],
+# swe-bench harness, [research] torch/transformers).
+module = [
+  "constitutional_swarm.bittensor.*",
+  "constitutional_swarm.langgraph_runtime.*",
+  "constitutional_swarm.swe_bench.*",
+  "constitutional_swarm.latent_dna",
+  "constitutional_swarm.eval.monotonic_mas.evaluator",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# Stable-core modules with pre-existing dynamic patterns pending annotation.
+module = [
+  "constitutional_swarm.bench",
+  "constitutional_swarm.compiler",
+  "constitutional_swarm.dna",
+  "constitutional_swarm.governance_receipts",
+  "constitutional_swarm.governed_handoff",
+  "constitutional_swarm.mesh.core",
+  "constitutional_swarm.private_vote",
+  "constitutional_swarm.protocol",
+  "constitutional_swarm.remote_vote_transport.transport",
+]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 addopts = ["-p", "no:braintrust"]
