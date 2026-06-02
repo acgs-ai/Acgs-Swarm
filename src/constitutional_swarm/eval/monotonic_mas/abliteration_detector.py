@@ -210,10 +210,15 @@ def detect_from_weights(
 
     - With a ``reference`` (matched matrix names): flag when the median
       candidate/reference energy ratio drops below ``ratio_threshold`` (default
-      0.25 -- i.e. >=75% of the refusal energy removed). This handles *partial*
-      abliteration (Heretic ablates some layers harder than others).
+      0.25 -- i.e. >=75% of the refusal energy removed). The median aggregation
+      catches *graded* partial abliteration (Heretic ablates some layers harder
+      than others, so most ratios drop together), but because it is a median it
+      only fires when a *majority* of probed matrices collapse: a sparse subset
+      (<=50% of matrices) ablated against ``direction`` evades this flag. Inspect
+      ``per_layer_energy`` directly to catch a minority-layer attack.
     - Without a reference: flag when the median absolute energy falls below
-      ``abs_floor`` (an exact abliteration drives energy to ~0).
+      ``abs_floor`` (an exact abliteration drives energy to ~0). Same majority
+      caveat applies.
     """
 
     if not write_matrices:

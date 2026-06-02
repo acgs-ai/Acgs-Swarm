@@ -77,6 +77,26 @@ def test_detect_from_weights_partial_abliteration() -> None:
     assert report.abliterated is True
 
 
+def test_detect_from_weights_minority_subset_is_not_flagged_by_median() -> None:
+    # Documented limitation: the reference-ratio test aggregates with the MEDIAN,
+    # so it only fires when a *majority* of probed matrices collapse. A sparse
+    # subset (<=50% of matrices) ablated against r evades the ratio flag, even
+    # though per-layer energies still expose it. Pinning this so the median
+    # aggregation stays an intentional contract (see detector docstring).
+    rng = _rng()
+    r = ad._unit(rng.standard_normal(D_MODEL))
+    clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(6)}
+    candidate = dict(clean)
+    for i in range(3):  # exactly half -> median sits at the clean side
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+
+    report = ad.detect_from_weights(candidate, r, reference=clean)
+    assert report.abliterated is False
+    # ...but the collapse is still visible per layer for a caller who inspects it.
+    ablated_energies = [report.per_layer_energy[f"layer{i}.W_out"] for i in range(3)]
+    assert all(e < 1e-9 for e in ablated_energies)
+
+
 def test_detect_from_weights_absolute_floor_no_reference() -> None:
     rng = _rng()
     r = ad._unit(rng.standard_normal(D_MODEL))
