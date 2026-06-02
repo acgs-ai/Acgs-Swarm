@@ -77,6 +77,87 @@ def test_detect_from_weights_partial_abliteration() -> None:
     assert report.abliterated is True
 
 
+def test_detect_from_weights_minority_subset_is_not_flagged_by_median() -> None:
+    # Documented limitation: the reference-ratio test aggregates with the MEDIAN,
+    # so it only fires when a *majority* of probed matrices collapse. A sparse
+    # subset (<=50% of matrices) ablated against r evades the ratio flag, even
+    # though per-layer energies still expose it. Pinning this so the median
+    # aggregation stays an intentional contract (see detector docstring).
+    rng = _rng()
+    r = ad._unit(rng.standard_normal(D_MODEL))
+    clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(6)}
+    candidate = dict(clean)
+    for i in range(3):  # exactly half -> median sits at the clean side
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+
+    report = ad.detect_from_weights(candidate, r, reference=clean)
+    assert report.abliterated is False
+    # ...but the collapse is still visible per layer for a caller who inspects it.
+    ablated_energies = [report.per_layer_energy[f"layer{i}.W_out"] for i in range(3)]
+    assert all(e < 1e-9 for e in ablated_energies)
+
+
+def _subset_candidate(r, n_total=6, n_ablated=3):
+    rng = _rng()
+    clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(n_total)}
+    candidate = dict(clean)
+    for i in range(n_ablated):
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+    return clean, candidate
+
+
+def test_aggregate_min_catches_minority_subset_median_misses() -> None:
+    # The minority-subset attack median misses (3/6) is caught by aggregate="min",
+    # which flags if *any* single matrix collapses.
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    clean, candidate = _subset_candidate(r, n_total=6, n_ablated=3)
+    assert ad.detect_from_weights(candidate, r, reference=clean).abliterated is False
+    report = ad.detect_from_weights(candidate, r, reference=clean, aggregate="min")
+    assert report.abliterated is True
+    assert "min refusal-energy ratio" in report.reasons[0]
+
+
+def test_aggregate_quantile_tunable_sensitivity() -> None:
+    # A single collapsed layer out of 6 (1/6 ~ 0.167): the 0.25 quantile sits
+    # just above it (clean), but min flags it.
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    clean, candidate = _subset_candidate(r, n_total=6, n_ablated=1)
+    q_report = ad.detect_from_weights(candidate, r, reference=clean, aggregate="quantile", quantile=0.25)
+    assert q_report.abliterated is False
+    assert ad.detect_from_weights(candidate, r, reference=clean, aggregate="min").abliterated is True
+    # Three of six collapsed -> the 0.25 quantile drops into the ablated cluster.
+    _, half = _subset_candidate(r, n_total=6, n_ablated=3)
+    assert ad.detect_from_weights(half, r, reference=clean, aggregate="quantile", quantile=0.25).abliterated is True
+
+
+def test_aggregate_no_reference_min_uses_absolute_floor() -> None:
+    # aggregate also applies on the no-reference (absolute-floor) path.
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    _, candidate = _subset_candidate(r, n_total=6, n_ablated=2)
+    assert ad.detect_from_weights(candidate, r).abliterated is False
+    report = ad.detect_from_weights(candidate, r, aggregate="min")
+    assert report.abliterated is True
+    assert "min refusal energy" in report.reasons[0]
+
+
+def test_aggregate_default_is_backward_compatible_median() -> None:
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    clean, candidate = _subset_candidate(r, n_total=6, n_ablated=5)
+    default = ad.detect_from_weights(candidate, r, reference=clean)
+    explicit = ad.detect_from_weights(candidate, r, reference=clean, aggregate="median")
+    assert default.abliterated == explicit.abliterated is True
+    assert default.score == explicit.score
+
+
+def test_aggregate_invalid_inputs_raise() -> None:
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    _, candidate = _subset_candidate(r, n_total=4, n_ablated=2)
+    with pytest.raises(ValueError, match="aggregate must be one of"):
+        ad.detect_from_weights(candidate, r, aggregate="bogus")
+    with pytest.raises(ValueError, match="quantile must be in"):
+        ad.detect_from_weights(candidate, r, aggregate="quantile", quantile=1.5)
+
+
 def test_detect_from_weights_absolute_floor_no_reference() -> None:
     rng = _rng()
     r = ad._unit(rng.standard_normal(D_MODEL))
