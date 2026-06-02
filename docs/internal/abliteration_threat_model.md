@@ -70,20 +70,33 @@ the detector logic or its tests):
 are included so the signal is verifiable end-to-end and so callers can build
 reference/adversarial fixtures.
 
-## Open follow-ups
+## Follow-ups
 
-- **Integrate** the detector into mesh node-admission / trust weighting (exclude or
-  down-weight flagged agents from quorum). Requires runtime activations/weights →
-  `research` extra + a model. *(Shipped: `node_admission.AbliterationAdmissionGate`
-  screens candidate write matrices with the `min` preset and feeds the rejected ids
-  into `CommitteeSelector.select(exclude=...)`, so an abliterated node cannot be
-  sampled into a committee. The gate also exposes per-agent reports for the
-  down-weight alternative.)*
-- **Harden steering**: orthogonalize the `violation_subspace` basis against `r̂` so
+### Shipped
+
+- ✅ **Detector integrated into quorum node-admission.**
+  `node_admission.AbliterationAdmissionGate` screens candidate validators' write
+  matrices and feeds the rejected ids into `CommitteeSelector.select(exclude=...)`,
+  so an abliterated node cannot be sampled into a committee. Defaults to the `min`
+  aggregation preset (flag if *any* write matrix collapses), which closes the
+  minority-subset evasion the `median` default missed (dogfood finding F1). The
+  gate also returns per-agent `AbliterationReport`s for the down-weight-instead-of-
+  exclude alternative. Screening still requires runtime weights → `research` extra
+  + a model. (PR #61.)
+- ✅ **Configurable detector aggregation.** `detect_from_weights` gained an
+  `aggregate` parameter (`"median"` | `"mean"` | `"min"` | `"quantile"`) so callers
+  can trade reference-noise robustness for minority-subset sensitivity. (PR #60.)
+
+### Open
+
+- ⬜ **Harden steering**: orthogonalize the `violation_subspace` basis against `r̂` so
   governance steering survives abliteration (arXiv:2603.24543 mitigation).
-- **Defense-in-depth at training time** (for trusted nodes): extended-refusal
+- ⬜ **Defense-in-depth at training time** (for trusted nodes): extended-refusal
   fine-tuning distributes refusal across dimensions and resists single-direction
   abliteration (arXiv:2505.19056, >90% residual refusal).
+- ⬜ **Activation-path admission**: the shipped gate screens on *weights*; add an
+  activation-based admission signal (`detect_from_activations`) for nodes that only
+  expose hidden states, not write matrices.
 
 ## Sources
 
