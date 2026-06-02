@@ -128,6 +128,8 @@ from constitutional_swarm.spectral_sphere import (
 from constitutional_swarm.swarm import SwarmExecutor, TaskDAG, TaskNode
 from constitutional_swarm.node_admission import (
     AbliterationAdmissionGate,
+    ActivationAdmissionGate,
+    ActivationProbe,
     AdmissionDecision,
 )
 from constitutional_swarm.validator_set import (
@@ -152,6 +154,8 @@ from constitutional_swarm.violation_subspace import (
 # but advertise only the stable 1.0 surface via __all__.
 __all__ = [
     "AbliterationAdmissionGate",
+    "ActivationAdmissionGate",
+    "ActivationProbe",
     "AdmissionDecision",
     "AgentCredential",
     "AgentDNA",

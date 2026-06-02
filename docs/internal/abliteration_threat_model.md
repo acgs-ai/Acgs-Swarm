@@ -86,6 +86,12 @@ reference/adversarial fixtures.
 - ✅ **Configurable detector aggregation.** `detect_from_weights` gained an
   `aggregate` parameter (`"median"` | `"mean"` | `"min"` | `"quantile"`) so callers
   can trade reference-noise robustness for minority-subset sensitivity. (PR #60.)
+- ✅ **Activation-path admission.** `node_admission.ActivationAdmissionGate` screens
+  nodes that expose final-hidden-state activations but not write matrices, via
+  `detect_from_activations` (harmful/benign separation-collapse vs. a trusted
+  `reference_separation`). Same `screen()` / `select_admissible()` surface as the
+  weight gate, so either modality feeds the same `CommitteeSelector.select(exclude=...)`
+  path. Candidates are passed as `ActivationProbe(harmful, harmless)`.
 
 ### Open
 
@@ -94,9 +100,6 @@ reference/adversarial fixtures.
 - ⬜ **Defense-in-depth at training time** (for trusted nodes): extended-refusal
   fine-tuning distributes refusal across dimensions and resists single-direction
   abliteration (arXiv:2505.19056, >90% residual refusal).
-- ⬜ **Activation-path admission**: the shipped gate screens on *weights*; add an
-  activation-based admission signal (`detect_from_activations`) for nodes that only
-  expose hidden states, not write matrices.
 
 ## Sources
 
