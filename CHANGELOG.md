@@ -17,6 +17,13 @@ The format is based on Keep a Changelog.
   down-weight-instead-of-exclude alternative; `select_admissible()` is a one-call
   screen-then-select wrapper supporting the fault-domain-independent path.
   Exported as `AbliterationAdmissionGate` / `AdmissionDecision`.
+- Activation-path admission: `node_admission.ActivationAdmissionGate` screens nodes
+  that expose final-hidden-state activations but not write matrices, via
+  `detect_from_activations` (harmful/benign separation-collapse vs. a trusted
+  reference). Candidates are passed as `ActivationProbe(harmful, harmless)`; the
+  `screen()` / `select_admissible()` surface matches the weight gate, so either
+  modality feeds the same `CommitteeSelector.select(exclude=...)` path. Exported as
+  `ActivationAdmissionGate` / `ActivationProbe`.
 - `detect_from_weights` gained a configurable `aggregate` parameter
   (`"median"` default | `"mean"` | `"min"` | `"quantile"` with a `quantile` knob)
   so callers can trade robustness for minority-subset sensitivity.

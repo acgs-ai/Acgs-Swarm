@@ -13,6 +13,8 @@ import pytest
 from constitutional_swarm.eval.monotonic_mas import abliteration_detector as ad
 from constitutional_swarm.node_admission import (
     AbliterationAdmissionGate,
+    ActivationAdmissionGate,
+    ActivationProbe,
     AdmissionDecision,
 )
 from constitutional_swarm.validator_set import (
@@ -174,3 +176,89 @@ def test_malformed_candidate_propagates_valueerror() -> None:
     gate = AbliterationAdmissionGate(r, reference=reference)
     with pytest.raises(ValueError, match="empty"):
         gate.screen({"bad": {}})
+
+
+# --- activation-path admission --------------------------------------------
+
+N_PROMPTS = 40
+
+
+def _activation_fixture():
+    rng = _rng()
+    harmless = rng.standard_normal((N_PROMPTS, D_MODEL))
+    harmful = rng.standard_normal((N_PROMPTS, D_MODEL)) + 3.0  # well-separated
+    ref_sep = ad.latent_separation(harmful, harmless)
+    clean = ActivationProbe(harmful=harmful, harmless=harmless)
+    # Abliteration collapses the harmful/benign separation: shrink the gap ~60%.
+    gap = harmful.mean(axis=0) - harmless.mean(axis=0)
+    collapsed = ActivationProbe(harmful=harmful - 0.6 * gap, harmless=harmless)
+    return ref_sep, clean, collapsed
+
+
+def test_activation_screen_admits_clean_rejects_collapsed() -> None:
+    ref_sep, clean, collapsed = _activation_fixture()
+    gate = ActivationAdmissionGate(ref_sep)
+    decision = gate.screen({"clean": clean, "tampered": collapsed})
+    assert isinstance(decision, AdmissionDecision)
+    assert decision.admitted == ("clean",)
+    assert decision.rejected == ("tampered",)
+    assert decision.reports["tampered"].mode == "activation"
+    assert decision.reports["tampered"].separation_ratio < 0.75
+
+
+def test_activation_select_admissible_excludes_collapsed_node() -> None:
+    ref_sep, clean, collapsed = _activation_fixture()
+    vset = _validator_set(["a", "b", "c", "d"])
+    selector = CommitteeSelector(vset)
+    gate = ActivationAdmissionGate(ref_sep)
+    candidates = {"a": clean, "b": clean, "c": collapsed, "d": clean}
+    selection, decision = gate.select_admissible(
+        selector, seed="act-1", committee_size=4, candidate_activations=candidates
+    )
+    assert "c" in decision.rejected
+    assert "c" not in selection.members
+    assert set(selection.members) == {"a", "b", "d"}
+
+
+def test_activation_select_admissible_unions_explicit_exclude() -> None:
+    ref_sep, clean, collapsed = _activation_fixture()
+    vset = _validator_set(["a", "b", "c", "d"])
+    selector = CommitteeSelector(vset)
+    gate = ActivationAdmissionGate(ref_sep)
+    candidates = {"a": clean, "b": collapsed, "c": clean, "d": clean}
+    selection, _ = gate.select_admissible(
+        selector, seed="act-2", committee_size=4, candidate_activations=candidates, exclude=["a"]
+    )
+    assert "a" not in selection.members  # explicit exclude
+    assert "b" not in selection.members  # collapse exclude
+    assert set(selection.members) == {"c", "d"}
+
+
+def test_activation_require_independent_path() -> None:
+    ref_sep, clean, collapsed = _activation_fixture()
+    vset = _validator_set(["a", "b", "c", "d", "e"])
+    selector = CommitteeSelector(vset)
+    gate = ActivationAdmissionGate(ref_sep)
+    candidates = {i: clean for i in ["a", "b", "c", "d"]}
+    candidates["e"] = collapsed
+    selection, _ = gate.select_admissible(
+        selector, seed="act-ind", committee_size=4,
+        candidate_activations=candidates, require_independent=True,
+    )
+    assert "e" not in selection.members
+    assert selection.has_quorum()
+
+
+def test_activation_gate_rejects_bad_reference_separation() -> None:
+    with pytest.raises(ValueError, match="reference_separation"):
+        ActivationAdmissionGate(0.0)
+    with pytest.raises(ValueError, match="reference_separation"):
+        ActivationAdmissionGate(float("nan"))
+
+
+def test_activation_malformed_candidate_propagates_valueerror() -> None:
+    ref_sep, *_ = _activation_fixture()
+    gate = ActivationAdmissionGate(ref_sep)
+    empty = ActivationProbe(harmful=np.empty((0, D_MODEL)), harmless=np.ones((4, D_MODEL)))
+    with pytest.raises(ValueError, match="empty"):
+        gate.screen({"bad": empty})
