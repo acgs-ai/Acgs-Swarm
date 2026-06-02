@@ -97,7 +97,18 @@ No functional bugs were found; this was the only fix, and it is documentation + 
 
 ## 7. Decisions for a human
 
-**F1 — Median aggregation makes the weight detector blind to minority-subset abliteration.**
+**F1 — Median aggregation makes the weight detector blind to minority-subset abliteration. → RESOLVED (`062b377`).**
+
+Implemented the recommended Option 2: `detect_from_weights` now takes an
+`aggregate` parameter (`"median"` default — backward-compatible — plus `"mean"`,
+`"min"`, `"quantile"` with a `quantile` knob). `"min"`/`"quantile"` catch the
+subset attacks median misses (verified: 4/8 subset → median misses, quantile &
+min flag). Remaining judgment for the operator: which preset to wire into
+quorum-admission gating. Original analysis kept below for context.
+
+---
+
+**F1 (original) — Median aggregation makes the weight detector blind to minority-subset abliteration.**
 
 - **What:** `detect_from_weights` flags only when the *median* per-matrix energy ratio (or absolute energy) crosses the threshold. Empirically (8 layers): 0–4/8 ablated → **not flagged**; 5–8/8 → flagged. An adaptive adversary who ablates ≤50% of residual-stream write matrices evades both the reference-ratio and absolute-floor flags, even though half the refusal mechanism is removed.
 - **Why not auto-fixed:** changing `median` → `min`/quantile/“any *k* matrices below threshold” is a **precision-recall security trade-off**, not an obvious bug. Median is robust to a noisy or imperfectly-matched reference and avoids false positives from one odd layer; a quantile catches subset attacks but raises false positives. Picking the operating point is a policy decision tied to how the detector gates quorum admission.
