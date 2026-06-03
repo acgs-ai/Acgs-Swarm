@@ -7,6 +7,17 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Byzantine tamper-fraction census: `byzantine_census.estimate_tampered_fraction`
+  turns a screened sample (`n_screened`, `n_tampered`) into a point estimate plus a
+  two-sided confidence interval (Wilson score or exact Clopper-Pearson — pure
+  NumPy/stdlib, no scipy) and a verdict against the `1/3` Byzantine bound
+  (`"safe"` / `"violated"` / `"inconclusive"`). `census_from_decisions` pools
+  abliteration admission decisions (dedup by agent) and refuses to count a
+  `RefusalDistributionReport` `fragile` flag (a trust signal, not a tamper verdict).
+  Bounds the *detectable* tampered fraction over *screened* nodes — `"safe"` is
+  necessary, not sufficient; closing the adversarial-self-report gap needs remote
+  attestation (out of the pure-NumPy core). Addresses the Byzantine-accounting gap in
+  `docs/internal/abliteration_threat_model.md`.
 - Refusal-distribution node admission: `node_admission.RefusalDistributionGate`
   screens candidate validators on the *distribution* axis — flagging a node whose
   refusal is single-direction (`refusal_distribution_score` below a configurable

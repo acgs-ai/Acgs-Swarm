@@ -133,12 +133,30 @@ reference/adversarial fixtures.
   `RefusalDirectionProbe(directions, write_matrices=None)`; the optional write matrices
   weight each direction by its *surviving* refusal-writing energy. Screening needs
   runtime directions/weights → `research` extra + a model; the score itself is pure-NumPy.
+- ✅ **Tamper-fraction census for Byzantine accounting** (addresses *Where it bites #2*).
+  `byzantine_census.estimate_tampered_fraction(n_screened, n_tampered, ...)` turns a
+  screened sample into a point estimate plus a two-sided confidence interval for the
+  swarm-wide tampered fraction (Wilson score or exact Clopper-Pearson, both pure-NumPy
+  /stdlib — no scipy), and renders a verdict against the `1/3` Byzantine bound:
+  `"safe"` (CI below threshold), `"violated"` (CI above), or `"inconclusive"` (CI
+  straddles → screen more). `census_from_decisions(...)` pools
+  `AbliterationAdmissionGate` / `ActivationAdmissionGate` decisions (dedup by agent),
+  and **refuses** to count a `RefusalDistributionReport` `fragile` flag — that is a
+  trust signal, not a tamper verdict. **Scope (honest):** this bounds only the
+  *detectable* tampered fraction over *screened* nodes and assumes the screen is sound
+  and the sample representative, so `"safe"` is *necessary but not sufficient* for the
+  true assumption. It does not catch a node that hides tampering from the screen
+  (adversarial self-report).
 
 ### Open
 
-- ⬜ **No tamper count for Byzantine accounting** (from *Where it bites #2*): the swarm
-  flags/excludes abliterated nodes but cannot *count* compromised peers to validate the
-  `<1/3` Byzantine assumption directly.
+- ⬜ **Adversarial self-report / unscreened tampering.** The census above bounds the
+  *detectable* fraction; a node that hides tampering from the screen is not counted.
+  Closing this needs verifiable model-integrity evidence — **remote attestation** (TEE
+  quote / signed weight digest + a verifier feeding the same census) — whose trust root
+  is hardware/external and therefore sits outside the pure-NumPy, externalized-enforcement
+  core (analogous to the extended-refusal training pipeline staying out of CI). Scoped as
+  an attestation-integration follow-up, not an incremental measurement primitive.
 
 ## Sources
 
