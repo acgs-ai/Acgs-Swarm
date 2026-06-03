@@ -7,6 +7,19 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Extended-refusal fine-tuning defense-in-depth (Option A — recipe + CI-safe
+  measurement). `abliteration_detector.refusal_distribution_score(directions, *,
+  write_matrices=None)` measures how *distributed* a model's refusal representation is
+  (`~0` = single-direction/abliteration-fragile, `~1` = spread across many directions/
+  extended-refusal hardened, arXiv:2505.19056) via the normalized participation ratio of
+  a set of extracted refusal directions, optionally weighted by surviving refusal-writing
+  energy across write matrices. Pure-NumPy, deterministic, no torch. Ships with an
+  operator recipe (`docs/recipes/extended_refusal_finetuning.md`) and a
+  `[research,finetune]`-gated, test-matrix-excluded reference driver
+  (`scripts/finetune_extended_refusal.py`) for the actual fine-tuning, plus an opt-in
+  `finetune` extra (`trl`, `peft`). The library *measures* the outcome; producing
+  hardened weights remains a trusted-node operator action. Closes the last open
+  follow-up (#2, *shipped-with-scope*) in `docs/internal/abliteration_threat_model.md`.
 - Abliteration-hardened steering: `violation_subspace.ViolationSubspace` gained
   `orthogonalize_against(r_hat)` and `refusal_alignment(r_hat)`. The former projects
   the refusal direction `r̂` out of the governance steering subspace so the steering

@@ -106,14 +106,31 @@ reference/adversarial fixtures.
   closes the silent-degradation gap in *"Where it bites" #1*; `r̂` comes from
   `abliteration_detector.refusal_direction`. Pure-NumPy, CI-safe.
 
+- ✅ **Training-time defense-in-depth (Option A: recipe + CI-safe measurement).**
+  Extended-refusal fine-tuning distributes refusal across many dimensions so no
+  single-direction abliteration can remove it (arXiv:2505.19056, >90% residual
+  refusal). Shipped *as Option A* (per the feasibility study): the library does **not**
+  absorb a training pipeline. It ships (a) `abliteration_detector.refusal_distribution_score`
+  — a pure-NumPy, CI-safe measurement of how distributed a model's refusal is
+  (`~0` = single-direction/abliteration-fragile, `~1` = distributed/hardened), the
+  verifiable "did the hardening work?" check; (b) a `[research,finetune]`-gated, test-
+  matrix-excluded reference recipe (`docs/recipes/extended_refusal_finetuning.md`) +
+  driver (`scripts/finetune_extended_refusal.py`) for the actual fine-tuning.
+  **Scope (honest):** the library *measures* the outcome; **producing hardened model
+  weights remains the trusted-node operator's action**, deliberately outside the
+  externalized-enforcement, CI-safe core. (Plan:
+  `docs/plans/2026-06-03-002-feat-extended-refusal-finetuning-plan.md`; feasibility:
+  `docs/plans/2026-06-03-001-feat-extended-refusal-finetuning-feasibility.md`.)
+
 ### Open
 
-- ⬜ **Defense-in-depth at training time** (for trusted nodes): extended-refusal
-  fine-tuning distributes refusal across dimensions and resists single-direction
-  abliteration (arXiv:2505.19056, >90% residual refusal). Requires a real model +
-  fine-tuning loop (torch, not CI-safe), so it sits outside the pure-NumPy detector/
-  steering core — scoped separately. See
-  `docs/plans/` (extended-refusal fine-tuning feasibility) before implementing.
+- ⬜ **Activation-/weight-path admission gate for `refusal_distribution_score`** —
+  the measurement ships; wiring it into `node_admission` (down-weight or exclude nodes
+  whose refusal is single-direction, alongside the existing abliteration gates) is an
+  additive follow-up. Requires runtime weights/activations → `research` extra + a model.
+- ⬜ **No tamper count for Byzantine accounting** (from *Where it bites #2*): the swarm
+  flags/excludes abliterated nodes but cannot *count* compromised peers to validate the
+  `<1/3` Byzantine assumption directly.
 
 ## Sources
 
