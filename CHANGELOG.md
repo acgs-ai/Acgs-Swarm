@@ -7,6 +7,17 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Refusal-distribution node admission: `node_admission.RefusalDistributionGate`
+  screens candidate validators on the *distribution* axis — flagging a node whose
+  refusal is single-direction (`refusal_distribution_score` below a configurable
+  `min_distribution`) so a trusted committee can prefer extended-refusal-hardened
+  nodes. Same `screen()` / `select_admissible()` surface as the abliteration gates,
+  feeding the same `CommitteeSelector.select(exclude=...)` path. Candidates are passed
+  as `RefusalDirectionProbe(directions, write_matrices=None)`. The flag is a trust
+  signal, not a tamper verdict — its report uses the field name `fragile`, so callers
+  may down-weight rather than exclude. (`AdmissionDecision` is now generic over its
+  report type.) Closes the activation-/weight-path admission follow-up in
+  `docs/internal/abliteration_threat_model.md`.
 - Extended-refusal fine-tuning defense-in-depth (Option A — recipe + CI-safe
   measurement). `abliteration_detector.refusal_distribution_score(directions, *,
   write_matrices=None)` measures how *distributed* a model's refusal representation is

@@ -18,13 +18,22 @@ access to a candidate node's residual-stream write matrices (the ``research``
 deployment with a live model). It does not modify any model and is independent
 of the VRF committee sampling itself -- it only contributes to the ``exclude``
 set that :meth:`CommitteeSelector.select` already honors.
+
+A third gate, :class:`RefusalDistributionGate`, screens on a different axis: not
+whether refusal was *removed* (the two abliteration gates above) but whether a
+node's refusal is mediated by a *single direction* (abliteration-fragile) versus
+*distributed* across many (extended-refusal hardened, arXiv:2505.19056). It lets a
+trusted committee prefer hardened nodes. The flag it raises is a trust signal, not
+a tamper verdict -- a fragile node is not abliterated, only one orthogonalization
+away from it -- so its report uses the honest field name ``fragile`` and a caller
+may down-weight rather than exclude.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 import numpy as np
 
@@ -32,6 +41,7 @@ from .eval.monotonic_mas.abliteration_detector import (
     AbliterationReport,
     detect_from_activations,
     detect_from_weights,
+    refusal_distribution_score,
 )
 from .validator_set import CommitteeSelection, CommitteeSelector
 
@@ -40,22 +50,29 @@ __all__ = [
     "ActivationAdmissionGate",
     "ActivationProbe",
     "AdmissionDecision",
+    "RefusalDirectionProbe",
+    "RefusalDistributionGate",
+    "RefusalDistributionReport",
 ]
 
 
+_ReportT = TypeVar("_ReportT")
+
+
 @dataclass(frozen=True)
-class AdmissionDecision:
-    """Outcome of screening candidate validators for abliteration.
+class AdmissionDecision(Generic[_ReportT]):
+    """Outcome of screening candidate validators.
 
     ``admitted`` and ``rejected`` partition the screened agent ids (each sorted
-    for determinism). ``reports`` maps every screened agent id to its
-    :class:`AbliterationReport`, so a caller can log *why* a node was rejected or
-    down-weight rather than exclude.
+    for determinism). ``reports`` maps every screened agent id to its report
+    (:class:`AbliterationReport` for the abliteration gates,
+    :class:`RefusalDistributionReport` for the distribution gate), so a caller can
+    log *why* a node was rejected or down-weight rather than exclude.
     """
 
     admitted: tuple[str, ...]
     rejected: tuple[str, ...]
-    reports: Mapping[str, AbliterationReport]
+    reports: Mapping[str, _ReportT]
 
     @property
     def rejected_set(self) -> frozenset[str]:
@@ -66,23 +83,28 @@ class AdmissionDecision:
 _Candidate = TypeVar("_Candidate")
 
 
+def _abliterated(report: AbliterationReport) -> bool:
+    return report.abliterated
+
+
 def _partition(
     candidates: Mapping[str, _Candidate],
-    evaluate: Callable[[_Candidate], AbliterationReport],
-) -> AdmissionDecision:
+    evaluate: Callable[[_Candidate], _ReportT],
+    is_rejected: Callable[[_ReportT], bool],
+) -> AdmissionDecision[_ReportT]:
     """Run ``evaluate`` on each candidate payload and partition the agent ids.
 
-    Shared by the weight- and activation-based gates: only the per-candidate
-    ``evaluate`` differs. Propagates ``ValueError`` from the detector for a
-    malformed candidate.
+    Shared by every gate; only the per-candidate ``evaluate`` and the
+    ``is_rejected`` predicate differ. Propagates ``ValueError`` from the detector
+    for a malformed candidate.
     """
-    reports: dict[str, AbliterationReport] = {}
+    reports: dict[str, _ReportT] = {}
     admitted: list[str] = []
     rejected: list[str] = []
     for agent_id, payload in candidates.items():
         report = evaluate(payload)
         reports[agent_id] = report
-        (rejected if report.abliterated else admitted).append(agent_id)
+        (rejected if is_rejected(report) else admitted).append(agent_id)
     return AdmissionDecision(
         admitted=tuple(sorted(admitted)),
         rejected=tuple(sorted(rejected)),
@@ -180,7 +202,7 @@ class AbliterationAdmissionGate:
         admitted / rejected with a per-agent report. Propagates ``ValueError``
         from the detector for a malformed candidate (e.g. empty matrices).
         """
-        return _partition(candidate_write_matrices, self.evaluate)
+        return _partition(candidate_write_matrices, self.evaluate, _abliterated)
 
     def select_admissible(
         self,
@@ -287,7 +309,7 @@ class ActivationAdmissionGate:
         from the detector for a malformed candidate (e.g. empty or
         dimension-mismatched activations).
         """
-        return _partition(candidate_activations, self.evaluate)
+        return _partition(candidate_activations, self.evaluate, _abliterated)
 
     def select_admissible(
         self,
@@ -309,6 +331,146 @@ class ActivationAdmissionGate:
         :class:`CommitteeSelection` and the :class:`AdmissionDecision`.
         """
         decision = self.screen(candidate_activations)
+        selection = _select_with_exclusions(
+            selector,
+            seed,
+            committee_size,
+            decision,
+            exclude=exclude,
+            require_independent=require_independent,
+            threshold_fraction=threshold_fraction,
+            max_retries=max_retries,
+        )
+        return selection, decision
+
+
+@dataclass(frozen=True)
+class RefusalDistributionReport:
+    """Verdict from a refusal-*distribution* probe.
+
+    ``score`` is the :func:`~constitutional_swarm.eval.monotonic_mas.
+    abliteration_detector.refusal_distribution_score` in ``[0, 1]`` -- higher means
+    refusal is spread across more directions (extended-refusal hardened), lower
+    means it collapses toward a single direction (abliteration-fragile).
+    ``fragile`` is ``True`` when ``score < min_distribution``: the refusal could be
+    removed by a single orthogonalization.
+
+    Unlike :class:`AbliterationReport`, this does **not** assert the model is
+    tampered -- a fragile node is honest but one abliteration edit away from losing
+    refusal. The field is named ``fragile`` (not ``abliterated``) for exactly that
+    reason.
+    """
+
+    fragile: bool
+    score: float
+    min_distribution: float
+    reasons: tuple[str, ...] = ()
+
+
+def _fragile(report: RefusalDistributionReport) -> bool:
+    return report.fragile
+
+
+@dataclass(frozen=True)
+class RefusalDirectionProbe:
+    """Refusal directions (and optionally write matrices) for one candidate node.
+
+    ``directions`` is an ``(m, d_model)`` stack of ``m >= 2`` refusal directions
+    extracted at *different* layers / token positions / prompt subsets via
+    :func:`~constitutional_swarm.eval.monotonic_mas.abliteration_detector.refusal_direction`.
+    ``write_matrices`` (optional, ``name -> [d_model, d_in]``) weights each
+    direction by the refusal-writing energy it still commands, so the score
+    reflects the *surviving* capacity. This is the input to
+    :func:`refusal_distribution_score`.
+    """
+
+    directions: np.ndarray
+    write_matrices: Mapping[str, np.ndarray] | None = None
+
+
+class RefusalDistributionGate:
+    """Admit by refusal *distribution*: prefer hardened nodes, flag fragile ones.
+
+    The trust-hardening counterpart to the abliteration gates. Where they flag a
+    node whose refusal has been *removed*, this flags a node whose refusal is
+    mediated by a *single direction* (abliteration-fragile) rather than distributed
+    across many (extended-refusal hardened, arXiv:2505.19056). It lets a trusted
+    committee prefer hardened validators. A candidate whose
+    :func:`refusal_distribution_score` falls below ``min_distribution`` is flagged
+    as ``fragile``.
+
+    The flag is a trust signal, **not** a tamper verdict -- the per-agent reports
+    carry the score, so a caller may down-weight a fragile node rather than exclude
+    it. :meth:`select_admissible` takes the exclude posture (a fragile node is kept
+    out of the committee), matching the abliteration gates' surface.
+
+    Parameters
+    ----------
+    min_distribution:
+        Flag a candidate whose distribution score is below this, in ``[0, 1]``
+        (default ``0.5``). Higher demands a more distributed (harder) refusal.
+    """
+
+    def __init__(self, *, min_distribution: float = 0.5) -> None:
+        if not 0.0 <= min_distribution <= 1.0:
+            msg = "min_distribution must be in [0, 1]"
+            raise ValueError(msg)
+        self._min_distribution = float(min_distribution)
+
+    def evaluate(self, probe: RefusalDirectionProbe) -> RefusalDistributionReport:
+        """Score one candidate's refusal distribution and decide if it is fragile."""
+        score = refusal_distribution_score(
+            probe.directions, write_matrices=probe.write_matrices
+        )
+        fragile = score < self._min_distribution
+        reasons: tuple[str, ...] = ()
+        if fragile:
+            reasons = (
+                f"refusal distribution {score:.3f} < {self._min_distribution} "
+                "(single-direction / abliteration-fragile)",
+            )
+        return RefusalDistributionReport(
+            fragile=fragile,
+            score=score,
+            min_distribution=self._min_distribution,
+            reasons=reasons,
+        )
+
+    def screen(
+        self,
+        candidate_directions: Mapping[str, RefusalDirectionProbe],
+    ) -> AdmissionDecision[RefusalDistributionReport]:
+        """Screen each candidate ``agent_id -> RefusalDirectionProbe`` for fragility.
+
+        Returns an :class:`AdmissionDecision` partitioning the candidates into
+        admitted (distributed) / rejected (fragile) with a per-agent report.
+        Propagates ``ValueError`` from the score for a malformed candidate (e.g.
+        fewer than two directions).
+        """
+        return _partition(candidate_directions, self.evaluate, _fragile)
+
+    def select_admissible(
+        self,
+        selector: CommitteeSelector,
+        seed: str,
+        committee_size: int,
+        candidate_directions: Mapping[str, RefusalDirectionProbe],
+        *,
+        exclude: Sequence[str] = (),
+        require_independent: bool = False,
+        threshold_fraction: float = 2 / 3,
+        max_retries: int = 8,
+    ) -> tuple[CommitteeSelection, AdmissionDecision[RefusalDistributionReport]]:
+        """Screen candidates, then select a committee with fragile nodes excluded.
+
+        Mirrors :meth:`AbliterationAdmissionGate.select_admissible`: the gate's
+        flagged ids are unioned with ``exclude`` and passed to the selector, so a
+        fragile node is not sampled into the committee. Returns the
+        :class:`CommitteeSelection` and the :class:`AdmissionDecision`. A caller
+        that prefers to down-weight rather than exclude should call :meth:`screen`
+        and read the per-agent scores instead.
+        """
+        decision = self.screen(candidate_directions)
         selection = _select_with_exclusions(
             selector,
             seed,
