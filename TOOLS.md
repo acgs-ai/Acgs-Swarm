@@ -22,7 +22,7 @@ the venv once with `make setup`, then use the `make` targets below.
 | `make test-all` | Adds research-marked tests. |
 | `make lint` | `ruff check src/constitutional_swarm/` (CI gate). |
 | `make format` | `ruff format` source + scripts. |
-| `make typecheck` | Static gate — ruff lint (no mypy/pyright configured; see [BLOCKERS.md](BLOCKERS.md) B3). |
+| `make typecheck` | Static type-check with mypy (config + adoption baseline in `pyproject.toml` `[tool.mypy]`). |
 | `make smoke` | Offline import + CLI `--help` sanity (no credentials). |
 | `make agent-check` | Validate registries + doc completeness. |
 | `make verify` | Full local gate: lint → agent-check → smoke → test. |

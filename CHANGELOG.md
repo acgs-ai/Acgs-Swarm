@@ -7,6 +7,12 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Static type-checking with mypy (closes BLOCKERS.md B3): `[tool.mypy]` config in
+  `pyproject.toml` (`ignore_missing_imports`, with an adoption baseline that
+  allow-lists modules carrying pre-existing type errors so the rest of the package
+  — including new code — is checked and protected from regressions). `make
+  typecheck` now runs `mypy` (was a ruff stand-in) and is part of `make verify`; a
+  `typecheck` CI job gates PRs. `mypy>=1.11` added to the `dev` extra.
 - Abliteration-aware quorum admission: `node_admission.AbliterationAdmissionGate`
   screens candidate validators' residual-stream write matrices with the
   abliteration detector and feeds the rejected agent ids into

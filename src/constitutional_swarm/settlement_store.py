@@ -15,13 +15,16 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Protocol
 
+_fcntl: ModuleType | None
 try:
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised on Windows
     _fcntl = None
 
+_msvcrt: ModuleType | None
 try:
     import msvcrt as _msvcrt
 except ImportError:  # pragma: no cover - exercised on POSIX

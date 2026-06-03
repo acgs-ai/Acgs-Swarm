@@ -253,7 +253,7 @@ class MerkleCRDT:
     def _heads_unlocked(self) -> frozenset[str]:
         """Heads computation without lock (caller must hold lock)."""
         all_cids = set(self._nodes.keys())
-        non_heads = set()
+        non_heads: set[str] = set()
         for node in self._nodes.values():
             non_heads.update(node.parent_cids)
         return frozenset(all_cids - non_heads)
