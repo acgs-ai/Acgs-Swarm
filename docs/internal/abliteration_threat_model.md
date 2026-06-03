@@ -121,13 +121,21 @@ reference/adversarial fixtures.
   externalized-enforcement, CI-safe core. (Plan:
   `docs/plans/2026-06-03-002-feat-extended-refusal-finetuning-plan.md`; feasibility:
   `docs/plans/2026-06-03-001-feat-extended-refusal-finetuning-feasibility.md`.)
+- ✅ **Refusal-distribution admission gate.** `node_admission.RefusalDistributionGate`
+  screens candidate validators on the *distribution* axis: it flags a node whose
+  refusal is mediated by a single direction (`refusal_distribution_score` below a
+  configurable `min_distribution`) so a trusted committee can prefer extended-refusal-
+  hardened nodes. Same `screen()` / `select_admissible()` surface as the abliteration
+  gates, feeding the same `CommitteeSelector.select(exclude=...)` path. The flag is a
+  **trust signal, not a tamper verdict** — its report uses the honest field name
+  `fragile` (the node is honest, just one orthogonalization from losing refusal), so a
+  caller may down-weight rather than exclude. Candidates are passed as
+  `RefusalDirectionProbe(directions, write_matrices=None)`; the optional write matrices
+  weight each direction by its *surviving* refusal-writing energy. Screening needs
+  runtime directions/weights → `research` extra + a model; the score itself is pure-NumPy.
 
 ### Open
 
-- ⬜ **Activation-/weight-path admission gate for `refusal_distribution_score`** —
-  the measurement ships; wiring it into `node_admission` (down-weight or exclude nodes
-  whose refusal is single-direction, alongside the existing abliteration gates) is an
-  additive follow-up. Requires runtime weights/activations → `research` extra + a model.
 - ⬜ **No tamper count for Byzantine accounting** (from *Where it bites #2*): the swarm
   flags/excludes abliterated nodes but cannot *count* compromised peers to validate the
   `<1/3` Byzantine assumption directly.
