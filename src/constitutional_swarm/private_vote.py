@@ -370,7 +370,7 @@ class CommitRecord:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> CommitRecord:
         try:
-            version = int(data["version"])  # type: ignore[arg-type]
+            version = int(data["version"])  # type: ignore[call-overload]
             proof_scheme: str | None = None
             validity_proof: bytes | None = None
             if version >= _V2_VERSION:
@@ -419,7 +419,7 @@ class RevealRecord:
     def from_dict(cls, data: Mapping[str, object]) -> RevealRecord:
         try:
             return cls(
-                version=int(data["version"]),  # type: ignore[arg-type]
+                version=int(data["version"]),  # type: ignore[call-overload]
                 commit=bytes.fromhex(str(data["commit"])),
                 choice=BallotChoice(str(data["choice"])),
                 nonce=bytes.fromhex(str(data["nonce"])),

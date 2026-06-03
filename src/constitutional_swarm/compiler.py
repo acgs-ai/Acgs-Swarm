@@ -8,10 +8,10 @@ graph (no cycles, no missing deps), and produces a TaskDAG ready for SwarmExecut
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -111,7 +111,10 @@ class GoalSpec:
 
     goal: str
     domains: tuple[str, ...] | list[str]
-    steps: tuple[GoalStep | Mapping[str, Any], ...] | list[GoalStep | Mapping[str, Any]]
+    # Accepts any sequence of GoalStep or raw mapping; __post_init__ normalizes
+    # each to a GoalStep. Sequence (covariant) so callers can pass e.g.
+    # list[dict[str, Any]] without an invariance error.
+    steps: Sequence[GoalStep | Mapping[str, Any]]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "domains", tuple(self.domains))
@@ -188,7 +191,10 @@ class DAGCompiler:
         Raises:
             ValueError: On validation failure (cycles, missing deps, etc.)
         """
-        steps = spec.steps
+        # GoalSpec.__post_init__ normalizes every step to a GoalStep, so the
+        # field's wider input type (Mapping allowed at construction) no longer
+        # applies here.
+        steps = cast("tuple[GoalStep, ...]", spec.steps)
         domains = spec.domains
 
         # Validate domains
@@ -249,14 +255,14 @@ class DAGCompiler:
         dag = TaskDAG(goal=spec.goal)
         for step in steps:
             node_id = title_to_id[step.title]
-            dep_ids = tuple(title_to_id[dt] for dt in step.depends_on)
+            dep_id_tuple = tuple(title_to_id[dt] for dt in step.depends_on)
             node = TaskNode(
                 node_id=node_id,
                 title=step.title,
                 description=step.description,
                 domain=step.domain,
                 required_capabilities=step.required_capabilities,
-                depends_on=dep_ids,
+                depends_on=dep_id_tuple,
                 priority=step.priority,
                 max_budget_tokens=step.max_budget_tokens,
             )

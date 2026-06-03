@@ -375,9 +375,9 @@ def main(argv: list[str] | None = None) -> int:
             0 if result.final_state in {"handoff_ready", "human_review_required"} else 1
         )
     if args.command == "verify":
-        result = verify_bundle(args.bundle)
-        print(json.dumps(result, sort_keys=True))
-        return 0 if result["ok"] else 1
+        verify_result = verify_bundle(args.bundle)
+        print(json.dumps(verify_result, sort_keys=True))
+        return 0 if verify_result["ok"] else 1
     if args.command == "pack":
         bundle = pack_task(args.task)
         print(
@@ -672,13 +672,11 @@ def _latest_payload(events: list[dict[str, Any]], event_type: str) -> dict[str, 
 
 
 def _load_actions(swarm: dict[str, Any], task: TaskSpec) -> list[Action]:
-    adapters = swarm.get("adapters") if isinstance(swarm.get("adapters"), dict) else {}
+    raw_adapters = swarm.get("adapters")
+    adapters = raw_adapters if isinstance(raw_adapters, dict) else {}
     adapter_name = _executor_adapter_name(swarm)
-    adapter_config = (
-        adapters.get(adapter_name)
-        if isinstance(adapters.get(adapter_name), dict)
-        else {}
-    )
+    raw_config = adapters.get(adapter_name)
+    adapter_config = raw_config if isinstance(raw_config, dict) else {}
     return build_adapter(adapter_name, adapter_config).propose_actions(task)
 
 

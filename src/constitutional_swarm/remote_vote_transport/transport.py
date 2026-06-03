@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -152,7 +153,9 @@ class RemoteVoteServer:
         async for message in websocket:
             request = decode_remote_vote_request(str(message))
             response = self._handler(request)
-            if asyncio.iscoroutine(response):
+            # isawaitable (not iscoroutine) narrows the union to RemoteVoteResponse
+            # in the else branch and also covers non-coroutine awaitables.
+            if inspect.isawaitable(response):
                 response = await response
             await websocket.send(encode_remote_vote_response(response))
 

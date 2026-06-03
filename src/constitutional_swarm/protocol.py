@@ -210,7 +210,7 @@ def encode_spectral_sphere_snapshot_v1(snapshot: dict[str, Any]) -> bytes:
 
 
 def _normalize(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _normalize(asdict(value))
     if isinstance(value, dict):
         return {str(key): _normalize(value[key]) for key in sorted(value)}

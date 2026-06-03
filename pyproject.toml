@@ -97,34 +97,19 @@ warn_redundant_casts = true
 # it would flip-flop the gate by environment.
 # Adoption baseline: the modules below still have pre-existing type errors and
 # are allowed to fail while they are tightened incrementally. Everything NOT
-# listed here is checked and must stay clean — new code (e.g. node_admission)
-# is type-checked from day one and protected against regressions. Graduate a
-# module by deleting its entry once it passes. See BLOCKERS.md B3.
+# listed here is checked and must stay clean. Graduate a module by deleting its
+# entry once it passes. See BLOCKERS.md B3.
 [[tool.mypy.overrides]]
 # Optional-dependency-gated subpackages: types resolve against extras that are
 # not installed in the typecheck environment ([bittensor], [langgraph],
-# swe-bench harness, [research] torch/transformers).
+# swe-bench harness, [research] torch/transformers), so clean-up requires those
+# extras present and is deferred.
 module = [
   "constitutional_swarm.bittensor.*",
   "constitutional_swarm.langgraph_runtime.*",
   "constitutional_swarm.swe_bench.*",
   "constitutional_swarm.latent_dna",
   "constitutional_swarm.eval.monotonic_mas.evaluator",
-]
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-# Stable-core modules with pre-existing dynamic patterns pending annotation.
-module = [
-  "constitutional_swarm.bench",
-  "constitutional_swarm.compiler",
-  "constitutional_swarm.dna",
-  "constitutional_swarm.governance_receipts",
-  "constitutional_swarm.governed_handoff",
-  "constitutional_swarm.mesh.core",
-  "constitutional_swarm.private_vote",
-  "constitutional_swarm.protocol",
-  "constitutional_swarm.remote_vote_transport.transport",
 ]
 ignore_errors = true
 

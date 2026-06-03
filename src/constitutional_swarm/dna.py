@@ -88,9 +88,10 @@ class AgentDNA:
     _total_latency_ns: int = field(init=False, repr=False, default=0)
     _disabled: bool = field(init=False, repr=False, default=False)
     # Per-instance lock protecting the mutable counter fields (_call_count,
-    # _violation_count, _total_latency_ns, _disabled).  Not included in repr
-    # or comparison; cannot be a field because threading.Lock is not picklable
-    # by default — we create it imperatively in __post_init__ instead.
+    # _violation_count, _total_latency_ns, _disabled). Declared init=False with
+    # no default and created imperatively in __post_init__ (threading.Lock is not
+    # picklable, so it must not be a default value); excluded from repr/compare.
+    _stats_lock: threading.Lock = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_engine", GovernanceEngine(self.constitution, strict=self.strict))
