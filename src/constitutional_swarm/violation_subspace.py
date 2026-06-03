@@ -10,6 +10,10 @@ This module introduces:
 
 - :class:`ViolationSubspace` — an orthonormal rank-k basis plus an
   optional LEACE whitening. Generalizes ``v_viol`` to any rank ``k``.
+  :meth:`~ViolationSubspace.orthogonalize_against` hardens the subspace
+  against abliteration by projecting the refusal direction ``r̂`` out, so
+  governance steering survives a model whose write matrices were
+  orthogonalized against ``r̂`` (see ``docs/internal/abliteration_threat_model.md``).
 - :func:`fit_subspace` — learn a subspace from labeled safe/unsafe
   hidden-state samples via truncated SVD of contrastive differences.
 - :func:`fit_leace` — LEACE-style oblique projection that erases
@@ -170,6 +174,116 @@ class ViolationSubspace:
         if self.is_leace:
             centered = centered @ self.whitener.T  # type: ignore[union-attr]
         return centered @ self.basis.T
+
+    # -----------------------------------------------------------------------
+    # Abliteration hardening (threat model: docs/internal/abliteration_threat_model.md)
+    #
+    # Abliteration (Arditi et al. 2406.11717) zeros the residual-stream *write*
+    # matrices along a refusal direction r̂, so any steering whose effect in the
+    # original residual space lies along r̂ is silently neutralized downstream.
+    # The governance steering direction v_viol is largely *aligned* with r̂
+    # (arXiv:2603.24543), so on an abliterated model the BODES/subspace steer()
+    # enters the stream but cannot be reinforced — efficacy collapses with no error.
+    #
+    # The mitigation projects r̂ out of the subspace so the steering edit in the
+    # original residual space is orthogonal to r̂ and survives abliteration.
+    #
+    # steer() subtracts ``active @ basis`` (plain) or ``active @ basis @ dewhitenerᵀ``
+    # (LEACE) from h, so the original-space edit is ⟂ r̂ iff the basis rows are ⟂
+    # r̃, where r̃ = r̂ (plain) or r̃ = dewhitener @ r̂ (LEACE). Both helpers work in
+    # that r̃ space, so plain and LEACE subspaces harden identically.
+    # -----------------------------------------------------------------------
+
+    _VANISH_TOL = 1e-9
+
+    def _refusal_in_basis_space(self, r_hat: np.ndarray) -> np.ndarray:
+        """Map refusal direction(s) ``r̂`` into the space the basis lives in.
+
+        Accepts a single direction ``(d,)`` or a stack ``(m, d)`` (multi-directional
+        refusal, arXiv:2602.02132). Returns ``(m, d)`` row vectors ``r̃``.
+        """
+        r = np.atleast_2d(np.asarray(r_hat, dtype=np.float64))
+        if r.ndim != 2 or r.shape[-1] != self.dim:
+            raise DimensionMismatchError(
+                f"refusal direction must have trailing dim {self.dim}, got {r.shape}"
+            )
+        if self.is_leace:
+            # Original-space edit maps through dewhitenerᵀ; dewhitener is symmetric.
+            r = r @ self.dewhitener.T  # type: ignore[union-attr]
+        return r
+
+    def refusal_alignment(self, r_hat: np.ndarray) -> float:
+        """Fraction of the refusal direction(s) captured by the steering subspace.
+
+        Returns a value in ``[0, 1]``: ``1.0`` means the refusal direction lies
+        entirely inside the violation subspace (maximally abliteration-vulnerable —
+        the whole steering edit is along r̂), ``0.0`` means the subspace is already
+        orthogonal to r̂ (steering survives abliteration). After
+        :meth:`orthogonalize_against` this drops to ≈ 0. Use it to quantify the
+        exposure the threat model identifies and to verify the hardening worked.
+
+        ``r_hat`` is the refusal direction from
+        ``abliteration_detector.refusal_direction`` (Arditi extraction); a single
+        ``(d,)`` vector or a ``(m, d)`` stack.
+        """
+        r = self._refusal_in_basis_space(r_hat)
+        norms = np.linalg.norm(r, axis=1)
+        keep = norms > self._VANISH_TOL
+        if not np.any(keep):
+            raise ValueError("refusal direction is numerically zero")
+        unit = r[keep] / norms[keep, None]
+        # basis rows are orthonormal, so ‖rᵤ @ basisᵀ‖² is the captured energy.
+        captured = np.sum((unit @ self.basis.T) ** 2, axis=1)
+        return float(np.mean(captured))
+
+    def orthogonalize_against(self, r_hat: np.ndarray) -> ViolationSubspace:
+        """Return a hardened copy with the refusal direction projected out.
+
+        Removes the span of ``r̂`` from the violation subspace so the steering edit
+        in the original residual space is orthogonal to ``r̂`` and survives
+        abliteration. ``mean``, ``whitener`` and ``dewhitener`` are preserved; only
+        the ``basis`` changes. The result has rank ``≤`` the original (rows that lay
+        entirely within the refusal span vanish and are dropped).
+
+        Raises
+        ------
+        ValueError
+            If the subspace lies entirely within the refusal span (every basis row
+            vanishes) — the steering was fundamentally abliteration-vulnerable and
+            must be refit from fresh contrastive samples rather than hardened.
+        """
+        r = self._refusal_in_basis_space(r_hat)
+        # Orthonormal row span Q of the (possibly multi-directional) refusal set.
+        _, sv, vt = np.linalg.svd(r, full_matrices=False)
+        q = vt[sv > self._VANISH_TOL]
+        if q.shape[0] == 0:
+            raise ValueError("refusal direction is numerically zero")
+        # Project the refusal span out of every basis row.
+        deflated = self.basis - (self.basis @ q.T) @ q
+        row_norms = np.linalg.norm(deflated, axis=1)
+        survivors = row_norms > self._VANISH_TOL
+        if not np.any(survivors):
+            raise ValueError(
+                "violation subspace lies entirely within the refusal span; cannot "
+                "harden — refit with fresh contrastive samples"
+            )
+        kept = deflated[survivors]
+        # Re-orthonormalize (deflation breaks mutual orthonormality).
+        ortho, _ = np.linalg.qr(kept.T)
+        hardened = ortho.T[: kept.shape[0]]
+        # Re-orient toward the unsafe cone so steer()'s positive-coordinate
+        # attenuation keeps retreating from violations. The original rows were
+        # oriented so unsafe projects positively; their sum proxies that direction.
+        unsafe_proxy = self.basis[survivors].sum(axis=0)
+        for i in range(hardened.shape[0]):
+            if np.dot(hardened[i], unsafe_proxy) < 0:
+                hardened[i] = -hardened[i]
+        return ViolationSubspace(
+            basis=hardened,
+            mean=self.mean,
+            whitener=self.whitener,
+            dewhitener=self.dewhitener,
+        )
 
     def steer(self, h: np.ndarray, gamma: float = 1.0, tau: float = 0.0) -> np.ndarray:
         """Apply risk-adaptive steering to ``h``.

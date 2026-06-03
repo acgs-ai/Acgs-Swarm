@@ -48,7 +48,9 @@ output validation + peer quorum, not in the model's weights.
    abliterated model the steering vector still enters the residual stream, but the
    abliterated write matrices cannot reinforce it downstream — efficacy drops with
    no error raised. Output validation backstops correctness, but the steering layer
-   quietly stops contributing.
+   quietly stops contributing. **Mitigated** by `ViolationSubspace.orthogonalize_against`
+   (see *Hardened steering* under Follow-ups → Shipped): steering in directions ⟂ `r̂`
+   is not what abliteration zeros, so it keeps contributing.
 2. **No tamper detection.** The swarm catches *violations* but could not detect a
    *tampered model*. Byzantine tolerance assumes <1/3 abliterated peers with no way
    to count them.
@@ -92,14 +94,26 @@ reference/adversarial fixtures.
   `reference_separation`). Same `screen()` / `select_admissible()` surface as the
   weight gate, so either modality feeds the same `CommitteeSelector.select(exclude=...)`
   path. Candidates are passed as `ActivationProbe(harmful, harmless)`.
+- ✅ **Hardened steering.** `ViolationSubspace.orthogonalize_against(r̂)` projects the
+  refusal direction out of the governance steering subspace, so the steering edit in
+  the original residual space is orthogonal to `r̂` and survives abliteration
+  (arXiv:2603.24543). It handles both the plain (RepE/mean-diff) and LEACE regimes —
+  the edit maps through `dewhitener` in LEACE mode, so the deflation is computed in
+  `r̃ = dewhitener @ r̂` space — and multi-directional refusal sets (arXiv:2602.02132).
+  `ViolationSubspace.refusal_alignment(r̂)` quantifies the exposure (fraction of `r̂`
+  captured by the subspace, ∈ `[0, 1]`) and verifies the fix drives it to ≈ 0. A basis
+  lying entirely within the refusal span raises (it must be refit, not hardened). This
+  closes the silent-degradation gap in *"Where it bites" #1*; `r̂` comes from
+  `abliteration_detector.refusal_direction`. Pure-NumPy, CI-safe.
 
 ### Open
 
-- ⬜ **Harden steering**: orthogonalize the `violation_subspace` basis against `r̂` so
-  governance steering survives abliteration (arXiv:2603.24543 mitigation).
 - ⬜ **Defense-in-depth at training time** (for trusted nodes): extended-refusal
   fine-tuning distributes refusal across dimensions and resists single-direction
-  abliteration (arXiv:2505.19056, >90% residual refusal).
+  abliteration (arXiv:2505.19056, >90% residual refusal). Requires a real model +
+  fine-tuning loop (torch, not CI-safe), so it sits outside the pure-NumPy detector/
+  steering core — scoped separately. See
+  `docs/plans/` (extended-refusal fine-tuning feasibility) before implementing.
 
 ## Sources
 
