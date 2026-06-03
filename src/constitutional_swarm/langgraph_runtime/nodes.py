@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
+
+if TYPE_CHECKING:
+    from constitutional_swarm.langgraph_runtime.state import SwarmGraphState
 
 # ---------------------------------------------------------------------------
 # serialize_for_crdt resolution
@@ -33,7 +36,7 @@ try:  # pragma: no cover - the fallback branch is exercised in worktrees
     )
 except ImportError:  # Unit 2 not merged yet
 
-    def _serialize_for_crdt(state: dict[str, Any]) -> str:
+    def _serialize_for_crdt(state: SwarmGraphState) -> str:
         """Local fallback serializer; reconciled when Unit 2 merges."""
         public = {k: v for k, v in state.items() if not str(k).startswith("_")}
         return json.dumps(public, default=str, sort_keys=True)
@@ -81,8 +84,10 @@ def generate_node(
 def append_crdt_node(state: Mapping[str, Any], *, crdt: Any) -> dict[str, Any]:
     """Append the current state to a MerkleCRDT.  Returns the new CID in state."""
     # ``dict(state)`` matches the eventual Unit 2 ``serialize_for_crdt`` signature
-    # (operates on a concrete dict, not the ``Mapping`` protocol).
-    payload = _serialize_for_crdt(dict(state))
+    # (operates on a concrete dict, not the ``Mapping`` protocol). The cast bridges
+    # the read-only ``Mapping`` parameter to the ``SwarmGraphState`` TypedDict the
+    # serializer declares; keys are a superset by construction.
+    payload = _serialize_for_crdt(cast("SwarmGraphState", dict(state)))
     governed = bool(state.get("governed", False))
     node = crdt.append(payload=payload, bodes_passed=governed)
     # MerkleCRDT.append returns a DAGNode whose CID lives on .cid; stubs may

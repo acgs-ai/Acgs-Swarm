@@ -74,6 +74,10 @@ class _HFModelLike(Protocol):
 
     def generate(self, *args: Any, **kwargs: Any) -> Any: ...
 
+    def eval(self) -> Any: ...
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
 
 class _BODESHook:
     """Internal forward hook implementing the CBF steering step.

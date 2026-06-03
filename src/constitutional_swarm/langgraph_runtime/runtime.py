@@ -15,8 +15,8 @@ Fail-closed contract:
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from typing import Any, TypedDict
+from collections.abc import Callable, Mapping
+from typing import Any, TypedDict, cast
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
@@ -66,15 +66,16 @@ def _import_or_stub_guards():
         return constitutional_hash_guard, fail_closed_guard
     except ImportError:
 
-        def constitutional_hash_guard(state):
+        def constitutional_hash_guard(state: Mapping[str, object]) -> str:
             return (
                 "ok"
                 if state.get("constitutional_hash") == CONSTITUTIONAL_HASH
                 else "halt"
             )
 
-        def fail_closed_guard(state):
-            if state.get("violations") or float(state.get("risk_score", 0.0)) >= 0.3:
+        def fail_closed_guard(state: Mapping[str, object]) -> str:
+            risk = float(cast("float", state.get("risk_score", 0.0) or 0.0))
+            if state.get("violations") or risk >= 0.3:
                 return "reject"
             return "accept"
 
@@ -94,7 +95,11 @@ def _import_or_stub_nodes():
         return generate_node, validate_node, append_crdt_node, settle_node
     except ImportError:
 
-        def generate_node(state, *, generator):
+        def generate_node(
+            state: Mapping[str, Any],
+            *,
+            generator: Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]],
+        ) -> dict[str, Any]:
             patch, stats = generator(state)
             return {
                 "patch": patch,
@@ -102,7 +107,7 @@ def _import_or_stub_nodes():
                 "constitutional_hash": CONSTITUTIONAL_HASH,
             }
 
-        def validate_node(state, *, dna):
+        def validate_node(state: Mapping[str, Any], *, dna: Any) -> dict[str, Any]:
             patch = state.get("patch", "")
             if not patch or dna is None:
                 return {"violations": [], "risk_score": 0.0, "governed": True}
@@ -116,7 +121,7 @@ def _import_or_stub_nodes():
                 "governed": True,
             }
 
-        def append_crdt_node(state, *, crdt):
+        def append_crdt_node(state: Mapping[str, Any], *, crdt: Any) -> dict[str, Any]:
             if crdt is None:
                 return {"cid": ""}
             payload = json.dumps(
@@ -129,7 +134,7 @@ def _import_or_stub_nodes():
             )
             return {"cid": str(cid)}
 
-        def settle_node(state):
+        def settle_node(state: Mapping[str, Any]) -> dict[str, Any]:
             return {"settled": bool(state.get("quorum_reached", False))}
 
         return generate_node, validate_node, append_crdt_node, settle_node

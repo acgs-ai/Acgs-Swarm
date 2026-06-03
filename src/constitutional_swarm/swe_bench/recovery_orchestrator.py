@@ -9,7 +9,7 @@ separate attempt log plus a derived ``final_rows`` view for reporting deltas.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -603,7 +603,7 @@ def _bundle(
     )
 
 
-def _summarize_rows(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     total = len(rows)
     patch_generated = sum(1 for row in rows if row.get("patch_generated"))
     applied = sum(1 for row in rows if row.get("applied"))

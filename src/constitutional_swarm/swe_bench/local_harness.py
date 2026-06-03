@@ -239,11 +239,12 @@ class LocalSWEBenchHarness:
                 effective_version = inst_version or self.python_version
                 if effective_version is None:
                     effective_version = _detect_python_version(worktree)
-                venv_path, test_python = self._ensure_env(
+                venv_path, isolated_python = self._ensure_env(
                     instance_id, worktree, result, python_version=effective_version
                 )
-                if test_python is None:
+                if isolated_python is None:
                     return result
+                test_python = isolated_python
             self._run_tests(worktree, fail_to_pass, pass_to_pass, result, test_python)
             result.stage = "done"
             result.resolved = (

@@ -95,23 +95,19 @@ warn_redundant_casts = true
 # NB: warn_unused_ignores is intentionally OFF — many `# type: ignore`s are only
 # unused when an optional extra (transport/research/...) is absent, so enabling
 # it would flip-flop the gate by environment.
-# Adoption baseline: the modules below still have pre-existing type errors and
-# are allowed to fail while they are tightened incrementally. Everything NOT
-# listed here is checked and must stay clean. Graduate a module by deleting its
-# entry once it passes. See BLOCKERS.md B3.
+# The whole package is now checked and must stay clean — there is no adoption
+# allow-list. New regressions in any module fail the gate. See BLOCKERS.md B3.
+
 [[tool.mypy.overrides]]
-# Optional-dependency-gated subpackages: types resolve against extras that are
-# not installed in the typecheck environment ([bittensor], [langgraph],
-# swe-bench harness, [research] torch/transformers), so clean-up requires those
-# extras present and is deferred.
-module = [
-  "constitutional_swarm.bittensor.*",
-  "constitutional_swarm.langgraph_runtime.*",
-  "constitutional_swarm.swe_bench.*",
-  "constitutional_swarm.latent_dna",
-  "constitutional_swarm.eval.monotonic_mas.evaluator",
-]
-ignore_errors = true
+# acgs-lite is installed (workspace/PyPI) but ships no py.typed, so mypy follows
+# it and reports its re-exported classes as untyped *variables* — "X is not valid
+# as a type", "object not callable" — rather than treating them as Any like the
+# other unstubbed deps. follow_imports=skip puts acgs-lite on the same footing as
+# the missing-import deps and, crucially, makes the gate robust to acgs-lite
+# version drift between the local workspace build and CI's PyPI wheel.
+module = ["acgs_lite", "acgs_lite.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [tool.pytest.ini_options]
 addopts = ["-p", "no:braintrust"]

@@ -27,6 +27,7 @@ All pickers must be deterministic given the same input order.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -132,7 +133,9 @@ def pick_vote(candidates: list[SWEPatch]) -> tuple[int, str]:
 
 # Registry for CLI dispatch. Picker callables can take an extra `dna` kwarg;
 # the runner provides it only to pickers that declare it.
-PICKERS = {
+# Pickers vary in arity (``pick_governed_score`` also takes a dna arg, gated by
+# ``needs_dna``), so the value type is the permissive ``Callable[..., tuple[int, str]]``.
+PICKERS: dict[str, Callable[..., tuple[int, str]]] = {
     "longest": pick_longest,
     "first-valid": pick_first_valid,
     "governed-score": pick_governed_score,

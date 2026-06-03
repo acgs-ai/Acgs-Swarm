@@ -148,10 +148,11 @@ class CAMECoordinator:
             self._grid = None  # type: ignore[assignment]
 
         # ---- rule codifier -----------------------------------------------
+        self._codifier: Any
         if codifier is not None:
             self._codifier = codifier
         elif RuleCodifier is not None:
-            self._codifier: Any = RuleCodifier(constitutional_hash=_CONSTITUTIONAL_HASH)
+            self._codifier = RuleCodifier(constitutional_hash=_CONSTITUTIONAL_HASH)
         else:
             self._codifier = None
 
