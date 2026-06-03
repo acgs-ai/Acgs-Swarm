@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+from functools import partial
 from typing import Any
 
 from constitutional_swarm.merkle_crdt import MerkleCRDT
@@ -63,7 +64,7 @@ def run_langgraph(
         )
 
         effective_agents = [
-            LangGraphSWEBenchAgent(graph_factory=lambda a=a: graph_factory(a))
+            LangGraphSWEBenchAgent(graph_factory=partial(graph_factory, a))
             for a in agents
         ]
 

@@ -36,7 +36,10 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 log = logging.getLogger(__name__)
 
@@ -209,7 +212,7 @@ def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> 
     in_tok = sum(r.get("input_tokens", 0) or 0 for r in logical)
     out_tok = sum(r.get("output_tokens", 0) or 0 for r in logical)
     cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in logical)
-    durations = [r.get("elapsed_s") for r in logical if r.get("elapsed_s") is not None]
+    durations = [d for r in logical if (d := r.get("elapsed_s")) is not None]
 
     summary = {
         "run_id": run_id,
@@ -282,6 +285,7 @@ def _build_agent(
     governed: bool = False,
 ):
     """Construct the SWEBenchAgent for the chosen provider, optionally governed."""
+    base: SWEBenchAgent
     if provider == "oauth":
         from constitutional_swarm.swe_bench.claude_oauth_agent import (
             ClaudeOAuthSWEBenchAgent,
@@ -451,7 +455,7 @@ def run_swarm_batch(
         log.info("Swarm batch %s: %d agents x %d tasks (model=%s)", batch_id, k, len(tasks), model)
 
         # Round-robin: task j -> agent j % k. Track elapsed per-instance via timing wrapper.
-        timings: list[float] = []
+        timings: list[tuple[int, str, float]] = []
         original_solves = [a.solve for a in agents]
 
         def _wrap(agent_idx: int):
@@ -791,7 +795,7 @@ def _recompute_summary_winners(
     in_tok = sum(r.get("input_tokens", 0) or 0 for r in winners)
     out_tok = sum(r.get("output_tokens", 0) or 0 for r in winners)
     cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in winners)
-    durations = [r.get("elapsed_s") for r in winners if r.get("elapsed_s") is not None]
+    durations = [d for r in winners if (d := r.get("elapsed_s")) is not None]
 
     summary = {
         "run_id": run_id,

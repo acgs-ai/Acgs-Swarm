@@ -15,6 +15,7 @@ Mirrors:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import cast
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
@@ -40,7 +41,9 @@ def fail_closed_guard(state: Mapping[str, object]) -> str:
     Mirrors swe_bench/governed_agent.py:135 - fail-closed on either signal.
     """
     violations = state.get("violations") or []
-    risk = float(state.get("risk_score", 0.0) or 0.0)
+    # state is a generic Mapping[str, object]; risk_score is numeric per
+    # SwarmGraphState. cast bridges the read-only-object value to float().
+    risk = float(cast("float", state.get("risk_score", 0.0) or 0.0))
     if violations or risk >= _RISK_THRESHOLD:
         return "reject"
     return "accept"

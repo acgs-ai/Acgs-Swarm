@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,14 +28,22 @@ from constitutional_swarm.bittensor.synapses import (
     JudgmentSynapse,
 )
 
-try:
-    import bittensor as bt
+if TYPE_CHECKING:
+    # bittensor.Synapse is unstubbed (treated as Any), which is not valid as a
+    # static base class. Pin the type-check base to the always-present pydantic
+    # BaseModel so GovernanceDeliberation has a concrete base for analysis; the
+    # runtime base is bt.Synapse when bittensor is installed.
+    _SynapseBase = BaseModel
+    HAS_BITTENSOR: bool
+else:
+    try:
+        import bittensor as bt
 
-    _SynapseBase = bt.Synapse
-    HAS_BITTENSOR = True
-except ImportError:
-    _SynapseBase = BaseModel  # type: ignore[assignment,misc]
-    HAS_BITTENSOR = False
+        _SynapseBase = bt.Synapse
+        HAS_BITTENSOR = True
+    except ImportError:
+        _SynapseBase = BaseModel
+        HAS_BITTENSOR = False
 
 
 class GovernanceDeliberation(_SynapseBase):

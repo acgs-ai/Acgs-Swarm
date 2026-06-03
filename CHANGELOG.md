@@ -53,8 +53,23 @@ The format is based on Keep a Changelog.
   `governance_receipts` (`Final` literal constants), `governed_handoff`
   (narrowing + a renamed local), `private_vote` (corrected `# type: ignore` code),
   `protocol` (guard `asdict` against dataclass *types*), `remote_vote_transport`
-  (`inspect.isawaitable` narrowing). Optional-dep-gated subpackages remain
-  allow-listed pending their extras in the typecheck env (see BLOCKERS.md B3).
+  (`inspect.isawaitable` narrowing).
+- Type-checking: graduated the remaining optional-dependency-gated subpackages
+  (`bittensor`, `langgraph_runtime`, `swe_bench`, `latent_dna`,
+  `eval.monotonic_mas.evaluator`) and **removed the adoption allow-list entirely**
+  — the whole package is now enforced. The acgs-lite `valid-type` /
+  `object-not-callable` noise (no `py.typed`) is handled package-wide by a single
+  `follow_imports = "skip"` override on `acgs_lite.*`, which also makes the gate
+  robust to acgs-lite version drift between the local workspace build and CI's
+  PyPI wheel. Remaining fixes were annotation-only / behavior-preserving:
+  `_HFModelLike` protocol gained `eval`/`__call__`; import-or-stub fallbacks in
+  `langgraph_runtime` annotated to match their real signatures; a `partial`
+  replaced a loop-capture lambda; `SwarmGraphState` casts on read-only `Mapping`
+  reads; `_summarize_rows` widened to a covariant `Sequence`; a corrected
+  `timings: list[tuple[int, str, float]]` annotation; `PICKERS` typed as
+  `dict[str, Callable[..., tuple[int, str]]]`; walrus narrowing for optional
+  duration lists. 108 source files check clean with no heavy extras installed
+  (closes the BLOCKERS.md B3 follow-up).
 - `SpectralSphereManifold` default `smoothing` lowered from `0.999` to `0.9`. The
   over-damped default retained 99.9% of stale state per projection, so the
   production trust manifold (built with defaults in `mesh/core.py`, consumed by

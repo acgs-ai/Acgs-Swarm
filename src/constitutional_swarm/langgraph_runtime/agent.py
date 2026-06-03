@@ -13,11 +13,12 @@ of the in-flight guard nodes inside the graph.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 if TYPE_CHECKING:
+    from constitutional_swarm.langgraph_runtime.state import SwarmGraphState
     from constitutional_swarm.latent_dna import LatentDNAWrapper
 
 
@@ -81,17 +82,20 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
             from constitutional_swarm.langgraph_runtime.state import init_state
         except ImportError:
             # Local fallback if Unit 2 (state module) hasn't merged yet.
-            def init_state(t: dict[str, Any]) -> dict[str, Any]:
-                return {
-                    "task_id": t.get("instance_id", "unknown"),
-                    "problem_statement": t.get("problem_statement", ""),
-                    "messages": [],
-                    "patch": "",
-                    "violations": [],
-                    "risk_score": 0.0,
-                    "intervention_rate": 0.0,
-                    "constitutional_hash": "",
-                }
+            def init_state(task: dict[str, Any]) -> SwarmGraphState:
+                return cast(
+                    "SwarmGraphState",
+                    {
+                        "task_id": task.get("instance_id", "unknown"),
+                        "problem_statement": task.get("problem_statement", ""),
+                        "messages": [],
+                        "patch": "",
+                        "violations": [],
+                        "risk_score": 0.0,
+                        "intervention_rate": 0.0,
+                        "constitutional_hash": "",
+                    },
+                )
 
         graph = self._graph_factory()
         initial = init_state(task)

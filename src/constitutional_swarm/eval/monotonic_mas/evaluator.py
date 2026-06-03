@@ -59,7 +59,10 @@ def import_graph_audit() -> dict:
 
     leaked = [name for name in dir(gen) if "constitutional_swarm" in name.lower()]
     # also look at the source for any 'import constitutional_swarm' line
-    src = Path(gen.__file__).read_text()
+    gen_file = gen.__file__
+    if gen_file is None:
+        return {"audited": False, "reason": "generator module exposes no source file"}
+    src = Path(gen_file).read_text()
     has_import_line = any(
         line.strip().startswith(("import constitutional_swarm", "from constitutional_swarm"))
         for line in src.splitlines()
