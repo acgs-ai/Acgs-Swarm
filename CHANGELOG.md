@@ -7,6 +7,7 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Agent self-evolution harness: `scripts/agent_self_evolve.py` discovers every operational agent manifest and vendored persona template, emits offline per-agent mutation scopes/guardrails/probes/suggestions, and is wired through `make agent-self-evolve`, `tools/registry.yaml`, and a runbook.
 - Byzantine tamper-fraction census: `byzantine_census.estimate_tampered_fraction`
   turns a screened sample (`n_screened`, `n_tampered`) into a point estimate plus a
   two-sided confidence interval (Wilson score or exact Clopper-Pearson — pure

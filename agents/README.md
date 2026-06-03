@@ -32,3 +32,16 @@ discover → register/select role → plan → execute → validate → produce 
 A completed task should report: execution log, changed-files summary, tests
 run, validation result, unresolved blockers ([../BLOCKERS.md](../BLOCKERS.md)),
 and the next recommended action.
+
+## Self-evolution harness
+
+Run the offline harness generator before mutating agent contracts or templates:
+
+```bash
+make agent-self-evolve
+```
+
+The report is written to `.omx/state/agent-self-evolve-report.json` and includes
+one harness per discovered operational manifest and persona template: mutation
+scope, guardrails, static probes, pass rates, and deterministic suggestions. The
+command is offline; it does not call live LLMs or external agent runtimes.
