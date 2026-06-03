@@ -49,7 +49,9 @@ class DNAValidationResult:
     risk_score: float = 0.0
     risk_level: str = "unknown"
     scoring_method: str = "keyword"
-    z3_result: Z3VerifyResult | None = None
+    # acgs-lite ships no py.typed, so some builds expose Z3* as runtime variables
+    # rather than types; tolerate that here (warn_unused_ignores is off).
+    z3_result: Z3VerifyResult | None = None  # type: ignore[valid-type]
 
 
 @dataclass
@@ -82,7 +84,7 @@ class AgentDNA:
     _engine: GovernanceEngine = field(init=False, repr=False)
     _maci: MACIEnforcer | None = field(init=False, repr=False, default=None)
     _scorer: ConstitutionalImpactScorer | None = field(init=False, repr=False, default=None)
-    _z3: Z3ConstraintVerifier | None = field(init=False, repr=False, default=None)
+    _z3: Z3ConstraintVerifier | None = field(init=False, repr=False, default=None)  # type: ignore[valid-type]
     _call_count: int = field(init=False, repr=False, default=0)
     _violation_count: int = field(init=False, repr=False, default=0)
     _total_latency_ns: int = field(init=False, repr=False, default=0)
@@ -103,7 +105,7 @@ class AgentDNA:
         if self.risk_scoring:
             object.__setattr__(self, "_scorer", ConstitutionalImpactScorer())
         if self.z3_verify:
-            object.__setattr__(self, "_z3", Z3ConstraintVerifier())
+            object.__setattr__(self, "_z3", Z3ConstraintVerifier())  # type: ignore[operator]
 
     @classmethod
     def from_rules(
@@ -258,7 +260,7 @@ class AgentDNA:
 
             # Layer 3: Z3 formal verification (opt-in, ~50-500ms).
             # Only invoked for critical-risk actions to keep cost proportional.
-            z3_result: Z3VerifyResult | None = None
+            z3_result: Z3VerifyResult | None = None  # type: ignore[valid-type]
             if self._z3 is not None and risk_score >= Z3_RISK_THRESHOLD:
                 z3_result = self._z3.verify(action)
 
