@@ -44,10 +44,14 @@ __all__ = [
     "apply_abliteration",
     "weight_refusal_energy",
     "latent_separation",
+    "refusal_distribution_score",
     "AbliterationReport",
     "detect_from_weights",
     "detect_from_activations",
 ]
+
+# Below this, a direction's norm / a singular value is treated as numerically zero.
+_VANISH = 1e-12
 
 
 def _unit(vector: np.ndarray) -> np.ndarray:
@@ -178,6 +182,103 @@ def latent_separation(harmful: np.ndarray, harmless: np.ndarray) -> float:
     return float(np.linalg.norm(harmful.mean(axis=0) - harmless.mean(axis=0)))
 
 
+def refusal_distribution_score(
+    directions: np.ndarray,
+    *,
+    write_matrices: Mapping[str, np.ndarray] | None = None,
+) -> float:
+    """Score how *distributed* a model's refusal representation is, in ``[0, 1]``.
+
+    Extended-refusal fine-tuning (arXiv:2505.19056) defends against abliteration by
+    spreading the refusal behavior across *many* dimensions, so no single-direction
+    edit ``W' = (I - r̂ r̂ᵀ) W`` can remove it. This is the CI-safe, pure-numpy
+    measurement of that property — the "did the hardening work?" check the
+    extended-refusal recipe verifies against:
+
+    - ``~0`` -> refusal collapses onto a *single* direction (every extraction
+      recovers the same ``r̂``): abliteration-fragile, the Arditi et al. regime
+      (arXiv:2406.11717) where one orthogonalization removes refusal.
+    - ``~1`` -> refusal is spread across mutually-distinct directions: a
+      single-direction edit leaves most of it intact (extended-refusal hardened).
+
+    ``directions`` is an ``(m, d_model)`` stack of ``m >= 2`` candidate refusal
+    directions extracted at *different* layers / token positions / prompt subsets
+    via :func:`refusal_direction`. The score is the normalized participation ratio
+    of the singular spectrum of the (optionally energy-weighted) unit directions:
+    collinear directions -> rank 1 -> ``~0``; mutually orthogonal directions ->
+    full rank -> ``~1``. The participation ratio ``(Σσ²)² / Σσ⁴`` lies in
+    ``[1, min(m, d)]`` and is mapped affinely onto ``[0, 1]``.
+
+    With ``write_matrices`` (weight mode): each direction is weighted by the refusal
+    energy it still commands across the residual-stream write matrices
+    (:func:`weight_refusal_energy`), so a direction the model can no longer write
+    along — e.g. one zeroed by abliteration — contributes less. The score then
+    reflects the distribution of the *surviving* refusal-writing capacity, which is
+    what a partially-abliterated hardened model actually retains. If every direction
+    has been zeroed out (no surviving capacity), returns ``0.0``.
+
+    Pure numpy; deterministic; no torch / live model. Raises ``ValueError`` on
+    fewer than two directions, empty/zero/non-finite directions, or an empty
+    ``write_matrices`` mapping.
+    """
+
+    dirs = np.atleast_2d(np.asarray(directions, dtype=np.float64))
+    if dirs.ndim != 2:
+        msg = "directions must be a 2D [m, d_model] array"
+        raise ValueError(msg)
+    m, d = dirs.shape
+    if m < 2:
+        msg = "need at least 2 candidate refusal directions to assess distribution"
+        raise ValueError(msg)
+    if d == 0:
+        msg = "refusal direction dimension must not be empty"
+        raise ValueError(msg)
+    _require_finite("directions", dirs)
+    norms = np.linalg.norm(dirs, axis=1)
+    if np.any(norms <= _VANISH):
+        msg = "each refusal direction must be non-zero"
+        raise ValueError(msg)
+    unit = dirs / norms[:, None]
+
+    rows = unit
+    if write_matrices is not None:
+        if not write_matrices:
+            msg = "write_matrices is empty; omit it for direction-only mode"
+            raise ValueError(msg)
+        # Per-direction surviving refusal-writing capacity: RMS energy over matrices.
+        weights = np.array(
+            [
+                float(
+                    np.sqrt(
+                        np.mean(
+                            [
+                                weight_refusal_energy(W, u) ** 2
+                                for W in write_matrices.values()
+                            ]
+                        )
+                    )
+                )
+                for u in unit
+            ],
+            dtype=np.float64,
+        )
+        if np.all(weights <= _VANISH):
+            # Refusal-writing capacity fully removed -> no surviving structure.
+            return 0.0
+        rows = unit * weights[:, None]
+
+    sv = np.linalg.svd(rows, compute_uv=False)
+    sv_sq = sv**2
+    total = float(sv_sq.sum())
+    if total <= _VANISH:
+        return 0.0
+    participation = total**2 / float((sv_sq**2).sum())
+    max_participation = float(min(m, d))
+    if max_participation <= 1.0:
+        return 0.0
+    return float(np.clip((participation - 1.0) / (max_participation - 1.0), 0.0, 1.0))
+
+
 @dataclass(frozen=True)
 class AbliterationReport:
     """Verdict from an abliteration probe.
@@ -272,7 +373,9 @@ def detect_from_weights(
         msg = "quantile must be in [0, 1]"
         raise ValueError(msg)
     r = _unit(direction)
-    per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
+    per_layer = {
+        name: weight_refusal_energy(W, r) for name, W in write_matrices.items()
+    }
     energies = np.array(list(per_layer.values()), dtype=np.float64)
     reasons: list[str] = []
 

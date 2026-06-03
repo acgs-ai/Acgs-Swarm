@@ -70,7 +70,9 @@ def test_detect_from_weights_partial_abliteration() -> None:
     clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(6)}
     candidate = dict(clean)
     for i in range(4):
-        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(
+            clean[f"layer{i}.W_out"], r
+        )
 
     report = ad.detect_from_weights(candidate, r, reference=clean)
     # Median ratio across 6 layers: 4 at ~0, 2 at ~1 -> median ~0 -> flagged.
@@ -88,7 +90,9 @@ def test_detect_from_weights_minority_subset_is_not_flagged_by_median() -> None:
     clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(6)}
     candidate = dict(clean)
     for i in range(3):  # exactly half -> median sits at the clean side
-        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(
+            clean[f"layer{i}.W_out"], r
+        )
 
     report = ad.detect_from_weights(candidate, r, reference=clean)
     assert report.abliterated is False
@@ -99,10 +103,14 @@ def test_detect_from_weights_minority_subset_is_not_flagged_by_median() -> None:
 
 def _subset_candidate(r, n_total=6, n_ablated=3):
     rng = _rng()
-    clean = {f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(n_total)}
+    clean = {
+        f"layer{i}.W_out": rng.standard_normal((D_MODEL, D_IN)) for i in range(n_total)
+    }
     candidate = dict(clean)
     for i in range(n_ablated):
-        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(clean[f"layer{i}.W_out"], r)
+        candidate[f"layer{i}.W_out"] = ad.apply_abliteration(
+            clean[f"layer{i}.W_out"], r
+        )
     return clean, candidate
 
 
@@ -122,12 +130,24 @@ def test_aggregate_quantile_tunable_sensitivity() -> None:
     # just above it (clean), but min flags it.
     r = ad._unit(_rng().standard_normal(D_MODEL))
     clean, candidate = _subset_candidate(r, n_total=6, n_ablated=1)
-    q_report = ad.detect_from_weights(candidate, r, reference=clean, aggregate="quantile", quantile=0.25)
+    q_report = ad.detect_from_weights(
+        candidate, r, reference=clean, aggregate="quantile", quantile=0.25
+    )
     assert q_report.abliterated is False
-    assert ad.detect_from_weights(candidate, r, reference=clean, aggregate="min").abliterated is True
+    assert (
+        ad.detect_from_weights(
+            candidate, r, reference=clean, aggregate="min"
+        ).abliterated
+        is True
+    )
     # Three of six collapsed -> the 0.25 quantile drops into the ablated cluster.
     _, half = _subset_candidate(r, n_total=6, n_ablated=3)
-    assert ad.detect_from_weights(half, r, reference=clean, aggregate="quantile", quantile=0.25).abliterated is True
+    assert (
+        ad.detect_from_weights(
+            half, r, reference=clean, aggregate="quantile", quantile=0.25
+        ).abliterated
+        is True
+    )
 
 
 def test_aggregate_no_reference_min_uses_absolute_floor() -> None:
@@ -181,7 +201,10 @@ def test_detect_from_weights_reference_calibration_edges() -> None:
     assert report.reasons == []
 
     below_threshold = {"layer0.W_O": np.array([[1.0], [np.sqrt(24.0)]])}
-    assert ad.detect_from_weights(below_threshold, r, reference=reference).abliterated is True
+    assert (
+        ad.detect_from_weights(below_threshold, r, reference=reference).abliterated
+        is True
+    )
 
 
 def test_detect_from_weights_rejects_unusable_reference() -> None:
@@ -190,10 +213,14 @@ def test_detect_from_weights_rejects_unusable_reference() -> None:
     candidate = {"candidate.W_O": rng.standard_normal((8, 8))}
 
     with pytest.raises(ValueError, match="shares no matrix names"):
-        ad.detect_from_weights(candidate, r, reference={"other.W_O": rng.standard_normal((8, 8))})
+        ad.detect_from_weights(
+            candidate, r, reference={"other.W_O": rng.standard_normal((8, 8))}
+        )
 
     with pytest.raises(ValueError, match="reference refusal energy"):
-        ad.detect_from_weights(candidate, r, reference={"candidate.W_O": np.zeros((8, 8))})
+        ad.detect_from_weights(
+            candidate, r, reference={"candidate.W_O": np.zeros((8, 8))}
+        )
 
 
 def test_detect_from_activations_flags_collapse() -> None:
@@ -211,11 +238,15 @@ def test_detect_from_activations_flags_collapse() -> None:
     harmful_ab = harmful @ proj.T
     harmless_ab = harmless @ proj.T
 
-    clean_report = ad.detect_from_activations(harmful, harmless, reference_separation=ref_sep)
+    clean_report = ad.detect_from_activations(
+        harmful, harmless, reference_separation=ref_sep
+    )
     assert clean_report.abliterated is False
     assert clean_report.separation_ratio == pytest.approx(1.0, abs=1e-6)
 
-    ab_report = ad.detect_from_activations(harmful_ab, harmless_ab, reference_separation=ref_sep)
+    ab_report = ad.detect_from_activations(
+        harmful_ab, harmless_ab, reference_separation=ref_sep
+    )
     assert ab_report.abliterated is True
     assert ab_report.separation_ratio < 0.75
     assert ab_report.reasons
@@ -285,11 +316,15 @@ def test_input_validation() -> None:
         ad.detect_from_weights({}, rng.standard_normal(8))
     with pytest.raises(ValueError):
         ad.detect_from_weights(
-            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), ratio_threshold=-0.1
+            {"W": rng.standard_normal((8, 8))},
+            rng.standard_normal(8),
+            ratio_threshold=-0.1,
         )
     with pytest.raises(ValueError):
         ad.detect_from_weights(
-            {"W": rng.standard_normal((8, 8))}, rng.standard_normal(8), ratio_threshold=1.1
+            {"W": rng.standard_normal((8, 8))},
+            rng.standard_normal(8),
+            ratio_threshold=1.1,
         )
     with pytest.raises(ValueError):
         ad.detect_from_weights(
@@ -326,3 +361,114 @@ def test_input_validation() -> None:
             reference_separation=1.0,
             ratio_threshold=1.1,
         )
+
+
+# ---------------------------------------------------------------------------
+# refusal_distribution_score: single-direction (abliteration-fragile) vs
+# distributed (extended-refusal hardened). Pure-numpy, deterministic.
+# ---------------------------------------------------------------------------
+
+
+def _orthonormal(m: int, d: int) -> np.ndarray:
+    """Return ``m`` orthonormal row vectors in ``R^d`` (m <= d)."""
+    q, _ = np.linalg.qr(_rng().standard_normal((d, m)))
+    return q.T[:m]
+
+
+def test_distribution_score_single_direction_is_zero() -> None:
+    # Every extraction recovers the same r̂ (collinear, up to scale/sign): the
+    # Arditi single-direction regime -> rank 1 -> score ~0 (abliteration-fragile).
+    r = ad._unit(_rng().standard_normal(D_MODEL))
+    directions = np.array([r, 2.0 * r, -0.5 * r, 1e3 * r])
+    assert ad.refusal_distribution_score(directions) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_distribution_score_orthogonal_directions_is_one() -> None:
+    # Refusal mediated by mutually-distinct directions -> full rank -> score ~1
+    # (extended-refusal hardened; a single-direction edit leaves the rest intact).
+    directions = _orthonormal(4, D_MODEL)
+    assert ad.refusal_distribution_score(directions) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_distribution_score_monotonic_as_spread_increases() -> None:
+    # Two unit directions at angle θ: score rises monotonically from 0 (collinear)
+    # to 1 (orthogonal) as θ goes 0 -> π/2.
+    scores = []
+    for theta in np.linspace(0.0, np.pi / 2, 9):
+        directions = np.array(
+            [
+                [1.0, 0.0],
+                [float(np.cos(theta)), float(np.sin(theta))],
+            ]
+        )
+        scores.append(ad.refusal_distribution_score(directions))
+    assert scores[0] == pytest.approx(0.0, abs=1e-9)
+    assert scores[-1] == pytest.approx(1.0, abs=1e-9)
+    diffs = np.diff(scores)
+    assert np.all(diffs >= -1e-12)  # non-decreasing
+    assert diffs.sum() > 0.5  # and actually climbs
+
+
+def test_distribution_score_weight_mode_drops_abliterated_direction() -> None:
+    # Build a model whose refusal-writing capacity is spread equally across 3
+    # orthonormal directions, then abliterate ONE. Weight mode should report the
+    # surviving (2-direction) distribution, scoring strictly below the clean model.
+    D = _orthonormal(3, D_MODEL)
+    A = _rng().standard_normal((3, D_IN))
+    A = A / np.linalg.norm(A, axis=1, keepdims=True)  # equal per-direction energy
+    W = D.T @ A  # d_jᵀ W = A[j] for orthonormal D -> equal refusal energy per dir
+
+    clean_score = ad.refusal_distribution_score(D, write_matrices={"W_O": W})
+    assert clean_score == pytest.approx(1.0, abs=1e-6)  # 3 equal orthogonal dirs
+
+    W_ab = ad.apply_abliteration(W, D[0])  # zero the model's writing along D[0]
+    ab_score = ad.refusal_distribution_score(D, write_matrices={"W_O": W_ab})
+    # Surviving capacity now lives on 2 of 3 directions: PR=2, max=3 -> 0.5.
+    assert ab_score == pytest.approx(0.5, abs=1e-6)
+    assert ab_score < clean_score
+
+    # Cross-check with the detector: the abliterated direction's energy collapsed,
+    # which detect_from_weights(min) flags against a clean reference.
+    flagged = ad.detect_from_weights(
+        {"W_O": W_ab}, D[0], reference={"W_O": W}, aggregate="min"
+    )
+    assert flagged.abliterated is True
+
+
+def test_distribution_score_weight_mode_all_removed_is_zero() -> None:
+    # A zero write matrix has no refusal-writing capacity along any direction ->
+    # no surviving structure -> 0.0 (rather than a NaN from 0/0).
+    D = _orthonormal(3, D_MODEL)
+    score = ad.refusal_distribution_score(
+        D, write_matrices={"W_O": np.zeros((D_MODEL, D_IN))}
+    )
+    assert score == 0.0
+
+
+def test_distribution_score_deterministic() -> None:
+    directions = _orthonormal(3, D_MODEL)
+    a = ad.refusal_distribution_score(directions)
+    b = ad.refusal_distribution_score(directions)
+    assert a == b
+
+
+def test_distribution_score_validation() -> None:
+    rng = _rng()
+    r = ad._unit(rng.standard_normal(D_MODEL))
+    # fewer than 2 directions
+    with pytest.raises(ValueError, match="at least 2"):
+        ad.refusal_distribution_score(r.reshape(1, -1))
+    # a zero direction in the stack
+    with pytest.raises(ValueError, match="non-zero"):
+        ad.refusal_distribution_score(np.vstack([r, np.zeros(D_MODEL)]))
+    # empty trailing dimension
+    with pytest.raises(ValueError, match="dimension must not be empty"):
+        ad.refusal_distribution_score(np.zeros((2, 0)))
+    # non-finite
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        bad = np.vstack([r, r])
+        bad[0, 0] = np.nan
+        ad.refusal_distribution_score(bad)
+    # empty write_matrices mapping
+    with pytest.raises(ValueError, match="write_matrices is empty"):
+        ad.refusal_distribution_score(_orthonormal(2, D_MODEL), write_matrices={})
