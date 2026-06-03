@@ -3,9 +3,15 @@ date: 2026-06-03
 topic: extended-refusal-finetuning
 focus: Training-time defense-in-depth against abliteration (feasibility)
 mode: repo-grounded
-status: proposed
+status: accepted
 origin: docs/internal/abliteration_threat_model.md (Follow-ups → Open, item #2)
+actioned_by: docs/plans/2026-06-03-002-feat-extended-refusal-finetuning-plan.md
 ---
+
+> **Status: accepted (Option A).** Actioned by
+> `docs/plans/2026-06-03-002-feat-extended-refusal-finetuning-plan.md` — shipped
+> `refusal_distribution_score` (CI-safe measurement), the operator recipe, and the
+> `finetune` extra; threat-model #2 moved to *Shipped (Option A, scoped)*.
 
 # feat: extended-refusal fine-tuning — feasibility & scope
 
