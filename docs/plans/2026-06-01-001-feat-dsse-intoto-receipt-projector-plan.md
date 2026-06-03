@@ -3,7 +3,7 @@ date: 2026-06-01
 topic: dsse-intoto-receipt-projector
 focus: Rung 1 of externally-verifiable governance receipts
 mode: repo-grounded
-status: active
+status: completed
 origin: docs/ideation/ (surprise-me ideation run e1190504 — idea #1, Rung 1)
 ---
 
