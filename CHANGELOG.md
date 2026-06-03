@@ -7,6 +7,17 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Abliteration-hardened steering: `violation_subspace.ViolationSubspace` gained
+  `orthogonalize_against(r_hat)` and `refusal_alignment(r_hat)`. The former projects
+  the refusal direction `r̂` out of the governance steering subspace so the steering
+  edit in the original residual space is orthogonal to `r̂` and survives abliteration
+  (which only zeros write matrices along `r̂`); it handles the plain (RepE/mean-diff)
+  and LEACE regimes (deflation computed in `r̃ = dewhitener @ r̂` space for LEACE) and
+  multi-directional refusal sets. The latter reports the fraction of `r̂` captured by
+  the subspace (∈ `[0, 1]`) to quantify exposure and verify the fix. A subspace lying
+  entirely within the refusal span raises (must be refit, not hardened). Pure-NumPy,
+  CI-safe; closes the "harden steering" follow-up in
+  `docs/internal/abliteration_threat_model.md`.
 - Static type-checking with mypy (closes BLOCKERS.md B3): `[tool.mypy]` config in
   `pyproject.toml` (`ignore_missing_imports`, with an adoption baseline that
   allow-lists modules carrying pre-existing type errors so the rest of the package

@@ -402,3 +402,130 @@ class TestProjectComponentDecomposition:
             h,
             err_msg="project_component + orthogonal_component must equal h for any mean",
         )
+
+
+# ---------------------------------------------------------------------------
+# Abliteration hardening — orthogonalize_against / refusal_alignment
+# (threat model: docs/internal/abliteration_threat_model.md, open item #1)
+# ---------------------------------------------------------------------------
+
+
+def _unit(*components: float) -> np.ndarray:
+    v = np.asarray(components, dtype=np.float64)
+    return v / np.linalg.norm(v)
+
+
+class TestRefusalAlignment:
+    def test_basis_on_refusal_axis_is_full_alignment(self):
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))  # basis = e0
+        assert sub.refusal_alignment(np.array([1.0, 0.0, 0.0, 0.0])) == pytest.approx(1.0)
+
+    def test_basis_orthogonal_to_refusal_is_zero_alignment(self):
+        # basis = e1, refusal = e0
+        basis = np.array([[0.0, 1.0, 0.0, 0.0]])
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        assert sub.refusal_alignment(np.array([1.0, 0.0, 0.0, 0.0])) == pytest.approx(0.0)
+
+    def test_partial_alignment_is_cos_squared(self):
+        # basis at 45° to refusal axis → captured energy = cos²(45°) = 0.5
+        basis = _unit(1.0, 1.0, 0.0, 0.0).reshape(1, -1)
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        assert sub.refusal_alignment(np.array([1.0, 0.0, 0.0, 0.0])) == pytest.approx(0.5)
+
+    def test_zero_refusal_raises(self):
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))
+        with pytest.raises(ValueError, match="numerically zero"):
+            sub.refusal_alignment(np.zeros(4))
+
+    def test_dim_mismatch_raises(self):
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))
+        with pytest.raises(DimensionMismatchError):
+            sub.refusal_alignment(np.zeros(5))
+
+
+class TestOrthogonalizeAgainstRefusal:
+    def test_fully_aligned_subspace_cannot_be_hardened(self):
+        # rank-1 basis exactly on the refusal direction → vanishes entirely
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))
+        with pytest.raises(ValueError, match="entirely within the refusal span"):
+            sub.orthogonalize_against(np.array([1.0, 0.0, 0.0, 0.0]))
+
+    def test_hardening_drives_alignment_to_zero(self):
+        basis = _unit(1.0, 1.0, 0.0, 0.0).reshape(1, -1)
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        r_hat = np.array([1.0, 0.0, 0.0, 0.0])
+        assert sub.refusal_alignment(r_hat) == pytest.approx(0.5)
+        hardened = sub.orthogonalize_against(r_hat)
+        assert hardened.refusal_alignment(r_hat) == pytest.approx(0.0, abs=1e-9)
+        # basis stays orthonormal (ViolationSubspace.__post_init__ would reject otherwise)
+        np.testing.assert_allclose(
+            hardened.basis @ hardened.basis.T, np.eye(hardened.rank), atol=1e-9
+        )
+
+    def test_steering_edit_is_orthogonal_to_refusal_plain(self):
+        # rank-2 basis spanning a refusal-aligned dir + an independent dir
+        basis = np.vstack([_unit(1.0, 1.0, 0.0, 0.0), _unit(0.0, 0.0, 1.0, 0.0)])
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        r_hat = np.array([1.0, 0.0, 0.0, 0.0])
+        hardened = sub.orthogonalize_against(r_hat)
+        rng = _rng(7)
+        for _ in range(20):
+            h = rng.normal(0, 2, size=4)
+            edit = h - hardened.steer(h, gamma=1.0)
+            # the residual-stream edit must carry no component along r̂
+            assert float(np.dot(edit, r_hat)) == pytest.approx(0.0, abs=1e-9)
+
+    def test_steering_edit_is_orthogonal_to_refusal_leace(self):
+        safe, unsafe = _make_clusters(d=12, n=120, separation=4.0, axis=0, seed=3)
+        sub = fit_leace(safe, unsafe, rank=2, ridge=1e-3)
+        assert sub.is_leace
+        # use the dominant class-separation direction as a stand-in refusal direction
+        r_hat = np.zeros(12)
+        r_hat[0] = 1.0
+        hardened = sub.orthogonalize_against(r_hat)
+        rng = _rng(11)
+        for _ in range(20):
+            h = rng.normal(0, 2, size=12)
+            edit = h - hardened.steer(h, gamma=1.0)
+            assert float(np.dot(edit, r_hat)) == pytest.approx(0.0, abs=1e-7)
+
+    def test_multi_directional_refusal(self):
+        # remove a 2D refusal span (arXiv:2602.02132 multi-directional refusal)
+        basis = np.vstack([_unit(1.0, 1.0, 1.0, 0.0), _unit(0.0, 0.0, 0.0, 1.0)])
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        refusals = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        hardened = sub.orthogonalize_against(refusals)
+        assert hardened.refusal_alignment(refusals) == pytest.approx(0.0, abs=1e-9)
+        # every hardened basis row is orthogonal to both refusal directions
+        for row in hardened.basis:
+            assert float(np.dot(row, refusals[0])) == pytest.approx(0.0, abs=1e-9)
+            assert float(np.dot(row, refusals[1])) == pytest.approx(0.0, abs=1e-9)
+
+    def test_already_orthogonal_preserves_rank(self):
+        basis = np.array([[0.0, 1.0, 0.0, 0.0]])  # ⟂ e0 already
+        sub = ViolationSubspace(basis=basis, mean=np.zeros(4))
+        hardened = sub.orthogonalize_against(np.array([1.0, 0.0, 0.0, 0.0]))
+        assert hardened.rank == sub.rank
+        np.testing.assert_allclose(np.abs(hardened.basis), np.abs(sub.basis), atol=1e-9)
+
+    def test_hardening_preserves_unsafe_retreat_orientation(self):
+        # After hardening, steer() must still retreat unsafe samples (not amplify).
+        safe, unsafe = _make_clusters(d=10, n=120, separation=4.0, axis=0, seed=5)
+        sub = fit_subspace(safe, unsafe, rank=2)
+        # refusal direction orthogonal to the class-separation axis so the subspace
+        # survives (a partial overlap, the realistic case)
+        r_hat = _unit(1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        hardened = sub.orthogonalize_against(r_hat)
+        # residual violation mass after steering must shrink (orientation intact)
+        score = adversarial_score(hardened, unsafe[:40], gamma=1.0)
+        assert score < 1.0
+
+    def test_dim_mismatch_raises(self):
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))
+        with pytest.raises(DimensionMismatchError):
+            sub.orthogonalize_against(np.zeros(5))
+
+    def test_zero_refusal_raises(self):
+        sub = ViolationSubspace(basis=np.eye(1, 4), mean=np.zeros(4))
+        with pytest.raises(ValueError, match="numerically zero"):
+            sub.orthogonalize_against(np.zeros(4))
