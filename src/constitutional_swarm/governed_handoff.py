@@ -8,8 +8,10 @@ JSONL audit evidence plus a bundle under the caller repository's ``.acgs`` dir.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -19,10 +21,28 @@ from pathlib import Path
 from time import time
 from typing import Any, Protocol
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+from constitutional_swarm.constants import CONSTITUTIONAL_HASH
+
 ALLOW = "allow"
 DENY = "deny"
 REVIEW = "human_review_required"
 ZERO_HASH = "0" * 64
+
+# Domain separator for the bundle attestation pre-image. Versioned so the signed
+# pre-image can never be confused with any other Ed25519 message in the system.
+BUNDLE_SIG_DOMAIN = "acgs.governed-handoff.bundle-attestation.v1"
+
+# Code-owned default tool/test command allowlist. The deterministic ``tool_call``
+# gate is default-DENY against this set (the supervisor owns it; the in-sandbox
+# constitution may only EXTEND it). Closes the prior default-ALLOW hole where any
+# command without a secret/metacharacter match (e.g. ``curl http://x/``) ran.
+DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("python", "python3", "pytest")
 
 
 @dataclass(frozen=True)
@@ -111,6 +131,15 @@ class PolicyEngine:
                 ],
             )
         ]
+        # Default-DENY allowlist: only executables named here may run. A
+        # constitution may EXTEND but the code-owned default always applies when
+        # the constitution provides no (non-empty) list.
+        allowlist = policy.get("command_allowlist")
+        self.command_allowlist: set[str] = (
+            {str(name) for name in allowlist}
+            if isinstance(allowlist, list) and allowlist
+            else set(DEFAULT_COMMAND_ALLOWLIST)
+        )
 
     def decide(self, gate: str, subject: str, **context: Any) -> PolicyDecision:
         if gate == "intake":
@@ -132,6 +161,19 @@ class PolicyEngine:
             return PolicyDecision("intake", subject, DENY, "task file does not exist")
         if not context.get("task_content"):
             return PolicyDecision("intake", subject, DENY, "task file is empty")
+        declared_version = None
+        if isinstance(self.constitution, dict):
+            declared_version = self.constitution.get(
+                "constitutional_version"
+            ) or self.constitution.get("constitutional_hash")
+        if declared_version is not None and str(declared_version) != CONSTITUTIONAL_HASH:
+            return PolicyDecision(
+                "intake",
+                subject,
+                DENY,
+                f"constitution version {declared_version!r} does not match pinned "
+                f"{CONSTITUTIONAL_HASH!r}; fail closed",
+            )
         if not required_roles.issubset(roles):
             missing = ", ".join(sorted(required_roles - roles))
             return PolicyDecision(
@@ -149,6 +191,22 @@ class PolicyEngine:
         if re.search(r"[;&|`$<>]", command):
             return PolicyDecision(
                 "tool_call", command, DENY, "shell metacharacters are not allowed"
+            )
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return PolicyDecision(
+                "tool_call", command, DENY, "unparseable command; fail closed"
+            )
+        if not argv:
+            return PolicyDecision("tool_call", command, DENY, "empty tool command")
+        executable = Path(argv[0]).name
+        if executable not in self.command_allowlist:
+            return PolicyDecision(
+                "tool_call",
+                command,
+                DENY,
+                f"command {executable!r} not in allowlist; fail closed",
             )
         return PolicyDecision("tool_call", command, ALLOW, "tool command allowed")
 
@@ -290,12 +348,103 @@ def build_adapter(name: str, config: dict[str, Any] | None = None) -> ExecutorAd
     raise ValueError(f"unknown executor adapter: {name}")
 
 
+@dataclass(frozen=True)
+class BundleSigner:
+    """Ed25519 signer the supervisor uses to make an evidence bundle unforgeable.
+
+    The private key lives only in the supervisor process; the sandboxed agent
+    never has it, so a self-consistent chain fabricated from scratch cannot carry
+    a valid signature.
+    """
+
+    key_id: str
+    private_key: Ed25519PrivateKey
+
+
+def _load_bundle_signer() -> BundleSigner | None:
+    """Load the supervisor signer from ``ACGS_SIGNING_KEY`` (hex Ed25519 seed).
+
+    Absent or malformed -> ``None``: the run is UNSIGNED and the bundle says so.
+    An unsigned bundle can never satisfy a trust-anchored verification.
+    """
+
+    raw = os.environ.get("ACGS_SIGNING_KEY", "").strip()
+    if not raw:
+        return None
+    key_id = os.environ.get("ACGS_SIGNING_KEY_ID", "").strip() or "acgs-supervisor"
+    try:
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(raw))
+    except ValueError:
+        return None
+    return BundleSigner(key_id=key_id, private_key=private_key)
+
+
+def _bundle_attestation_preimage(bundle: dict[str, Any]) -> bytes:
+    """Canonical, domain-separated bytes binding a bundle's authoritative summary.
+
+    Signing THIS (not the whole file) is what makes verification prove authorship:
+    any change to the chain, the constitution/version pin, the final state, the
+    task identity, or the event count invalidates the signature. The ``signature``
+    block itself is excluded from the pre-image.
+    """
+
+    task_metadata = bundle.get("task_metadata") or {}
+    final_state = bundle.get("final_state") or {}
+    summary = {
+        "domain": BUNDLE_SIG_DOMAIN,
+        "schema_version": bundle.get("schema_version"),
+        "task_id": task_metadata.get("task_id"),
+        "task_hash": task_metadata.get("task_hash"),
+        "constitution_hash": bundle.get("constitution_hash"),
+        "constitutional_version": bundle.get("constitutional_version"),
+        "workflow_hash": bundle.get("workflow_hash"),
+        "final_state": (
+            final_state.get("state") if isinstance(final_state, dict) else final_state
+        ),
+        "event_count": len(bundle.get("audit_events") or []),
+        "chain_hash": bundle.get("chain_hash"),
+    }
+    return canonical_json(summary).encode("utf-8")
+
+
+def _verify_bundle_signature(
+    bundle: dict[str, Any], trusted_public_keys: dict[str, str] | None
+) -> str:
+    """Return a signature status for a bundle's ``signature`` block.
+
+    Statuses: ``unsigned`` (no block); ``no_trust_anchor`` (signed but the caller
+    supplied no trusted keys, so authorship cannot be established); ``untrusted_key``;
+    ``invalid``; ``valid``. Trust derives ONLY from ``trusted_public_keys`` (an
+    out-of-band map of key id -> hex Ed25519 public key); the key embedded in the
+    bundle is a hint and is never trusted on its own.
+    """
+
+    block = bundle.get("signature")
+    if not isinstance(block, dict) or not block.get("sig"):
+        return "unsigned"
+    if not trusted_public_keys:
+        return "no_trust_anchor"
+    public_hex = trusted_public_keys.get(str(block.get("key_id", "")))
+    if public_hex is None:
+        return "untrusted_key"
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
+        public_key.verify(
+            base64.b64decode(str(block["sig"])), _bundle_attestation_preimage(bundle)
+        )
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return "invalid"
+    return "valid"
+
+
 def build_bundle(
     *,
     audit_path: Path,
     bundle_path: Path,
     constitution_hash: str,
     workflow_hash: str,
+    constitutional_version: str = CONSTITUTIONAL_HASH,
+    signer: BundleSigner | None = None,
 ) -> dict[str, Any]:
     events = read_audit(audit_path)
     chain_hash = replay_hashes(events)
@@ -303,6 +452,7 @@ def build_bundle(
         "schema_version": 1,
         "audit_path": str(audit_path),
         "constitution_hash": constitution_hash,
+        "constitutional_version": constitutional_version,
         "workflow_hash": workflow_hash,
         "task_metadata": _latest_payload(events, "task_metadata"),
         "role_assignments": _latest_payload(events, "role_assignments"),
@@ -316,6 +466,15 @@ def build_bundle(
             {k: v for k, v in event.items() if k != "_line"} for event in events
         ],
     }
+    if signer is not None:
+        signature = signer.private_key.sign(_bundle_attestation_preimage(bundle))
+        bundle["signature"] = {
+            "alg": "ed25519",
+            "domain": BUNDLE_SIG_DOMAIN,
+            "key_id": signer.key_id,
+            "public_key": signer.private_key.public_key().public_bytes_raw().hex(),
+            "sig": base64.b64encode(signature).decode("ascii"),
+        }
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     bundle_path.write_text(
         json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -332,6 +491,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="Verify an evidence bundle")
     verify.add_argument("--bundle", required=True, type=Path)
+    verify.add_argument(
+        "--trusted-key",
+        action="append",
+        default=[],
+        metavar="KEYID=HEXPUBKEY",
+        help=(
+            "Trusted Ed25519 public key as KEYID=HEX (repeatable). When any is "
+            "given, a valid signature is REQUIRED for ok=true."
+        ),
+    )
 
     pack = subparsers.add_parser(
         "pack", help="Rebuild a bundle from an audit JSONL task id"
@@ -355,6 +524,17 @@ def hash_yaml_payload(payload: dict[str, Any]) -> str:
     return sha256_text(canonical_json(payload))
 
 
+def _parse_trusted_keys(items: list[str] | None) -> dict[str, str]:
+    """Parse ``KEYID=HEXPUBKEY`` CLI items into a trusted-key map."""
+
+    trusted: dict[str, str] = {}
+    for item in items or []:
+        key_id, sep, hex_value = item.partition("=")
+        if sep and key_id.strip() and hex_value.strip():
+            trusted[key_id.strip()] = hex_value.strip()
+    return trusted
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
@@ -367,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
                     "audit_path": str(result.audit_path),
                     "bundle_path": str(result.bundle_path),
                     "chain_hash": result.chain_hash,
+                    "signed": _load_bundle_signer() is not None,
                 },
                 sort_keys=True,
             )
@@ -375,7 +556,10 @@ def main(argv: list[str] | None = None) -> int:
             0 if result.final_state in {"handoff_ready", "human_review_required"} else 1
         )
     if args.command == "verify":
-        verify_result = verify_bundle(args.bundle)
+        trusted = _parse_trusted_keys(args.trusted_key)
+        verify_result = verify_bundle(
+            args.bundle, trusted_public_keys=trusted or None
+        )
         print(json.dumps(verify_result, sort_keys=True))
         return 0 if verify_result["ok"] else 1
     if args.command == "pack":
@@ -469,6 +653,7 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
     workflow_hash = hash_yaml_payload(swarm)
     logger = AuditLogger(audit_path, task.task_id)
     policy = PolicyEngine(constitution, swarm, repo_root)
+    signer = _load_bundle_signer()
 
     logger.emit(
         "observer",
@@ -491,7 +676,9 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
     )
     _record_decision(logger, intake)
     if intake.outcome != ALLOW:
-        return _finish(logger, bundle_path, constitution_hash, workflow_hash, "blocked")
+        return _finish(
+            logger, bundle_path, constitution_hash, workflow_hash, "blocked", signer=signer
+        )
 
     _transition(policy, logger, "intake_pending->planned")
     logger.emit(
@@ -553,14 +740,18 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
     else:
         final_state = "handoff_ready"
     _transition(policy, logger, f"validating->{final_state}")
-    return _finish(logger, bundle_path, constitution_hash, workflow_hash, final_state)
+    return _finish(
+        logger, bundle_path, constitution_hash, workflow_hash, final_state, signer=signer
+    )
 
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def verify_bundle(bundle_path: Path) -> dict[str, Any]:
+def verify_bundle(
+    bundle_path: Path, *, trusted_public_keys: dict[str, str] | None = None
+) -> dict[str, Any]:
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     audit_path = Path(bundle["audit_path"])
     events = (
@@ -568,22 +759,35 @@ def verify_bundle(bundle_path: Path) -> dict[str, Any]:
         if audit_path.exists()
         else bundle.get("audit_events", [])
     )
+    signature_status = _verify_bundle_signature(bundle, trusted_public_keys)
     try:
         chain_hash = replay_hashes(events)
     except ValueError as exc:
         return {
             "ok": False,
+            "chain_ok": False,
             "chain_hash": None,
             "expected_chain_hash": bundle.get("chain_hash"),
             "event_count": len(events),
+            "signature_status": signature_status,
             "error": str(exc),
         }
-    ok = chain_hash == bundle.get("chain_hash")
+    chain_ok = chain_hash == bundle.get("chain_hash")
+    # With a trust anchor, authorship is REQUIRED: a self-consistent chain that is
+    # unsigned or signed by an untrusted/forged key fails (closing the
+    # fabricate-a-coherent-chain-from-scratch hole). Without an anchor, ``ok``
+    # reflects chain-consistency only and ``signature_status`` reports honestly.
+    if trusted_public_keys:
+        ok = chain_ok and signature_status == "valid"
+    else:
+        ok = chain_ok
     return {
         "ok": ok,
+        "chain_ok": chain_ok,
         "chain_hash": chain_hash,
         "expected_chain_hash": bundle.get("chain_hash"),
         "event_count": len(events),
+        "signature_status": signature_status,
     }
 
 
@@ -598,6 +802,8 @@ def _finish(
     constitution_hash: str,
     workflow_hash: str,
     final_state: str,
+    *,
+    signer: BundleSigner | None = None,
 ) -> RunResult:
     logger.emit("observer", "final_state", {"state": final_state})
     bundle = build_bundle(
@@ -605,6 +811,7 @@ def _finish(
         bundle_path=bundle_path,
         constitution_hash=constitution_hash,
         workflow_hash=workflow_hash,
+        signer=signer,
     )
     return RunResult(
         task_id=logger.task_id,

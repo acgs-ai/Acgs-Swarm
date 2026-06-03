@@ -38,3 +38,32 @@ Index of architecture & product decisions. Detailed ADRs live in
 | Pytest path | `pythonpath = ["src", "."]` | A few tests `import scripts.*`; repo root must be importable when running from root. |
 | Static analysis | ruff only (no mypy/pyright yet) | Recorded as [BLOCKERS.md](BLOCKERS.md) B3; `make typecheck` runs ruff as the interim gate. |
 | Single source of truth for commands | `tools/registry.yaml` | Validated by `make agent-check`; `TOOLS.md` is the human view. |
+
+## Decisions log
+
+### 2026-06-03 — Governed-handoff kernel hardening (make the security claims true)
+
+A real-world validation pass found `governed_handoff.py`'s evidence bundle did not
+deliver the forgery-resistance its framing implies, and the deterministic gate was
+default-ALLOW. Hardened the kernel (executor side unchanged) so the repo's own
+security claims hold:
+
+| Change | Before | After |
+|---|---|---|
+| Evidence bundle integrity | `verify_bundle` only re-checked chain self-consistency → a coherent chain fabricated from scratch verified green (verifier == forger) | `build_bundle` optionally Ed25519-signs a domain-separated attestation pre-image (`BUNDLE_SIG_DOMAIN`, binds chain_hash + constitution_hash + version pin + final_state + task identity). `verify_bundle(..., trusted_public_keys=...)` REQUIRES a valid signature for `ok` when a trust anchor is supplied. Trust derives only from out-of-band keys, never the bundle-embedded key. |
+| `tool_call` gate | default-ALLOW (denylist only) → `curl http://x/` ran | code-owned default-DENY allowlist `DEFAULT_COMMAND_ALLOWLIST = (python, python3, pytest)`; constitution may extend, never weaken the default |
+| Constitution version pin | `608508a9bd224290` computed + emitted but never compared | `_intake` fails closed if the constitution **declares** a `constitutional_version` / `constitutional_hash` that ≠ the pinned constant (enforce-if-declared; silent when undeclared, preserving existing configs) |
+
+**New public surface:** `BundleSigner`, `verify_bundle(trusted_public_keys=...)`,
+`build_bundle(constitutional_version=, signer=)`, env `ACGS_SIGNING_KEY` /
+`ACGS_SIGNING_KEY_ID`, CLI `acgs-swarm verify --trusted-key KEYID=HEX`. Backward
+compatible: with no signer/anchor, `verify_bundle(path)` still returns `ok` on
+chain-consistency and runs stay unsigned (honestly reported as `signed: false`).
+The constitutional hash constant itself is **unchanged** — this only adds
+enforcement that references it. Signing uses the core `cryptography` dep (no new
+optional extra). Deferred: REVIEW-halts-loop and full executor loop-ification
+(belong with the agent-loop work, not this correctness fix).
+
+**Why:** the productized signed-evidence-bundle space is commoditized (Microsoft
+AGT, nono, Pipelock, Fuzentry), so the durable, identity-aligned move is making
+the deterministic kernel actually forgery-resistant as research.
