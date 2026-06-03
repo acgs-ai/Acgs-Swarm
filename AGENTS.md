@@ -1,7 +1,7 @@
 # constitutional-swarm
 
 ## Purpose
-Orchestrator-free constitutional governance runtime for multi-agent systems. Built on `acgs-lite`, it embeds governance per agent, supports DAG-compiled execution without a central orchestrator, provides peer-validated settlement via `ConstitutionalMesh`, and ships research modules for the MCFS (Manifold-Constrained Federated Swarm) stack — latent DNA steering, spectral-sphere trust dynamics, Merkle-CRDT artifact stores, and SWE-Bench evaluation scaffolds. This package is a **git submodule** of the ACGS monorepo; always run `git add`/`git commit` from inside this directory, not the parent repo.
+Orchestrator-free constitutional governance runtime for multi-agent systems. Built on `acgs-lite`, it embeds governance per agent, supports DAG-compiled execution without a central orchestrator, provides peer-validated settlement via `ConstitutionalMesh`, and ships research modules for the MCFS (Manifold-Constrained Federated Swarm) stack — latent DNA steering, spectral-sphere trust dynamics, Merkle-CRDT artifact stores, and SWE-Bench evaluation scaffolds. This is a **standalone repository** with its own remote (the default working context); it is *also* vendored as a git submodule in the ACGS monorepo. See "Working In This Directory" for the git workflow in each context.
 
 ## Key Files
 | File | Description |
@@ -28,15 +28,16 @@ Orchestrator-free constitutional governance runtime for multi-agent systems. Bui
 ## For AI Agents
 
 ### Working In This Directory
-- **This is a git submodule.** Always run `git add` / `git commit` from inside `packages/constitutional_swarm/`, not the monorepo root. Stage only `.py` files explicitly — never `git add -A`.
-- Base branch: `main`. Parent repo integration branch: `fix/p0-security-hardening`.
+- **Default context — standalone repo (own remote).** Branch from `main`; `git add` / `git commit` / `git push` from this repo root. Stage files explicitly (`.py` + the specific docs you changed) — never `git add -A`.
+- **Monorepo context only — git submodule.** When working inside the ACGS monorepo checkout (not here), run `git add` / `git commit` from inside `packages/constitutional_swarm/`, not the monorepo root; the parent-repo integration branch is `fix/p0-security-hardening`. These submodule rules do not apply to the standalone checkout.
+- Base branch: `main`.
 - Do not "fix" `src/constitutional_swarm/manifold.py` (Birkhoff/Sinkhorn baseline) — its uniformity collapse is the empirical proof kept as a research control. `spectral_sphere.py` is the production-direction replacement.
 - Feature branches live in `.worktrees/` (gitignored); create with `git worktree add .worktrees/<name> -b <name>`.
 - Repository memories persist in CLAUDE.md and `.claude/rules/`; Codex/OMX read this `AGENTS.md`.
 
 ### Testing Requirements
 ```bash
-# From inside this submodule
+# From this repo root (standalone); inside the monorepo, prefix with packages/constitutional_swarm/
 python -m pytest tests/ --import-mode=importlib -q     # 1603 passed, 1 skipped, 2 xfailed
 python -m ruff check src/                              # 53 known pre-existing errors in latent_dna.py
 python -m ruff format src/
@@ -71,5 +72,10 @@ This repo is self-describing and tool-executable. A fresh agent should:
 
 Key maps: [`TASKS.md`](TASKS.md) (what to do next) · [`DECISIONS.md`](DECISIONS.md) (why things are the way they are).
 
-> Note: despite the "git submodule" framing above, this checkout is a
-> standalone repository with its own remote. See BLOCKERS.md (B6).
+> **Repository context (authoritative).** This checkout is a standalone
+> repository with its own remote — work here directly (branch from `main`,
+> commit/push from this root). It is *also* vendored as a git submodule in the
+> ACGS monorepo; the submodule-only `git add`/`git commit`-from-
+> `packages/constitutional_swarm/` rule applies *only* when working inside that
+> monorepo checkout. If any auto-generated section above still reads "this is a
+> git submodule" unconditionally, this note governs.

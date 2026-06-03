@@ -57,6 +57,11 @@ The format is based on Keep a Changelog.
 - pytest `pythonpath` now includes the repo root so tests importing `scripts.*`
   collect when run from the project root; interpreter-agnostic assertion in the
   official SWE-bench command test (`sys.executable` may be `python3`).
+- Docs: `CLAUDE.md` and `AGENTS.md` no longer describe this checkout
+  unconditionally as a "git submodule" (closes BLOCKERS.md B6). The standalone
+  repository (its own remote) is now the documented default git workflow, and the
+  submodule `git add`/`git commit`-from-`packages/constitutional_swarm/` rules are
+  scoped to the ACGS-monorepo checkout only.
 
 ## [1.0.0] - 2026-04-23
 

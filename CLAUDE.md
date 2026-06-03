@@ -2,23 +2,35 @@
 
 For repo-wide rules, see `/CLAUDE.md` and `.claude/rules/` (Claude Code auto-loads these). AGENTS.md serves Codex/OMX.
 
-## Submodule operations
+## Repository context & git workflow
 
-This is a git submodule. Always run `git add` / `git commit` from inside
-`packages/constitutional_swarm/`, not the repo root.
+This is a **standalone repository** with its own remote — that is the default
+working context. Work here directly:
 
-- Base branch: `main`
-- Parent repo integration branch: `fix/p0-security-hardening`
-- Stage only `.py` files explicitly — never `git add -A`
+- Base branch: `main`. Branch from `main`; `git add` / `git commit` / `git push`
+  from this repo root.
+- Stage files explicitly (`.py` and the specific docs you changed) — never
+  `git add -A`.
+
+It is **also vendored as a git submodule** in the ACGS monorepo. The
+submodule-only rules apply *only when you are working inside that monorepo
+checkout*, not here:
+
+- Run `git add` / `git commit` from inside `packages/constitutional_swarm/`, not
+  the monorepo root.
+- Parent-repo integration branch: `fix/p0-security-hardening`.
+
+If your working directory is this repo (its own `.git`, own remote), you are in
+the standalone context — ignore the submodule rules.
 
 ## Testing
 
 ```bash
-# From repo root
-python -m pytest packages/constitutional_swarm/tests/ --import-mode=importlib
-
-# From inside the submodule
+# Standalone (this repo) — from the repo root
 python -m pytest tests/ --import-mode=importlib
+
+# Inside the ACGS monorepo checkout — from the monorepo root
+python -m pytest packages/constitutional_swarm/tests/ --import-mode=importlib
 ```
 
 ## Commands
