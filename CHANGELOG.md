@@ -44,6 +44,17 @@ The format is based on Keep a Changelog.
   checkout resolves `acgs-lite` from PyPI.
 
 ### Fixed
+- Type-checking: graduated the stable-core modules to a clean mypy pass and
+  removed their `[[tool.mypy.overrides]]` allow-list entry, so they are now
+  enforced. Fixes are annotation-only / behavior-preserving: `compiler` (cast the
+  post-init-normalized `GoalSpec.steps`; `GoalSpec.steps` widened to a covariant
+  `Sequence`), `dna` (`_stats_lock` declared as an `init=False` field), `mesh.core`
+  (typed optional `RemoteVoteClient` import; cast the spectral shadow manifold),
+  `governance_receipts` (`Final` literal constants), `governed_handoff`
+  (narrowing + a renamed local), `private_vote` (corrected `# type: ignore` code),
+  `protocol` (guard `asdict` against dataclass *types*), `remote_vote_transport`
+  (`inspect.isawaitable` narrowing). Optional-dep-gated subpackages remain
+  allow-listed pending their extras in the typecheck env (see BLOCKERS.md B3).
 - `SpectralSphereManifold` default `smoothing` lowered from `0.999` to `0.9`. The
   over-damped default retained 99.9% of stale state per projection, so the
   production trust manifold (built with defaults in `mesh/core.py`, consumed by

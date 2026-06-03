@@ -10,14 +10,15 @@ import hashlib
 import json
 import time
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-PROFILE_VERSION = "acgs.local.intoto-dsse-shaped.v0.1"
-CANONICALIZATION_ALGORITHM = "json-sort-keys-separators-v0"
+# Final so mypy infers the literal type, matching the Literal[...] model fields.
+PROFILE_VERSION: Final = "acgs.local.intoto-dsse-shaped.v0.1"
+CANONICALIZATION_ALGORITHM: Final = "json-sort-keys-separators-v0"
 REQUIRED_ROLES = (
     "constitution_author",
     "executor",

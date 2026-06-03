@@ -30,7 +30,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from acgs_lite import Constitution
 from cryptography.exceptions import InvalidSignature
@@ -698,6 +698,7 @@ class ConstitutionalMesh:
                 raise KeyError(f"Assignment {assignment_id} not found")
             peer_ids = assignment.peers
 
+        _Client: type[RemoteVoteClient] | None
         try:
             from constitutional_swarm.remote_vote_transport import RemoteVoteClient as _Client
         except ImportError:
@@ -1193,7 +1194,11 @@ class ConstitutionalMesh:
         self._manifold = self._build_manifold(n, self._manifold_type)
         self._restore_trust_from_store()
         if self._shadow_spectral:
-            self._shadow_manifold = self._build_manifold(n, "spectral")
+            # "spectral" always yields a SpectralSphereManifold (the shadow's type).
+            self._shadow_manifold = cast(
+                "spectral_sphere_mod.SpectralSphereManifold",
+                self._build_manifold(n, "spectral"),
+            )
             self._restore_trust_from_store(self._shadow_manifold)
 
     def _build_manifold(
