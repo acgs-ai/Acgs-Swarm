@@ -1,6 +1,6 @@
 ---
 date: 2026-06-03
-status: active
+status: completed
 type: feat
 title: "feat: extended-refusal fine-tuning — Option A (recipe + CI-safe measurement)"
 origin: docs/plans/2026-06-03-001-feat-extended-refusal-finetuning-feasibility.md
