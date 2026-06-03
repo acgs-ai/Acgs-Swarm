@@ -19,6 +19,7 @@ Orchestrator-free constitutional governance runtime for multi-agent systems. Bui
 | `src/` | Python package source for `constitutional_swarm` (see `src/AGENTS.md`) |
 | `tests/` | Pytest suite — 1603 passing, 1 skipped, 2 xfailed (see `tests/AGENTS.md`) |
 | `docs/` | Long-form design docs, including MACI DP protocol draft (see `docs/AGENTS.md`) |
+| `docs/solutions/` | Documented solutions to past problems (bugs, best practices, design/workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`) — relevant when implementing or debugging in documented areas |
 | `examples/` | Minimal runnable artifacts (e.g., sample constitution YAML) (see `examples/AGENTS.md`) |
 | `scripts/` | Operational scripts: testnet deploy, citation verification, security reporting (see `scripts/AGENTS.md`) |
 | `specs/` | TLA+ formal specifications and model-checker configs (see `specs/AGENTS.md`) |
