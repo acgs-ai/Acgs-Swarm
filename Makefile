@@ -22,7 +22,7 @@ TEST_MARKERS ?= not slow and not benchmark and not e2e and not research and not 
 PYTEST = $(UV) run --no-sync pytest tests/ --import-mode=importlib
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev test test-all lint format typecheck smoke verify agent-check clean
+.PHONY: help setup dev test test-all lint format typecheck smoke verify agent-check agent-self-evolve clean
 
 help: ## Show this help
 	@echo "constitutional-swarm — make targets:"
@@ -59,6 +59,9 @@ smoke: ## Fast import + CLI sanity check (no network, no API keys)
 
 agent-check: ## Validate agent/tool registries + doc completeness (no install required)
 	$(UV) run --no-sync python scripts/agent_check.py
+
+agent-self-evolve: ## Build offline self-evolution harnesses for every repo agent
+	python3 scripts/agent_self_evolve.py --json --write-report .omx/state/agent-self-evolve-report.json --fail-under 1.0
 
 verify: lint typecheck agent-check smoke test ## Full local gate: lint -> typecheck -> registry/doc check -> smoke -> tests
 	@echo "OK: verify passed."
