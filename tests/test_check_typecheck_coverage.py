@@ -105,14 +105,67 @@ def test_blocking_typecheck_extras_parsing() -> None:
             # A typecheck job with a shell-var extra: the literal `dev` is picked
             # up but the `$EXTRA` token must be dropped, not counted as covered.
             "typecheck-dyn": _job(['pip install -e ".[dev,$EXTRA]"', "mypy"]),
-            # Runs mypy but is non-blocking -> does not satisfy coverage.
+            # Runs mypy but is non-blocking at job level -> does not satisfy coverage.
             "research-typecheck": _job(
                 ['pip install -e ".[dev,research]"', "mypy"], continue_on_error=True
             ),
+            # Dynamic job-level expressions can be true for some matrix entries,
+            # so they must not satisfy blocking coverage either.
+            "experimental-typecheck": {
+                "continue-on-error": "${{ matrix.experimental }}",
+                "steps": [
+                    {"run": 'pip install -e ".[dev,experimental]"'},
+                    {"run": "mypy"},
+                ],
+            },
+            # Non-boolean job-level values are not literal False, even if they
+            # compare equal to False in Python (0 == False).
+            "zero-job-typecheck": {
+                "continue-on-error": 0,
+                "steps": [
+                    {"run": 'pip install -e ".[dev,zerojob]"'},
+                    {"run": "mypy"},
+                ],
+            },
+            # Literal False at job level is blocking and must satisfy coverage.
+            "false-job-typecheck": {
+                "continue-on-error": False,
+                "steps": [
+                    {"run": 'pip install -e ".[dev,falsejob]"'},
+                    {"run": "mypy"},
+                ],
+            },
+            # Runs mypy but is non-blocking at step level -> does not satisfy coverage.
+            "soft-typecheck": {
+                "steps": [
+                    {"run": 'pip install -e ".[dev,soft]"'},
+                    {"run": "mypy", "continue-on-error": True},
+                ]
+            },
+            # Dynamic and non-boolean step-level values are likewise non-blocking.
+            "expr-step-typecheck": {
+                "steps": [
+                    {"run": 'pip install -e ".[dev,exprstep]"'},
+                    {"run": "mypy", "continue-on-error": "${{ matrix.experimental }}"},
+                ]
+            },
+            "zero-step-typecheck": {
+                "steps": [
+                    {"run": 'pip install -e ".[dev,zerostep]"'},
+                    {"run": "mypy", "continue-on-error": 0},
+                ]
+            },
+            # Literal False at step level is blocking and must satisfy coverage.
+            "false-step-typecheck": {
+                "steps": [
+                    {"run": 'pip install -e ".[dev,falsestep]"'},
+                    {"run": "mypy", "continue-on-error": False},
+                ]
+            },
         }
     )
     extras = blocking_typecheck_extras(ci)
-    assert extras == {"dev", "transport"}, extras
+    assert extras == {"dev", "transport", "falsejob", "falsestep"}, extras
     # No interpolation / shell-var token may leak in.
     assert not any("matrix" in e or "{" in e or "$" in e for e in extras), extras
 

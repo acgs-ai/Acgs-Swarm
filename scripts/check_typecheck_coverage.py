@@ -8,7 +8,7 @@ extra in ``[project.optional-dependencies]`` is classified in the
 ``[tool.constitutional_swarm.typecheck_coverage]`` manifest as either:
 
 - ``checked`` — type-bearing; it MUST be installed by a *blocking* typecheck CI
-  job (a job whose step runs ``mypy`` and is not ``continue-on-error``); or
+  job (a job and ``mypy`` step whose ``continue-on-error`` is absent or false); or
 - ``excepted`` — not type-checked by the gate; it MUST carry a non-empty reason.
 
 So a newly added extra-gated module cannot silently escape the type surface.
@@ -42,11 +42,20 @@ _EXTRAS_RE = re.compile(r"\.\[([^\]]+)\]")
 _MYPY_RE = re.compile(r"\bmypy\b")
 
 
+def _continue_on_error_is_blocking(config: dict[str, Any]) -> bool:
+    """Return True only when continue-on-error is absent or literal False."""
+
+    return "continue-on-error" not in config or config["continue-on-error"] is False
+
+
 def blocking_typecheck_extras(ci: dict[str, Any]) -> set[str]:
     """Return the union of extras installed by every *blocking* typecheck job.
 
-    A job qualifies when (a) some step's ``run`` invokes ``mypy`` and (b) the job
-    is not ``continue-on-error`` (a non-blocking job does not satisfy coverage).
+    A job qualifies when (a) job-level ``continue-on-error`` is absent or
+    literal ``False`` and (b) at least one step's ``run`` invokes ``mypy`` with
+    step-level ``continue-on-error`` absent or literal ``False``. Dynamic
+    expressions and other non-boolean values are treated as non-blocking because
+    they can allow failure without failing the workflow.
     Extras are extracted from that same job's ``pip install -e ".[...]"`` step;
     interpolation tokens like ``${{ matrix.extras }}`` are ignored so the
     ``test`` job's templated install can never leak in.
@@ -54,14 +63,16 @@ def blocking_typecheck_extras(ci: dict[str, Any]) -> set[str]:
 
     extras: set[str] = set()
     for job in (ci.get("jobs") or {}).values():
-        if not isinstance(job, dict) or job.get("continue-on-error") is True:
+        if not isinstance(job, dict) or not _continue_on_error_is_blocking(job):
             continue
-        runs = [
-            step.get("run", "")
-            for step in (job.get("steps") or [])
-            if isinstance(step, dict)
-        ]
-        if not any(_MYPY_RE.search(run) for run in runs):
+        steps = [step for step in (job.get("steps") or []) if isinstance(step, dict)]
+        runs = [step.get("run", "") for step in steps]
+        has_blocking_mypy = any(
+            _MYPY_RE.search(step.get("run", ""))
+            and _continue_on_error_is_blocking(step)
+            for step in steps
+        )
+        if not has_blocking_mypy:
             continue
         for run in runs:
             for match in _EXTRAS_RE.finditer(run):
