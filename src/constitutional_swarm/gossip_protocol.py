@@ -259,7 +259,7 @@ class GossipServer:
         try:
             import websockets  # type: ignore[import]
         except ImportError:
-            connection_closed_error = RuntimeError
+            connection_closed_error: type[BaseException] = RuntimeError
         else:
             connection_closed_error = websockets.exceptions.ConnectionClosed
 

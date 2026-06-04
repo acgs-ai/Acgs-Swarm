@@ -39,6 +39,8 @@ Run the offline harness generator before mutating agent contracts or templates:
 
 ```bash
 make agent-self-evolve
+# or run the harness module directly:
+uv run --no-sync python -m constitutional_swarm.agent_self_evolve --json --fail-under 1.0
 ```
 
 The report is written to `.omx/state/agent-self-evolve-report.json` and includes

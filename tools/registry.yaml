@@ -110,8 +110,8 @@ tools:
       - "Invalid manifest/template metadata -> reported as a failed static probe"
       - "Probe pass rate below --fail-under threshold -> non-zero exit"
     retry: "Idempotent; safe to re-run after fixing the reported agent contract or template metadata."
-    validation: "python3 scripts/agent_self_evolve.py --no-templates --fail-under 1.0 exits 0"
-    owner_module: scripts/agent_self_evolve.py
+    validation: "uv run --no-sync python -m constitutional_swarm.agent_self_evolve --no-templates --fail-under 1.0 exits 0"
+    owner_module: src/constitutional_swarm/agent_self_evolve.py
     runbook: tools/runbooks/agent-self-evolve.md
 
   - name: verify

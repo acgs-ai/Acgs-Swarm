@@ -83,6 +83,7 @@ langgraph-swarm = [
 ]
 
 [project.scripts]
+acgs-agent-self-evolve = "constitutional_swarm.agent_self_evolve:main"
 acgs-swarm = "constitutional_swarm.governed_handoff:main"
 acgs-verify-receipts = "constitutional_swarm.governance_receipts_cli:main"
 

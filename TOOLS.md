@@ -25,7 +25,7 @@ the venv once with `make setup`, then use the `make` targets below.
 | `make typecheck` | Static type-check with mypy (config + adoption baseline in `pyproject.toml` `[tool.mypy]`). |
 | `make smoke` | Offline import + CLI `--help` sanity (no credentials). |
 | `make agent-check` | Validate registries + doc completeness. |
-| `make agent-self-evolve` | Build offline self-evolution harnesses for every operational and template agent. |
+| `make agent-self-evolve` | Build offline self-evolution harnesses for every operational and template agent (module `constitutional_swarm.agent_self_evolve`, also exposed as the `acgs-agent-self-evolve` console script after `make setup`). |
 | `make verify` | Full local gate: lint → agent-check → smoke → test. |
 | `make clean` | Remove caches and build artifacts. |
 
@@ -49,7 +49,8 @@ Run `make help` for the live list.
 | `python scripts/generate_security_report.py` | Build `security-audit-report.md` from security tests. |
 | `python scripts/testnet_deploy.py {register\|miner\|validator} ...` | Bittensor testnet deploy ([runbook](tools/runbooks/testnet-deploy.md)). |
 | `python scripts/agent_check.py` | The agent-operability gate (same as `make agent-check`). |
-| `python3 scripts/agent_self_evolve.py --json --fail-under 1.0` | Direct self-evolution harness report for every repo agent. |
+| `uv run --no-sync python -m constitutional_swarm.agent_self_evolve --json --fail-under 1.0` | Packaged self-evolution harness report for every repo agent. |
+| `python3 scripts/agent_self_evolve.py --json --fail-under 1.0` | Backwards-compatible direct wrapper for the same harness. |
 
 > Prefix script invocations with `uv run --no-sync` so they run in the venv.
 > Additional eval scripts exist under `scripts/`; all are catalogued or wrapped
