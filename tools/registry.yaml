@@ -70,6 +70,19 @@ tools:
     validation: "exit code 0"
     owner_module: Makefile
 
+  - name: typecheck-coverage
+    purpose: Assert every optional extra is type-checked (installed by a blocking mypy job) or excepted with a reason, so a new extra-gated module cannot silently escape the type surface.
+    command: make typecheck-coverage
+    env: []
+    inputs: ["pyproject.toml", ".github/workflows/ci.yml"]
+    outputs: ["per-extra classification verdict (PASS/FAIL)"]
+    failure_modes:
+      - "An optional extra is unclassified, a 'checked' extra is not installed by a blocking typecheck job, or an 'excepted' extra lacks a reason -> non-zero exit"
+    retry: "Classify the extra in pyproject.toml [tool.constitutional_swarm.typecheck_coverage], then re-run."
+    validation: "exit code 0 ('typecheck-coverage: ALL CHECKS PASSED')"
+    owner_module: scripts/check_typecheck_coverage.py
+    runbook: tools/runbooks/typecheck-coverage.md
+
   - name: smoke
     purpose: Fast offline import + CLI sanity check; needs no credentials.
     command: make smoke

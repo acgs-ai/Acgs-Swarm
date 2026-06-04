@@ -117,6 +117,27 @@ module = ["acgs_lite", "acgs_lite.*"]
 follow_imports = "skip"
 follow_imports_for_stubs = true
 
+[tool.constitutional_swarm.typecheck_coverage]
+# Guardrail manifest (scripts/check_typecheck_coverage.py, `make typecheck-coverage`).
+# Every extra in [project.optional-dependencies] must appear here so a new
+# extra-gated module cannot silently escape the type-check surface. See DECISIONS.md.
+#   "checked"  — type-bearing (ships py.typed, used in type positions); MUST be
+#                installed by a blocking typecheck CI job (typecheck-transport).
+#   "excepted" — not type-checked by the gate; each needs a reason.
+checked = ["transport"]
+
+[tool.constitutional_swarm.typecheck_coverage.excepted]
+dev = "tooling only (pytest/ruff/mypy); not imported by src/"
+bittensor = "bittensor ships no py.typed; installing adds no coverage over ignore_missing_imports"
+research = "torch/transformers are heavy and crash mypy; low value-to-cost — follow_imports=skip if ever gated"
+latent = "deprecated alias of research"
+finetune = "research + trl/peft; heavy and out of the test matrix"
+semantic = "sentence-transformers; heavy, stub-less"
+vertex = "anthropic[vertex]/google-cloud-aiplatform; stub-less"
+gemini = "google-genai; stub-less"
+langgraph = "type-bearing but has a known live error (langgraph_runtime/swarm_topology.py:126) and a mypy-1.11 crash; graduation tracked in follow-up, not clean"
+langgraph-swarm = "extends langgraph; same deferral"
+
 [tool.pytest.ini_options]
 addopts = ["-p", "no:braintrust"]
 asyncio_mode = "auto"
