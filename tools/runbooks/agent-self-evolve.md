@@ -14,12 +14,17 @@ mutation scope, guardrails, probes, static pass rates, and suggested fixes.
 make agent-self-evolve
 ```
 
-Direct script usage:
+Direct module usage:
 
 ```bash
-python3 scripts/agent_self_evolve.py --json --write-report .omx/state/agent-self-evolve-report.json --fail-under 1.0
-python3 scripts/agent_self_evolve.py --no-templates --fail-under 1.0
+uv run --no-sync python -m constitutional_swarm.agent_self_evolve --json --write-report .omx/state/agent-self-evolve-report.json --fail-under 1.0
+uv run --no-sync python -m constitutional_swarm.agent_self_evolve --no-templates --fail-under 1.0
+python3 scripts/agent_self_evolve.py --json --fail-under 1.0  # compatibility wrapper
 ```
+
+After `make setup` re-syncs the venv, the same harness is also available as the
+`acgs-agent-self-evolve` console script (e.g.
+`uv run --no-sync acgs-agent-self-evolve --no-templates --fail-under 1.0`).
 
 ## Output
 

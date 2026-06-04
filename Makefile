@@ -56,12 +56,13 @@ smoke: ## Fast import + CLI sanity check (no network, no API keys)
 	$(UV) run --no-sync python -c "import constitutional_swarm; print('import constitutional_swarm OK')"
 	$(UV) run --no-sync acgs-swarm --help >/dev/null && echo "acgs-swarm CLI OK"
 	$(UV) run --no-sync acgs-verify-receipts --help >/dev/null && echo "acgs-verify-receipts CLI OK"
+	$(UV) run --no-sync acgs-agent-self-evolve --help >/dev/null && echo "acgs-agent-self-evolve CLI OK"
 
 agent-check: ## Validate agent/tool registries + doc completeness (no install required)
 	$(UV) run --no-sync python scripts/agent_check.py
 
 agent-self-evolve: ## Build offline self-evolution harnesses for every repo agent
-	python3 scripts/agent_self_evolve.py --json --write-report .omx/state/agent-self-evolve-report.json --fail-under 1.0
+	$(UV) run --no-sync acgs-agent-self-evolve --json --write-report .omx/state/agent-self-evolve-report.json --fail-under 1.0
 
 verify: lint typecheck agent-check smoke test ## Full local gate: lint -> typecheck -> registry/doc check -> smoke -> tests
 	@echo "OK: verify passed."

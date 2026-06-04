@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -79,3 +80,32 @@ def test_reference_patterns_are_source_backed() -> None:
     assert refs["smolagents-code-governance"]["source"].startswith("https://huggingface.co/docs/smolagents/")
     assert "fail-closed" in " ".join(refs["hermes-runtime-governance"]["principles"])
     assert "generated code" in " ".join(refs["smolagents-code-governance"]["principles"])
+
+
+def test_harness_is_available_as_package_module() -> None:
+    from constitutional_swarm import agent_self_evolve as packaged
+
+    report = packaged.build_report(ROOT, include_templates=False)
+
+    assert report["summary"]["operational_agents"] == len(list(ROOT.glob("agents/*.agent.yaml")))
+    assert "coder" in report["agents"]
+
+
+def test_write_report_creates_parent_directories(tmp_path: Path) -> None:
+    nested_path = tmp_path / "missing" / "state" / "report.json"
+    assert not nested_path.parent.exists()
+
+    rc = agent_self_evolve.main(
+        ["--root", str(ROOT), "--no-templates", "--write-report", str(nested_path)]
+    )
+
+    assert rc == 0
+    assert nested_path.exists()
+    payload = json.loads(nested_path.read_text(encoding="utf-8"))
+    assert "summary" in payload
+
+
+def test_pyproject_exposes_agent_self_evolve_console_script() -> None:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert 'acgs-agent-self-evolve = "constitutional_swarm.agent_self_evolve:main"' in text
