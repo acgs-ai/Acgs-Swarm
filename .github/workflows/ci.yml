@@ -42,10 +42,29 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      # dev-only: the mypy config uses ignore_missing_imports, so optional
-      # extras are not needed and would only add env variance to the gate.
+      # no-extras surface: this is the published-library distribution contract —
+      # the package must type-check with no optional deps installed. Type errors
+      # that only surface once an extra's real (py.typed) types resolve are NOT
+      # visible here; the typecheck-transport job below covers that surface.
       - name: Install
         run: pip install -e ".[dev]"
+      - name: Type-check
+        run: mypy
+
+  typecheck-transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      # transport surface: websockets ships py.typed, so installing it lets mypy
+      # resolve the real types in transport-gated modules (e.g. gossip_protocol,
+      # remote_vote_transport) that the no-extras job cannot see. This is where
+      # env-sensitive type errors are caught — matching the local `make typecheck`
+      # default (EXTRAS="dev transport").
+      - name: Install
+        run: pip install -e ".[dev,transport]"
       - name: Type-check
         run: mypy
 
