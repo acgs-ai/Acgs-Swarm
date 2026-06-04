@@ -90,6 +90,7 @@ cd .worktrees/<branch-name>
 - `paper/README.md` — entry point for the package paper draft and manuscript assets
 - `paper/constitutional_swarm_paper.md` — long-form Markdown paper draft for package claims and theory
 - `docs/maci_dp_protocol.md` — MCFS privacy and MACI protocol draft
+- `docs/solutions/` — documented solutions to past problems (bugs, best practices, design/workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`); relevant when implementing or debugging in documented areas
 - `HANDOFF_CODEX.md` — historical implementation handoff for Codex/OMX
 
 ## Skill routing
