@@ -59,15 +59,15 @@ tools:
     owner_module: Makefile
 
   - name: typecheck
-    purpose: Static type-check with mypy (config + adoption baseline in pyproject.toml [tool.mypy]).
+    purpose: Static type-check with mypy (whole package, no allow-list; config in pyproject.toml [tool.mypy]). CI runs two surfaces — no-extras and transport.
     command: make typecheck
     env: []
     inputs: ["src/constitutional_swarm/"]
-    outputs: ["ruff diagnostics"]
+    outputs: ["mypy diagnostics"]
     failure_modes:
-      - "No dedicated type checker exists yet (see BLOCKERS.md B3)"
-    retry: "Same as lint."
-    validation: "exit code 0"
+      - "Type error -> non-zero exit (env-sensitive: the typecheck-transport CI job installs websockets so transport types resolve; see typecheck-coverage)"
+    retry: "Fix the annotation per src/constitutional_swarm/AGENTS.md, then re-run."
+    validation: "exit code 0 ('Success: no issues found')"
     owner_module: Makefile
 
   - name: typecheck-coverage

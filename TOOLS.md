@@ -22,11 +22,12 @@ the venv once with `make setup`, then use the `make` targets below.
 | `make test-all` | Adds research-marked tests. |
 | `make lint` | `ruff check src/constitutional_swarm/` (CI gate). |
 | `make format` | `ruff format` source + scripts. |
-| `make typecheck` | Static type-check with mypy (config + adoption baseline in `pyproject.toml` `[tool.mypy]`). |
+| `make typecheck` | Static type-check with mypy (whole package, no allow-list; config in `pyproject.toml` `[tool.mypy]`). CI runs two surfaces: no-extras + `transport`. |
+| `make typecheck-coverage` | Assert every optional extra is type-checked (in a blocking mypy job) or excepted with a reason. |
 | `make smoke` | Offline import + CLI `--help` sanity (no credentials). |
 | `make agent-check` | Validate registries + doc completeness. |
 | `make agent-self-evolve` | Build offline self-evolution harnesses for every operational and template agent (module `constitutional_swarm.agent_self_evolve`, also exposed as the `acgs-agent-self-evolve` console script after `make setup`). |
-| `make verify` | Full local gate: lint → agent-check → smoke → test. |
+| `make verify` | Full local gate: lint → typecheck → agent-check → typecheck-coverage → smoke → test. |
 | `make clean` | Remove caches and build artifacts. |
 
 Run `make help` for the live list.

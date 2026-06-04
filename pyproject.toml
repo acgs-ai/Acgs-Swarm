@@ -92,17 +92,23 @@ where = ["src"]
 include = ["constitutional_swarm*"]
 
 [tool.mypy]
-# Static type-check gate (BLOCKERS.md B3). Runs via `make typecheck` and the
-# `typecheck` CI job. Third-party deps (acgs-lite, braintrust, torch,
-# transformers, bittensor, langgraph, websockets, ...) ship no stubs, so missing
-# imports are ignored rather than annotated.
+# Static type-check gate (BLOCKERS.md B3). Runs via `make typecheck` and two CI
+# jobs (no-extras + typecheck-transport). Most unstubbed third-party deps
+# (acgs-lite, braintrust, torch, transformers, bittensor, ...) are ignored as
+# missing imports. NB: `websockets` (transport) and `langgraph`/`langchain` DO
+# ship py.typed — installing those extras makes mypy resolve their real types, so
+# the gate is environment-sensitive. `make typecheck-coverage` enforces that every
+# py.typed extra is in a blocking typecheck job or excepted with a reason.
 python_version = "3.11"
 files = ["src/constitutional_swarm"]
 ignore_missing_imports = true
 warn_redundant_casts = true
-# NB: warn_unused_ignores is intentionally OFF — many `# type: ignore`s are only
-# unused when an optional extra (transport/research/...) is absent, so enabling
-# it would flip-flop the gate by environment.
+# NB: warn_unused_ignores is intentionally OFF. The broad env-divergent ignore
+# clusters (dna.py Z3 re-exports, violation_subspace numpy reads) are needed in
+# some extra configurations and unused in others, so enabling it would flip-flop
+# the gate by environment. (The `[import]` ignores on optional imports are already
+# redundant under global ignore_missing_imports; re-enabling cleanly would need the
+# `# type: ignore[code,unused-ignore]` idiom — deferred.)
 # The whole package is now checked and must stay clean — there is no adoption
 # allow-list. New regressions in any module fail the gate. See BLOCKERS.md B3.
 
@@ -112,7 +118,9 @@ warn_redundant_casts = true
 # as a type", "object not callable" — rather than treating them as Any like the
 # other unstubbed deps. follow_imports=skip puts acgs-lite on the same footing as
 # the missing-import deps and, crucially, makes the gate robust to acgs-lite
-# version drift between the local workspace build and CI's PyPI wheel.
+# version drift between the local workspace build and CI's PyPI wheel. (Newer
+# acgs-lite builds may ship py.typed locally; the override is kept regardless, so
+# the gate's verdict does not depend on which acgs-lite build is installed.)
 module = ["acgs_lite", "acgs_lite.*"]
 follow_imports = "skip"
 follow_imports_for_stubs = true
