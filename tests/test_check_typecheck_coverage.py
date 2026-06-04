@@ -102,6 +102,9 @@ def test_blocking_typecheck_extras_parsing() -> None:
             "typecheck-transport": _job(['pip install -e ".[dev,transport]"', "mypy"]),
             # Has transport but runs no mypy -> not a typecheck job.
             "test": _job(['pip install -e ".[${{ matrix.extras }},transport]"', "pytest -q"]),
+            # A typecheck job with a shell-var extra: the literal `dev` is picked
+            # up but the `$EXTRA` token must be dropped, not counted as covered.
+            "typecheck-dyn": _job(['pip install -e ".[dev,$EXTRA]"', "mypy"]),
             # Runs mypy but is non-blocking -> does not satisfy coverage.
             "research-typecheck": _job(
                 ['pip install -e ".[dev,research]"', "mypy"], continue_on_error=True
@@ -110,8 +113,8 @@ def test_blocking_typecheck_extras_parsing() -> None:
     )
     extras = blocking_typecheck_extras(ci)
     assert extras == {"dev", "transport"}, extras
-    # The interpolation token from the test job must never leak in.
-    assert not any("matrix" in e or "{" in e for e in extras), extras
+    # No interpolation / shell-var token may leak in.
+    assert not any("matrix" in e or "{" in e or "$" in e for e in extras), extras
 
 
 def test_real_repo_pyproject_and_ci_pass() -> None:

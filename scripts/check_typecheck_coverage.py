@@ -67,7 +67,9 @@ def blocking_typecheck_extras(ci: dict[str, Any]) -> set[str]:
             for match in _EXTRAS_RE.finditer(run):
                 for token in match.group(1).split(","):
                     token = token.strip()
-                    if token and "${{" not in token and "{" not in token:
+                    # Reject any interpolation/shell token (`${{ matrix.extras }}`,
+                    # `$VAR`, `{...}`) — real extra names are [a-z0-9._-] only.
+                    if token and "$" not in token and "{" not in token:
                         extras.add(token)
     return extras
 
