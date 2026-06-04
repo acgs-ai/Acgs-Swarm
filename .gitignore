@@ -33,6 +33,9 @@ SYSTEMIC_IMPROVEMENT.md
 HANDOFF_*.md
 *-command-message*.txt
 
+# Tooling caches (compound-engineering plugin scratch)
+.context/
+
 # Coverage and runtime artifacts
 .coverage
 coverage.json

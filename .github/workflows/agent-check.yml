@@ -31,6 +31,9 @@ jobs:
       - name: Agent self-check (registries + doc completeness)
         run: uv run --no-sync python scripts/agent_check.py
 
+      - name: Typecheck coverage (every optional extra checked or excepted)
+        run: uv run --no-sync python scripts/check_typecheck_coverage.py
+
       - name: Smoke (import + CLI sanity)
         run: |
           uv run --no-sync python -c "import constitutional_swarm; print('import OK')"

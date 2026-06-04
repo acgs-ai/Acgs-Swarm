@@ -36,10 +36,33 @@ Index of architecture & product decisions. Detailed ADRs live in
 | Dependency/runner | `uv` + `uv.lock` | Reproducible installs; the system interpreter is `python3` with no global pip/ruff/pytest. |
 | Standalone setup | `uv sync --no-sources` (in `make setup`) | `pyproject` pins `acgs-lite = { workspace = true }` for monorepo dev; a standalone clone resolves it from PyPI instead. See [BLOCKERS.md](BLOCKERS.md) B1. |
 | Pytest path | `pythonpath = ["src", "."]` | A few tests `import scripts.*`; repo root must be importable when running from root. |
-| Static analysis | ruff only (no mypy/pyright yet) | Recorded as [BLOCKERS.md](BLOCKERS.md) B3; `make typecheck` runs ruff as the interim gate. |
+| Static analysis | mypy (whole package, no allow-list) + ruff | `make typecheck` runs mypy across two CI surfaces (no-extras + `transport`); `make typecheck-coverage` guards extra-gating. See [BLOCKERS.md](BLOCKERS.md) B3 and the 2026-06-03 typecheck env-consistency log entry below. |
 | Single source of truth for commands | `tools/registry.yaml` | Validated by `make agent-check`; `TOOLS.md` is the human view. |
 
 ## Decisions log
+
+### 2026-06-03 — Typecheck gate environment consistency
+
+The mypy gate ran only in a dev-only CI job, so type errors that surface only when
+an optional `py.typed` extra is installed (e.g. `websockets`/`transport`) never
+blocked a PR — a structural blind spot proven by `gossip_protocol.py`. Decisions:
+
+- **Two blocking typecheck CI jobs**, not one: keep the no-extras job (the published
+  library's distribution contract) and add `typecheck-transport` (`.[dev,transport]`,
+  matching the local `make typecheck` default `EXTRAS="dev transport"`). A single
+  replace was the lighter alternative; two jobs guarantee a superset without leaning
+  on the dominance argument.
+- **Heavy `research` (torch/transformers) stays out of the gate** — heavy and crashes
+  mypy; `follow_imports = "skip"` if ever gated.
+- **`warn_unused_ignores` stays OFF** — env-divergent ignores would flip-flop;
+  re-enabling cleanly needs the `# type: ignore[code,unused-ignore]` idiom — deferred.
+- **Regression guardrail**: `make typecheck-coverage` (`scripts/check_typecheck_coverage.py`)
+  asserts every optional extra is `checked` (installed by a blocking mypy job) or
+  `excepted` (with a reason) in `[tool.constitutional_swarm.typecheck_coverage]`, so a
+  new extra-gated module cannot silently reopen the blind spot. `langgraph` is excepted
+  with a known live error (`swarm_topology.py:126`) pending a code fix + mypy-band pin.
+
+Plan: `docs/plans/2026-06-03-003-fix-typecheck-env-consistency-plan.md`.
 
 ### 2026-06-03 — Governed-handoff kernel hardening (make the security claims true)
 
