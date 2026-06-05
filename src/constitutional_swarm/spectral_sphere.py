@@ -178,7 +178,9 @@ class SpectralSphereManifold:
                                       → Perron-Frobenius collapse by cycle 10
 
         SpectralSphereManifold.compose() → spectral_sphere_project
-                                          → trust variance preserved (>80% retention)
+                                          → trust variance preserved (stable
+                                            fixed point with residual_alpha=0.1;
+                                            see compose() for exact figures)
 
     The manifold relaxes the doubly-stochastic constraint entirely, keeping only
     ‖H‖₂ ≤ r. This allows agents to hold negative trust entries (representing
@@ -294,7 +296,7 @@ class SpectralSphereManifold:
         self,
         other: SpectralSphereManifold,
         *,
-        residual_alpha: float = 0.0,
+        residual_alpha: float = 0.1,
     ) -> SpectralSphereManifold:
         """Compose two spectral-sphere manifolds.
 
@@ -305,9 +307,14 @@ class SpectralSphereManifold:
         Args:
             other: The manifold to compose with (right-hand side).
             residual_alpha: Fraction of identity matrix added to the composed
-                product before projection. 0.0 = pure composition (default,
-                backward compatible). Values in [0.05, 0.20] stabilize variance
-                by preventing power-iteration convergence to a rank-1 limit.
+                product before projection. Default 0.1 — the production-safe
+                value used by swarm_ode.py and every retention test. Values in
+                [0.05, 0.20] stabilize variance by preventing power-iteration
+                convergence to a rank-1 limit. Pass 0.0 only to deliberately
+                reproduce the unmitigated collapse (e.g. baseline contrast tests):
+                pure composition is matrix power iteration and drives H^k to a
+                rank-1 attractor, the same operator-choice collapse Sinkhorn/
+                Birkhoff projection suffers.
 
                 Formally: result = spectral_project(alpha * I + (1 - alpha) * (A @ B))
 
@@ -315,9 +322,14 @@ class SpectralSphereManifold:
                 With alpha > 0, H^k never converges to rank-1 because each composition
                 injects alpha * I of identity structure back into the product.
 
-        Birkhoff (GovernanceManifold): 0% retention at cycle 10.
-        Spectral sphere (alpha=0.0):  ~5% retention at cycle 10, decays slowly.
-        Spectral sphere (alpha=0.1):  >80% retention across 100+ cycles.
+        Variance retention measured at cycle 10 (n=10, structured init):
+            Birkhoff (GovernanceManifold):          0.0% — full collapse.
+            Spectral sphere (alpha=0.0):          ~2-5%, then rank-1 by cycle 20
+                                                  (sigma_2/sigma_1 -> 0).
+            Spectral sphere (alpha=0.1):          stable fixed point (~20% at
+                                                  n=10, flat across 100+ cycles;
+                                                  sigma_2/sigma_1 ~ 0.3).
+        See tests/test_spectral_sphere_retention.py for the empirical proof.
         """
         if self._n != other._n:
             raise ValueError("Cannot compose manifolds of different sizes")
