@@ -330,7 +330,7 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        return MinerAxonServer(miner)
+        return MinerAxonServer(miner, allow_unauthenticated=True)
 
     @pytest.mark.asyncio
     async def test_forward_fn_fills_response(self, axon_server):

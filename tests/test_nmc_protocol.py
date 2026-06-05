@@ -48,15 +48,16 @@ def _three_miner_session(
     exclude_sybils: bool = True,
 ) -> tuple[NMCSession, dict]:
     miners = {"m1", "m2", "m3"}
+    weights = {"m1": w1, "m2": w2, "m3": w3}
     session = NMCSession(
         case_id="ESC-test",
         required_miners=miners,
         min_reveals=2,
         exclude_sybils=exclude_sybils,
+        miner_weights=weights,
     )
     nonces = {m: uuid.uuid4().hex for m in miners}
     judgments = {"m1": j1, "m2": j2, "m3": j3}
-    weights = {"m1": w1, "m2": w2, "m3": w3}
 
     # Commit phase
     for m in miners:

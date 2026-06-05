@@ -2,7 +2,7 @@
 
 Provides handler functions compatible with bittensor's axon.attach() API:
   - forward_fn: async handler that processes governance cases
-  - blacklist_fn: rejects requests (placeholder, always allows)
+  - blacklist_fn: rejects unauthenticated / untrusted validator requests
   - verify_fn: validates required fields before processing
   - priority_fn: ranks requests by impact score
 
@@ -24,6 +24,7 @@ Usage (real bittensor):
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from constitutional_swarm.bittensor.miner import (
     ConstitutionalMiner,
@@ -45,8 +46,16 @@ class MinerAxonServer:
     delegating actual processing to the ConstitutionalMiner.
     """
 
-    def __init__(self, miner: ConstitutionalMiner) -> None:
+    def __init__(
+        self,
+        miner: ConstitutionalMiner,
+        *,
+        trusted_validator_hotkeys: set[str] | None = None,
+        allow_unauthenticated: bool = False,
+    ) -> None:
         self._miner = miner
+        self._trusted_validator_hotkeys = set(trusted_validator_hotkeys or set())
+        self._allow_unauthenticated = allow_unauthenticated
 
     @property
     def miner(self) -> ConstitutionalMiner:
@@ -85,10 +94,16 @@ class MinerAxonServer:
         """Decide whether to reject a request outright.
 
         Returns True to blacklist (reject), False to allow.
-        Currently allows all requests — tier-based filtering
-        will be added post-testnet validation.
+        Fail-closed unless the server is explicitly configured for local
+        unauthenticated operation or the caller hotkey is in the trusted
+        validator set.
         """
-        return False
+        if self._allow_unauthenticated:
+            return False
+        caller = self._caller_hotkey(synapse)
+        if not caller:
+            return True
+        return caller not in self._trusted_validator_hotkeys
 
     def verify(self, synapse: GovernanceDeliberation) -> None:
         """Validate required fields before processing.
@@ -107,6 +122,28 @@ class MinerAxonServer:
         """Assign processing priority based on impact score.
 
         Higher impact cases get processed first when the miner
-        has a backlog of requests.
+        has a backlog of authenticated requests.  Untrusted callers get zero
+        priority so an attacker cannot self-rank by setting impact_score.
         """
-        return synapse.impact_score
+        if self.blacklist(synapse):
+            return 0.0
+        return max(float(synapse.impact_score), 0.0)
+
+    @staticmethod
+    def _caller_hotkey(synapse: Any) -> str:
+        """Best-effort Bittensor caller hotkey extraction.
+
+        Real bt.Synapse objects carry caller identity under ``dendrite``; local
+        tests may provide a flat validator_hotkey/request_hotkey field.
+        """
+
+        for container_name in ("dendrite", "axon"):
+            container = getattr(synapse, container_name, None)
+            hotkey = getattr(container, "hotkey", "")
+            if hotkey:
+                return str(hotkey)
+        for field_name in ("validator_hotkey", "request_hotkey", "hotkey"):
+            hotkey = getattr(synapse, field_name, "")
+            if hotkey:
+                return str(hotkey)
+        return ""

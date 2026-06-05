@@ -39,10 +39,10 @@ ZERO_HASH = "0" * 64
 BUNDLE_SIG_DOMAIN = "acgs.governed-handoff.bundle-attestation.v1"
 
 # Code-owned default tool/test command allowlist. The deterministic ``tool_call``
-# gate is default-DENY against this set (the supervisor owns it; the in-sandbox
-# constitution may only EXTEND it). Closes the prior default-ALLOW hole where any
-# command without a secret/metacharacter match (e.g. ``curl http://x/``) ran.
-DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("python", "python3", "pytest")
+# gate is default-DENY against this set. Keep this to inert commands; interpreter
+# and test-runner commands remain denied even if a local policy allowlists them.
+DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("true", "echo")
+DENIED_INTERPRETER_COMMANDS: frozenset[str] = frozenset({"python", "python3", "pytest"})
 
 
 @dataclass(frozen=True)
@@ -201,6 +201,13 @@ class PolicyEngine:
         if not argv:
             return PolicyDecision("tool_call", command, DENY, "empty tool command")
         executable = Path(argv[0]).name
+        if executable in DENIED_INTERPRETER_COMMANDS:
+            return PolicyDecision(
+                "tool_call",
+                command,
+                DENY,
+                f"interpreter/test runner {executable!r} is not allowed for task directives",
+            )
         if executable not in self.command_allowlist:
             return PolicyDecision(
                 "tool_call",

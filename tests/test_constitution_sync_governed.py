@@ -65,7 +65,7 @@ def _stake(members: set[str], weight: int = 1) -> dict[str, int]:
 class TestApplyGovernedHappyPath:
     def test_successful_governed_update_bumps_epoch(self):
         dist = ConstitutionDistributor(YAML_E1)
-        receiver = ConstitutionReceiver(node_id="miner-01")
+        receiver = ConstitutionReceiver(node_id="miner-01", allow_unsigned=True)
         # Bootstrap via ungoverned apply (legacy path).
         receiver.apply(dist.broadcast_message())
         assert receiver.active_epoch is None
@@ -89,7 +89,7 @@ class TestApplyGovernedHappyPath:
         assert receiver.active_hash == msg.expected_hash
 
     def test_subsequent_governed_update_requires_epoch_continuity(self):
-        receiver = ConstitutionReceiver(node_id="miner-02")
+        receiver = ConstitutionReceiver(node_id="miner-02", allow_unsigned=True)
         dist = ConstitutionDistributor(YAML_BOOT)
         receiver.apply(dist.broadcast_message())
 
@@ -126,7 +126,7 @@ class TestApplyGovernedHappyPath:
 class TestApplyGovernedRejection:
     def _setup(self):
         dist = ConstitutionDistributor(YAML_BOOT)
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
         return dist, receiver
 
@@ -226,7 +226,7 @@ class TestApplyGovernedRejection:
 
     def test_rejects_certificate_with_wrong_active_prior(self):
         dist = ConstitutionDistributor(YAML_E1)
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
 
         wrong_prior = _version(0, ())
@@ -245,7 +245,7 @@ class TestApplyGovernedRejection:
 
     def test_rejects_message_not_bound_to_certificate_proposal(self):
         dist = ConstitutionDistributor(YAML_BOOT)
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
 
         v0 = _version(0, ())
@@ -266,7 +266,7 @@ class TestApplyGovernedRejection:
 class TestApplyGovernedIntegrity:
     def test_hash_mismatch_after_valid_cert_still_rejects(self):
         dist = ConstitutionDistributor(YAML_E1)
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
 
         prior = _version(0, ("safety-01",))
@@ -297,7 +297,7 @@ class TestApplyGovernedIntegrity:
         assert receiver.active_epoch is None
 
     def test_summary_includes_active_epoch(self):
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         assert receiver.summary()["active_epoch"] is None
 
         dist = ConstitutionDistributor(YAML_BOOT)
@@ -316,7 +316,7 @@ class TestApplyGovernedIntegrity:
 
     def test_legacy_apply_does_not_touch_active_epoch(self):
         dist = ConstitutionDistributor(YAML_E1)
-        receiver = ConstitutionReceiver(node_id="m")
+        receiver = ConstitutionReceiver(node_id="m", allow_unsigned=True)
         result = receiver.apply(dist.broadcast_message())
         assert result.success
         assert receiver.active_epoch is None

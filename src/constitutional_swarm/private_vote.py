@@ -628,8 +628,9 @@ def tally(
         # Collect all reveals per commit — the valid one is found during tally.
         reveals_by_commit.setdefault(rv.commit, []).append(rv)
 
-    # Filter by epoch/subject + verify commit signatures + nullifier dedup.
+    # Filter by epoch/subject + verify commit signatures + voter/nullifier dedup.
     seen_nullifiers: dict[bytes, CommitRecord] = {}
+    seen_voters: dict[bytes, CommitRecord] = {}
     accepted: list[CommitRecord] = []
     rejected: list[tuple[bytes, str]] = []
     provers_map: Mapping[str, ValidityProver] = provers or {}
@@ -674,6 +675,11 @@ def tally(
             rejected.append((c.commit, "duplicate nullifier"))
             continue
         seen_nullifiers[c.nullifier] = c
+        prior_voter = seen_voters.get(c.voter)
+        if prior_voter is not None:
+            rejected.append((c.commit, "duplicate voter"))
+            continue
+        seen_voters[c.voter] = c
         accepted.append(c)
 
     totals: dict[BallotChoice, int] = {ch: 0 for ch in BallotChoice}
@@ -737,6 +743,7 @@ class PrivateBallotBox:
     subject: bytes
     _commits: dict[bytes, CommitRecord] = field(default_factory=dict)
     _nullifiers: dict[bytes, bytes] = field(default_factory=dict)  # nullifier -> commit
+    _voters: dict[bytes, bytes] = field(default_factory=dict)  # voter pubkey -> commit
     _reveals: dict[bytes, RevealRecord] = field(default_factory=dict)
     _closed_commits: bool = False
 
@@ -760,8 +767,12 @@ class PrivateBallotBox:
         prior = self._nullifiers.get(record.nullifier)
         if prior is not None and prior != record.commit:
             raise DoubleVoteError("nullifier reuse")
+        prior_voter = self._voters.get(record.voter)
+        if prior_voter is not None and prior_voter != record.commit:
+            raise DoubleVoteError("duplicate voter")
         self._commits[record.commit] = record
         self._nullifiers[record.nullifier] = record.commit
+        self._voters[record.voter] = record.commit
 
     def close_commit_phase(self) -> None:
         self._closed_commits = True

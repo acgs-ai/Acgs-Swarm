@@ -59,6 +59,7 @@ def _make_validator(
         stake=stake,
         reputation=reputation,
         fault_domain=fault_domain,
+        public_key_bytes=pk_bytes,
     )
     return ident, sk, pk_bytes
 

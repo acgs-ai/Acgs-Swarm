@@ -22,6 +22,7 @@ Roadmap reference: 08-subnet-implementation-roadmap.md § Phase 2.1
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -127,7 +128,18 @@ class ProofEvidence:
 
     def membership_leaf(self) -> str:
         """SHA-256 leaf hash for Merkle tree inclusion."""
-        payload = f"{self.root_hash}:{self.content_hash}:{self.constitutional_hash}"
+        payload = json.dumps(
+            {
+                "v": 2,
+                "proof_id": self.proof_id,
+                "root_hash": self.root_hash,
+                "content_hash": self.content_hash,
+                "vote_hashes": list(self.vote_hashes),
+                "constitutional_hash": self.constitutional_hash,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
 

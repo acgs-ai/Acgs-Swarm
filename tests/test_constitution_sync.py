@@ -178,7 +178,7 @@ class TestConstitutionDistributor:
 
 class TestConstitutionReceiver:
     def test_uninitialised(self):
-        r = ConstitutionReceiver("miner-01")
+        r = ConstitutionReceiver("miner-01", allow_unsigned=True)
         assert not r.is_initialised
         assert r.active_hash == ""
         assert r.active_yaml == ""
@@ -187,7 +187,7 @@ class TestConstitutionReceiver:
         dist = ConstitutionDistributor(YAML_V1)
         msg = dist.broadcast_message()
 
-        receiver = ConstitutionReceiver("miner-01")
+        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
         result = receiver.apply(msg)
 
         assert result.success is True
@@ -203,7 +203,7 @@ class TestConstitutionReceiver:
             yaml_content=msg.yaml_content + "\n# tampered",
             issued_at=msg.issued_at,
         )
-        receiver = ConstitutionReceiver("miner-01")
+        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
         result = receiver.apply(tampered)
 
         assert result.success is False
@@ -212,7 +212,7 @@ class TestConstitutionReceiver:
     def test_apply_noop_same_version(self):
         dist = ConstitutionDistributor(YAML_V1)
         msg = dist.broadcast_message()
-        receiver = ConstitutionReceiver("miner-01")
+        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
         receiver.apply(msg)
 
         result = receiver.apply(msg)
@@ -222,7 +222,7 @@ class TestConstitutionReceiver:
 
     def test_apply_version_update(self):
         dist = ConstitutionDistributor(YAML_V1)
-        receiver = ConstitutionReceiver("miner-01")
+        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
 
         dist.update(YAML_V2)
@@ -234,7 +234,7 @@ class TestConstitutionReceiver:
 
     def test_verify_task_hash_matches(self):
         dist = ConstitutionDistributor(YAML_V1)
-        receiver = ConstitutionReceiver("miner-01")
+        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
         receiver.apply(dist.broadcast_message())
 
         assert receiver.verify_task_hash(dist.active_hash) is True
@@ -248,7 +248,7 @@ class TestConstitutionReceiver:
 
     def test_multiple_receivers_stay_in_sync(self):
         dist = ConstitutionDistributor(YAML_V1)
-        miners = [ConstitutionReceiver(f"miner-{i:02d}") for i in range(5)]
+        miners = [ConstitutionReceiver(f"miner-{i:02d}", allow_unsigned=True) for i in range(5)]
 
         msg = dist.broadcast_message()
         for m in miners:
