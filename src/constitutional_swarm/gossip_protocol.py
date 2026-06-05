@@ -44,6 +44,7 @@ import asyncio
 import json
 import logging
 import random
+import secrets
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -213,16 +214,23 @@ class GossipServer:
         port: int = 0,
         *,
         secret_token: str | None = None,
+        allow_unauthenticated: bool = False,
     ) -> None:
         self.crdt = crdt
         self.host = host
         self.port = port
         self._secret_token = secret_token
+        self._allow_unauthenticated = allow_unauthenticated
         self._server: Any = None  # websockets.Server
         self._actual_port: int = port
 
     async def start(self) -> None:
         """Start the WebSocket server. Raises ImportError if websockets not installed."""
+        if self._secret_token is None and not self._allow_unauthenticated:
+            raise ValueError(
+                "GossipServer requires secret_token unless "
+                "allow_unauthenticated=True is set explicitly"
+            )
         try:
             import websockets  # type: ignore[import]
         except ImportError as exc:
@@ -271,8 +279,8 @@ class GossipServer:
             # message (or a wrong token) closes the connection immediately.
             if self._secret_token is not None:
                 try:
-                    first_msg = await websocket.__anext__()
-                except StopAsyncIteration:
+                    first_msg = await websocket.recv()
+                except connection_closed_error:
                     return
                 try:
                     auth = json.loads(first_msg)
@@ -394,12 +402,21 @@ class SwarmNode:
         port: int = 0,
         reject_unverified: bool = True,
         gossip_batch_size: int = 0,
+        secret_token: str | None = None,
+        allow_unauthenticated: bool = False,
     ) -> None:
         self.agent_id = agent_id
         self.crdt = MerkleCRDT(agent_id, reject_unverified=reject_unverified)
         self.registry = GossipPeerRegistry()
         self.client = GossipClient()
-        self._server = GossipServer(self.crdt, host=host, port=port)
+        self._secret_token = secret_token
+        self._server = GossipServer(
+            self.crdt,
+            host=host,
+            port=port,
+            secret_token=secret_token,
+            allow_unauthenticated=allow_unauthenticated,
+        )
         self._gossip_batch_size = gossip_batch_size
         self._running = False
 
@@ -471,7 +488,10 @@ class SwarmNode:
             return {"peers_contacted": 0, "successes": 0, "nodes_sent": 0}
 
         results = await asyncio.gather(
-            *[self.client.send_batch(host, port, nodes) for host, port in peers],
+            *[
+                self.client.send_batch(host, port, nodes, secret_token=self._secret_token)
+                for host, port in peers
+            ],
             return_exceptions=True,
         )
         successes = sum(1 for r in results if r is True)
@@ -517,6 +537,7 @@ async def spin_up_swarm(
     *,
     host: str = "127.0.0.1",
     reject_unverified: bool = True,
+    secret_token: str | None = None,
 ) -> list[SwarmNode]:
     """Spin up n_nodes SwarmNodes on localhost with OS-assigned ports.
 
@@ -531,8 +552,14 @@ async def spin_up_swarm(
         finally:
             await asyncio.gather(*[n.stop() for n in nodes])
     """
+    shared_secret = secret_token or secrets.token_urlsafe(32)
     nodes = [
-        SwarmNode(f"agent-{i}", host=host, reject_unverified=reject_unverified)
+        SwarmNode(
+            f"agent-{i}",
+            host=host,
+            reject_unverified=reject_unverified,
+            secret_token=shared_secret,
+        )
         for i in range(n_nodes)
     ]
     # Start all servers

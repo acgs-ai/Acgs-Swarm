@@ -321,6 +321,8 @@ def verify_certificate(
     qc: QuorumCertificate,
     *,
     validator_set: ValidatorSet,
+    threshold_fraction: float = 2 / 3,
+    expected_threshold_weight: float | None = None,
 ) -> None:
     """Re-verify a QC against the current validator set.
 
@@ -351,6 +353,14 @@ def verify_certificate(
         ident = validator_set.get(sv.voter_id)
         if ident is None:
             raise InvalidCertificateError(f"voter {sv.voter_id!r} not in validator set")
+        if ident.public_key_bytes is None:
+            raise InvalidCertificateError(
+                f"registered public key missing for voter {sv.voter_id!r}"
+            )
+        if sv.public_key_bytes != ident.public_key_bytes:
+            raise InvalidCertificateError(
+                f"embedded public key for voter {sv.voter_id!r} does not match registry"
+            )
         domain = policy.resolve_domain(ident)
         per_domain[domain] = per_domain.get(domain, 0.0) + ident.effective_weight
         seen_voters.add(sv.voter_id)
@@ -368,6 +378,16 @@ def verify_certificate(
     if recomputed + 1e-9 < qc.achieved_weight:
         raise InsufficientQuorumError(
             f"recomputed weight {recomputed:.6f} < stored {qc.achieved_weight:.6f}"
+        )
+    trusted_threshold = (
+        expected_threshold_weight
+        if expected_threshold_weight is not None
+        else max(qc.threshold_weight, threshold_fraction * validator_set.total_weight())
+    )
+    if recomputed + 1e-9 < trusted_threshold:
+        raise InvalidCertificateError(
+            f"recomputed weight {recomputed:.6f} below trusted threshold "
+            f"{trusted_threshold:.6f}"
         )
 
 

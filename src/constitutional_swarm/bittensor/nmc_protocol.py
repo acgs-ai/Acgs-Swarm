@@ -58,7 +58,7 @@ class NMCSessionState(Enum):
 
 class SynthesisMethod(Enum):
     MAJORITY_VOTE = "majority_vote"  # most common judgment text wins
-    WEIGHTED_VOTE = "weighted_vote"  # weight by miner-provided weight (tier)
+    WEIGHTED_VOTE = "weighted_vote"  # weight by trusted coordinator tier map
     UNANIMOUS = "unanimous"  # all miners must agree (strictest)
 
 
@@ -235,6 +235,8 @@ class NMCSession:
         min_reveals: int = 2,
         deadline_seconds: float = 300.0,
         exclude_sybils: bool = True,
+        miner_weights: dict[str, float] | None = None,
+        trust_supplied_weights: bool = False,
     ) -> None:
         self.session_id = uuid.uuid4().hex[:12]
         self.case_id = case_id
@@ -242,6 +244,8 @@ class NMCSession:
         self._min_reveals = min_reveals
         self._deadline_at = time.time() + deadline_seconds
         self._exclude_sybils = exclude_sybils
+        self._miner_weights = dict(miner_weights or {})
+        self._trust_supplied_weights = trust_supplied_weights
 
         self._commitments: dict[str, NMCCommitment] = {}  # miner_uid → commitment
         self._reveals: dict[str, NMCReveal] = {}  # miner_uid → reveal
@@ -301,6 +305,8 @@ class NMCSession:
             raise ValueError(f"Session {self.session_id} deadline passed")
         if miner_uid in self._commitments:
             raise ValueError(f"Miner {miner_uid} already committed")
+        if self._required and miner_uid not in self._required:
+            raise ValueError(f"Miner {miner_uid} is not required for this session")
 
         c = NMCCommitment(
             commitment_id=uuid.uuid4().hex[:8],
@@ -356,7 +362,7 @@ class NMCSession:
             miner_uid=miner_uid,
             judgment_text=judgment_text,
             nonce=nonce,
-            weight=weight,
+            weight=self._trusted_weight(miner_uid, weight),
             revealed_at=time.time(),
         )
         # Verify commitment
@@ -364,6 +370,21 @@ class NMCSession:
             raise ValueError(f"Miner {miner_uid} reveal does not match commitment")
         self._reveals[miner_uid] = rev
         return True
+
+    def _trusted_weight(self, miner_uid: str, supplied_weight: float) -> float:
+        if self._miner_weights:
+            if miner_uid not in self._miner_weights:
+                raise ValueError(f"Miner {miner_uid} has no trusted weight")
+            trusted = self._miner_weights[miner_uid]
+        elif self._trust_supplied_weights:
+            # Legacy/local simulation escape hatch. Production sessions should
+            # pass miner_weights from the validator/metagraph tier registry.
+            trusted = supplied_weight
+        else:
+            trusted = 1.0
+        if trusted < 0.0:
+            raise ValueError("miner weight must be non-negative")
+        return trusted
 
     # ------------------------------------------------------------------
     # Phase 3: Synthesize
