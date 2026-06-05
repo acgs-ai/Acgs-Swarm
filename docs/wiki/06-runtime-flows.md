@@ -133,7 +133,7 @@ Replicas converge to the same head set without a coordinator
 
 > **Baseline control:** `manifold.py` runs the same projection with
 > Birkhoff/Sinkhorn and **collapses to uniformity** — the kept empirical proof,
-> not a path to use in production. (See [03-domains §trust](03-domains.md).)
+> not a path to use in production. (See [03-domains §trust](03-domains.md#trust-dynamics).)
 
 ---
 

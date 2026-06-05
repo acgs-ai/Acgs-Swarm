@@ -69,6 +69,7 @@ Outputs are accepted only after **assigned peers vote**, and decisions become
   fault-domain weight caps and VRF-style deterministic committee selection
   (`CommitteeSelector.select`).
 
+<a id="trust-dynamics"></a>
 ## Domain 4 — Trust dynamics / the governance manifold (Pattern D)
 
 Trust between agents is a matrix that evolves over time. Left unconstrained it

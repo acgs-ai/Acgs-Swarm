@@ -369,6 +369,7 @@ The largest subpackage; a full incentive subnet. By role:
 
 ---
 
+<a id="scripts"></a>
 ## `scripts/` (operator & eval CLIs)
 
 Each operator-facing script should have a `tools/registry.yaml` entry (enforced

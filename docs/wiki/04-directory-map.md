@@ -80,7 +80,7 @@ Top-level package guide: [`src/constitutional_swarm/AGENTS.md`](../../src/consti
   (validated by `make agent-check` against `schemas/registry.schema.json`);
   `runbooks/` holds per-tool guides (setup, test, governed-handoff,
   testnet-deploy, agent-check, agent-self-evolve, typecheck-coverage).
-- **`scripts/`** — see [05 §scripts](05-module-reference.md) and `TOOLS.md`.
+- **`scripts/`** — see [05 §scripts](05-module-reference.md#scripts) and `TOOLS.md`.
   Notable: `reproduce_paper_claims.py`, `run_governance_benchmark.py`,
   `run_swe_bench_lite.py`, `verify_citations.py`, `generate_security_report.py`,
   `testnet_deploy.py`, `agent_check.py`, `agent_self_evolve.py`.
