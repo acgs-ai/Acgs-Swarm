@@ -184,6 +184,11 @@ Choose another tool first when you need:
 - Treat optional research modules as experimental surfaces, not hardened defaults.
 
 ## Documentation map
+> **Maintainers & AI agents:** start at the consolidated wiki —
+> [`docs/wiki/`](docs/wiki/README.md). It ties these docs together with
+> per-module code logic, end-to-end runtime flows, the roadmap, and a handoff
+> checklist.
+
 | Audience | Start here | Then read |
 |---|---|---|
 | New contributors | [`docs/quickstart.md`](docs/quickstart.md) | [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/community.md`](docs/community.md) |
