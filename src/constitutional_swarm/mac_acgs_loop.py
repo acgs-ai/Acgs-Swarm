@@ -38,13 +38,21 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from constitutional_swarm.bittensor.came_coordinator import (
-    CAMECoordinator,
-    CAMECoordinatorConfig,
-    CAMECycleResult,
-)
+if TYPE_CHECKING:
+    # Optional `bittensor` extra. Imported lazily at construction time (see
+    # `_default_came_config` and the function-local imports below) so that
+    # `import constitutional_swarm` never pulls in the bittensor subpackage
+    # (~458ms) when the extra is not in use. See
+    # docs/RUNTIME_OPTIMIZATION_REPORT.md bottleneck B1 and
+    # src/constitutional_swarm/AGENTS.md.
+    from constitutional_swarm.bittensor.came_coordinator import (
+        CAMECoordinator,
+        CAMECoordinatorConfig,
+        CAMECycleResult,
+    )
+
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
 from constitutional_swarm.debate_resolver import (
     DebateResolver,
@@ -138,6 +146,18 @@ class ConstitutionUpdate:
 # ---------------------------------------------------------------------------
 
 
+def _default_came_config() -> CAMECoordinatorConfig:
+    """Build a default ``CAMECoordinatorConfig`` with a lazy bittensor import.
+
+    Used as the ``default_factory`` for :attr:`MacAcgsConfig.came_config` so the
+    optional ``bittensor`` subpackage is only imported when a config is actually
+    instantiated, not at module load time.
+    """
+    from constitutional_swarm.bittensor.came_coordinator import CAMECoordinatorConfig
+
+    return CAMECoordinatorConfig()
+
+
 @dataclass
 class MacAcgsConfig:
     """Configuration for the MAC-ACGS auto-constitution loop.
@@ -161,7 +181,7 @@ class MacAcgsConfig:
     auto_defend: bool = True
     max_updates_per_cycle: int = 5
     audit_log_size: int = 5000
-    came_config: CAMECoordinatorConfig = field(default_factory=CAMECoordinatorConfig)
+    came_config: CAMECoordinatorConfig = field(default_factory=_default_came_config)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +272,11 @@ class MacAcgsLoop:
         debate: DebateResolver | None = None,
     ) -> None:
         self._config = config or MacAcgsConfig()
-        self._came = came or CAMECoordinator(config=self._config.came_config)
+        if came is None:
+            from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
+
+            came = CAMECoordinator(config=self._config.came_config)
+        self._came = came
         self._debate = debate or DebateResolver(
             approval_threshold=self._config.debate_approval_threshold,
             min_challenges=self._config.debate_min_challenges,
@@ -304,13 +328,20 @@ class MacAcgsLoop:
         hash_ok = self._verify_hash()
         events.append(
             self._event(
-                PipelineEventType.HASH_VERIFIED if hash_ok else PipelineEventType.HASH_MISMATCH,
+                PipelineEventType.HASH_VERIFIED
+                if hash_ok
+                else PipelineEventType.HASH_MISMATCH,
                 cycle,
-                {"constitutional_hash": self._config.constitutional_hash, "verified": hash_ok},
+                {
+                    "constitutional_hash": self._config.constitutional_hash,
+                    "verified": hash_ok,
+                },
             )
         )
         if not hash_ok:
             # Fail-closed: abort cycle
+            from constitutional_swarm.bittensor.came_coordinator import CAMECycleResult
+
             came_result = CAMECycleResult(
                 grid_coverage=0.0,
                 ceiling_detected=False,
@@ -454,7 +485,11 @@ class MacAcgsLoop:
                     updates.append(update)
                     self._constitution_updates.append(update)
                     events.append(
-                        self._event(PipelineEventType.CONSTITUTION_UPDATED, cycle, update.to_dict())
+                        self._event(
+                            PipelineEventType.CONSTITUTION_UPDATED,
+                            cycle,
+                            update.to_dict(),
+                        )
                     )
                 else:
                     proposals_rejected += 1

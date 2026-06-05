@@ -14,7 +14,7 @@ Full module inventory: see `README.md` at the repo root.
 | `mesh/` | `ConstitutionalMesh` package. Requires Ed25519 vote signatures (`register_local_signer`, `register_remote_agent`, `sign_vote`); raise `InvalidVoteSignatureError` on mismatch. |
 | `evolution_log.py` | Writes must remain strictly monotonic with non-negative acceleration; raise `NonIncreasingValueError` / `DecelerationBlockedError`, never silently drop records. |
 | `latent_dna.py` | 53 pre-existing RUF002/RUF003 ruff errors (Greek characters). Do not mass-rewrite — suppress targeted rules if lint-clean is required. |
-| `mac_acgs_loop.py` | Known import-boundary violation — see MANUAL section below for details. |
+| `mac_acgs_loop.py` | Import boundary is lazy (bittensor loaded only at construction). Guarded by `tests/test_core_import_isolation.py` — keep it that way. See MANUAL section. |
 | `__init__.py` | Re-exports all stable symbols. Any new public symbol must be added here and to `__all__` (alphabetized). |
 
 ## Subdirectories
@@ -47,28 +47,29 @@ Full module inventory: see `README.md` at the repo root.
 
 <!-- MANUAL: -->
 
-### Known Issue: mac_acgs_loop.py bittensor import leak
+### Resolved: mac_acgs_loop.py bittensor import leak
 
-`mac_acgs_loop.py` line 43 unconditionally imports `bittensor.came_coordinator`:
+**Status: fixed (2026-06-05).** `mac_acgs_loop.py` no longer imports
+`bittensor.came_coordinator` at module scope. The bittensor symbols load lazily
+— only when a MAC-ACGS object is actually constructed — so
+`import constitutional_swarm` stays light (cold import ~267ms, down from ~458ms
+of bittensor cost) and no longer pulls in the bittensor subpackage.
 
-```python
-from constitutional_swarm.bittensor.came_coordinator import (...)
-```
+The naive "move the import into one method" sketch was insufficient: the module
+had **three** runtime touch points, including a dataclass
+`field(default_factory=CAMECoordinatorConfig)` that is evaluated at *module load*
+time. The implemented fix:
 
-This loads the entire bittensor subpackage (~458ms, measured 2026-04-24) on every
-`import constitutional_swarm`, even when bittensor is not in use. Bittensor is an
-optional extra; this violates the "keep core import-free of optional extras" rule.
+- A `TYPE_CHECKING` block imports the three symbols for annotations (the module
+  already uses `from __future__ import annotations`, so annotations are lazy
+  strings).
+- A module-level `_default_came_config()` helper does a function-local import and
+  is used as the field's `default_factory` (defers the import to first
+  `MacAcgsConfig()` instantiation).
+- Function-local imports at the two construction sites (`MacAcgsLoop.__init__`
+  and the cycle method's fail-closed `CAMECycleResult` branch).
 
-**Fix:** move the import inside the method that constructs `CAMECoordinator`:
-
-```python
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
-
-def _build_came_coordinator(self, ...) -> "CAMECoordinator":
-    from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
-    return CAMECoordinator(...)
-```
-
-Tracked in: `docs/RUNTIME_OPTIMIZATION_REPORT.md` (bottleneck B1).
+**Do not reintroduce a module-level bittensor import here.**
+`tests/test_core_import_isolation.py` is a subprocess regression guard that fails
+if any `constitutional_swarm.bittensor*` module is loaded by the core import.
+Historical context: `docs/RUNTIME_OPTIMIZATION_REPORT.md` (bottleneck B1).

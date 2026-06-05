@@ -33,7 +33,15 @@ The 4.2s cold start is dominated by the bittensor dependency chain loaded uncond
 
 ## Bottlenecks Found
 
-### B1 — `mac_acgs_loop.py:43`: Unconditional bittensor import (HIGH)
+### B1 — `mac_acgs_loop.py:43`: Unconditional bittensor import (HIGH) — ✅ RESOLVED 2026-06-05
+
+> **Resolved.** `mac_acgs_loop.py` now imports the bittensor `came_coordinator`
+> symbols lazily (a `TYPE_CHECKING` block for annotations, a
+> `_default_came_config()` factory for the dataclass default, and function-local
+> imports at the two construction sites). Cold `import constitutional_swarm`
+> dropped to ~267ms and no longer loads the bittensor subpackage. Guarded by
+> `tests/test_core_import_isolation.py`. The analysis below is retained for
+> historical context.
 
 ```
 import time:       599 |     457,472 |   constitutional_swarm.mac_acgs_loop
