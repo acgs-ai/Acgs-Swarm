@@ -42,7 +42,37 @@ BUNDLE_SIG_DOMAIN = "acgs.governed-handoff.bundle-attestation.v1"
 # gate is default-DENY against this set. Keep this to inert commands; interpreter
 # and test-runner commands remain denied even if a local policy allowlists them.
 DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("true", "echo")
-DENIED_INTERPRETER_COMMANDS: frozenset[str] = frozenset({"python", "python3", "pytest"})
+
+# Executables that can execute arbitrary code from their arguments — interpreters,
+# test runners, generic launchers, and shells. The ``tool_call`` gate denies these
+# UNCONDITIONALLY: a local policy may not re-enable them via ``command_allowlist``,
+# because e.g. ``python -c <code>``, a ``pytest`` conftest, or ``bash -c`` would
+# bypass every other gate (protected paths, secret patterns, file-write rules).
+# Match is on the resolved basename; ``_is_denied_interpreter`` also catches
+# version-suffixed names (``python3.11``) the literal set would otherwise miss.
+DENIED_INTERPRETER_COMMANDS: frozenset[str] = frozenset(
+    {
+        "python", "python2", "python3", "pypy", "pypy3",
+        "pytest", "py.test", "tox", "nox",
+        "ipython", "bpython",
+        "node", "nodejs", "npx", "deno", "bun",
+        "ruby", "perl", "php", "lua", "rscript",
+        "sh", "bash", "zsh", "fish", "dash", "ksh",
+        "env", "uv", "uvx", "poetry", "pipenv", "hatch", "pdm",
+    }
+)
+
+# Version-suffixed interpreter basenames (python3.11, python3.12, pypy3.10, ...).
+_DENIED_INTERPRETER_PATTERN = re.compile(r"^(python|pypy)\d+(\.\d+)*$", re.IGNORECASE)
+
+
+def _is_denied_interpreter(executable: str) -> bool:
+    """Return True if ``executable`` (a resolved basename) is an interpreter-class
+    command that may never be re-enabled through ``command_allowlist``."""
+    name = executable.lower()
+    return name in DENIED_INTERPRETER_COMMANDS or bool(
+        _DENIED_INTERPRETER_PATTERN.match(name)
+    )
 
 
 @dataclass(frozen=True)
@@ -201,7 +231,7 @@ class PolicyEngine:
         if not argv:
             return PolicyDecision("tool_call", command, DENY, "empty tool command")
         executable = Path(argv[0]).name
-        if executable in DENIED_INTERPRETER_COMMANDS:
+        if _is_denied_interpreter(executable):
             return PolicyDecision(
                 "tool_call",
                 command,
