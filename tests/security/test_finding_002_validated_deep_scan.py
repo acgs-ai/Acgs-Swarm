@@ -147,6 +147,35 @@ def test_governed_handoff_denies_interpreter_commands_even_if_allowlisted() -> N
     assert "interpreter" in decision.reason
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3.11 -c pass",  # version-suffixed interpreter
+        "python3.12 -c pass",
+        "pypy3 -c pass",
+        "/usr/bin/python3 -c pass",  # absolute path still resolves to a denied basename
+        "uv run python -c pass",  # generic launcher
+        "bash -c pass",  # shell
+        "node -e pass",
+    ],
+)
+def test_governed_handoff_denies_interpreter_aliases_even_if_allowlisted(
+    command: str,
+) -> None:
+    # A trusted-but-fallible constitution must not be able to re-enable any
+    # interpreter-class command through command_allowlist — not even versioned
+    # names or launchers the literal denylist would otherwise miss.
+    executable = command.split()[0].rsplit("/", 1)[-1]
+    policy = PolicyEngine(
+        constitution={},
+        swarm={"policies": {"command_allowlist": [executable]}},
+        repo_root=Path("."),
+    )
+    decision = policy.decide("tool_call", command)
+    assert decision.outcome == DENY
+    assert "interpreter" in decision.reason
+
+
 def _commitment(judgment: str, nonce: str) -> str:
     return hashlib.sha256(f"{judgment}:{nonce}".encode()).hexdigest()
 
