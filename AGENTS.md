@@ -63,7 +63,7 @@ WebSocket gossip tests require `pip install -e ".[transport]"`.
 
 This repo is self-describing and tool-executable. A fresh agent should:
 
-1. Read [`README.md`](README.md) and this file, then [`ARCHITECTURE.md`](ARCHITECTURE.md) + [`PROJECT_MAP.md`](PROJECT_MAP.md).
+1. Read [`README.md`](README.md) and this file, then [`ARCHITECTURE.md`](ARCHITECTURE.md) + [`PROJECT_MAP.md`](PROJECT_MAP.md). For a guided, top-to-bottom orientation (domains, per-module code logic, runtime flows, roadmap, handoff checklist), use the consolidated wiki: [`docs/wiki/`](docs/wiki/README.md).
 2. `make setup` — one-command environment (standalone-safe; uses `uv sync --no-sources`).
 3. Discover tools in [`TOOLS.md`](TOOLS.md) / [`tools/registry.yaml`](tools/registry.yaml).
 4. Select a role from [`agents/`](agents/) (`researcher`, `coder`, `reviewer`, `qa`, `docs`, `release`).
