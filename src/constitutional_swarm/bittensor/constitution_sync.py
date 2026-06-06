@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from ..epoch_reconfig import (
     ConstitutionVersion,
@@ -95,11 +97,40 @@ class ConstitutionSyncMessage:
     issuer_id: str = "subnet-owner"
     block_height: int | None = None
     description: str = ""
+    signature: bytes | None = None
 
     def verify(self) -> bool:
         """Verify the embedded hash matches the content."""
         computed = hashlib.sha256(self.yaml_content.encode()).hexdigest()[:16]
         return computed == self.expected_hash
+
+    def signing_payload(self) -> bytes:
+        import json
+
+        payload = {
+            "version_id": self.version_id,
+            "expected_hash": self.expected_hash,
+            "yaml_content": self.yaml_content,
+            "issued_at": self.issued_at,
+            "issuer_id": self.issuer_id,
+            "block_height": self.block_height,
+            "description": self.description,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+    def verify_signature(self, trusted_issuer_keys: dict[str, bytes]) -> bool:
+        if self.signature is None:
+            return False
+        key_bytes = trusted_issuer_keys.get(self.issuer_id)
+        if key_bytes is None:
+            return False
+        try:
+            Ed25519PublicKey.from_public_bytes(key_bytes).verify(
+                self.signature, self.signing_payload()
+            )
+            return True
+        except (InvalidSignature, ValueError):
+            return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +141,7 @@ class ConstitutionSyncMessage:
             "issuer_id": self.issuer_id,
             "block_height": self.block_height,
             "description": self.description,
+            "signature": self.signature.hex() if self.signature is not None else None,
         }
 
     @classmethod
@@ -122,6 +154,11 @@ class ConstitutionSyncMessage:
             issuer_id=d.get("issuer_id", "subnet-owner"),
             block_height=d.get("block_height"),
             description=d.get("description", ""),
+            signature=(
+                bytes.fromhex(d["signature"])
+                if isinstance(d.get("signature"), str) and d.get("signature")
+                else None
+            ),
         )
 
 
@@ -258,8 +295,16 @@ class ConstitutionReceiver:
         hash_ = receiver.active_hash
     """
 
-    def __init__(self, node_id: str) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        *,
+        trusted_issuer_keys: dict[str, bytes] | None = None,
+        allow_unsigned: bool = False,
+    ) -> None:
         self._node_id = node_id
+        self._trusted_issuer_keys = dict(trusted_issuer_keys or {})
+        self._allow_unsigned = allow_unsigned
         self._active: ConstitutionVersionRecord | None = None
         self._history: list[ConstitutionVersionRecord] = []
         self._seen_hashes: set[str] = set()
@@ -335,6 +380,18 @@ class ConstitutionReceiver:
 
         Returns SyncResult with success flag and human-readable message.
         """
+        old_hash = self.active_hash
+        if not self._allow_unsigned and not msg.verify_signature(self._trusted_issuer_keys):
+            return SyncResult(
+                success=False,
+                message="Signature or governed transition required for constitution sync",
+                old_hash=old_hash,
+            )
+
+        return self._apply_verified(msg)
+
+    def _apply_verified(self, msg: ConstitutionSyncMessage) -> SyncResult:
+        """Apply a message after authentication/governance has already succeeded."""
         old_hash = self.active_hash
 
         # 1. Hash integrity check
@@ -483,7 +540,9 @@ class ConstitutionReceiver:
             )
 
         # 4. Hash integrity + activation.
-        result = self.apply(msg)
+        # The transition certificate is the authentication path here; do not
+        # require a separate issuer signature after governed verification.
+        result = self._apply_verified(msg)
         if result.success and result.new_hash and result.new_hash != old_hash:
             self._active_epoch = proposal.proposed.epoch
         return result

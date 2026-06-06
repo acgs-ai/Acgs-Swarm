@@ -75,6 +75,7 @@ class ValidatorIdentity:
     stake: float
     reputation: float = 1.0
     fault_domain: str = ""
+    public_key_bytes: bytes | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_id:
@@ -83,6 +84,8 @@ class ValidatorIdentity:
             raise ValueError(f"stake must be non-negative, got {self.stake}")
         if not 0.0 <= self.reputation <= 1.0:
             raise ValueError(f"reputation must be in [0, 1], got {self.reputation}")
+        if self.public_key_bytes is not None and len(self.public_key_bytes) != 32:
+            raise ValueError("public_key_bytes must be a raw Ed25519 public key")
 
     @property
     def effective_weight(self) -> float:

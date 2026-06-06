@@ -61,8 +61,19 @@ _PRICING_PER_1M: dict[str, tuple[float, float]] = {
 _DEFAULT_RUN_ROOT = Path(".omc/swe_bench_runs")
 
 
+def _safe_path_component(value: str, *, field_name: str) -> str:
+    if not value or value in {".", ".."}:
+        raise ValueError(f"{field_name} must be a non-empty path component")
+    candidate = Path(value)
+    if candidate.is_absolute() or len(candidate.parts) != 1:
+        raise ValueError(f"{field_name} must be a single relative path component")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ValueError(f"{field_name} must not contain traversal components")
+    return value
+
+
 def _run_dir(run_id: str) -> Path:
-    return _DEFAULT_RUN_ROOT / run_id
+    return _DEFAULT_RUN_ROOT / _safe_path_component(run_id, field_name="run_id")
 
 
 def _results_path(run_id: str) -> Path:
@@ -269,9 +280,13 @@ def _record_from_solve(
 
 
 def _save_patch(run_id: str, instance_id: str, patch: str) -> None:
+    safe_instance_id = _safe_path_component(instance_id, field_name="instance_id")
     patch_dir = _run_dir(run_id) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
-    (patch_dir / f"{instance_id}.diff").write_text(patch)
+    patch_path = (patch_dir / f"{safe_instance_id}.diff").resolve()
+    if not patch_path.is_relative_to(patch_dir.resolve()):
+        raise ValueError("instance_id escapes patch directory")
+    patch_path.write_text(patch)
 
 
 def _build_agent(

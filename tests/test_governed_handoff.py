@@ -24,6 +24,9 @@ policy:
   protected_paths:
     - ".acgs/**"
     - "protected/**"
+  command_allowlist:
+    - "true"
+    - echo
   secret_command_patterns:
     - '\b(cat|grep|rg)\b.*(\.env|secret|token)'
     - '\b(printenv|env)\b'
@@ -103,7 +106,7 @@ def test_protected_path_edit_requires_human_review_after_test_proof(
             [
                 "task_id: protected-review",
                 "ACGS_WRITE protected/config.txt :: changed",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",
@@ -131,7 +134,7 @@ def test_secret_reading_command_is_denied(tmp_path: Path) -> None:
             [
                 "task_id: secret-denied",
                 "ACGS_TOOL cat .env",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",
@@ -155,7 +158,7 @@ def test_write_directive_cannot_escape_repo_root(tmp_path: Path) -> None:
             [
                 "task_id: outside-write-denied",
                 "ACGS_WRITE ../outside.txt :: bad",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",
@@ -202,7 +205,7 @@ def test_one_passing_test_proof_allows_handoff(tmp_path: Path) -> None:
             [
                 "task_id: happy-path",
                 "ACGS_WRITE output/result.txt :: changed",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",
@@ -233,7 +236,7 @@ def test_bundle_verification_detects_broken_hash_chain(tmp_path: Path) -> None:
     write_configs(tmp_path)
     task = tmp_path / "task.md"
     task.write_text(
-        'task_id: tamper-check\nACGS_WRITE output.txt :: ok\nACGS_TEST python -c "print(1)"',
+        'task_id: tamper-check\nACGS_WRITE output.txt :: ok\nACGS_TEST true',
         encoding="utf-8",
     )
     result = run_task(task, repo_root=tmp_path)
@@ -255,7 +258,7 @@ def test_cli_run_verify_and_pack(
     write_configs(tmp_path)
     task = tmp_path / "task.md"
     task.write_text(
-        'task_id: cli-task\nACGS_WRITE output.txt :: ok\nACGS_TEST python -c "print(1)"',
+        'task_id: cli-task\nACGS_WRITE output.txt :: ok\nACGS_TEST true',
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -282,7 +285,7 @@ def _happy_task(tmp_path: Path, task_id: str) -> Path:
             [
                 f"task_id: {task_id}",
                 "ACGS_WRITE output/result.txt :: changed",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",
@@ -379,7 +382,7 @@ def test_allowlist_denies_non_whitelisted_command(tmp_path: Path) -> None:
             [
                 "task_id: allowlist-deny",
                 "ACGS_TOOL curl http://example.com/x",
-                'ACGS_TEST python -c "print(1)"',
+                'ACGS_TEST true',
             ]
         ),
         encoding="utf-8",

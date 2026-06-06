@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Protocol
 
@@ -219,6 +220,37 @@ class ComplianceCertificate:
         }
 
 
+def _certificate_payload(cert: ComplianceCertificate) -> bytes:
+    """Canonical bytes for certificate-scoped proofs.
+
+    The old HMAC payload covered only the snapshot/threshold.  That let an
+    attacker replay a valid proof onto a different subject, period, issuer, or
+    status copy.  Bind every semantically attested certificate field except the
+    proof itself so verification authenticates the exact certificate presented.
+    """
+
+    return json.dumps(
+        {
+            "cert_id": cert.cert_id,
+            "issued_at": cert.issued_at,
+            "expires_at": cert.expires_at,
+            "issuer_id": cert.issuer_id,
+            "subject_id": cert.subject_id,
+            "period": {
+                "start_at": cert.period.start_at,
+                "end_at": cert.period.end_at,
+                "label": cert.period.label,
+            },
+            "snapshot": cert.snapshot.to_dict(),
+            "proof_type": cert.proof_type.value,
+            "threshold": cert.threshold,
+            "status": cert.status.value,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Prover interface (pluggable)
 # ---------------------------------------------------------------------------
@@ -294,6 +326,13 @@ class HMACProver:
         expected = self.prove(snapshot, threshold, constitutional_hash)
         return hmac.compare_digest(proof, expected)
 
+    def prove_certificate(self, cert: ComplianceCertificate) -> str:
+        return hmac.new(self._key, _certificate_payload(cert), hashlib.sha256).hexdigest()
+
+    def verify_certificate(self, cert: ComplianceCertificate) -> bool:
+        expected = self.prove_certificate(cert)
+        return hmac.compare_digest(cert.proof, expected)
+
 
 class ZKPStubProver:
     """ZKP stub — records circuit inputs for when Noir SDK is available.
@@ -322,6 +361,14 @@ class ZKPStubProver:
     ) -> bool:
         expected = self.prove(snapshot, threshold, constitutional_hash)
         return proof == expected
+
+    def prove_certificate(self, cert: ComplianceCertificate) -> str:
+        return "zkp_stub:cert:" + hashlib.sha256(
+            b"zkp_stub:cert:" + _certificate_payload(cert)
+        ).hexdigest()
+
+    def verify_certificate(self, cert: ComplianceCertificate) -> bool:
+        return hmac.compare_digest(cert.proof, self.prove_certificate(cert))
 
 
 class HashCommitmentProver:
@@ -367,6 +414,17 @@ class HashCommitmentProver:
     ) -> bool:
         expected = self.prove(snapshot, threshold, constitutional_hash)
         return hmac.compare_digest(proof, expected)
+
+    def prove_certificate(self, cert: ComplianceCertificate) -> str:
+        mac = hmac.new(
+            self._key,
+            b"commitment-cert-v1:" + _certificate_payload(cert),
+            hashlib.sha256,
+        ).hexdigest()
+        return "commitment:" + mac
+
+    def verify_certificate(self, cert: ComplianceCertificate) -> bool:
+        return hmac.compare_digest(cert.proof, self.prove_certificate(cert))
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +499,6 @@ class CertificateIssuer:
                 f"{snapshot.compliance_rate:.4%} < threshold {threshold:.4%}"
             )
 
-        proof = self._prover.prove(snapshot, threshold, snapshot.constitutional_hash)
         now = time.time()
         cert = ComplianceCertificate(
             cert_id=uuid.uuid4().hex[:16],
@@ -452,18 +509,29 @@ class CertificateIssuer:
             period=period,
             snapshot=snapshot,
             proof_type=self._proof_type,
-            proof=proof,
+            proof="",
             threshold=threshold,
         )
+        prove_certificate = getattr(self._prover, "prove_certificate", None)
+        if callable(prove_certificate):
+            proof = prove_certificate(cert)
+        else:
+            proof = self._prover.prove(snapshot, threshold, snapshot.constitutional_hash)
+        cert = replace(cert, proof=proof)
         self._issued[cert.cert_id] = cert
         return cert
 
     def verify(self, cert: ComplianceCertificate) -> bool:
         """Verify a certificate's proof and status."""
+        if cert.status != CertificateStatus.VALID:
+            return False
         if cert.cert_id in self._revoked:
             return False
         if cert.is_expired:
             return False
+        verify_certificate = getattr(self._prover, "verify_certificate", None)
+        if callable(verify_certificate):
+            return bool(verify_certificate(cert))
         return self._prover.verify(
             cert.proof,
             cert.snapshot,

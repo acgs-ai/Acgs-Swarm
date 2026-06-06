@@ -182,7 +182,7 @@ def test_registry_sample_bounded() -> None:
 async def test_server_receives_nodes() -> None:
     """Client sends a batch; server merges it into its CRDT."""
     crdt = MerkleCRDT("server")
-    server = GossipServer(crdt, host="127.0.0.1", port=0)
+    server = GossipServer(crdt, host="127.0.0.1", port=0, allow_unauthenticated=True)
     await server.start()
     try:
         # Create source nodes
@@ -210,7 +210,7 @@ async def test_server_rejects_tampered_nodes() -> None:
     import json
 
     crdt = MerkleCRDT("server", reject_unverified=True)
-    server = GossipServer(crdt, host="127.0.0.1", port=0)
+    server = GossipServer(crdt, host="127.0.0.1", port=0, allow_unauthenticated=True)
     await server.start()
     try:
         node = _make_node()
@@ -233,7 +233,7 @@ async def test_server_ignores_malformed_json() -> None:
     import websockets as ws
 
     crdt = MerkleCRDT("server")
-    server = GossipServer(crdt, host="127.0.0.1", port=0)
+    server = GossipServer(crdt, host="127.0.0.1", port=0, allow_unauthenticated=True)
     await server.start()
     try:
         uri = f"ws://127.0.0.1:{server.actual_port}"
@@ -270,7 +270,7 @@ async def test_client_empty_batch_is_noop() -> None:
 @pytest.mark.asyncio
 async def test_swarm_node_context_manager() -> None:
     """SwarmNode as async context manager must start and stop cleanly."""
-    async with SwarmNode("agent-0") as node:
+    async with SwarmNode("agent-0", allow_unauthenticated=True) as node:
         assert node.actual_port > 0
         assert node._running is True
     assert node._running is False
@@ -279,7 +279,7 @@ async def test_swarm_node_context_manager() -> None:
 @pytest.mark.asyncio
 async def test_swarm_node_gossip_round_no_peers() -> None:
     """gossip_round with no registered peers returns 0 successes."""
-    async with SwarmNode("agent-0") as node:
+    async with SwarmNode("agent-0", allow_unauthenticated=True) as node:
         node.crdt.append(payload="hello")
         result = await node.gossip_round(n_peers=2)
     assert result["peers_contacted"] == 0
@@ -289,8 +289,8 @@ async def test_swarm_node_gossip_round_no_peers() -> None:
 @pytest.mark.asyncio
 async def test_two_node_gossip() -> None:
     """Two SwarmNodes gossip; both should converge to the same CID set."""
-    async with SwarmNode("agent-0") as a:
-        async with SwarmNode("agent-1") as b:
+    async with SwarmNode("agent-0", secret_token="test-token") as a:
+        async with SwarmNode("agent-1", secret_token="test-token") as b:
             # Register each other
             a.registry.add(b.host, b.actual_port)
             b.registry.add(a.host, a.actual_port)
@@ -315,7 +315,7 @@ async def test_two_node_gossip() -> None:
 @pytest.mark.asyncio
 async def test_swarm_node_registry_excludes_self() -> None:
     """SwarmNode sets self_addr correctly after start()."""
-    async with SwarmNode("agent-0") as node:
+    async with SwarmNode("agent-0", allow_unauthenticated=True) as node:
         assert node.registry.self_addr == ("127.0.0.1", node.actual_port)
         # Adding self should be ignored
         node.registry.add("127.0.0.1", node.actual_port)
@@ -367,7 +367,7 @@ async def test_byzantine_node_does_not_corrupt_swarm() -> None:
 
     honest_nodes = await spin_up_swarm(4)
     byzantine_crdt = MerkleCRDT("byzantine", reject_unverified=False)
-    byzantine_server = GossipServer(byzantine_crdt, host="127.0.0.1", port=0)
+    byzantine_server = GossipServer(byzantine_crdt, host="127.0.0.1", port=0, allow_unauthenticated=True)
     await byzantine_server.start()
     byz_port = byzantine_server.actual_port
 
