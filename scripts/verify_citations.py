@@ -149,7 +149,7 @@ def _verify_one(c: Citation, timeout: float) -> Citation:
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.status == 200, None
+                return resp.status, resp.status // 100 == 2, None
         except urllib.error.HTTPError as e:
             # 301/302 DOI redirects = valid. 403/429 = publisher anti-bot (DOI
             # itself resolves, which is what we care about). 5xx = transient
