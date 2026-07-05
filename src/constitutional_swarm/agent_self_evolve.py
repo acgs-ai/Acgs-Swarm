@@ -18,7 +18,6 @@ from typing import Any
 
 import yaml
 
-
 OPERATIONAL_AGENT_GLOB = "agents/*.agent.yaml"
 TEMPLATE_AGENT_GLOB = "agents/templates/**/*.md"
 REQUIRED_MANIFEST_KEYS = {
@@ -90,7 +89,6 @@ def _frontmatter(path: Path) -> tuple[dict[str, Any], str] | None:
     return data, body
 
 
-
 def reference_patterns() -> dict[str, dict[str, Any]]:
     """Source-backed design patterns every self-evolution harness must preserve."""
 
@@ -100,7 +98,9 @@ def reference_patterns() -> dict[str, dict[str, Any]]:
             # External design references (not vendored here); named by basename so
             # the report stays portable and leaks no local filesystem layout.
             "source": "hermes_acgs_middleware.py",
-            "supporting_adr": "adr-0001-in-context-procedure-execution-external-runtime-governance.md",
+            "supporting_adr": (
+                "adr-0001-in-context-procedure-execution-external-runtime-governance.md"
+            ),
             "seams": ["pre_tool", "post_tool", "final_check", "evidence_writer"],
             "principles": [
                 "runtime gates are authoritative; prompt-level self-attestation is not enough",
@@ -132,6 +132,7 @@ def reference_patterns() -> dict[str, dict[str, Any]]:
             ],
         },
     }
+
 
 def _tool_names(root: Path) -> set[str]:
     registry = root / "tools" / "registry.yaml"
@@ -174,9 +175,7 @@ def discover_agents(root: Path | str = ".", *, include_templates: bool = True) -
             payload["display_name"] = data.get("name")
             # Use the filename stem as the stable machine id. Template
             # frontmatter often contains display names with spaces/title case.
-            records.append(
-                AgentRecord(name=path.stem, kind="template", path=path, data=payload)
-            )
+            records.append(AgentRecord(name=path.stem, kind="template", path=path, data=payload))
 
     return records
 
@@ -265,7 +264,6 @@ def _template_checks(agent: AgentRecord) -> list[dict[str, Any]]:
     ]
 
 
-
 def _harness_references() -> list[dict[str, Any]]:
     refs = reference_patterns()
     return [
@@ -279,6 +277,7 @@ def _harness_references() -> list[dict[str, Any]]:
         for ref in refs.values()
     ]
 
+
 def _harness(agent: AgentRecord) -> dict[str, Any]:
     source = str(agent.path.as_posix())
     common_guardrails = [
@@ -288,7 +287,8 @@ def _harness(agent: AgentRecord) -> dict[str, Any]:
     ]
 
     if agent.kind == "operational":
-        guardrails = common_guardrails + [
+        guardrails = [
+            *common_guardrails,
             *[str(item) for item in agent.data.get("safety", [])],
             *[str(item) for item in (agent.data.get("scope", {}) or {}).get("forbidden", [])],
         ]
@@ -316,7 +316,8 @@ def _harness(agent: AgentRecord) -> dict[str, Any]:
         ]
         objective = f"Improve the {agent.name} role contract without changing repo invariants."
     else:
-        guardrails = common_guardrails + [
+        guardrails = [
+            *common_guardrails,
             "Keep YAML frontmatter parseable with name, description, and color metadata.",
             "Keep the filename stem as the stable machine id.",
             "Do not remove domain-specific deliverable templates from the persona body.",
@@ -368,9 +369,7 @@ def evaluate_agent(agent: AgentRecord, *, tool_names: set[str]) -> dict[str, Any
     )
     passed = sum(1 for item in checks if item["passed"])
     total = len(checks)
-    suggestions = [
-        f"Fix {item['id']}: {item['detail']}" for item in checks if not item["passed"]
-    ]
+    suggestions = [f"Fix {item['id']}: {item['detail']}" for item in checks if not item["passed"]]
     return {
         "harness": _harness(agent),
         "checks": checks,
