@@ -7,12 +7,12 @@ Demonstrates the full auto-constitution pipeline with real components only:
     -> adversarial debate (DebateResolver) -> constitutional update
     -> hash verification (fail-closed) -> audit log
 
-Why the adapter below exists: ``CAMECoordinator``'s default wiring hands the
-codifier live grid approaches, but ``RuleCodifier.find_clusters()`` clusters
-``PrecedentRecord`` objects (and ``MinerQualityGrid`` exposes no approach
-iterator), so the default composition can never propose a rule. Feeding the
-codifier from an explicit precedent stream — escalated, validator-approved
-cases — closes the loop. Run:
+Why the precedent-backed codifier exists: post-#118 ``CAMECoordinator`` is
+deliberately precedent-agnostic — at ceiling it passes the codifier an empty
+``live_approaches`` list (feeding raw grid approaches into rule proposal would
+bypass validator consensus), so a plain ``RuleCodifier`` receives nothing and
+can never propose a rule. ``PrecedentBackedCodifier`` closes the loop by owning
+its own explicit precedent stream — escalated, validator-approved cases. Run:
 
     python examples/mac_acgs_autonomous_research.py
 """
@@ -29,33 +29,12 @@ from constitutional_swarm.bittensor.map_elites import (
     GovernanceDomain,
     MinerApproach,
 )
+from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
 from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
 from constitutional_swarm.bittensor.protocol import EscalationType
-from constitutional_swarm.bittensor.rule_codifier import RuleCodifier
 from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
 
 CONSTITUTIONAL_HASH = "608508a9bd224290"
-
-
-class PrecedentBackedCodifier:
-    """Real RuleCodifier fed by an accumulated precedent stream."""
-
-    def __init__(self) -> None:
-        self.inner = RuleCodifier(
-            constitutional_hash=CONSTITUTIONAL_HASH,
-            min_cluster_size=5,
-            min_validator_agreement=0.85,
-        )
-        self.precedents: list[PrecedentRecord] = []
-
-    def observe(self, precedent: PrecedentRecord) -> None:
-        self.precedents.append(precedent)
-
-    def find_clusters(self, _live_approaches: list) -> list:
-        return self.inner.find_clusters(self.precedents)
-
-    def propose_rules(self, clusters: list) -> list[str]:
-        return [c.rule_text for c in self.inner.propose_rules(clusters)]
 
 
 def synth_approaches(rng: random.Random, cycle: int, n: int = 24) -> list[MinerApproach]:
