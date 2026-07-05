@@ -123,6 +123,16 @@ class CAMECoordinator:
         A :class:`~constitutional_swarm.bittensor.rule_codifier.RuleCodifier`
         instance.  If *None* and ``RuleCodifier`` is available, a default
         instance is constructed with a placeholder constitutional hash.
+
+        The default composition is intentionally non-generative: the
+        coordinator never extracts approaches from the grid to feed rule
+        proposal (that would bypass validator consensus), so a plain
+        ``RuleCodifier`` always receives an empty precedent list and
+        proposes nothing, even at ceiling. To close the loop, pass a
+        codifier that manages its own validated ``PrecedentRecord``
+        stream — see ``PrecedentBackedCodifier`` in
+        ``examples/mac_acgs_autonomous_research.py`` for the sanctioned
+        pattern.
     evolution_log:
         An already-*opened* :class:`~constitutional_swarm.evolution_log.EvolutionLog`
         instance.  If *None* and ``EvolutionLog`` is available, an in-memory
@@ -254,14 +264,16 @@ class CAMECoordinator:
 
         if ceiling and cooldown_elapsed and self._codifier is not None:
             try:
-                # Extract approaches from the live grid so the codifier has real data.
-                # Fall back to an empty list if the grid has no extractable approaches.
+                # The coordinator does not extract approaches from the grid for
+                # codification. Feeding raw (unvalidated) MinerApproach data into
+                # rule proposal would bypass validator consensus. Codification is
+                # delegated entirely to the codifier: a plain RuleCodifier receives
+                # an empty list and proposes nothing; a precedent-backed codifier
+                # (see PrecedentBackedCodifier in
+                # examples/mac_acgs_autonomous_research.py) manages its own
+                # validated PrecedentRecord stream internally and ignores this
+                # argument.
                 live_approaches: list[Any] = []
-                if self._grid is not None:
-                    if hasattr(self._grid, "approaches"):
-                        live_approaches = list(self._grid.approaches())
-                    elif hasattr(self._grid, "niche_map"):
-                        live_approaches = list(self._grid.niche_map.values())
                 if hasattr(self._codifier, "find_clusters") and hasattr(
                     self._codifier, "propose_rules"
                 ):

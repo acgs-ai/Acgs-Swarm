@@ -49,6 +49,23 @@ def test_default_wiring_never_proposes_rules_at_ceiling() -> None:
     assert loop.constitution_updates() == []
 
 
+def test_default_codifier_evolve_cycle_never_proposes_rules() -> None:
+    """Direct CAMECycleResult companion to the audit-log proxy above.
+
+    Asserts on ``rules_proposed`` itself (not the downstream constitution-update
+    proxy) so the explicit-skip branch in ``evolve_cycle`` is covered directly,
+    including at cycles where ``ceiling_detected`` is True.
+    """
+    came = CAMECoordinator()
+    rng = random.Random(42)
+    ceiling_seen = False
+    for cycle in range(1, 9):
+        result = came.evolve_cycle(example.synth_approaches(rng, cycle))
+        assert result.rules_proposed == []
+        ceiling_seen = ceiling_seen or result.ceiling_detected
+    assert ceiling_seen, "expected at least one ceiling cycle in this synthetic run"
+
+
 def test_precedent_backed_codifier_commits_constitutional_update() -> None:
     codifier = example.PrecedentBackedCodifier()
     loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
