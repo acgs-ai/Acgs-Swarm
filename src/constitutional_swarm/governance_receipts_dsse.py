@@ -50,15 +50,15 @@ UNSIGNED_PROJECTION_NOTE = (
 )
 
 __all__ = [
-    "STATEMENT_TYPE",
     "DSSE_PAYLOAD_TYPE",
-    "PREDICATE_TYPE",
     "EVIDENCE_DIGEST_ALG",
+    "PREDICATE_TYPE",
+    "STATEMENT_TYPE",
     "UNSIGNED_PROJECTION_NOTE",
     "DsseSigner",
     "pae",
-    "to_in_toto_statement",
     "to_dsse_envelope",
+    "to_in_toto_statement",
     "verify_dsse_envelope",
 ]
 
@@ -106,8 +106,7 @@ def to_in_toto_statement(receipt: GovernanceReceipt) -> dict:
         "policy_hash": payload.policy_hash,
         "decision": payload.decision,
         "roles": {
-            role: identity.model_dump(mode="json")
-            for role, identity in payload.roles.items()
+            role: identity.model_dump(mode="json") for role, identity in payload.roles.items()
         },
         "validator_votes": [vote.model_dump(mode="json") for vote in payload.validator_votes],
         "rejected_alternative": payload.rejected_alternative,

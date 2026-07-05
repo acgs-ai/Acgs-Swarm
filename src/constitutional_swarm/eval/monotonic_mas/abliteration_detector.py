@@ -40,14 +40,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 __all__ = [
-    "refusal_direction",
-    "apply_abliteration",
-    "weight_refusal_energy",
-    "latent_separation",
-    "refusal_distribution_score",
     "AbliterationReport",
-    "detect_from_weights",
+    "apply_abliteration",
     "detect_from_activations",
+    "detect_from_weights",
+    "latent_separation",
+    "refusal_direction",
+    "refusal_distribution_score",
+    "weight_refusal_energy",
 ]
 
 # Below this, a direction's norm / a singular value is treated as numerically zero.
@@ -250,12 +250,7 @@ def refusal_distribution_score(
             [
                 float(
                     np.sqrt(
-                        np.mean(
-                            [
-                                weight_refusal_energy(W, u) ** 2
-                                for W in write_matrices.values()
-                            ]
-                        )
+                        np.mean([weight_refusal_energy(W, u) ** 2 for W in write_matrices.values()])
                     )
                 )
                 for u in unit
@@ -373,9 +368,7 @@ def detect_from_weights(
         msg = "quantile must be in [0, 1]"
         raise ValueError(msg)
     r = _unit(direction)
-    per_layer = {
-        name: weight_refusal_energy(W, r) for name, W in write_matrices.items()
-    }
+    per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
     energies = np.array(list(per_layer.values()), dtype=np.float64)
     reasons: list[str] = []
 
@@ -399,7 +392,8 @@ def detect_from_weights(
         if abliterated:
             reasons.append(
                 f"{aggregate} refusal-energy ratio {agg_ratio:.3f} < {ratio_threshold} "
-                f"({len([x for x in ratios if x < ratio_threshold])}/{len(ratios)} matrices collapsed)"
+                f"({len([x for x in ratios if x < ratio_threshold])}/{len(ratios)} "
+                f"matrices collapsed)"
             )
         return AbliterationReport(
             abliterated=abliterated,
