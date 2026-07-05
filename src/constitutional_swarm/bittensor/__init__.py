@@ -96,6 +96,11 @@ from constitutional_swarm.bittensor.nmc_protocol import (
     SynthesisMethod,
 )
 
+# CAME loop-closing adapter (precedent-backed rule codification)
+from constitutional_swarm.bittensor.precedent_backed_codifier import (
+    PrecedentBackedCodifier,
+)
+
 # Phase 3: Precedent Feedback Loop
 from constitutional_swarm.bittensor.precedent_store import (
     PrecedentMatch,
@@ -229,6 +234,8 @@ __all__ = [
     "NMCCoordinator",
     "NMCSession",
     "NMCSessionState",
+    # CAME loop-closing adapter
+    "PrecedentBackedCodifier",
     # Phase 3.3 — Rule Codifier
     "PrecedentCluster",
     # Phase 3 — Precedent Feedback Loop
