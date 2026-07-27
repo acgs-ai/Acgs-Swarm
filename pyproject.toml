@@ -34,8 +34,17 @@ PyPI = "https://pypi.org/project/constitutional-swarm/"
 # transport.py:133 artifact that vanishes under 2.x) and a langgraph-triggered
 # internal crash; an unbounded upper edge would let a future release flip the
 # gate non-deterministically — counter to this gate's env-consistency contract.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4", "mypy>=2,<3"]
-bittensor = ["bittensor>=7.0"]
+# ruff bounded below 0.16: 0.16.0 expands the default rule set (BLE001, TRY004,
+# PERF402, RUF100, ...) and flips the lint gate red with 54 findings on a tree
+# that is clean under 0.15.x (uv.lock pins 0.15.12). Same env-consistency
+# rationale as the mypy bound; raise deliberately alongside a lint-clean pass.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4,<0.16", "mypy>=2,<3"]
+# bittensor bounded below 11: v11 removed the miner/validator networking stack
+# (axon/dendrite/synapse) that synapse_adapter.py, axon_server.py, and
+# dendrite_client.py build on (bt.Synapse access raises AttributeError).
+# Migrating to the v11 ServeAxon/http_auth model is a separate project; the
+# uv.lock known-good is 10.2.0.
+bittensor = ["bittensor>=7.0,<11"]
 transport = ["websockets>=12.0"]
 # research: MCFS research stack (latent DNA steering, swarm ODE dynamics)
 research = ["torch>=2.0", "transformers>=4.40"]
