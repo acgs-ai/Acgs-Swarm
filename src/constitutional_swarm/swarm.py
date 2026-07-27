@@ -33,8 +33,8 @@ def _with_status(
     node: TaskNode,
     status: ExecutionStatus,
     *,
-    claimed_by: str | None | object = _UNSET,
-    artifact_id: str | None | object = _UNSET,
+    claimed_by: str | object | None = _UNSET,
+    artifact_id: str | object | None = _UNSET,
 ) -> TaskNode:
     """Clone a TaskNode while updating lifecycle fields."""
     updates: dict[str, Any] = {
