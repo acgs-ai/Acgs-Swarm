@@ -605,14 +605,14 @@ transport = [
 [package.metadata]
 requires-dist = [
     { name = "acgs-lite", specifier = ">=2.8.1" },
-    { name = "bittensor", marker = "extra == 'bittensor'", specifier = ">=7.0" },
+    { name = "bittensor", marker = "extra == 'bittensor'", specifier = ">=7.0,<11" },
     { name = "braintrust", specifier = "==0.16.0" },
     { name = "constitutional-swarm", extras = ["research"], marker = "extra == 'latent'" },
     { name = "cryptography", specifier = ">=44.0.2" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.16" },
     { name = "torch", marker = "extra == 'research'", specifier = ">=2.0" },
     { name = "transformers", marker = "extra == 'research'", specifier = ">=4.40" },
     { name = "websockets", marker = "extra == 'transport'", specifier = ">=12.0" },
