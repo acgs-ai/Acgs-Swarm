@@ -14,7 +14,7 @@ Usage:
         --constitution constitution.yaml --netuid <id>
 
 Requirements:
-    pip install bittensor>=7.0.0
+    pip install "bittensor>=7.0,<11"
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def _check_bittensor() -> None:
         import bittensor  # noqa: F401
     except ImportError:
         print("ERROR: bittensor package not installed.")
-        print("  pip install bittensor>=7.0.0")
+        print('  pip install "bittensor>=7.0,<11"')
         sys.exit(1)
 
 
