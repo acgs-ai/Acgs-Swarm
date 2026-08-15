@@ -1,7 +1,7 @@
 """Agent DNA — embedded constitutional governance co-processor.
 
 Every agent carries an immutable constitutional validator that intercepts
-outputs before they leave. Governance is local (443ns), not networked.
+outputs before they leave. Governance is local, not networked.
 No central bus needed. Scales to 800+ agents with O(1) governance cost.
 """
 
@@ -243,7 +243,7 @@ class AgentDNA:
             risk_lv = impact["risk_level"]
             scoring_method = impact["scoring_method"]
 
-        # Layer 2: constitutional keyword/rule engine (always, ~443ns)
+        # Layer 2: constitutional keyword/rule engine (always; unit bound <50us)
         start = time.perf_counter_ns()
         try:
             result = self._engine.validate(action)

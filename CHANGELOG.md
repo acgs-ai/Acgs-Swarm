@@ -15,6 +15,9 @@ The format is based on Keep a Changelog.
 - `braintrust` is an optional extra (`[braintrust]`), not a core dependency.
 - `numpy` is no longer a core runtime dependency; it ships with `[dev]` and
   `[research]`.
+- Paper-claim registry statuses are now `measured` / `formula` / `non_claim` /
+  `withdrawn`. Withdrawn 2656% and hardcoded latency pins no longer count as
+  reproduction passes.
 
 ### Added
 - Agent self-evolution harness: `constitutional_swarm.agent_self_evolve` / `acgs-agent-self-evolve` discovers every operational agent manifest and vendored persona template, emits offline per-agent mutation scopes/guardrails/probes/suggestions, and is wired through `make agent-self-evolve`, `tools/registry.yaml`, a script wrapper, and a runbook.

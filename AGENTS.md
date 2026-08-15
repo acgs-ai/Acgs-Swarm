@@ -17,7 +17,7 @@ Orchestrator-free constitutional governance runtime for multi-agent systems. Bui
 | Directory | Purpose |
 |-----------|---------|
 | `src/` | Python package source for `constitutional_swarm` (see `src/AGENTS.md`) |
-| `tests/` | Pytest suite — 1603 passing, 1 skipped, 2 xfailed (see `tests/AGENTS.md`) |
+| `tests/` | Pytest suite (see `tests/AGENTS.md`; do not hardcode a live count) |
 | `docs/` | Long-form design docs, including MACI DP protocol draft (see `docs/AGENTS.md`) |
 | `docs/solutions/` | Documented solutions to past problems (bugs, best practices, design/workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`) — relevant when implementing or debugging in documented areas |
 | `examples/` | Minimal runnable artifacts (e.g., sample constitution YAML) (see `examples/AGENTS.md`) |
@@ -39,7 +39,7 @@ Orchestrator-free constitutional governance runtime for multi-agent systems. Bui
 ### Testing Requirements
 ```bash
 # From this repo root (standalone); inside the monorepo, prefix with packages/constitutional_swarm/
-python -m pytest tests/ --import-mode=importlib -q     # 1603 passed, 1 skipped, 2 xfailed
+python -m pytest tests/ --import-mode=importlib -q     # default markers exclude slow/e2e/research/bittensor
 python -m ruff check src/                              # 53 known pre-existing errors in latent_dna.py
 python -m ruff format src/
 ```

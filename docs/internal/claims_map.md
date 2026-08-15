@@ -98,7 +98,7 @@ reproducibility datum rather than silently treating the two scales as identical.
 | ICLR 2027 | `python scripts/verify_citations.py --root papers/iclr2027 --skip-network` | 0 | 18 citation identifiers found; lint-only citation scan passed. |
 | NDSS 2027 | `python scripts/verify_citations.py --root papers/ndss2027` | 0 | 18 citations scanned; 18 verified; 0 failed. |
 | NDSS 2027 | `python scripts/verify_citations.py --root papers/ndss2027 --skip-network` | 0 | 18 citation identifiers found; lint-only citation scan passed. |
-| ICLR 2027 + NDSS 2027 | `python scripts/reproduce_paper_claims.py` | 0 | 24 previously unmapped claims checked; 24 passed. |
+| ICLR 2027 + NDSS 2027 | `python scripts/reproduce_paper_claims.py` | 0 | scored measured/formula claims only; withdrawn 2656% and hardcoded latency pins are not counted as passes. |
 | ICLR 2027 + NDSS 2027 | `python -m pytest tests/test_paper_reproducibility.py --import-mode=importlib -q` | 0 | 3 tests passed; harness registry covers all 24 previously unmapped claims. |
 
 ## Task B4 Citation Verification

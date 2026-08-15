@@ -1,13 +1,13 @@
 """Constitutional Mesh — Byzantine-tolerant peer validation with cryptographic proof.
 
 The defensible core of constitutional_swarm. Every agent's output is validated by randomly
-assigned peers using the ACGS constitutional engine (443ns). No single
+assigned peers using the ACGS constitutional engine. No single
 validator bottleneck. Tolerates up to 1/3 faulty/malicious agents.
 
 Cryptographic proof chain:
   1. Producer creates output with constitutional hash
   2. Mesh assigns random peers (producer excluded — MACI)
-  3. Each peer validates via embedded DNA (443ns, Rust engine)
+  3. Each peer validates via embedded DNA (local acgs-lite engine)
   4. Votes are signed with the peer's Ed25519 private key
   5. Quorum result produces a Merkle proof linking:
      - Producer's output hash
@@ -101,7 +101,7 @@ class ConstitutionalMesh:
     - No single validator bottleneck
     - MACI-compliant (no self-validation)
     - Cryptographic proof chain for auditability
-    - Sub-microsecond per validation (443ns via Rust engine)
+    - Local validation via AgentDNA (unit tests bound average latency under 50us)
     """
 
     def __init__(
