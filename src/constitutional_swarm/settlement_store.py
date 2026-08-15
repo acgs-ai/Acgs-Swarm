@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import warnings
 from collections.abc import Generator
@@ -17,6 +18,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol
+
+_RECEIPT_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _fcntl: ModuleType | None
 try:
@@ -50,7 +53,26 @@ class SettlementRecord:
     constitutional_hash: str = ""
     schema_version: int = 1
     is_recovered: bool = False
-    receipt_digest: str = ""
+    receipt_digest: str | None = None
+
+
+def normalize_receipt_digest(value: str | None) -> str | None:
+    """Accept a SHA-256 hex pointer or the absent-binding sentinel.
+
+    Empty string and ``None`` mean "no completed receipt binding". Any other
+    value must be a 64-character lowercase hex digest. This field is a pointer
+    to a v0.1 receipt *payload digest*, not part of the settlement canonical
+    digest.
+    """
+
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not _RECEIPT_DIGEST_RE.fullmatch(value):
+        raise ValueError(
+            "receipt_digest must be a 64-character lowercase sha256 hex digest "
+            f"or empty/None, got {value!r}"
+        )
+    return value
 
 
 class SettlementStore(Protocol):
@@ -258,7 +280,14 @@ class JSONLSettlementStore:
             "path": str(self.path),
             "concurrency": "advisory-lock",
             "scale_default": "sqlite",
+            "receipt_digest": True,
         }
+
+    def get(self, assignment_id: str) -> SettlementRecord | None:
+        for record in self.load_all():
+            if str(record.assignment.get("assignment_id", "")) == assignment_id:
+                return record
+        return None
 
     def _load_pending_payloads(self) -> dict[str, dict[str, Any]]:
         if not self.pending_path.exists():
@@ -284,7 +313,7 @@ class JSONLSettlementStore:
             "constitutional_hash": record.constitutional_hash,
             "schema_version": record.schema_version,
             "is_recovered": record.is_recovered,
-            "receipt_digest": record.receipt_digest,
+            "receipt_digest": normalize_receipt_digest(record.receipt_digest),
         }
 
     @classmethod
@@ -299,7 +328,9 @@ class JSONLSettlementStore:
         if "is_recovered" in payload:
             record_kwargs["is_recovered"] = bool(payload["is_recovered"])
         if "receipt_digest" in payload:
-            record_kwargs["receipt_digest"] = str(payload["receipt_digest"])
+            record_kwargs["receipt_digest"] = normalize_receipt_digest(
+                payload["receipt_digest"] if payload["receipt_digest"] is not None else None
+            )
         return SettlementRecord(**record_kwargs)
 
 
@@ -386,7 +417,25 @@ class SQLiteSettlementStore:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # Nullable receipt pointer. Absent/NULL means the row has no
+            # completed v0.1 receipt binding. Idempotent on existing DBs.
+            try:
+                conn.execute("ALTER TABLE mesh_settlements ADD COLUMN receipt_digest TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE pending_settlements ADD COLUMN receipt_digest TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row[1]) for row in rows}
+
+    def has_receipt_digest_column(self) -> bool:
+        return "receipt_digest" in self._table_columns("mesh_settlements")
 
     def append(self, record: SettlementRecord) -> None:
         """Append a settlement record.
@@ -396,6 +445,7 @@ class SQLiteSettlementStore:
         the original settlement.
         """
         assignment_id = str(record.assignment["assignment_id"])
+        digest = normalize_receipt_digest(record.receipt_digest)
         with sqlite3.connect(self.path) as conn:
             try:
                 conn.execute(
@@ -406,8 +456,9 @@ class SQLiteSettlementStore:
                         result_json,
                         constitutional_hash,
                         schema_version,
-                        is_recovered
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        is_recovered,
+                        receipt_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         assignment_id,
@@ -416,6 +467,7 @@ class SQLiteSettlementStore:
                         record.constitutional_hash,
                         record.schema_version,
                         int(record.is_recovered),
+                        digest,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -430,6 +482,7 @@ class SQLiteSettlementStore:
     def mark_pending(self, record: SettlementRecord) -> None:
         pending_record = replace(record, is_recovered=False)
         assignment_id = str(pending_record.assignment["assignment_id"])
+        digest = normalize_receipt_digest(pending_record.receipt_digest)
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 """
@@ -439,8 +492,9 @@ class SQLiteSettlementStore:
                     result_json,
                     constitutional_hash,
                     schema_version,
-                    is_recovered
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    is_recovered,
+                    receipt_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     assignment_id,
@@ -449,6 +503,7 @@ class SQLiteSettlementStore:
                     pending_record.constitutional_hash,
                     pending_record.schema_version,
                     int(pending_record.is_recovered),
+                    digest,
                 ),
             )
             conn.commit()
@@ -465,51 +520,43 @@ class SQLiteSettlementStore:
         return self._load_records_from_table("pending_settlements")
 
     def _load_records_from_table(self, table_name: str) -> list[SettlementRecord]:
-        if table_name == "mesh_settlements":
-            select_with_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash,
-                       schema_version, is_recovered
-                FROM mesh_settlements
-                ORDER BY assignment_id
-            """
-            select_without_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash, schema_version, 0
-                FROM mesh_settlements
-                ORDER BY assignment_id
-            """
-            select_without_schema_version = """
-                SELECT assignment_json, result_json, constitutional_hash, 1, 0
-                FROM mesh_settlements
-                ORDER BY assignment_id
-            """
-        elif table_name == "pending_settlements":
-            select_with_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash,
-                       schema_version, is_recovered
-                FROM pending_settlements
-                ORDER BY assignment_id
-            """
-            select_without_is_recovered = """
-                SELECT assignment_json, result_json, constitutional_hash, schema_version, 0
-                FROM pending_settlements
-                ORDER BY assignment_id
-            """
-            select_without_schema_version = """
-                SELECT assignment_json, result_json, constitutional_hash, 1, 0
-                FROM pending_settlements
-                ORDER BY assignment_id
-            """
-        else:  # pragma: no cover - internal invariant guard
+        if table_name not in {"mesh_settlements", "pending_settlements"}:
             raise ValueError(f"Unsupported settlement table: {table_name}")
+
+        select_with_digest = f"""
+            SELECT assignment_json, result_json, constitutional_hash,
+                   schema_version, is_recovered, receipt_digest
+            FROM {table_name}
+            ORDER BY assignment_id
+        """
+        select_without_digest = f"""
+            SELECT assignment_json, result_json, constitutional_hash,
+                   schema_version, is_recovered, NULL
+            FROM {table_name}
+            ORDER BY assignment_id
+        """
+        select_without_is_recovered = f"""
+            SELECT assignment_json, result_json, constitutional_hash, schema_version, 0, NULL
+            FROM {table_name}
+            ORDER BY assignment_id
+        """
+        select_without_schema_version = f"""
+            SELECT assignment_json, result_json, constitutional_hash, 1, 0, NULL
+            FROM {table_name}
+            ORDER BY assignment_id
+        """
 
         with sqlite3.connect(self.path) as conn:
             try:
-                rows = conn.execute(select_with_is_recovered).fetchall()
+                rows = conn.execute(select_with_digest).fetchall()
             except sqlite3.OperationalError:
                 try:
-                    rows = conn.execute(select_without_is_recovered).fetchall()
+                    rows = conn.execute(select_without_digest).fetchall()
                 except sqlite3.OperationalError:
-                    rows = conn.execute(select_without_schema_version).fetchall()
+                    try:
+                        rows = conn.execute(select_without_is_recovered).fetchall()
+                    except sqlite3.OperationalError:
+                        rows = conn.execute(select_without_schema_version).fetchall()
         return [
             SettlementRecord(
                 assignment=dict(json.loads(assignment_json)),
@@ -517,9 +564,16 @@ class SQLiteSettlementStore:
                 constitutional_hash=constitutional_hash,
                 schema_version=int(schema_version),
                 is_recovered=bool(is_recovered),
+                receipt_digest=normalize_receipt_digest(receipt_digest),
             )
-            for assignment_json, result_json, constitutional_hash, schema_version, is_recovered
-            in rows
+            for (
+                assignment_json,
+                result_json,
+                constitutional_hash,
+                schema_version,
+                is_recovered,
+                receipt_digest,
+            ) in rows
         ]
 
     def pending_count(self) -> int:
@@ -531,7 +585,16 @@ class SQLiteSettlementStore:
         return {
             "backend": "sqlite",
             "path": str(self.path),
+            "receipt_digest": self.has_receipt_digest_column(),
+            "columns": sorted(self._table_columns("mesh_settlements")),
         }
+
+    def get(self, assignment_id: str) -> SettlementRecord | None:
+        """Return one committed settlement, or None if absent."""
+        for record in self.load_all():
+            if str(record.assignment.get("assignment_id", "")) == assignment_id:
+                return record
+        return None
 
 
 __all__ = [
@@ -540,4 +603,5 @@ __all__ = [
     "SQLiteSettlementStore",
     "SettlementRecord",
     "SettlementStore",
+    "normalize_receipt_digest",
 ]
