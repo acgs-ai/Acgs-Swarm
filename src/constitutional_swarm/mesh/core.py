@@ -1612,6 +1612,7 @@ class ConstitutionalMesh:
             committed_receipt_index,
             evidence_lock,
             receipt_path_for,
+            store_filesystem_path,
             write_receipt_atomic,
         )
 
@@ -1641,8 +1642,12 @@ class ConstitutionalMesh:
             raise SettlementPersistenceError(
                 f"Settlement {assignment_id} receipt could not be built"
             ) from exc
-        receipt_path = receipt_path_for(self._settlement_store, assignment_id)
         bound = replace(record, receipt_digest=receipt.payload_digest)
+        if store_filesystem_path(self._settlement_store) is None:
+            # In-memory adapters have no receipt file; still persist the pointer.
+            self._settlement_store.append(bound)
+            return
+        receipt_path = receipt_path_for(self._settlement_store, assignment_id)
         with evidence_lock(self._settlement_store):
             try:
                 write_receipt_atomic(

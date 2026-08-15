@@ -50,8 +50,22 @@ RECEIPT_IDENTITY_KIND = "payload_digest"
 _RECEIPT_NAME = re.compile(r"^(?P<stem>.+)\.(?P<assignment_id>[^.]+)\.receipt\.json$")
 
 
+def store_filesystem_path(store: Any) -> Path | None:
+    """Return the store's durable path, or None for in-memory adapters."""
+    describe = getattr(store, "describe", None)
+    if describe is None:
+        return None
+    raw = describe().get("path")
+    if not raw:
+        return None
+    return Path(str(raw))
+
+
 def store_path(store: Any) -> Path:
-    return Path(str(store.describe()["path"]))
+    path = store_filesystem_path(store)
+    if path is None:
+        raise ValueError("settlement store has no filesystem path")
+    return path
 
 
 def receipt_path_for(store: Any, assignment_id: str) -> Path:
@@ -73,7 +87,11 @@ def evidence_lock(store: Any):
     Uses a dedicated lock file so it never nests with JSONLSettlementStore's
     per-append advisory lock (non-recursive flock would deadlock).
     """
-    lock_path = store_path(store).with_name(store_path(store).name + ".evidence.lock")
+    path = store_filesystem_path(store)
+    if path is None:
+        yield
+        return
+    lock_path = path.with_name(path.name + ".evidence.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
     try:
