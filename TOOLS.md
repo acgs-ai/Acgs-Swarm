@@ -43,6 +43,7 @@ Run `make help` for the live list.
 
 | Command | Purpose |
 |---|---|
+| `python scripts/verify_isolated_wheel.py` | Build the wheel and install it into a blank venv (`make verify-wheel`). |
 | `python scripts/reproduce_paper_claims.py` | Emit JSON metrics reproducing empirical claims. |
 | `python scripts/run_governance_benchmark.py --model-backend offline-deterministic` | Governance benchmark (offline default). |
 | `python scripts/run_swe_bench_lite.py --limit 10` | SWE-bench Lite harness (needs API key, costs tokens). |

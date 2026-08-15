@@ -12,6 +12,7 @@ Operational one-off scripts: testnet deployment, citation verification for the p
 | `testnet_deploy.py` | Deploys a constitutional-swarm testnet; consumes `examples/constitution.yaml` via the `--constitution` flag |
 | `verify_citations.py` | Scans repo files for arXiv IDs and DOI strings, then optionally verifies the corresponding `arxiv.org` / `doi.org` URLs resolve |
 | `generate_security_report.py` | Produces `security-audit-report.md` from source scans and the `tests/security/` results |
+| `verify_isolated_wheel.py` | Builds the wheel and installs it into a blank venv (`make verify-wheel`) |
 
 ## For AI Agents
 

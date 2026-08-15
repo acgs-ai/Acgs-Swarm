@@ -186,6 +186,20 @@ tools:
     owner_module: src/constitutional_swarm/governance_receipts_dsse.py
 
   # --- Evaluation & research scripts -----------------------------------------
+  - name: verify-isolated-wheel
+    purpose: Build the published wheel and install it into a blank virtualenv that does not inherit the project .venv.
+    command: make verify-wheel
+    env: []
+    inputs: ["--python (repeatable), --wheel, --metadata-only"]
+    outputs: ["pip check, facade import, console-script --help, import-graph, METADATA isolation"]
+    failure_modes:
+      - "interpreter missing -> script exits"
+      - "numpy/braintrust in core Requires-Dist -> fail closed"
+      - "default import loads a sidecar/research module -> fail closed"
+    retry: "Idempotent; rebuilds the wheel unless --wheel is passed."
+    validation: "exit code 0 and 'isolated wheel gate OK'"
+    owner_module: scripts/verify_isolated_wheel.py
+
   - name: reproduce-paper-claims
     purpose: Emit JSON metrics for local reproduction of the package's empirical paper claims.
     command: uv run --no-sync python scripts/reproduce_paper_claims.py --seeds 42 --sizes 10,50 --cycles 10,50
