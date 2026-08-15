@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import random
 import threading
 import time
@@ -772,7 +773,10 @@ class ConstitutionalMesh:
                 settled=True,
                 settled_at=settled_at,
             )
-            pending_record = self._build_settlement_record(assignment, final)
+            pending_record = replace(
+                self._build_settlement_record(assignment, final),
+                votes=self._vote_dicts(list(self._votes.get(assignment_id, []))),
+            )
             recovered_assignment = replace(assignment, is_recovered=True)
             settled_record = self._build_settlement_record(recovered_assignment, final)
             settled_votes = list(self._votes.get(assignment_id, []))
@@ -782,12 +786,14 @@ class ConstitutionalMesh:
         try:
             if self._settlement_store is not None:
                 self._settlement_store.mark_pending(pending_record)
+                self._maybe_crash("after-pending")
             with self._lock:
                 existing = self._final_results.get(assignment_id)
                 if existing is not None:
                     return existing
                 self._final_results[assignment_id] = final
             self._persist_settlement_record(settled_record, votes=settled_votes)
+            self._maybe_crash("after-append")
             if self._settlement_store is not None:
                 self._settlement_store.clear_pending(assignment_id)
             with self._lock:
@@ -1660,6 +1666,7 @@ class ConstitutionalMesh:
                     receipt_path,
                     GovernanceReceiptBundle(receipts=[receipt]),
                 )
+                self._maybe_crash("after-receipt")
             except Exception as exc:
                 raise SettlementPersistenceError(
                     f"Settlement {assignment_id} receipt could not be persisted"
@@ -1765,7 +1772,8 @@ class ConstitutionalMesh:
                     self._build_settlement_record(
                         replace(assignment, is_recovered=True),
                         result,
-                    )
+                    ),
+                    votes=list(record.votes),
                 )
                 with self._lock:
                     current_assignment = self._assignments.get(assignment.assignment_id)
@@ -1810,6 +1818,34 @@ class ConstitutionalMesh:
         if self._settlement_store is None:
             return None
         return str(self._settlement_store.describe().get("backend"))
+
+    def _maybe_crash(self, point: str) -> None:
+        configured = getattr(self, "_settle_crash_point", None) or os.environ.get(
+            "ACGS_SETTLE_CRASH"
+        )
+        if configured == point:
+            os._exit(17)
+
+    @staticmethod
+    def _vote_dicts(votes: list[Any]) -> tuple[dict[str, Any], ...]:
+        payload: list[dict[str, Any]] = []
+        for vote in votes:
+            if isinstance(vote, dict):
+                payload.append(dict(vote))
+                continue
+            payload.append(
+                {
+                    "assignment_id": vote.assignment_id,
+                    "voter_id": vote.voter_id,
+                    "approved": vote.approved,
+                    "reason": vote.reason,
+                    "signature": vote.signature,
+                    "constitutional_hash": vote.constitutional_hash,
+                    "content_hash": vote.content_hash,
+                    "timestamp": vote.timestamp,
+                }
+            )
+        return tuple(payload)
 
     def _build_settlement_record(
         self, assignment: PeerAssignment, result: MeshResult

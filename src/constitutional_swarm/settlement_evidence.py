@@ -47,7 +47,8 @@ except ImportError:  # pragma: no cover
 RECEIPT_SIGNER_KEY_ID = "settlement-receipt"
 RECEIPT_PAYLOAD_TYPE = "application/vnd.acgs.governance-receipt.v0.1+json"
 RECEIPT_IDENTITY_KIND = "payload_digest"
-_RECEIPT_NAME = re.compile(r"^(?P<stem>.+)\.(?P<assignment_id>[^.]+)\.receipt\.json$")
+_RECEIPT_SUFFIX = ".receipt.json"
+_RECEIPT_NAME = re.compile(r"^(?P<stem>.+)\.(?P<assignment_id>.+)\.receipt\.json$")
 
 
 def store_filesystem_path(store: Any) -> Path | None:
@@ -73,11 +74,30 @@ def receipt_path_for(store: Any, assignment_id: str) -> Path:
     return path.with_name(f"{path.name}.{assignment_id}.receipt.json")
 
 
-def parse_receipt_assignment_id(path: Path) -> str | None:
-    match = _RECEIPT_NAME.match(path.name)
+def parse_receipt_assignment_id(
+    path: Path,
+    *,
+    store_name: str | None = None,
+) -> str | None:
+    """Extract the assignment id using the store filename as the prefix.
+
+    Receipts are ``{store_name}.{assignment_id}.receipt.json``. Using the
+    store prefix (not ``[^.]+``) keeps dotted assignment ids intact.
+    """
+    name = path.name
+    if not name.endswith(_RECEIPT_SUFFIX):
+        return None
+    body = name[: -len(_RECEIPT_SUFFIX)]
+    if store_name:
+        prefix = f"{store_name}."
+        if not body.startswith(prefix):
+            return None
+        assignment_id = body[len(prefix) :]
+        return assignment_id or None
+    match = _RECEIPT_NAME.match(name)
     if match is None:
         return None
-    return match.group("assignment_id")
+    return match.group("assignment_id") or None
 
 
 @contextmanager
@@ -113,6 +133,16 @@ def write_receipt_atomic(path: Path, bundle: GovernanceReceiptBundle) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def committed_receipt_index(store: Any) -> dict[str, str]:
@@ -129,12 +159,14 @@ def committed_receipt_index(store: Any) -> dict[str, str]:
 def list_orphan_receipts(store: Any) -> list[Path]:
     referenced = committed_receipt_index(store)
     orphans: list[Path] = []
-    root = store_path(store).parent
-    prefix = store_path(store).name + "."
+    store_file = store_path(store)
+    root = store_file.parent
+    store_name = store_file.name
+    prefix = store_name + "."
     if not root.exists():
         return orphans
     for path in root.glob(f"{prefix}*.receipt.json"):
-        assignment_id = parse_receipt_assignment_id(path)
+        assignment_id = parse_receipt_assignment_id(path, store_name=store_name)
         if assignment_id is None:
             orphans.append(path)
             continue
@@ -148,8 +180,9 @@ def reconcile_orphan_receipts(store: Any) -> list[str]:
     removed: list[str] = []
     with evidence_lock(store):
         referenced = committed_receipt_index(store)
+        store_name = store_path(store).name
         for path in list_orphan_receipts(store):
-            assignment_id = parse_receipt_assignment_id(path)
+            assignment_id = parse_receipt_assignment_id(path, store_name=store_name)
             if assignment_id is not None and assignment_id in referenced:
                 continue
             path.unlink(missing_ok=True)
@@ -242,6 +275,42 @@ def bind_and_verify(
             ReceiptIssue(
                 code="assignment_mismatch",
                 message="receipt assignment_id does not match settlement",
+                receipt_id=receipt_id,
+            )
+        )
+    expected_action = str(record.assignment.get("artifact_id", assignment_id))
+    if receipt.payload.action != expected_action:
+        issues.append(
+            ReceiptIssue(
+                code="action_mismatch",
+                message="receipt action does not match settlement artifact_id",
+                receipt_id=receipt_id,
+            )
+        )
+    expected_decision = "approved" if bool(record.result.get("accepted", False)) else "denied"
+    if receipt.payload.decision != expected_decision:
+        issues.append(
+            ReceiptIssue(
+                code="decision_mismatch",
+                message="receipt decision does not match settlement accepted",
+                receipt_id=receipt_id,
+            )
+        )
+    expected_policy = str(record.constitutional_hash)
+    if receipt.payload.policy_hash != expected_policy:
+        issues.append(
+            ReceiptIssue(
+                code="policy_hash_mismatch",
+                message="receipt policy_hash does not match settlement constitutional_hash",
+                receipt_id=receipt_id,
+            )
+        )
+    expected_content = str(record.assignment.get("content_hash", "none"))
+    if receipt.payload.evidence_hashes.get("content") != expected_content:
+        issues.append(
+            ReceiptIssue(
+                code="content_hash_mismatch",
+                message="receipt content hash does not match settlement content_hash",
                 receipt_id=receipt_id,
             )
         )

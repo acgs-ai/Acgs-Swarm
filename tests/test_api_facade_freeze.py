@@ -35,6 +35,7 @@ STABLE_FACADE = (
     "InvalidVoteSignatureError",
     "JSONLSettlementStore",
     "MeshHaltedError",
+    "MeshSnapshotStaleError",
     "MeshProof",
     "MeshResult",
     "PROFILE_VERSION",

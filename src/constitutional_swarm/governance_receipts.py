@@ -289,6 +289,7 @@ def receipt_from_mesh_settlement(
             "assignment_id": assignment_id,
             "profile": PROFILE_VERSION,
             "claim": "local-dsse-shaped-receipt",
+            **({"recovery": "degraded-votes"} if not votes else {}),
         },
     )
     return build_receipt(payload=payload, signatures=signatures)

@@ -164,6 +164,91 @@ def test_receipt_copied_beside_other_store_fails(tmp_path) -> None:
     assert verdict.valid is False
 
 
+def test_signed_semantic_contradiction_fails(tmp_path) -> None:
+    mesh, store, assignment = _settle(tmp_path)
+    record = store.get(assignment.assignment_id)
+    assert record is not None
+    from constitutional_swarm.governance_receipts import (
+        GovernanceReceiptBundle,
+        ReceiptPayload,
+        RoleIdentity,
+        ValidatorVote,
+        settlement_canonical_digest,
+    )
+    from constitutional_swarm.settlement_store import SettlementRecord
+
+    contradicted = SettlementRecord(
+        assignment={**record.assignment, "artifact_id": "mutated-artifact"},
+        result={**record.result, "accepted": not bool(record.result.get("accepted"))},
+        constitutional_hash=record.constitutional_hash,
+        schema_version=record.schema_version,
+        is_recovered=record.is_recovered,
+        receipt_digest=record.receipt_digest,
+    )
+    bundle = bundle_from_json(receipt_path_for(store, assignment.assignment_id).read_text())
+    verdict = bind_and_verify(contradicted, bundle, trusted_signers=_trusted(mesh))
+    assert verdict.valid is False
+    assert any(
+        issue.code in {"action_mismatch", "decision_mismatch", "settlement_digest_mismatch"}
+        for issue in verdict.issues
+    )
+
+    roles = {
+        name: RoleIdentity(role=name, identity_id=name, display_name=name)
+        for name in ("constitution_author", "executor", "validator", "auditor")
+    }
+    payload = ReceiptPayload(
+        receipt_id=f"mesh-{assignment.assignment_id}",
+        action="wrong-action",
+        policy_version="local-constitution",
+        policy_hash=record.constitutional_hash,
+        roles=roles,
+        evidence_hashes={
+            "settlement": settlement_canonical_digest(record),
+            "content": str(record.assignment.get("content_hash", "none")),
+        },
+        decision="approved" if not bool(record.result.get("accepted")) else "denied",
+        validator_votes=[ValidatorVote(validator_id="v", decision="approve", rationale="ok")],
+        rejected_alternative="skip",
+        metadata={"assignment_id": assignment.assignment_id, "claim": "local-dsse-shaped-receipt"},
+    )
+    rogue = Ed25519PrivateKey.generate()
+    sig = rogue.sign(payload_canonical_bytes(payload))
+    forged = build_receipt(
+        payload=payload,
+        signatures=[
+            SignatureRecord(
+                key_id=RECEIPT_SIGNER_KEY_ID,
+                algorithm="ed25519",
+                public_key_hex=rogue.public_key()
+                .public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+                .hex(),
+                signature_hex=sig.hex(),
+            )
+        ],
+    )
+    trusted = {
+        RECEIPT_SIGNER_KEY_ID: rogue.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        .hex()
+    }
+    bound = SettlementRecord(
+        assignment=record.assignment,
+        result=record.result,
+        constitutional_hash=record.constitutional_hash,
+        receipt_digest=forged.payload_digest,
+    )
+    verdict = bind_and_verify(bound, GovernanceReceiptBundle(receipts=[forged]), trusted_signers=trusted)
+    assert verdict.valid is False
+    assert any(issue.code in {"action_mismatch", "decision_mismatch"} for issue in verdict.issues)
+
+
 def test_orphan_without_committed_settlement_fails(tmp_path) -> None:
     store = JSONLSettlementStore(tmp_path / "only.jsonl")
     verdict = verify_committed_settlement_receipt(store, "ghost")

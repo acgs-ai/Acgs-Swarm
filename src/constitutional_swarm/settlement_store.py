@@ -54,6 +54,7 @@ class SettlementRecord:
     schema_version: int = 1
     is_recovered: bool = False
     receipt_digest: str | None = None
+    votes: tuple[dict[str, Any], ...] = ()
 
 
 def normalize_receipt_digest(value: str | None) -> str | None:
@@ -320,6 +321,7 @@ class JSONLSettlementStore:
             "schema_version": record.schema_version,
             "is_recovered": record.is_recovered,
             "receipt_digest": normalize_receipt_digest(record.receipt_digest),
+            "votes": list(record.votes),
         }
 
     @classmethod
@@ -337,6 +339,9 @@ class JSONLSettlementStore:
             record_kwargs["receipt_digest"] = normalize_receipt_digest(
                 payload["receipt_digest"] if payload["receipt_digest"] is not None else None
             )
+        raw_votes = payload.get("votes") or ()
+        if raw_votes:
+            record_kwargs["votes"] = tuple(dict(item) for item in raw_votes)
         return SettlementRecord(**record_kwargs)
 
 
@@ -363,7 +368,8 @@ class SQLiteSettlementStore:
                     constitutional_hash TEXT NOT NULL DEFAULT '',
                     schema_version INTEGER NOT NULL DEFAULT 1,
                     is_recovered INTEGER NOT NULL DEFAULT 0,
-                    receipt_digest TEXT
+                    receipt_digest TEXT,
+                    votes_json TEXT
                 )
                 """
             )
@@ -376,7 +382,8 @@ class SQLiteSettlementStore:
                     constitutional_hash TEXT NOT NULL DEFAULT '',
                     schema_version INTEGER NOT NULL DEFAULT 1,
                     is_recovered INTEGER NOT NULL DEFAULT 0,
-                    receipt_digest TEXT
+                    receipt_digest TEXT,
+                    votes_json TEXT
                 )
                 """
             )
@@ -437,6 +444,16 @@ class SQLiteSettlementStore:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+            try:
+                conn.execute("ALTER TABLE mesh_settlements ADD COLUMN votes_json TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+            try:
+                conn.execute("ALTER TABLE pending_settlements ADD COLUMN votes_json TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
             conn.commit()
 
     def _table_columns(self, table_name: str) -> set[str]:
@@ -456,6 +473,7 @@ class SQLiteSettlementStore:
         """
         assignment_id = str(record.assignment["assignment_id"])
         digest = normalize_receipt_digest(record.receipt_digest)
+        votes_json = json.dumps(list(record.votes), separators=(",", ":")) if record.votes else None
         with sqlite3.connect(self.path) as conn:
             try:
                 conn.execute(
@@ -467,8 +485,9 @@ class SQLiteSettlementStore:
                         constitutional_hash,
                         schema_version,
                         is_recovered,
-                        receipt_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        receipt_digest,
+                        votes_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         assignment_id,
@@ -478,6 +497,7 @@ class SQLiteSettlementStore:
                         record.schema_version,
                         int(record.is_recovered),
                         digest,
+                        votes_json,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -493,6 +513,11 @@ class SQLiteSettlementStore:
         pending_record = replace(record, is_recovered=False)
         assignment_id = str(pending_record.assignment["assignment_id"])
         digest = normalize_receipt_digest(pending_record.receipt_digest)
+        votes_json = (
+            json.dumps(list(pending_record.votes), separators=(",", ":"))
+            if pending_record.votes
+            else None
+        )
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 """
@@ -503,8 +528,9 @@ class SQLiteSettlementStore:
                     constitutional_hash,
                     schema_version,
                     is_recovered,
-                    receipt_digest
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    receipt_digest,
+                    votes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     assignment_id,
@@ -514,6 +540,7 @@ class SQLiteSettlementStore:
                     pending_record.schema_version,
                     int(pending_record.is_recovered),
                     digest,
+                    votes_json,
                 ),
             )
             conn.commit()
@@ -533,25 +560,27 @@ class SQLiteSettlementStore:
         if table_name not in {"mesh_settlements", "pending_settlements"}:
             raise ValueError(f"Unsupported settlement table: {table_name}")
 
+        has_votes = "votes_json" in self._table_columns(table_name)
+        votes_expr = "votes_json" if has_votes else "NULL"
         select_with_digest = f"""
             SELECT assignment_json, result_json, constitutional_hash,
-                   schema_version, is_recovered, receipt_digest
+                   schema_version, is_recovered, receipt_digest, {votes_expr}
             FROM {table_name}
             ORDER BY assignment_id
         """
         select_without_digest = f"""
             SELECT assignment_json, result_json, constitutional_hash,
-                   schema_version, is_recovered, NULL
+                   schema_version, is_recovered, NULL, {votes_expr}
             FROM {table_name}
             ORDER BY assignment_id
         """
         select_without_is_recovered = f"""
-            SELECT assignment_json, result_json, constitutional_hash, schema_version, 0, NULL
+            SELECT assignment_json, result_json, constitutional_hash, schema_version, 0, NULL, {votes_expr}
             FROM {table_name}
             ORDER BY assignment_id
         """
         select_without_schema_version = f"""
-            SELECT assignment_json, result_json, constitutional_hash, 1, 0, NULL
+            SELECT assignment_json, result_json, constitutional_hash, 1, 0, NULL, {votes_expr}
             FROM {table_name}
             ORDER BY assignment_id
         """
@@ -573,24 +602,32 @@ class SQLiteSettlementStore:
                         if "no such column" not in str(older).lower():
                             raise
                         rows = conn.execute(select_without_schema_version).fetchall()
-        return [
-            SettlementRecord(
-                assignment=dict(json.loads(assignment_json)),
-                result=dict(json.loads(result_json)),
-                constitutional_hash=constitutional_hash,
-                schema_version=int(schema_version),
-                is_recovered=bool(is_recovered),
-                receipt_digest=normalize_receipt_digest(receipt_digest),
+        records = []
+        for (
+            assignment_json,
+            result_json,
+            constitutional_hash,
+            schema_version,
+            is_recovered,
+            receipt_digest,
+            votes_json,
+        ) in rows:
+            votes: tuple[dict[str, Any], ...] = ()
+            if votes_json:
+                parsed = json.loads(votes_json)
+                votes = tuple(dict(item) for item in parsed)
+            records.append(
+                SettlementRecord(
+                    assignment=dict(json.loads(assignment_json)),
+                    result=dict(json.loads(result_json)),
+                    constitutional_hash=constitutional_hash,
+                    schema_version=int(schema_version),
+                    is_recovered=bool(is_recovered),
+                    receipt_digest=normalize_receipt_digest(receipt_digest),
+                    votes=votes,
+                )
             )
-            for (
-                assignment_json,
-                result_json,
-                constitutional_hash,
-                schema_version,
-                is_recovered,
-                receipt_digest,
-            ) in rows
-        ]
+        return records
 
     def pending_count(self) -> int:
         with sqlite3.connect(self.path) as conn:
