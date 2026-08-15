@@ -690,6 +690,7 @@ class ConstitutionalMesh:
             pending_record = self._build_settlement_record(assignment, final)
             recovered_assignment = replace(assignment, is_recovered=True)
             settled_record = self._build_settlement_record(recovered_assignment, final)
+            settled_votes = list(self._votes.get(assignment_id, []))
         # Persist outside the lock — store I/O must not block mesh operations.
         # A durable pending marker is written first so startup reconciliation can
         # recover frozen-but-not-yet-durable settlements after a crash.
@@ -701,7 +702,7 @@ class ConstitutionalMesh:
                 if existing is not None:
                     return existing
                 self._final_results[assignment_id] = final
-            self._persist_settlement_record(settled_record)
+            self._persist_settlement_record(settled_record, votes=settled_votes)
             if self._settlement_store is not None:
                 self._settlement_store.clear_pending(assignment_id)
             with self._lock:
@@ -1467,13 +1468,84 @@ class ConstitutionalMesh:
 
     def _persist_settlement(self, assignment: PeerAssignment, result: MeshResult) -> None:
         """Append a settled assignment/result snapshot to disk when configured."""
-        self._persist_settlement_record(self._build_settlement_record(assignment, result))
+        votes = list(self._votes.get(assignment.assignment_id, []))
+        self._persist_settlement_record(
+            self._build_settlement_record(assignment, result),
+            votes=votes,
+        )
 
-    def _persist_settlement_record(self, record: SettlementRecord) -> None:
-        """Append a pre-built settlement record when configured."""
+    def _persist_settlement_record(
+        self,
+        record: SettlementRecord,
+        *,
+        votes: list[Any] | None = None,
+    ) -> None:
+        """Append a pre-built settlement record when configured.
+
+        When a store is configured, also emit a v0.1 receipt bound to the
+        protocol settlement digest. Receipt write happens first so a settlement
+        is never marked as having verifiable evidence unless the receipt exists.
+        """
         if self._settlement_store is None:
             return
-        self._settlement_store.append(record)
+        from cryptography.hazmat.primitives import serialization
+
+        from constitutional_swarm.governance_receipts import (
+            GovernanceReceiptBundle,
+            SignatureRecord,
+            bundle_to_json,
+            build_receipt,
+            payload_canonical_bytes,
+            receipt_from_mesh_settlement,
+        )
+
+        try:
+            unsigned = receipt_from_mesh_settlement(record, votes or [])
+            payload_bytes = payload_canonical_bytes(unsigned.payload)
+            signature = self._request_signing_private_key.sign(payload_bytes)
+            public_hex = self._request_signing_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            ).hex()
+            receipt = build_receipt(
+                payload=unsigned.payload,
+                signatures=[
+                    SignatureRecord(
+                        key_id="mesh-settlement",
+                        algorithm="ed25519",
+                        public_key_hex=public_hex,
+                        signature_hex=signature.hex(),
+                    )
+                ],
+            )
+        except Exception as exc:
+            raise SettlementPersistenceError(
+                f"Settlement {record.assignment.get('assignment_id')} receipt could not be built"
+            ) from exc
+        receipt_path = self._receipt_bundle_path(str(record.assignment["assignment_id"]))
+        tmp_path = receipt_path.with_name(receipt_path.name + ".tmp")
+        try:
+            tmp_path.write_text(
+                bundle_to_json(GovernanceReceiptBundle(receipts=[receipt])),
+                encoding="utf-8",
+            )
+            tmp_path.replace(receipt_path)
+        except Exception as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise SettlementPersistenceError(
+                f"Settlement {record.assignment.get('assignment_id')} receipt could not be persisted"
+            ) from exc
+        bound = replace(record, receipt_digest=receipt.payload_digest)
+        try:
+            self._settlement_store.append(bound)
+        except Exception:
+            receipt_path.unlink(missing_ok=True)
+            raise
+
+    def _receipt_bundle_path(self, assignment_id: str) -> Path:
+        described = self._settlement_store.describe() if self._settlement_store is not None else {}
+        store_path = Path(str(described.get("path", "mesh-settlements.jsonl")))
+        return store_path.with_name(f"{store_path.name}.{assignment_id}.receipt.json")
 
     def _load_settlements(self) -> None:
         """Load settled assignments/results from disk when configured."""

@@ -172,6 +172,19 @@ tools:
     validation: "uv run --no-sync acgs-verify-receipts --help"
     owner_module: src/constitutional_swarm/governance_receipts_cli.py
 
+  - name: project-receipt-dsse
+    purpose: Project a local v0.1 governance receipt onto an unsigned DSSE/in-toto shape for interoperability only.
+    command: uv run --no-sync python -m constitutional_swarm.governance_receipts_dsse <bundle.json>
+    env: []
+    inputs: ["<path to receipt bundle JSON>"]
+    outputs: ["DSSE-shaped envelope JSON on stdout (not a standards claim)"]
+    failure_modes:
+      - "Missing file -> error"
+      - "Malformed receipt -> validation error"
+    retry: "Read-only and idempotent."
+    validation: "uv run --no-sync python -m constitutional_swarm.governance_receipts_dsse --help"
+    owner_module: src/constitutional_swarm/governance_receipts_dsse.py
+
   # --- Evaluation & research scripts -----------------------------------------
   - name: reproduce-paper-claims
     purpose: Emit JSON metrics for local reproduction of the package's empirical paper claims.

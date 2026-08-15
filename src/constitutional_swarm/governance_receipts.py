@@ -194,6 +194,106 @@ def receipt_hash(receipt: GovernanceReceipt) -> str:
     return sha256_hex(canonical_json_bytes(receipt.model_dump(mode="json", exclude_none=False)))
 
 
+def settlement_canonical_digest(record: Any) -> str:
+    """SHA-256 of the protocol v1 settlement encoding.
+
+    ``receipt_digest`` is a pointer and is not part of this digest.
+    """
+
+    from constitutional_swarm.protocol import (
+        encode_settlement_record_v1,
+        protocol_sha256_hex,
+    )
+
+    return protocol_sha256_hex(encode_settlement_record_v1(record))
+
+
+def receipt_from_mesh_settlement(
+    record: Any,
+    votes: list[Any],
+    *,
+    previous_receipt_hash: str | None = None,
+    signatures: list[SignatureRecord] | None = None,
+) -> GovernanceReceipt:
+    """Project a mesh settlement onto the existing v0.1 receipt profile.
+
+    This does not invent a fourth evidence format. The settlement digest is
+    bound into ``evidence_hashes`` and the receipt digest can be stored on the
+    settlement as a pointer. The receipt remains a local DSSE-shaped profile,
+    not SCITT, Sigstore, or a compliance certificate.
+    """
+
+    assignment = dict(record.assignment)
+    assignment_id = str(assignment.get("assignment_id", ""))
+    if not assignment_id:
+        raise ValueError("settlement assignment_id is required")
+    settlement_digest = settlement_canonical_digest(record)
+    validator_votes = []
+    for vote in votes:
+        approved = bool(getattr(vote, "approved", vote.get("approved") if isinstance(vote, dict) else False))
+        voter_id = str(getattr(vote, "voter_id", vote.get("voter_id") if isinstance(vote, dict) else ""))
+        reason = str(getattr(vote, "reason", vote.get("reason") if isinstance(vote, dict) else "vote"))
+        validator_votes.append(
+            ValidatorVote(
+                validator_id=voter_id or "unknown-validator",
+                decision="approve" if approved else "deny",
+                rationale=reason or "no-reason",
+            )
+        )
+    if not validator_votes:
+        validator_votes.append(
+            ValidatorVote(
+                validator_id="mesh-validator",
+                decision="approve" if bool(record.result.get("accepted", False)) else "deny",
+                rationale="settlement quorum recorded without inline vote copies",
+            )
+        )
+    producer_id = str(assignment.get("producer_id", "producer"))
+    validator_id = validator_votes[0].validator_id
+    payload = ReceiptPayload(
+        receipt_id=f"mesh-{assignment_id}",
+        action=str(assignment.get("artifact_id", assignment_id)),
+        policy_version="local-constitution",
+        policy_hash=str(record.constitutional_hash),
+        roles={
+            "constitution_author": RoleIdentity(
+                role="constitution_author",
+                identity_id="constitution",
+                display_name="constitution",
+            ),
+            "executor": RoleIdentity(
+                role="executor",
+                identity_id=producer_id,
+                display_name=producer_id,
+            ),
+            "validator": RoleIdentity(
+                role="validator",
+                identity_id=validator_id if validator_id != producer_id else "mesh-validator",
+                display_name="mesh-validator",
+            ),
+            "auditor": RoleIdentity(
+                role="auditor",
+                identity_id="acgs-verify-receipts",
+                display_name="acgs-verify-receipts",
+            ),
+        },
+        evidence_hashes={
+            "settlement": settlement_digest,
+            "content": str(assignment.get("content_hash", "none")),
+        },
+        decision="approved" if bool(record.result.get("accepted", False)) else "denied",
+        validator_votes=validator_votes,
+        rejected_alternative="execute-without-settlement",
+        previous_receipt_hash=previous_receipt_hash,
+        metadata={
+            "assignment_id": assignment_id,
+            "profile": PROFILE_VERSION,
+            "claim": "local-dsse-shaped-receipt",
+        },
+    )
+    return build_receipt(payload=payload, signatures=signatures)
+
+
 def build_receipt(
     *,
     payload: ReceiptPayload,

@@ -50,6 +50,7 @@ class SettlementRecord:
     constitutional_hash: str = ""
     schema_version: int = 1
     is_recovered: bool = False
+    receipt_digest: str = ""
 
 
 class SettlementStore(Protocol):
@@ -283,6 +284,7 @@ class JSONLSettlementStore:
             "constitutional_hash": record.constitutional_hash,
             "schema_version": record.schema_version,
             "is_recovered": record.is_recovered,
+            "receipt_digest": record.receipt_digest,
         }
 
     @classmethod
@@ -296,6 +298,8 @@ class JSONLSettlementStore:
             record_kwargs["schema_version"] = int(payload["schema_version"])
         if "is_recovered" in payload:
             record_kwargs["is_recovered"] = bool(payload["is_recovered"])
+        if "receipt_digest" in payload:
+            record_kwargs["receipt_digest"] = str(payload["receipt_digest"])
         return SettlementRecord(**record_kwargs)
 
 

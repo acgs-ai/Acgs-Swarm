@@ -253,3 +253,35 @@ def verify_dsse_envelope(
         "reason": "",
         "key_ids": [e.get("keyid", "") for e in signatures],
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: project a receipt bundle to an unsigned DSSE-shaped envelope."""
+
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+
+    from constitutional_swarm.governance_receipts import bundle_from_json
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Project a local v0.1 governance receipt bundle to an unsigned "
+            "DSSE/in-toto shape. This is not a SCITT/Sigstore/compliance claim."
+        )
+    )
+    parser.add_argument("bundle", nargs="?", help="Path to a receipt bundle JSON file")
+    args = parser.parse_args(argv)
+    if args.bundle is None:
+        parser.print_help()
+        return 0
+    bundle = bundle_from_json(Path(args.bundle).read_text(encoding="utf-8"))
+    envelope = to_dsse_envelope(bundle.receipts[0])
+    json.dump(envelope, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
