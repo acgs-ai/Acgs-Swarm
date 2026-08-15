@@ -42,6 +42,11 @@ dev = [
   "ruff>=0.4,<0.16",
   "mypy>=2,<3",
   "numpy>=1.24",
+  # scripts/agent_check.py (make agent-check / CI agent-operability) imports
+  # these directly. They used to arrive transitively via numpy/braintrust and
+  # vanished once those left the default extra graph.
+  "jsonschema>=4.18",
+  "pyyaml>=6.0",
 ]
 # Observability for testnet/eval scripts only (scripts/testnet_deploy.py).
 # Not imported by the runtime; pytest still disables the plugin via addopts.
@@ -155,7 +160,7 @@ follow_imports_for_stubs = true
 checked = ["transport"]
 
 [tool.constitutional_swarm.typecheck_coverage.excepted]
-dev = "tooling only (pytest/ruff/mypy/numpy for tests); not imported by the default runtime"
+dev = "tooling only (pytest/ruff/mypy/numpy/jsonschema/pyyaml for tests + agent-check); not imported by the default runtime"
 braintrust = "optional testnet/eval telemetry; pytest disables the plugin; not imported by src/"
 bittensor = "bittensor ships no py.typed; installing adds no coverage over ignore_missing_imports"
 research = "torch/transformers are heavy and crash mypy; low value-to-cost — follow_imports=skip if ever gated"

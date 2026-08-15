@@ -6,6 +6,16 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- Declare `jsonschema` and `pyyaml` on the `[dev]` extra so
+  `make agent-check` / CI agent-operability can import
+  `scripts/agent_check.py` after `numpy`/`braintrust` left the default
+  extra graph.
+- Concurrent `full_validation` thread-safety test retries
+  `MeshSnapshotStaleError`. Reputation settlement is supposed to
+  invalidate in-flight routing snapshots; zero stale errors is not
+  part of the contract.
+
 ### Changed
 - Default `import constitutional_swarm` now eager-loads only the governance
   runtime surface (AgentDNA, DAG/executor, ConstitutionalMesh, settlement

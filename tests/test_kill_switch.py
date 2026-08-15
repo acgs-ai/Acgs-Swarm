@@ -7,7 +7,12 @@ import threading
 import pytest
 from acgs_lite import Constitution
 from constitutional_swarm.dna import AgentDNA, DNADisabledError
-from constitutional_swarm.mesh import ConstitutionalMesh, DuplicateVoteError, MeshHaltedError
+from constitutional_swarm.mesh import (
+    ConstitutionalMesh,
+    DuplicateVoteError,
+    MeshHaltedError,
+    MeshSnapshotStaleError,
+)
 
 
 def _vote_signature(
@@ -188,7 +193,14 @@ class TestMeshThreadSafety:
         assert mesh.agent_count == 100
 
     def test_concurrent_validations(self) -> None:
-        """Multiple threads running validations concurrently."""
+        """Concurrent full_validation must not crash or deadlock.
+
+        Reputation settlement bumps ``_state_generation``, which is supposed to
+        invalidate in-flight routing snapshots. ``request_validation`` already
+        retries a few times; under contention that budget can still exhaust.
+        Retry ``MeshSnapshotStaleError`` per assignment so this test still
+        proves thread safety without requiring zero snapshot invalidations.
+        """
         mesh = ConstitutionalMesh(Constitution.default(), seed=7)
         for i in range(20):
             mesh.register_local_signer(f"agent-{i:02d}")
@@ -196,17 +208,35 @@ class TestMeshThreadSafety:
         results: list[bool] = []
         errors: list[Exception] = []
         lock = threading.Lock()
+        stale_retries = 8
+
+        def validate_one(j: int) -> None:
+            last_stale: MeshSnapshotStaleError | None = None
+            for _ in range(stale_retries):
+                try:
+                    result = mesh.full_validation(
+                        f"agent-{j % 20:02d}",
+                        f"safe work {j}",
+                        f"art-{j}",
+                    )
+                    with lock:
+                        results.append(result.accepted)
+                    return
+                except MeshSnapshotStaleError as exc:
+                    last_stale = exc
+            with lock:
+                errors.append(
+                    last_stale
+                    or RuntimeError(f"validation {j} exhausted snapshot retries")
+                )
 
         def validate_batch(start: int, count: int) -> None:
             try:
                 for j in range(start, start + count):
-                    producer = f"agent-{j % 20:02d}"
-                    r = mesh.full_validation(producer, f"safe work {j}", f"art-{j}")
-                    with lock:
-                        results.append(r.accepted)
-            except Exception as e:
+                    validate_one(j)
+            except Exception as exc:
                 with lock:
-                    errors.append(e)
+                    errors.append(exc)
 
         threads = [threading.Thread(target=validate_batch, args=(i * 10, 10)) for i in range(4)]
         for t in threads:
