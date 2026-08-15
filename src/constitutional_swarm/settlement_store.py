@@ -70,6 +70,20 @@ class SettlementStore(Protocol):
     def describe(self) -> dict[str, Any]: ...
 
 
+@dataclass(slots=True)
+class _JsonlAssignmentIndex:
+    """In-process cache of assignment IDs keyed to a file identity.
+
+    Invalidated when inode, size, or mtime change so an external writer (or a
+    second store instance) cannot hide a duplicate behind a stale set.
+    """
+
+    assignment_ids: set[str]
+    inode: int | None
+    size: int
+    mtime_ns: int
+
+
 class JSONLSettlementStore:
     """Append-only JSONL settlement store.
 
@@ -79,12 +93,22 @@ class JSONLSettlementStore:
     File-level locking (``fcntl.LOCK_EX``) serialises concurrent ``append``
     and pending-update calls so that duplicate-detection and read-modify-write
     operations are atomic.
+
+    Duplicate detection uses an in-memory assignment-id index rebuilt under the
+    same lock when the log's inode/size/mtime change. JSONL is therefore safe
+    for cooperating processes that take the advisory lock; it is not a scale
+    store. Multi-writer or large-volume deployments should use
+    ``SQLiteSettlementStore``.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.pending_path = self.path.with_name(f"{self.path.name}.pending")
         self._lock_path = self.path.with_name(f"{self.path.name}.lock")
+        self._index: _JsonlAssignmentIndex | None = None
+        # Instrumentation for tests: whole-file scans and JSON object decodes.
+        self.scan_passes = 0
+        self.json_decode_count = 0
 
     @contextmanager
     def _file_lock(self) -> Generator[None, None, None]:
@@ -115,21 +139,61 @@ class JSONLSettlementStore:
                 _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
             os.close(fd)
 
+    def _file_signature(self) -> tuple[int | None, int, int]:
+        if not self.path.exists():
+            return (None, 0, 0)
+        stat = self.path.stat()
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _index_matches_file(self) -> bool:
+        if self._index is None:
+            return False
+        inode, size, mtime_ns = self._file_signature()
+        return (
+            self._index.inode == inode
+            and self._index.size == size
+            and self._index.mtime_ns == mtime_ns
+        )
+
+    def _remember_index(self, assignment_ids: set[str]) -> None:
+        inode, size, mtime_ns = self._file_signature()
+        self._index = _JsonlAssignmentIndex(
+            assignment_ids=assignment_ids,
+            inode=inode,
+            size=size,
+            mtime_ns=mtime_ns,
+        )
+
+    def _known_assignment_ids_locked(self) -> set[str]:
+        if self._index_matches_file():
+            assert self._index is not None
+            return self._index.assignment_ids
+        ids = {
+            str(record.assignment.get("assignment_id", ""))
+            for record in self.load_all()
+        }
+        ids.discard("")
+        self._remember_index(ids)
+        return ids
+
     def append(self, record: SettlementRecord) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         assignment_id = str(record.assignment["assignment_id"])
         with self._file_lock():
-            for existing in self.load_all():
-                if str(existing.assignment.get("assignment_id", "")) == assignment_id:
-                    raise DuplicateSettlementError(f"Settlement {assignment_id} already exists")
+            known_ids = self._known_assignment_ids_locked()
+            if assignment_id in known_ids:
+                raise DuplicateSettlementError(f"Settlement {assignment_id} already exists")
             payload = self._payload_from_record(record)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            known_ids.add(assignment_id)
+            self._remember_index(known_ids)
 
     def load_all(self) -> list[SettlementRecord]:
         if not self.path.exists():
             return []
 
+        self.scan_passes += 1
         records: list[SettlementRecord] = []
         with self.path.open(encoding="utf-8") as fh:
             lines = fh.readlines()
@@ -141,6 +205,7 @@ class JSONLSettlementStore:
                 continue
             try:
                 payload = json.loads(line)
+                self.json_decode_count += 1
             except json.JSONDecodeError:
                 is_terminal_line = lineno == len(lines)
                 # Salvage only the final truncated append. Earlier corruption
@@ -190,6 +255,8 @@ class JSONLSettlementStore:
         return {
             "backend": "jsonl",
             "path": str(self.path),
+            "concurrency": "advisory-lock",
+            "scale_default": "sqlite",
         }
 
     def _load_pending_payloads(self) -> dict[str, dict[str, Any]]:
