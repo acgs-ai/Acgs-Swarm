@@ -47,6 +47,7 @@ from constitutional_swarm.mesh.exceptions import (
     InsufficientPeersError,
     InvalidVoteSignatureError,
     MeshHaltedError,
+    MeshSnapshotStaleError,
     RecoveredAssignmentError,
     RemoteVoteReplayError,
     SettlementPersistenceError,
@@ -112,6 +113,7 @@ class ConstitutionalMesh:
         seed: int | None = None,
         use_manifold: bool = False,
         manifold_type: Literal["birkhoff", "spectral"] = "birkhoff",
+        trust_policy: Literal["uniform", "spectral", "birkhoff"] | Any = "uniform",
         shadow_spectral: bool = False,
         risk_scoring: bool = False,
         settlement_store_path: str | Path | None = None,
@@ -127,6 +129,23 @@ class ConstitutionalMesh:
             raise ValueError(
                 f"manifold_type must be 'birkhoff' or 'spectral', got {manifold_type!r}"
             )
+        custom_policy = trust_policy if callable(trust_policy) else None
+        if custom_policy is None and trust_policy not in {"uniform", "spectral", "birkhoff"}:
+            raise ValueError(
+                "trust_policy must be 'uniform', 'spectral', 'birkhoff', or a callable, "
+                f"got {trust_policy!r}"
+            )
+        if custom_policy is not None:
+            resolved_policy = "custom"
+            use_manifold = False
+        elif use_manifold and trust_policy == "uniform":
+            # Legacy: use_manifold=True + default trust_policy keeps manifold_type.
+            resolved_policy = manifold_type
+        else:
+            resolved_policy = str(trust_policy)
+            use_manifold = resolved_policy in {"spectral", "birkhoff"}
+            if use_manifold:
+                manifold_type = resolved_policy  # type: ignore[assignment]
         self._constitution = constitution
         self._dna = AgentDNA(
             constitution=constitution,
@@ -152,6 +171,11 @@ class ConstitutionalMesh:
         self._final_results: dict[str, MeshResult] = {}
         self._use_manifold = use_manifold
         self._manifold_type = manifold_type
+        self._trust_policy = resolved_policy
+        self._custom_trust_policy = custom_policy
+        self._state_generation = 0
+        self._constitution_generation = 0
+        self._voter_dna: dict[str, tuple[int, AgentDNA]] = {}
         self._manifold: GovernanceManifold | spectral_sphere_mod.SpectralSphereManifold | None = (
             None
         )
@@ -205,11 +229,13 @@ class ConstitutionalMesh:
         """
         with self._lock:
             self._halted = True
+            self._state_generation += 1
 
     def resume(self) -> None:
         """Resume mesh operations after a halt."""
         with self._lock:
             self._halted = False
+            self._state_generation += 1
 
     @property
     def is_halted(self) -> bool:
@@ -249,6 +275,7 @@ class ConstitutionalMesh:
                 self._agent_indices[agent_id] = len(self._agent_indices)
                 self._rebuild_manifold()
                 self._restore_archive_for_agent(agent_id)
+            self._state_generation += 1
 
     def register_local_signer(
         self,
@@ -271,6 +298,7 @@ class ConstitutionalMesh:
                 self._agent_indices[agent_id] = len(self._agent_indices)
                 self._rebuild_manifold()
                 self._restore_archive_for_agent(agent_id)
+            self._state_generation += 1
 
     def register_agent(self, *args: Any, **kwargs: Any) -> None:
         """Removed in v0.3.0. Use register_local_signer() or register_remote_agent()."""
@@ -306,6 +334,8 @@ class ConstitutionalMesh:
                     existing_agent_id: idx for idx, existing_agent_id in enumerate(remaining_ids)
                 }
                 self._rebuild_manifold()
+            self._voter_dna.pop(agent_id, None)
+            self._state_generation += 1
 
     def rotate_constitution(
         self,
@@ -333,6 +363,9 @@ class ConstitutionalMesh:
                 agent_id="mesh-validator",
                 risk_scoring=self._risk_scoring,
             )
+            self._constitution_generation += 1
+            self._state_generation += 1
+            self._voter_dna.clear()
             if self._use_manifold:
                 if preserve_trust:
                     self._rebuild_manifold()
@@ -344,6 +377,18 @@ class ConstitutionalMesh:
                         self._shadow_metrics = []
                     self._trust_store = {}
                     self._rebuild_manifold()
+
+    def _voter_dna_locked(self, voter_id: str) -> AgentDNA:
+        cached = self._voter_dna.get(voter_id)
+        if cached is not None and cached[0] == self._constitution_generation:
+            return cached[1]
+        dna = AgentDNA(
+            constitution=self._constitution,
+            agent_id=voter_id,
+            strict=False,
+        )
+        self._voter_dna[voter_id] = (self._constitution_generation, dna)
+        return dna
 
     def get_reputation(self, agent_id: str) -> float:
         """Get an agent's reputation score."""
@@ -363,62 +408,139 @@ class ConstitutionalMesh:
     ) -> PeerAssignment:
         """Request peer validation of a producer's output.
 
-        Step 1: Constitutional DNA pre-check (443ns). Catches obvious
-                violations before wasting peer time.
-        Step 2: Select random peers, excluding the producer (MACI).
-        Step 3: Return assignment with cryptographic content hash.
+        DNA validation and trust projection run outside the mesh lock.
+        The assignment is committed only after re-checking halt,
+        membership, and constitution generation.
 
         Raises:
             ConstitutionalViolationError: Content violates constitution.
             InsufficientPeersError: Not enough peers available.
             KeyError: Producer not registered.
             MeshHaltedError: Mesh is halted.
+            MeshSnapshotStaleError: Snapshot became invalid and retries exhausted.
         """
+        last_stale: MeshSnapshotStaleError | None = None
+        for _ in range(3):
+            try:
+                return self._request_validation_once(producer_id, content, artifact_id)
+            except MeshSnapshotStaleError as exc:
+                last_stale = exc
+        assert last_stale is not None
+        raise last_stale
+
+    def _request_validation_once(
+        self,
+        producer_id: str,
+        content: str,
+        artifact_id: str,
+    ) -> PeerAssignment:
         with self._lock:
             self._check_halted()
             if producer_id not in self._agents:
                 raise KeyError(f"Producer {producer_id} not registered")
-
-            # Step 1: DNA pre-check — fail fast on constitutional violations.
-            # When risk_scoring is enabled, the result carries a semantic risk
-            # score that drives adaptive peer selection in Step 2.
-            dna_result = self._dna.validate(content)
-
-            # Step 2: Select peers (exclude producer — MACI).
-            # Adaptive scaling: high-risk content (score >= 0.5) gets extra
-            # peers up to max available, increasing Byzantine fault tolerance.
+            dna = self._dna
             available = [aid for aid in self._agents if aid != producer_id]
-            base_needed = min(self._peers_per_validation, len(available))
-            if self._risk_scoring and dna_result.risk_score >= 0.8:
-                # critical — use all available peers
-                needed = len(available)
-            elif self._risk_scoring and dna_result.risk_score >= 0.5:
-                # high — one extra peer
-                needed = min(base_needed + 1, len(available))
-            else:
-                needed = base_needed
-            if needed < self._quorum:
-                raise InsufficientPeersError(
-                    f"Need {self._quorum} peers for quorum, only {needed} available"
-                )
-            peers = tuple(self._select_peers(available, needed, producer_id))
+            snapshot_generation = self._state_generation
+            snapshot_constitution = self._constitution_generation
+            snapshot_hash = self.constitutional_hash
+            trust_raw = self._copy_raw_trust_locked()
+            agent_indices = dict(self._agent_indices)
 
-            # Step 3: Create assignment with content hash
-            content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
-            assignment = PeerAssignment(
-                assignment_id=uuid.uuid4().hex[:12],
-                producer_id=producer_id,
-                artifact_id=artifact_id,
-                content=content,
-                content_hash=content_hash,
-                peers=peers,
-                constitutional_hash=self.constitutional_hash,
-                timestamp=time.time(),
+        dna_result = dna.validate(content)
+        base_needed = min(self._peers_per_validation, len(available))
+        if self._risk_scoring and dna_result.risk_score >= 0.8:
+            needed = len(available)
+        elif self._risk_scoring and dna_result.risk_score >= 0.5:
+            needed = min(base_needed + 1, len(available))
+        else:
+            needed = base_needed
+        if needed < self._quorum:
+            raise InsufficientPeersError(
+                f"Need {self._quorum} peers for quorum, only {needed} available"
             )
+        peers = tuple(
+            self._select_peers_unlocked(
+                available,
+                needed,
+                producer_id,
+                trust_raw=trust_raw,
+                agent_indices=agent_indices,
+            )
+        )
+
+        content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
+        assignment = PeerAssignment(
+            assignment_id=uuid.uuid4().hex[:12],
+            producer_id=producer_id,
+            artifact_id=artifact_id,
+            content=content,
+            content_hash=content_hash,
+            peers=peers,
+            constitutional_hash=snapshot_hash,
+            timestamp=time.time(),
+        )
+
+        with self._lock:
+            self._check_halted()
+            if (
+                snapshot_generation != self._state_generation
+                or snapshot_constitution != self._constitution_generation
+            ):
+                raise MeshSnapshotStaleError(
+                    "mesh membership or constitution changed during validation"
+                )
+            if producer_id not in self._agents:
+                raise MeshSnapshotStaleError(f"Producer {producer_id} unregistered during validation")
+            missing = [peer for peer in peers if peer not in self._agents]
+            if missing:
+                raise MeshSnapshotStaleError(
+                    f"Assigned peers unregistered during validation: {missing}"
+                )
+            if assignment.constitutional_hash != self.constitutional_hash:
+                raise MeshSnapshotStaleError("constitution hash changed during validation")
             self._assignments[assignment.assignment_id] = assignment
             self._votes[assignment.assignment_id] = []
             self._agents[producer_id].validations_received += 1
             return assignment
+
+    def _copy_raw_trust_locked(self) -> list[list[float]] | None:
+        if not self._use_manifold or self._manifold is None:
+            return None
+        raw = getattr(self._manifold, "_raw_trust", None)
+        if raw is None:
+            return None
+        return [list(row) for row in raw]
+
+    def _select_peers_unlocked(
+        self,
+        available: list[str],
+        needed: int,
+        producer_id: str,
+        *,
+        trust_raw: list[list[float]] | None,
+        agent_indices: dict[str, int] | None = None,
+    ) -> list[str]:
+        indices = self._agent_indices if agent_indices is None else agent_indices
+        if self._custom_trust_policy is not None:
+            selected = self._custom_trust_policy(available, needed, producer_id)
+            return list(selected)[:needed]
+        if not self._use_manifold or trust_raw is None or producer_id not in indices:
+            return list(self._rng.sample(available, k=needed))
+        detached = self._build_manifold(len(trust_raw), self._manifold_type)
+        detached._raw_trust = trust_raw  # type: ignore[attr-defined]
+        if hasattr(detached, "_projected"):
+            detached._projected = None  # type: ignore[attr-defined]
+        proj = detached.project()
+        if not getattr(proj, "converged", True):
+            return list(self._rng.sample(available, k=needed))
+        producer_idx = indices[producer_id]
+        trust_row = proj.matrix[producer_idx]
+        weight_map: dict[str, float] = {}
+        for aid in available:
+            idx = indices.get(aid)
+            weight = trust_row[idx] if idx is not None else 0.01
+            weight_map[aid] = max(weight, 0.01)
+        return self._sample_weighted_peers(available, needed, weight_map)
 
     def submit_vote(
         self,
@@ -613,12 +735,8 @@ class ConstitutionalMesh:
                     "use prepare_remote_vote() and submit_vote() for remote peers"
                 )
             content = assignment.content
+            voter_dna = self._voter_dna_locked(voter_id)
 
-        voter_dna = AgentDNA(
-            constitution=self._constitution,
-            agent_id=voter_id,
-            strict=False,
-        )
         result = voter_dna.validate(content)
 
         if result.valid:
@@ -1018,27 +1136,19 @@ class ConstitutionalMesh:
         Falls back to uniform random sampling when the manifold is
         disabled, not yet converged, or the producer is not indexed.
         """
-        if (
-            not self._use_manifold
-            or self._manifold is None
-            or producer_id not in self._agent_indices
-        ):
-            return list(self._rng.sample(available, k=needed))
+        return self._select_peers_unlocked(
+            available,
+            needed,
+            producer_id,
+            trust_raw=self._copy_raw_trust_locked(),
+        )
 
-        proj = self._manifold.project()
-        if not getattr(proj, "converged", True):
-            return list(self._rng.sample(available, k=needed))
-
-        producer_idx = self._agent_indices[producer_id]
-        trust_row = proj.matrix[producer_idx]
-
-        # Build {agent_id: weight} dict — O(1) lookup, no index() calls
-        weight_map: dict[str, float] = {}
-        for aid in available:
-            idx = self._agent_indices.get(aid)
-            w = trust_row[idx] if idx is not None else 0.01
-            weight_map[aid] = max(w, 0.01)  # floor to prevent zero-weight exclusion
-
+    def _sample_weighted_peers(
+        self,
+        available: list[str],
+        needed: int,
+        weight_map: dict[str, float],
+    ) -> list[str]:
         if needed >= len(available):
             return list(available)
 

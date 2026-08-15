@@ -29,6 +29,10 @@ class MeshHaltedError(RuntimeError):
     """Mesh has been halted; all operations are blocked until resumed."""
 
 
+class MeshSnapshotStaleError(RuntimeError):
+    """A lock-free validation snapshot is no longer valid and must not be committed."""
+
+
 class SettlementPersistenceError(RuntimeError):
     """Raised when a settled result cannot be persisted after freeze."""
 
