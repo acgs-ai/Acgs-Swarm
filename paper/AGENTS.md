@@ -15,7 +15,9 @@ Long-form Markdown paper draft for the constitutional-swarm package itself — t
 ## For AI Agents
 
 ### Working In This Directory
-- Keep the Markdown paper in sync with the code: empirical numbers (e.g., 443 ns/check, 1019 tests, 3/5 quorum) should match the current implementation.
+- Keep the Markdown paper labeled as a historical draft. Do not restore
+  withdrawn pins (`443 ns`, `2,656%`) as live product claims. Live status
+  lives in `scripts/reproduce_paper_claims.py`.
 - Cross-reference modules with `src/constitutional_swarm/<name>.py` paths so readers can jump to the code.
 - Do not commit rendered PDFs here — those belong in `papers/<venue>/`.
 

@@ -12,6 +12,10 @@ It combines local constitutional enforcement (`AgentDNA`), DAG-based swarm execu
 This package is **not** a generic agent framework and **not** an all-in-one orchestration platform.
 It is a governance runtime you can embed into your existing agent stack.
 
+Public import policy: `docs/API_COMPATIBILITY.md`. Hardcoded historical pins
+such as `443 ns`, `2,656%`, or official SWE-bench scores are **not** current
+product claims.
+
 ## Why it exists
 Most multi-agent systems can execute tasks, but fewer can show:
 - what policy was applied,
@@ -42,7 +46,7 @@ Most multi-agent systems can execute tasks, but fewer can show:
 | An orchestrator-free governance runtime | A generic no-governance multi-agent framework |
 | Local constitutional enforcement + peer validation | A centralized coordinator product |
 | Durable settlement + replayable receipts | A compliance certificate |
-| Stable core plus clearly separated research modules | A claim that all APIs are stable |
+| Stable eager façade plus lazy legacy imports | A promise that `import *` still dumps research symbols |
 
 ## Install
 Requires Python **3.11+** (`pyproject.toml`).

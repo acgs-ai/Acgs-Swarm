@@ -8,7 +8,7 @@ Quick lookup for the vocabulary used across the codebase. Conceptual depth is in
 | Term | Meaning |
 |---|---|
 | **ACGS** | Autonomous Constitutional Governance System — the parent program; `acgs-lite` is its single-action governance base that this package extends to societies of agents. |
-| **Agent DNA** | The embedded constitutional co-processor (`AgentDNA`) carried by each agent; validates actions locally (~443ns/check). Pattern A. |
+| **Agent DNA** | The embedded constitutional co-processor (`AgentDNA`) carried by each agent; validates actions locally on the hot path. Pattern A. The former `443 ns` pin is withdrawn. |
 | **Abliteration** | Attack that surgically removes a model's refusal direction so it complies with anything. Screened by `node_admission.py`. |
 | **BODES** | The residual-stream steering technique in `latent_dna.py` — a forward hook nudges generation away from a learned violation direction. |
 | **Birkhoff polytope** | The set of doubly-stochastic matrices. `manifold.py`'s Sinkhorn-Knopp projection targets it; its uniformity collapse is the kept research control. |

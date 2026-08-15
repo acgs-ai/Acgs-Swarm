@@ -91,6 +91,7 @@ def test_residual_compose_retains_variance(n: int, cycles: int) -> None:
     Observed fixed-point behavior (empirical):
         n=10, cycles=50:   stabilizes at ~20% retention (perfectly flat from cycle 10)
         n=50, cycles=100:  stabilizes at ~142% retention (flat from cycle 10)
+        These percentages are live harness measurements, not product SLAs.
 
     Note: retention > 100% is correct for n=50 - the residual alpha * I injection adds
     diagonal structure that increases variance above the original random initialization.

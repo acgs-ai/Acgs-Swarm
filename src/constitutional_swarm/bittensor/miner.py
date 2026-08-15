@@ -3,7 +3,7 @@
 Wraps AgentDNA + SwarmExecutor into a Bittensor-compatible miner that:
   1. Receives escalated governance cases (DeliberationSynapse)
   2. Validates constitution hash match
-  3. Runs local DNA pre-check on its judgment (443ns)
+  3. Runs local DNA pre-check on its judgment
   4. Returns judgment with cryptographic artifact hash (JudgmentSynapse)
 
 The actual deliberation is delegated to a pluggable handler — the miner
@@ -159,7 +159,7 @@ class ConstitutionalMiner:
         Steps:
           1. Verify constitution hash matches (current or previous during rollover)
           2. Run deliberation handler (human or AI)
-          3. DNA pre-check on judgment (443ns)
+          3. DNA pre-check on judgment
           4. Create content-addressed artifact
           5. Return JudgmentSynapse
 
@@ -201,7 +201,7 @@ class ConstitutionalMiner:
         elapsed_ms = (time.monotonic() - start) * 1000
         self._stats.total_deliberation_time_ms += elapsed_ms
 
-        # Step 3: DNA pre-check (443ns)
+        # Step 3: DNA pre-check (local; former 443ns pin withdrawn)
         dna_result = self._dna.validate(judgment)
         self._stats.total_dna_latency_ns += dna_result.latency_ns
 

@@ -1,10 +1,10 @@
 """Precedent Cascade — Four-Stage Evolutionary Filter for Constitution Amendment.
 
 New precedents are candidate mutations to the effective constitution.
-A four-stage cascade filters them from cheapest (443ns DNA check) to most
+A four-stage cascade filters them from cheapest (local DNA check) to most
 expensive (multi-miner consensus + compatibility verification).
 
-Stage 1: DNA Pre-check       → 443ns, catches obvious violations
+Stage 1: DNA Pre-check       → local DNA check, catches obvious violations
 Stage 2: Mesh Validation     → 3-peer quorum, quality filter
 Stage 3: Multi-Miner Consensus → N-miner stability check
 Stage 4: Constitutional Compatibility → contradiction detection
@@ -276,7 +276,7 @@ class PrecedentCascade:
     # -- Stage Implementations -----------------------------------------------
 
     def _stage_dna(self, candidate: PrecedentCandidate) -> CascadeResult:
-        """Stage 1: DNA pre-check (443ns target)."""
+        """Stage 1: DNA pre-check (local, no published nanosecond target)."""
         start = time.perf_counter_ns()
         result = self._dna.validate(candidate.judgment_text)
         elapsed = time.perf_counter_ns() - start

@@ -11,7 +11,9 @@ The format is based on Keep a Changelog.
   runtime surface (AgentDNA, DAG/executor, ConstitutionalMesh, settlement
   stores, v0.1 receipts). Research, Bittensor, LangGraph, eval, and benchmark
   symbols remain available via lazy `__getattr__` or explicit submodule
-  imports.
+  imports. `from constitutional_swarm import *` is now the stable façade
+  only — an intentional import-star compatibility break. See
+  `docs/API_COMPATIBILITY.md`. The next published version should be 1.1.0.
 - `braintrust` is an optional extra (`[braintrust]`), not a core dependency.
 - `numpy` is no longer a core runtime dependency; it ships with `[dev]` and
   `[research]`.

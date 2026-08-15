@@ -10,23 +10,23 @@ Definition used here: `mapped` means an existing `scripts/` entry or pytest test
 |---|---:|---|---|---|
 | ICLR-01 | `sections/abstract.tex:5` | In controlled experiments with `n=50`, Sinkhorn-normalized trust reaches `0%` variance retention by cycle 10. | `tests/test_manifold_degeneration.py::test_birkhoff_uniformity_collapse` | mapped |
 | ICLR-02 | `sections/abstract.tex:13` | SpectralSphere plus residual achieves stable `142%` variance retention for `n=50` and `20%` for `n=10`. | `tests/test_spectral_sphere_retention.py::test_residual_compose_retains_variance` | mapped |
-| ICLR-03 | `sections/abstract.tex:18` | The Neural ODE achieves `2,656%` topological capacity relative to the Sinkhorn baseline. | `scripts/reproduce_paper_claims.py --claim-id ICLR-03` | mapped |
+| ICLR-03 | `sections/abstract.tex:18` | The Neural ODE achieves `2,656%` topological capacity relative to the Sinkhorn baseline. | `scripts/reproduce_paper_claims.py --claim-id ICLR-03` | mapped / withdrawn |
 | ICLR-04 | `sections/abstract.tex:24` | Residual injection at `alpha=0.1` reduces epsilon-DP noise requirements by exactly `10%`. | `tests/test_rule_consistency.py::TestDPNoiseHelpers::test_calibrate_sigma_decreases_with_alpha` | mapped |
 | ICLR-05 | `sections/introduction.tex:20` | For `n=50`, variance retention falls from `100%` to `0%` by cycle 10, and for `n=10` reaches `0%` by cycle 6. | `tests/test_manifold_degeneration.py::test_birkhoff_uniformity_collapse` | mapped |
 | ICLR-06 | `sections/introduction.tex:39` | Iterated Sinkhorn collapses variance to zero while SpectralSphere with residual converges to a non-degenerate equilibrium. | `tests/test_manifold_degeneration.py::test_birkhoff_uniformity_collapse`; `tests/test_spectral_sphere_retention.py::test_residual_compose_retains_variance` | mapped |
-| ICLR-07 | `sections/introduction.tex:65` | The ODE achieves `2,656%` topological capacity relative to Sinkhorn. | `scripts/reproduce_paper_claims.py --claim-id ICLR-07` | mapped |
+| ICLR-07 | `sections/introduction.tex:65` | The ODE achieves `2,656%` topological capacity relative to Sinkhorn. | `scripts/reproduce_paper_claims.py --claim-id ICLR-07` | mapped / withdrawn |
 | ICLR-08 | `sections/experiments.tex:24` | Experiments run `30` random seeds for each swarm size `n in {10, 50}` and report mean plus standard deviation. | `scripts/reproduce_paper_claims.py --claim-id ICLR-08` | mapped |
 | ICLR-09 | `sections/experiments.tex:47` | Variance-retention table results are means over `30` seeds with standard deviations `< 3%` for non-collapsed rows. | `scripts/reproduce_paper_claims.py --claim-id ICLR-09` | mapped |
 | ICLR-10 | `sections/experiments.tex:57` | Sinkhorn table rows report collapse to `0%` by cycle 10 for both `n=50` and `n=10`. | `tests/test_manifold_degeneration.py::test_birkhoff_uniformity_collapse` | mapped |
 | ICLR-11 | `sections/experiments.tex:60` | SpectralSphere plus residual at `alpha=0.1` stabilizes at `142%` for `n=50` and `20%` for `n=10`. | `tests/test_spectral_sphere_retention.py::test_residual_compose_retains_variance` | mapped |
 | ICLR-12 | `sections/experiments.tex:62` | SpectralSphere without residual initially amplifies variance but collapses to `0%` by cycle 50. | `scripts/reproduce_paper_claims.py --claim-id ICLR-12` | mapped |
 | ICLR-13 | `sections/experiments.tex:96` | Equilibrium variance retention decreases at smaller scale, and practical swarms with `n >= 20` exceed `50%` retention. | `scripts/reproduce_paper_claims.py --claim-id ICLR-13` | mapped |
-| ICLR-14 | `sections/experiments.tex:118` | Neural ODE topological capacity is `2,656%`, about `26x` Sinkhorn, at cycle 10. | `scripts/reproduce_paper_claims.py --claim-id ICLR-14` | mapped |
+| ICLR-14 | `sections/experiments.tex:118` | Neural ODE topological capacity is `2,656%`, about `26x` Sinkhorn, at cycle 10. | `scripts/reproduce_paper_claims.py --claim-id ICLR-14` | mapped / withdrawn |
 | ICLR-15 | `sections/experiments.tex:144` | DP-noise table reports exact sigma values and `-10%`, `-20%`, and `-50%` reductions for alpha values `0.1`, `0.2`, and `0.5`. | `scripts/reproduce_paper_claims.py --claim-id ICLR-15` | mapped |
 | ICLR-16 | `sections/experiments.tex:160` | Radius sensitivity gives `71%`, `142%`, and `287%` equilibrium variance retention for `r=0.5`, `1.0`, and `2.0`. | `scripts/reproduce_paper_claims.py --claim-id ICLR-16` | mapped |
 | ICLR-17 | `sections/experiments.tex:166` | Increasing `alpha` from `0.1` to `0.5` reduces `n=50` variance retention from `142%` to `38%`. | `scripts/reproduce_paper_claims.py --claim-id ICLR-17` | mapped |
 | ICLR-18 | `sections/conclusion.tex:6` | Sinkhorn empirically collapses to `0%` variance retention by cycle 10 for `n in {10, 50}` with no recovery. | `tests/test_manifold_degeneration.py::test_birkhoff_uniformity_collapse` | mapped |
-| ICLR-19 | `sections/conclusion.tex:10` | SpectralSphere with residual achieves `142%` stable retention for `n=50`, `20%` for `n=10`, and ODE capacity of `2,656%`. | `scripts/reproduce_paper_claims.py --claim-id ICLR-19` | mapped |
+| ICLR-19 | `sections/conclusion.tex:10` | SpectralSphere with residual achieves `142%` stable retention for `n=50`, `20%` for `n=10`, and ODE capacity of `2,656%`. | `scripts/reproduce_paper_claims.py --claim-id ICLR-19` | mapped / withdrawn |
 | ICLR-20 | `sections/conclusion.tex:20` | At `alpha=0.1`, the stability fix reduces required DP noise by `10%`. | `tests/test_rule_consistency.py::TestDPNoiseHelpers::test_calibrate_sigma_decreases_with_alpha` | mapped |
 
 ## NDSS 2027

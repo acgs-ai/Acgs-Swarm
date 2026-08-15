@@ -18,7 +18,7 @@ Mathematical foundation:
     3. Conservation: row/column sums = 1 (trust is conserved, not
        created or destroyed)
 
-The constitutional validation engine (443ns) serves as the manifold
+The local constitutional validation engine serves as the manifold
 projection operator P_M^gov — analogous to Sinkhorn-Knopp in mHC.
 """
 

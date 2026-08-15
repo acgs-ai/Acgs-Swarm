@@ -1,5 +1,12 @@
 # constitutional_swarm: Manifold-Constrained Constitutional Governance for Multi-Agent Systems
 
+> **Historical draft — not a live product claim sheet.**
+> Numbers such as `443 ns`, a published Rust/PyO3 latency, and `2,656%`
+> topological capacity are **withdrawn**. Current statuses are
+> `measured` / `formula` / `non_claim` / `withdrawn` / `not_run` in
+> `scripts/reproduce_paper_claims.py`. Keep the narrative below for
+> context; do not quote it as a current product claim.
+
 ## Abstract
 
 As multi-agent AI systems scale beyond hundreds of coordinating agents, unconstrained inter-agent communication creates O(N²) coordination overhead, trust instability, and goal drift — problems structurally analogous to signal explosion in deep neural networks with unconstrained residual connections. We introduce **constitutional_swarm**, a framework that eliminates orchestrators entirely by embedding constitutional governance directly into each agent as a sub-microsecond co-processor ("Agent DNA") and projecting inter-agent trust onto the Birkhoff polytope via Sinkhorn-Knopp normalization. Drawing on the mathematical foundations of Manifold-Constrained Hyper-Connections (mHC; Xie et al., 2025), we prove three properties: (1) **bounded influence** — the spectral norm of the governance manifold is ≤ 1, preventing trust explosion; (2) **compositional closure** — governance chains remain stable at arbitrary depth; (3) **conservation** — trust is neither created nor destroyed across agent interactions. Our prototype validates at 443ns per constitutional check via a Rust/PyO3 engine, achieves Byzantine fault tolerance through peer validation with cryptographic Merkle proofs, and reduces coordination overhead from O(N²) to O(N). We demonstrate these properties empirically on swarms of 10–800 simulated agents.

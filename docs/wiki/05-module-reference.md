@@ -20,7 +20,7 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `.check_maci`, `.govern`, `.disable`/`.enable`, `.hash`, `.stats`),
   `DNAValidationResult`, `constitutional_dna` (decorator), `DNADisabledError`.
 - **Logic:** `validate(text)` runs the constitution's rule matchers and returns
-  valid + violations + risk; built to run in ~443ns so it sits inline.
+  valid + violations + risk; built to sit inline on the local hot path.
   `constitutional_dna` wraps any callable to validate its output.
 - **⚠** A disabled DNA **raises** `DNADisabledError` on `validate()` — it never
   silently passes. Greek-symbol-heavy sibling `latent_dna.py` is *not* this.

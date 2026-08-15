@@ -243,8 +243,9 @@ Birkhoff Uniformity Collapse:
 H_proj = (1 − α) · Proj_r(H_new) + α · I
 ```
 
-where α ∈ (0, 1) (empirically optimal at α = 0.1, yielding a stable 142% variance
-retention for n=50 agents). While designed as a leaky integrator for topological
+where α ∈ (0, 1) (historically reported as a stable 142% variance
+retention for n=50 agents in the SpectralSphere research harness — a
+measured research observation, not a product SLA). While designed as a leaky integrator for topological
 stability, this formulation provides a secondary benefit: it is a strict contraction
 mapping on the L₂ sensitivity, reducing the required DP noise budget.
 
