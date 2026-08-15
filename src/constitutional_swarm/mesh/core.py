@@ -1493,17 +1493,30 @@ class ConstitutionalMesh:
         from constitutional_swarm.governance_receipts import (
             GovernanceReceiptBundle,
             SignatureRecord,
-            bundle_to_json,
             build_receipt,
             payload_canonical_bytes,
             receipt_from_mesh_settlement,
         )
+        from constitutional_swarm.settlement_evidence import (
+            RECEIPT_SIGNER_KEY_ID,
+            committed_receipt_index,
+            evidence_lock,
+            receipt_path_for,
+            write_receipt_atomic,
+        )
 
+        assignment_id = str(record.assignment["assignment_id"])
         try:
             unsigned = receipt_from_mesh_settlement(record, votes or [])
             payload_bytes = payload_canonical_bytes(unsigned.payload)
-            signature = self._request_signing_private_key.sign(payload_bytes)
-            public_hex = self._request_signing_public_key.public_bytes(
+            signing_key = getattr(
+                self, "_receipt_signing_private_key", self._request_signing_private_key
+            )
+            signing_public = getattr(
+                self, "_receipt_signing_public_key", self._request_signing_public_key
+            )
+            signature = signing_key.sign(payload_bytes)
+            public_hex = signing_public.public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw,
             ).hex()
@@ -1511,7 +1524,7 @@ class ConstitutionalMesh:
                 payload=unsigned.payload,
                 signatures=[
                     SignatureRecord(
-                        key_id="mesh-settlement",
+                        key_id=RECEIPT_SIGNER_KEY_ID,
                         algorithm="ed25519",
                         public_key_hex=public_hex,
                         signature_hex=signature.hex(),
@@ -1520,32 +1533,34 @@ class ConstitutionalMesh:
             )
         except Exception as exc:
             raise SettlementPersistenceError(
-                f"Settlement {record.assignment.get('assignment_id')} receipt could not be built"
+                f"Settlement {assignment_id} receipt could not be built"
             ) from exc
-        receipt_path = self._receipt_bundle_path(str(record.assignment["assignment_id"]))
-        tmp_path = receipt_path.with_name(receipt_path.name + ".tmp")
-        try:
-            tmp_path.write_text(
-                bundle_to_json(GovernanceReceiptBundle(receipts=[receipt])),
-                encoding="utf-8",
-            )
-            tmp_path.replace(receipt_path)
-        except Exception as exc:
-            tmp_path.unlink(missing_ok=True)
-            raise SettlementPersistenceError(
-                f"Settlement {record.assignment.get('assignment_id')} receipt could not be persisted"
-            ) from exc
+        receipt_path = receipt_path_for(self._settlement_store, assignment_id)
         bound = replace(record, receipt_digest=receipt.payload_digest)
-        try:
-            self._settlement_store.append(bound)
-        except Exception:
-            receipt_path.unlink(missing_ok=True)
-            raise
+        with evidence_lock(self._settlement_store):
+            try:
+                write_receipt_atomic(
+                    receipt_path,
+                    GovernanceReceiptBundle(receipts=[receipt]),
+                )
+            except Exception as exc:
+                raise SettlementPersistenceError(
+                    f"Settlement {assignment_id} receipt could not be persisted"
+                ) from exc
+            try:
+                self._settlement_store.append(bound)
+            except Exception:
+                referenced = committed_receipt_index(self._settlement_store)
+                if assignment_id not in referenced:
+                    receipt_path.unlink(missing_ok=True)
+                raise
 
     def _receipt_bundle_path(self, assignment_id: str) -> Path:
-        described = self._settlement_store.describe() if self._settlement_store is not None else {}
-        store_path = Path(str(described.get("path", "mesh-settlements.jsonl")))
-        return store_path.with_name(f"{store_path.name}.{assignment_id}.receipt.json")
+        from constitutional_swarm.settlement_evidence import receipt_path_for
+
+        if self._settlement_store is None:
+            return Path(f"mesh-settlements.jsonl.{assignment_id}.receipt.json")
+        return receipt_path_for(self._settlement_store, assignment_id)
 
     def _load_settlements(self) -> None:
         """Load settled assignments/results from disk when configured."""

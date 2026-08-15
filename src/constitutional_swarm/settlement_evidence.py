@@ -1,0 +1,267 @@
+"""Lifecycle helpers for mesh settlements bound to v0.1 receipts.
+
+Receipt identity
+----------------
+``SettlementRecord.receipt_digest`` is the receipt **payload digest**
+(canonical statement identity). It is not the signed-envelope hash
+(``receipt_hash``). The canonical settlement digest is computed by
+``protocol.encode_settlement_record_v1`` and **excludes** ``receipt_digest``,
+so the pointer cannot appear inside its own pre-image.
+
+A receipt file is **authoritative completed evidence** only when a committed
+settlement row references its payload digest. An on-disk receipt without that
+pointer is an orphan and must not be reported as completed evidence.
+
+This module does not introduce a fourth evidence format. It composes the
+existing ``acgs.local.intoto-dsse-shaped.v0.1`` profile.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from collections.abc import Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from constitutional_swarm.governance_receipts import (
+    PROFILE_VERSION,
+    GovernanceReceiptBundle,
+    ReceiptIssue,
+    VerificationVerdict,
+    bundle_from_json,
+    bundle_to_json,
+    settlement_canonical_digest,
+    verify_bundle,
+)
+from constitutional_swarm.settlement_store import SettlementRecord, normalize_receipt_digest
+
+_fcntl: ModuleType | None
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None
+
+RECEIPT_SIGNER_KEY_ID = "settlement-receipt"
+RECEIPT_PAYLOAD_TYPE = "application/vnd.acgs.governance-receipt.v0.1+json"
+RECEIPT_IDENTITY_KIND = "payload_digest"
+_RECEIPT_NAME = re.compile(r"^(?P<stem>.+)\.(?P<assignment_id>[^.]+)\.receipt\.json$")
+
+
+def store_path(store: Any) -> Path:
+    return Path(str(store.describe()["path"]))
+
+
+def receipt_path_for(store: Any, assignment_id: str) -> Path:
+    path = store_path(store)
+    return path.with_name(f"{path.name}.{assignment_id}.receipt.json")
+
+
+def parse_receipt_assignment_id(path: Path) -> str | None:
+    match = _RECEIPT_NAME.match(path.name)
+    if match is None:
+        return None
+    return match.group("assignment_id")
+
+
+@contextmanager
+def evidence_lock(store: Any):
+    """Exclusive lock shared by settlement writers and orphan reconciliation.
+
+    Uses a dedicated lock file so it never nests with JSONLSettlementStore's
+    per-append advisory lock (non-recursive flock would deadlock).
+    """
+    lock_path = store_path(store).with_name(store_path(store).name + ".evidence.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def write_receipt_atomic(path: Path, bundle: GovernanceReceiptBundle) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    payload = bundle_to_json(bundle)
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def committed_receipt_index(store: Any) -> dict[str, str]:
+    """assignment_id -> payload digest for committed settlements with a pointer."""
+    index: dict[str, str] = {}
+    for record in store.load_all():
+        assignment_id = str(record.assignment.get("assignment_id", ""))
+        digest = normalize_receipt_digest(record.receipt_digest)
+        if assignment_id and digest:
+            index[assignment_id] = digest
+    return index
+
+
+def list_orphan_receipts(store: Any) -> list[Path]:
+    referenced = committed_receipt_index(store)
+    orphans: list[Path] = []
+    root = store_path(store).parent
+    prefix = store_path(store).name + "."
+    if not root.exists():
+        return orphans
+    for path in root.glob(f"{prefix}*.receipt.json"):
+        assignment_id = parse_receipt_assignment_id(path)
+        if assignment_id is None:
+            orphans.append(path)
+            continue
+        if assignment_id not in referenced:
+            orphans.append(path)
+    return orphans
+
+
+def reconcile_orphan_receipts(store: Any) -> list[str]:
+    """Delete unreferenced receipt files. Never unlink a referenced assignment."""
+    removed: list[str] = []
+    with evidence_lock(store):
+        referenced = committed_receipt_index(store)
+        for path in list_orphan_receipts(store):
+            assignment_id = parse_receipt_assignment_id(path)
+            if assignment_id is not None and assignment_id in referenced:
+                continue
+            path.unlink(missing_ok=True)
+            removed.append(str(path))
+    return removed
+
+
+def _fail(
+    code: str,
+    message: str,
+    receipt_id: str | None = None,
+) -> VerificationVerdict:
+    return VerificationVerdict(
+        valid=False,
+        mode="fail_closed",
+        profile_version=PROFILE_VERSION,
+        receipt_count=0,
+        signature_status="unverifiable",
+        issues=[ReceiptIssue(code=code, message=message, receipt_id=receipt_id)],
+        receipt_hashes=[],
+    )
+
+
+def verify_committed_settlement_receipt(
+    store: Any,
+    assignment_id: str,
+    *,
+    trusted_signers: Mapping[str, str] | None = None,
+) -> VerificationVerdict:
+    """Verify evidence starting from a committed settlement pointer.
+
+    An orphan receipt (file present, no settlement pointer) is not completed
+    evidence and fails closed.
+    """
+    getter = getattr(store, "get", None)
+    record = getter(assignment_id) if getter is not None else None
+    if record is None:
+        for item in store.load_all():
+            if str(item.assignment.get("assignment_id", "")) == assignment_id:
+                record = item
+                break
+    if record is None:
+        return _fail("settlement_missing", f"no committed settlement {assignment_id}")
+    digest = normalize_receipt_digest(record.receipt_digest)
+    if digest is None:
+        return _fail(
+            "receipt_unbound",
+            "settlement has no receipt_digest; file-only receipts are orphans",
+        )
+    path = receipt_path_for(store, assignment_id)
+    if not path.exists():
+        return _fail("receipt_missing", f"referenced receipt file absent: {path}")
+    try:
+        bundle = bundle_from_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — fail closed on any malformed artifact
+        return _fail("receipt_malformed", f"receipt could not be parsed: {exc}")
+    return bind_and_verify(record, bundle, trusted_signers=trusted_signers)
+
+
+def bind_and_verify(
+    record: SettlementRecord,
+    bundle: GovernanceReceiptBundle,
+    *,
+    trusted_signers: Mapping[str, str] | None = None,
+) -> VerificationVerdict:
+    """Check settlement pointer + existing v0.1 bundle verification together."""
+    issues: list[ReceiptIssue] = []
+    digest = normalize_receipt_digest(record.receipt_digest)
+    receipt = bundle.receipts[0]
+    receipt_id = receipt.payload.receipt_id
+    assignment_id = str(record.assignment.get("assignment_id", ""))
+    if digest is None:
+        issues.append(
+            ReceiptIssue(
+                code="receipt_unbound",
+                message="settlement pointer is empty",
+                receipt_id=receipt_id,
+            )
+        )
+    elif receipt.payload_digest != digest:
+        issues.append(
+            ReceiptIssue(
+                code="receipt_pointer_mismatch",
+                message="settlement.receipt_digest is not the receipt payload digest",
+                receipt_id=receipt_id,
+            )
+        )
+    if receipt.payload.metadata.get("assignment_id") != assignment_id:
+        issues.append(
+            ReceiptIssue(
+                code="assignment_mismatch",
+                message="receipt assignment_id does not match settlement",
+                receipt_id=receipt_id,
+            )
+        )
+    expected_settlement = settlement_canonical_digest(record)
+    actual_settlement = receipt.payload.evidence_hashes.get("settlement")
+    if actual_settlement != expected_settlement:
+        issues.append(
+            ReceiptIssue(
+                code="settlement_digest_mismatch",
+                message="receipt settlement digest does not match the loaded record",
+                receipt_id=receipt_id,
+            )
+        )
+    if receipt.payload_type != RECEIPT_PAYLOAD_TYPE:
+        issues.append(
+            ReceiptIssue(
+                code="payload_type_mismatch",
+                message=f"unexpected payload type {receipt.payload_type}",
+                receipt_id=receipt_id,
+            )
+        )
+    if receipt.profile_version != PROFILE_VERSION:
+        issues.append(
+            ReceiptIssue(
+                code="profile_mismatch",
+                message=f"unexpected profile {receipt.profile_version}",
+                receipt_id=receipt_id,
+            )
+        )
+    verdict = verify_bundle(bundle, trusted_signers=trusted_signers)
+    combined = list(issues) + list(verdict.issues)
+    valid = not issues and verdict.valid
+    return VerificationVerdict(
+        valid=valid,
+        mode="fail_closed",
+        profile_version=PROFILE_VERSION,
+        receipt_count=verdict.receipt_count,
+        signature_status=verdict.signature_status,
+        issues=combined,
+        receipt_hashes=verdict.receipt_hashes,
+    )
