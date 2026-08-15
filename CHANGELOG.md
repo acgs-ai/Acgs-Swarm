@@ -12,8 +12,13 @@ The format is based on Keep a Changelog.
   stores, v0.1 receipts). Research, Bittensor, LangGraph, eval, and benchmark
   symbols remain available via lazy `__getattr__` or explicit submodule
   imports. `from constitutional_swarm import *` is now the stable façade
-  only — an intentional import-star compatibility break. See
-  `docs/API_COMPATIBILITY.md`. The next published version should be 1.1.0.
+  only — an intentional import-star compatibility break. `MeshSnapshotStaleError`
+  is part of that façade. See `docs/API_COMPATIBILITY.md`. The next published
+  version should be 1.1.0.
+- Mesh settlement receipts now bind `action` / `decision` / policy and content
+  hashes to the committed settlement, persist pending votes for crash recovery,
+  and treat a receipt as completed evidence only when a settlement points at
+  its payload digest.
 - `braintrust` is an optional extra (`[braintrust]`), not a core dependency.
 - `numpy` is no longer a core runtime dependency; it ships with `[dev]` and
   `[research]`.
@@ -22,6 +27,12 @@ The format is based on Keep a Changelog.
   reproduction passes.
 
 ### Added
+- Isolated-wheel packaging gate: `scripts/verify_isolated_wheel.py` /
+  `make verify-wheel` installs the built wheel into a blank venv.
+- `acgs-verify-receipts --settlement-store --assignment-id` starts
+  verification from a committed settlement pointer.
+- SQLite settlements persist a nullable `receipt_digest` pointer with
+  idempotent migration of older databases.
 - Agent self-evolution harness: `constitutional_swarm.agent_self_evolve` / `acgs-agent-self-evolve` discovers every operational agent manifest and vendored persona template, emits offline per-agent mutation scopes/guardrails/probes/suggestions, and is wired through `make agent-self-evolve`, `tools/registry.yaml`, a script wrapper, and a runbook.
 - Byzantine tamper-fraction census: `byzantine_census.estimate_tampered_fraction`
   turns a screened sample (`n_screened`, `n_tampered`) into a point estimate plus a

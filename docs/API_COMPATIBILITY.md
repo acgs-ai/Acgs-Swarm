@@ -40,6 +40,21 @@ points at that payload digest. Mesh receipts are signed with the
 dedicated `settlement-receipt` key id. Request/vote signatures use a
 different key and a different pre-image.
 
+`bind_and_verify` also requires the receipt `action`, `decision`,
+`policy_hash`, and content hash to match the settlement record. Receipt
+filenames are `{store_name}.{assignment_id}.receipt.json`; the store
+prefix is stripped so dotted assignment ids stay referenced.
+
+Pending settlements persist vote copies. Reconcile reuses those votes.
+If no votes are present, the recovered receipt is labeled
+`metadata.recovery=degraded-votes`.
+
+`MeshSnapshotStaleError` is exported from the eager façade because
+`ConstitutionalMesh.request_validation` can raise it.
+
+Default receipt signing keys are process-local. Restart verification
+requires the same `receipt_signing_private_key`.
+
 ## Non-goals
 
 - Do not reintroduce eager optional dependencies to preserve import-star.
