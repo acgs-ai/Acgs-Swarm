@@ -120,6 +120,7 @@ class ConstitutionalMesh:
         settlement_store: SettlementStore | None = None,
         auto_reconcile: bool = True,
         request_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
+        receipt_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
     ) -> None:
         if quorum > peers_per_validation:
             raise ValueError(
@@ -166,6 +167,16 @@ class ConstitutionalMesh:
             else self._coerce_private_key(request_signing_private_key)
         )
         self._request_signing_public_key = self._request_signing_private_key.public_key()
+        # Dedicated settlement-receipt key. Request/vote signatures use a
+        # different key and a different pre-image (colon-joined vote bytes vs
+        # canonical receipt payload). Callers may pass the same material, but
+        # the default is a distinct key.
+        self._receipt_signing_private_key = (
+            Ed25519PrivateKey.generate()
+            if receipt_signing_private_key is None
+            else self._coerce_private_key(receipt_signing_private_key)
+        )
+        self._receipt_signing_public_key = self._receipt_signing_private_key.public_key()
         self._assignments: dict[str, PeerAssignment] = {}
         self._votes: dict[str, list[ValidationVote]] = {}
         self._final_results: dict[str, MeshResult] = {}
@@ -1509,12 +1520,8 @@ class ConstitutionalMesh:
         try:
             unsigned = receipt_from_mesh_settlement(record, votes or [])
             payload_bytes = payload_canonical_bytes(unsigned.payload)
-            signing_key = getattr(
-                self, "_receipt_signing_private_key", self._request_signing_private_key
-            )
-            signing_public = getattr(
-                self, "_receipt_signing_public_key", self._request_signing_public_key
-            )
+            signing_key = self._receipt_signing_private_key
+            signing_public = self._receipt_signing_public_key
             signature = signing_key.sign(payload_bytes)
             public_hex = signing_public.public_bytes(
                 encoding=serialization.Encoding.Raw,

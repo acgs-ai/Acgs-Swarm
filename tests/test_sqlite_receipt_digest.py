@@ -140,7 +140,7 @@ def test_sqlite_settlement_receipt_verifies(tmp_path) -> None:
     receipt_path = mesh._receipt_bundle_path(assignment.assignment_id)
     bundle = bundle_from_json(receipt_path.read_text(encoding="utf-8"))
     trusted = {
-        "settlement-receipt": mesh._request_signing_public_key.public_bytes(
+        "settlement-receipt": mesh._receipt_signing_public_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         ).hex()

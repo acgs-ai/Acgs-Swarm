@@ -21,7 +21,7 @@ from constitutional_swarm.governance_receipts_dsse import to_dsse_envelope
 
 def _trusted_signers(mesh: ConstitutionalMesh) -> dict[str, str]:
     return {
-        "settlement-receipt": mesh._request_signing_public_key.public_bytes(
+        "settlement-receipt": mesh._receipt_signing_public_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         ).hex()
