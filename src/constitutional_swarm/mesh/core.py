@@ -41,7 +41,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from constitutional_swarm.dna import AgentDNA
-from constitutional_swarm.manifold import GovernanceManifold
 from constitutional_swarm.mesh.exceptions import (
     AssignmentSettledError,
     DuplicateVoteError,
@@ -76,6 +75,7 @@ from constitutional_swarm.settlement_store import (
 
 if TYPE_CHECKING:
     import constitutional_swarm.spectral_sphere as spectral_sphere_mod
+    from constitutional_swarm.manifold import GovernanceManifold
     from constitutional_swarm.remote_vote_transport import RemoteVoteClient, RemoteVoteResponse
 
 
@@ -1211,6 +1211,8 @@ class ConstitutionalMesh:
             import constitutional_swarm.spectral_sphere as spectral_sphere_mod_local
 
             return spectral_sphere_mod_local.SpectralSphereManifold(num_agents=n, r=1.0)
+        from constitutional_swarm.manifold import GovernanceManifold
+
         return GovernanceManifold(n)
 
     # -- Internal ----------------------------------------------------------

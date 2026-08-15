@@ -6,6 +6,16 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+- Default `import constitutional_swarm` now eager-loads only the governance
+  runtime surface (AgentDNA, DAG/executor, ConstitutionalMesh, settlement
+  stores, v0.1 receipts). Research, Bittensor, LangGraph, eval, and benchmark
+  symbols remain available via lazy `__getattr__` or explicit submodule
+  imports.
+- `braintrust` is an optional extra (`[braintrust]`), not a core dependency.
+- `numpy` is no longer a core runtime dependency; it ships with `[dev]` and
+  `[research]`.
+
 ### Added
 - Agent self-evolution harness: `constitutional_swarm.agent_self_evolve` / `acgs-agent-self-evolve` discovers every operational agent manifest and vendored persona template, emits offline per-agent mutation scopes/guardrails/probes/suggestions, and is wired through `make agent-self-evolve`, `tools/registry.yaml`, a script wrapper, and a runbook.
 - Byzantine tamper-fraction census: `byzantine_census.estimate_tampered_fraction`

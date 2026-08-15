@@ -52,11 +52,18 @@ Requires Python **3.11+** (`pyproject.toml`).
 pip install constitutional-swarm
 
 # Optional extras
-pip install "constitutional-swarm[transport]"   # websockets remote-vote transport
-pip install "constitutional-swarm[research]"    # torch + transformers research stack
-pip install "constitutional-swarm[bittensor]"   # Bittensor subnet integration
-pip install "constitutional-swarm[langgraph]"   # LangGraph runtime adapter
+pip install "constitutional-swarm[dev]"              # pytest, ruff, mypy, numpy (tests)
+pip install "constitutional-swarm[transport]"        # websockets remote-vote transport
+pip install "constitutional-swarm[research]"         # torch + transformers + numpy
+pip install "constitutional-swarm[latent]"           # deprecated alias of research
+pip install "constitutional-swarm[finetune]"         # research + trl/peft recipe
+pip install "constitutional-swarm[semantic]"         # sentence-transformers role-drift
+pip install "constitutional-swarm[bittensor]"        # Bittensor subnet integration
+pip install "constitutional-swarm[langgraph]"        # LangGraph runtime adapter
 pip install "constitutional-swarm[langgraph-swarm]"  # LangGraph handoff topology
+pip install "constitutional-swarm[vertex]"           # Anthropic-on-Vertex SWE-bench agent
+pip install "constitutional-swarm[gemini]"           # Gemini SWE-bench agent
+pip install "constitutional-swarm[braintrust]"       # optional testnet/eval telemetry
 ```
 
 ## 5-minute quickstart

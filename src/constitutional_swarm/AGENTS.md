@@ -15,7 +15,7 @@ Full module inventory: see `README.md` at the repo root.
 | `evolution_log.py` | Writes must remain strictly monotonic with non-negative acceleration; raise `NonIncreasingValueError` / `DecelerationBlockedError`, never silently drop records. |
 | `latent_dna.py` | 53 pre-existing RUF002/RUF003 ruff errors (Greek characters). Do not mass-rewrite — suppress targeted rules if lint-clean is required. |
 | `mac_acgs_loop.py` | Import boundary is lazy (bittensor loaded only at construction). Guarded by `tests/test_core_import_isolation.py` — keep it that way. See MANUAL section. |
-| `__init__.py` | Re-exports all stable symbols. Any new public symbol must be added here and to `__all__` (alphabetized). |
+| `__init__.py` | Eager product surface only. Legacy/research names go through `__getattr__` (`_LAZY_ATTRS` / `_LAZY_MODULES`), not top-level imports. |
 
 ## Subdirectories
 | Directory | Purpose |
@@ -26,7 +26,7 @@ Full module inventory: see `README.md` at the repo root.
 ## For AI Agents
 
 ### Working In This Directory
-- Any new public symbol **must** be added to `__init__.py`'s imports and `__all__` list (alphabetized).
+- New *stable product* symbols go in `__init__.py` eager imports and `__all__`. Research/sidecar names go in `_LAZY_ATTRS` or `_LAZY_MODULES` so they stay off the default import graph.
 - Vote submission paths require signatures: when modifying `mesh/`, preserve the `register_local_signer` / `register_remote_agent` / `sign_vote` contract and raise `InvalidVoteSignatureError` on mismatch.
 - `EvolutionLog` writes must remain strictly monotonic with non-negative acceleration; new write paths should raise `NonIncreasingValueError` / `DecelerationBlockedError` rather than silently dropping records.
 - `manifold.py` is the **research control**, not a bug. Changes that "fix" its collapse must be sent through `spectral_sphere.py` instead.
