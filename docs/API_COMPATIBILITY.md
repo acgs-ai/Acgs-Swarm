@@ -47,9 +47,15 @@ filenames are `{store_name}.{assignment_id}.receipt.json`; the store
 prefix is stripped so dotted assignment ids stay referenced.
 
 Pending settlements persist signed vote copies plus the voter public
-key. Reconcile authenticates those votes before projecting a receipt.
+key. Reconcile authenticates those votes before projecting a receipt:
+mutating `voter_id` or `approved` without a matching signature fails
+closed. The public key lives in the same pending record, so this is
+**not** an external voter trust root. A writer who can replace the
+pending record can insert a self-consistent forged vote. Treat the
+pending store as a trust boundary.
+
 If no votes are present, the recovered receipt is labeled
-`metadata.recovery=degraded-votes`. Tampered pending votes fail closed.
+`metadata.recovery=degraded-votes`.
 
 `MeshSnapshotStaleError` is exported from the eager façade because
 `ConstitutionalMesh.request_validation` can raise it.
