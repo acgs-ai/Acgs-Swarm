@@ -67,6 +67,9 @@ def _build_pending_record(
         result=source_mesh._serialize_result(result),
         constitutional_hash=result.constitutional_hash,
         is_recovered=is_recovered,
+        votes=source_mesh._vote_dicts(
+            source_mesh._votes.get(assignment.assignment_id, [])
+        ),
     )
     if not is_recovered:
         record = replace(

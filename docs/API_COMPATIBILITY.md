@@ -54,7 +54,9 @@ closed. The public key lives in the same pending record, so this is
 pending record can insert a self-consistent forged vote. Treat the
 pending store as a trust boundary.
 
-If no votes are present, the recovered receipt is labeled
+If no votes are present on a pending record, reconcile fails closed
+instead of synthesizing a `mesh-validator` approval. Vote-less persist
+paths outside reconcile may still label
 `metadata.recovery=degraded-votes`.
 
 `MeshSnapshotStaleError` is exported from the eager façade because

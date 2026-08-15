@@ -336,3 +336,37 @@ def test_tampered_pending_votes_fail_closed(tmp_path) -> None:
     report = mesh.reconcile_pending_settlements()
     assert report.failed == 1
     assert store.get(assignment_id) is None
+    assert assignment_id not in mesh._final_results
+
+
+def test_empty_pending_votes_fail_closed(tmp_path) -> None:
+    from acgs_lite import Constitution
+    from constitutional_swarm import ConstitutionalMesh, JSONLSettlementStore
+
+    code, store_path, assignment_id = _run_mesh_crash(tmp_path, point="after-pending")
+    assert code == 17
+    store = JSONLSettlementStore(store_path)
+    pending = store.load_pending()
+    assert pending
+    store.clear_pending(assignment_id)
+    store.mark_pending(
+        SettlementRecord(
+            assignment=pending[0].assignment,
+            result=pending[0].result,
+            constitutional_hash=pending[0].constitutional_hash,
+            schema_version=pending[0].schema_version,
+            is_recovered=False,
+            receipt_digest=pending[0].receipt_digest,
+            votes=(),
+        )
+    )
+    mesh = ConstitutionalMesh(
+        Constitution.default(),
+        seed=3,
+        settlement_store=store,
+        auto_reconcile=False,
+    )
+    report = mesh.reconcile_pending_settlements()
+    assert report.failed == 1
+    assert store.get(assignment_id) is None
+    assert assignment_id not in mesh._final_results

@@ -1740,6 +1740,7 @@ class ConstitutionalMesh:
                         "Persisted settlement constitutional hash does not match current mesh"
                     )
 
+                installed = False
                 with self._lock:
                     existing_assignment = self._assignments.get(
                         assignment.assignment_id
@@ -1757,9 +1758,14 @@ class ConstitutionalMesh:
                             errors=errors,
                         )
                         continue
+                if not record.votes:
+                    raise ValueError("pending settlement has no authentic votes")
+                recovered_votes = self._authenticated_vote_dicts(list(record.votes))
+                with self._lock:
                     self._assignments.setdefault(assignment.assignment_id, assignment)
                     self._votes.setdefault(assignment.assignment_id, [])
                     self._final_results.setdefault(assignment.assignment_id, result)
+                    installed = True
 
                 report = ReconciliationReport(
                     attempted=report.attempted + 1,
@@ -1768,18 +1774,22 @@ class ConstitutionalMesh:
                     failed=report.failed,
                     errors=errors,
                 )
-                recovered_votes = (
-                    self._authenticated_vote_dicts(list(record.votes))
-                    if record.votes
-                    else []
-                )
-                self._persist_settlement_record(
-                    self._build_settlement_record(
-                        replace(assignment, is_recovered=True),
-                        result,
-                    ),
-                    votes=recovered_votes,
-                )
+                try:
+                    self._persist_settlement_record(
+                        self._build_settlement_record(
+                            replace(assignment, is_recovered=True),
+                            result,
+                        ),
+                        votes=recovered_votes,
+                    )
+                except Exception:
+                    if installed:
+                        with self._lock:
+                            self._final_results.pop(assignment.assignment_id, None)
+                            current = self._assignments.get(assignment.assignment_id)
+                            if current is assignment:
+                                self._assignments.pop(assignment.assignment_id, None)
+                    raise
                 with self._lock:
                     current_assignment = self._assignments.get(assignment.assignment_id)
                     if (
