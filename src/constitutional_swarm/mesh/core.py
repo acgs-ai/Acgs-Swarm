@@ -1768,12 +1768,17 @@ class ConstitutionalMesh:
                     failed=report.failed,
                     errors=errors,
                 )
+                recovered_votes = (
+                    self._authenticated_vote_dicts(list(record.votes))
+                    if record.votes
+                    else []
+                )
                 self._persist_settlement_record(
                     self._build_settlement_record(
                         replace(assignment, is_recovered=True),
                         result,
                     ),
-                    votes=list(record.votes),
+                    votes=recovered_votes,
                 )
                 with self._lock:
                     current_assignment = self._assignments.get(assignment.assignment_id)
@@ -1820,18 +1825,26 @@ class ConstitutionalMesh:
         return str(self._settlement_store.describe().get("backend"))
 
     def _maybe_crash(self, point: str) -> None:
-        configured = getattr(self, "_settle_crash_point", None) or os.environ.get(
-            "ACGS_SETTLE_CRASH"
-        )
-        if configured == point:
+        if getattr(self, "_settle_crash_point", None) == point:
             os._exit(17)
 
-    @staticmethod
-    def _vote_dicts(votes: list[Any]) -> tuple[dict[str, Any], ...]:
+    def _public_key_hex(self, voter_id: str) -> str | None:
+        public_key = self._agent_vote_public_keys.get(voter_id)
+        if public_key is None:
+            return None
+        return public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+
+    def _vote_dicts(self, votes: list[Any]) -> tuple[dict[str, Any], ...]:
         payload: list[dict[str, Any]] = []
         for vote in votes:
             if isinstance(vote, dict):
-                payload.append(dict(vote))
+                item = dict(vote)
+                if not item.get("public_key_hex"):
+                    item["public_key_hex"] = self._public_key_hex(str(item.get("voter_id", "")))
+                payload.append(item)
                 continue
             payload.append(
                 {
@@ -1843,9 +1856,37 @@ class ConstitutionalMesh:
                     "constitutional_hash": vote.constitutional_hash,
                     "content_hash": vote.content_hash,
                     "timestamp": vote.timestamp,
+                    "public_key_hex": self._public_key_hex(vote.voter_id),
                 }
             )
         return tuple(payload)
+
+    def _authenticated_vote_dicts(self, votes: list[Any]) -> list[Any]:
+        authenticated: list[dict[str, Any]] = []
+        for vote in self._vote_dicts(votes):
+            public_hex = vote.get("public_key_hex")
+            signature = vote.get("signature")
+            if not public_hex or not signature:
+                raise ValueError("pending vote missing public key or signature")
+            try:
+                public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(public_hex)))
+                public_key.verify(
+                    bytes.fromhex(str(signature)),
+                    self._vote_payload_bytes(
+                        assignment_id=str(vote.get("assignment_id", "")),
+                        voter_id=str(vote.get("voter_id", "")),
+                        approved=bool(vote.get("approved")),
+                        reason=str(vote.get("reason", "")),
+                        constitutional_hash=str(vote.get("constitutional_hash", "")),
+                        content_hash=str(vote.get("content_hash", "")),
+                    ),
+                )
+            except (ValueError, InvalidSignature) as exc:
+                raise ValueError(
+                    f"pending vote {vote.get('voter_id')} is not authentic"
+                ) from exc
+            authenticated.append(vote)
+        return authenticated
 
     def _build_settlement_record(
         self, assignment: PeerAssignment, result: MeshResult

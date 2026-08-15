@@ -249,6 +249,51 @@ def test_signed_semantic_contradiction_fails(tmp_path) -> None:
     assert any(issue.code in {"action_mismatch", "decision_mismatch"} for issue in verdict.issues)
 
 
+def test_extra_signed_receipt_in_bundle_fails(tmp_path) -> None:
+    mesh, store, assignment = _settle(tmp_path)
+    record = store.get(assignment.assignment_id)
+    assert record is not None
+    from constitutional_swarm.governance_receipts import (
+        GovernanceReceiptBundle,
+        receipt_hash,
+        settlement_canonical_digest,
+    )
+
+    first = bundle_from_json(receipt_path_for(store, assignment.assignment_id).read_text()).receipts[0]
+    rogue = Ed25519PrivateKey.generate()
+    follow = first.payload.model_copy(
+        update={
+            "receipt_id": first.payload.receipt_id + "-followup",
+            "action": "wrong-action",
+            "decision": "denied",
+            "previous_receipt_hash": receipt_hash(first),
+            "evidence_hashes": {
+                "settlement": settlement_canonical_digest(record),
+                "content": "bb" * 32,
+            },
+        }
+    )
+    signed_follow = build_receipt(
+        payload=follow,
+        signatures=[
+            SignatureRecord(
+                key_id=RECEIPT_SIGNER_KEY_ID,
+                algorithm="ed25519",
+                public_key_hex=_trusted(mesh)[RECEIPT_SIGNER_KEY_ID],
+                signature_hex=rogue.sign(payload_canonical_bytes(follow)).hex(),
+            )
+        ],
+    )
+    # First receipt remains the trusted matching one; extra receipt must fail closed.
+    verdict = bind_and_verify(
+        record,
+        GovernanceReceiptBundle(receipts=[first, signed_follow]),
+        trusted_signers=_trusted(mesh),
+    )
+    assert verdict.valid is False
+    assert any(issue.code == "receipt_count_mismatch" for issue in verdict.issues)
+
+
 def test_orphan_without_committed_settlement_fails(tmp_path) -> None:
     store = JSONLSettlementStore(tmp_path / "only.jsonl")
     verdict = verify_committed_settlement_receipt(store, "ghost")

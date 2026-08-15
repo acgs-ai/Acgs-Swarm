@@ -251,6 +251,21 @@ def bind_and_verify(
     """Check settlement pointer + existing v0.1 bundle verification together."""
     issues: list[ReceiptIssue] = []
     digest = normalize_receipt_digest(record.receipt_digest)
+    if len(bundle.receipts) != 1:
+        return VerificationVerdict(
+            valid=False,
+            mode="fail_closed",
+            profile_version=PROFILE_VERSION,
+            receipt_count=len(bundle.receipts),
+            signature_status="unverifiable",
+            issues=[
+                ReceiptIssue(
+                    code="receipt_count_mismatch",
+                    message="settlement evidence must bind exactly one receipt",
+                )
+            ],
+            receipt_hashes=[],
+        )
     receipt = bundle.receipts[0]
     receipt_id = receipt.payload.receipt_id
     assignment_id = str(record.assignment.get("assignment_id", ""))

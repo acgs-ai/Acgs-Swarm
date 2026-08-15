@@ -41,13 +41,15 @@ dedicated `settlement-receipt` key id. Request/vote signatures use a
 different key and a different pre-image.
 
 `bind_and_verify` also requires the receipt `action`, `decision`,
-`policy_hash`, and content hash to match the settlement record. Receipt
+`policy_hash`, and content hash to match the settlement record, and
+rejects bundles that do not contain exactly one receipt. Receipt
 filenames are `{store_name}.{assignment_id}.receipt.json`; the store
 prefix is stripped so dotted assignment ids stay referenced.
 
-Pending settlements persist vote copies. Reconcile reuses those votes.
+Pending settlements persist signed vote copies plus the voter public
+key. Reconcile authenticates those votes before projecting a receipt.
 If no votes are present, the recovered receipt is labeled
-`metadata.recovery=degraded-votes`.
+`metadata.recovery=degraded-votes`. Tampered pending votes fail closed.
 
 `MeshSnapshotStaleError` is exported from the eager façade because
 `ConstitutionalMesh.request_validation` can raise it.
