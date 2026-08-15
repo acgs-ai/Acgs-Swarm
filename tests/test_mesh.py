@@ -1445,6 +1445,9 @@ class TestMeshSettlePersistenceIntegration:
             assignment=source_mesh._serialize_assignment(assignment),
             result=source_mesh._serialize_result(result),
             constitutional_hash=result.constitutional_hash,
+            votes=source_mesh._vote_dicts(
+                source_mesh._votes.get(assignment.assignment_id, [])
+            ),
         )
 
         store = JSONLSettlementStore(tmp_path / "mesh.jsonl")
@@ -1473,6 +1476,9 @@ class TestMeshSettlePersistenceIntegration:
             assignment=source_mesh._serialize_assignment(assignment),
             result=source_mesh._serialize_result(result),
             constitutional_hash=result.constitutional_hash,
+            votes=source_mesh._vote_dicts(
+                source_mesh._votes.get(assignment.assignment_id, [])
+            ),
         )
 
         store = SQLiteSettlementStore(tmp_path / "mesh.db")
@@ -1501,6 +1507,9 @@ class TestMeshSettlePersistenceIntegration:
             assignment=source_mesh._serialize_assignment(assignment),
             result=source_mesh._serialize_result(result),
             constitutional_hash=result.constitutional_hash,
+            votes=source_mesh._vote_dicts(
+                source_mesh._votes.get(assignment.assignment_id, [])
+            ),
         )
 
         store = JSONLSettlementStore(tmp_path / "mesh-retry.jsonl")
