@@ -71,6 +71,7 @@ STABLE_FACADE = (
     "payload_digest",
     "receipt_hash",
     "verify_bundle",
+    "verify_committed_settlement_receipt",
     "verdict_to_json",
 )
 

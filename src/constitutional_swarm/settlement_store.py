@@ -193,7 +193,7 @@ class JSONLSettlementStore:
             return self._index.assignment_ids
         ids = {
             str(record.assignment.get("assignment_id", ""))
-            for record in self.load_all()
+            for record in self._load_all_unlocked()
         }
         ids.discard("")
         self._remember_index(ids)
@@ -209,10 +209,16 @@ class JSONLSettlementStore:
             payload = self._payload_from_record(record)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             known_ids.add(assignment_id)
             self._remember_index(known_ids)
 
     def load_all(self) -> list[SettlementRecord]:
+        with self._file_lock():
+            return self._load_all_unlocked()
+
+    def _load_all_unlocked(self) -> list[SettlementRecord]:
         if not self.path.exists():
             return []
 
@@ -356,7 +362,8 @@ class SQLiteSettlementStore:
                     result_json TEXT NOT NULL,
                     constitutional_hash TEXT NOT NULL DEFAULT '',
                     schema_version INTEGER NOT NULL DEFAULT 1,
-                    is_recovered INTEGER NOT NULL DEFAULT 0
+                    is_recovered INTEGER NOT NULL DEFAULT 0,
+                    receipt_digest TEXT
                 )
                 """
             )
@@ -368,7 +375,8 @@ class SQLiteSettlementStore:
                     result_json TEXT NOT NULL,
                     constitutional_hash TEXT NOT NULL DEFAULT '',
                     schema_version INTEGER NOT NULL DEFAULT 1,
-                    is_recovered INTEGER NOT NULL DEFAULT 0
+                    is_recovered INTEGER NOT NULL DEFAULT 0,
+                    receipt_digest TEXT
                 )
                 """
             )
@@ -421,12 +429,14 @@ class SQLiteSettlementStore:
             # completed v0.1 receipt binding. Idempotent on existing DBs.
             try:
                 conn.execute("ALTER TABLE mesh_settlements ADD COLUMN receipt_digest TEXT")
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
             try:
                 conn.execute("ALTER TABLE pending_settlements ADD COLUMN receipt_digest TEXT")
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
             conn.commit()
 
     def _table_columns(self, table_name: str) -> set[str]:
@@ -549,13 +559,19 @@ class SQLiteSettlementStore:
         with sqlite3.connect(self.path) as conn:
             try:
                 rows = conn.execute(select_with_digest).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                if "no such column" not in str(exc).lower():
+                    raise
                 try:
                     rows = conn.execute(select_without_digest).fetchall()
-                except sqlite3.OperationalError:
+                except sqlite3.OperationalError as inner:
+                    if "no such column" not in str(inner).lower():
+                        raise
                     try:
                         rows = conn.execute(select_without_is_recovered).fetchall()
-                    except sqlite3.OperationalError:
+                    except sqlite3.OperationalError as older:
+                        if "no such column" not in str(older).lower():
+                            raise
                         rows = conn.execute(select_without_schema_version).fetchall()
         return [
             SettlementRecord(

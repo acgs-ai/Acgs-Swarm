@@ -255,6 +255,15 @@ def bind_and_verify(
                 receipt_id=receipt_id,
             )
         )
+    verifying_ids = {signature.key_id for signature in receipt.signatures}
+    if RECEIPT_SIGNER_KEY_ID not in verifying_ids:
+        issues.append(
+            ReceiptIssue(
+                code="receipt_signer_role",
+                message="mesh evidence must be signed with key_id settlement-receipt",
+                receipt_id=receipt_id,
+            )
+        )
     if receipt.payload_type != RECEIPT_PAYLOAD_TYPE:
         issues.append(
             ReceiptIssue(

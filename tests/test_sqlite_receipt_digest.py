@@ -146,4 +146,10 @@ def test_sqlite_settlement_receipt_verifies(tmp_path) -> None:
         ).hex()
     }
     assert bundle.receipts[0].payload_digest == loaded.receipt_digest
+    from constitutional_swarm.settlement_evidence import verify_committed_settlement_receipt
+
     assert verify_bundle(bundle, trusted_signers=trusted).valid
+    committed = verify_committed_settlement_receipt(
+        store, assignment.assignment_id, trusted_signers=trusted
+    )
+    assert committed.valid is True

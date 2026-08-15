@@ -16,7 +16,8 @@ Cryptographic proof chain:
   6. Anyone can verify the proof independently
 
 No competitor can replicate this: agents constitutionally validating
-each other's work, with cryptographic proof, at sub-microsecond cost.
+each other's work, with cryptographic proof. There is no published
+sub-microsecond product latency claim.
 """
 
 from __future__ import annotations
@@ -104,7 +105,7 @@ class ConstitutionalMesh:
     - No single validator bottleneck
     - MACI-compliant (no self-validation)
     - Cryptographic proof chain for auditability
-    - Local validation via AgentDNA (unit tests bound average latency under 50us)
+    - Local validation via AgentDNA (full pipeline tests bound average latency under 10ms)
     """
 
     def __init__(
@@ -1649,6 +1650,11 @@ class ConstitutionalMesh:
             return
         receipt_path = receipt_path_for(self._settlement_store, assignment_id)
         with evidence_lock(self._settlement_store):
+            referenced = committed_receipt_index(self._settlement_store)
+            if assignment_id in referenced:
+                # A committed pointer already exists. Do not replace the file.
+                self._settlement_store.append(bound)
+                return
             try:
                 write_receipt_atomic(
                     receipt_path,
@@ -1661,8 +1667,8 @@ class ConstitutionalMesh:
             try:
                 self._settlement_store.append(bound)
             except Exception:
-                referenced = committed_receipt_index(self._settlement_store)
-                if assignment_id not in referenced:
+                still_referenced = committed_receipt_index(self._settlement_store)
+                if assignment_id not in still_referenced:
                     receipt_path.unlink(missing_ok=True)
                 raise
 

@@ -67,6 +67,9 @@ from constitutional_swarm.mesh import (
     UnauthorizedVoterError,
     ValidationVote,
 )
+from constitutional_swarm.settlement_evidence import (
+    verify_committed_settlement_receipt,
+)
 from constitutional_swarm.settlement_store import (
     DuplicateSettlementError,
     JSONLSettlementStore,
@@ -431,5 +434,6 @@ __all__ = [
     "payload_digest",
     "receipt_hash",
     "verify_bundle",
+    "verify_committed_settlement_receipt",
     "verdict_to_json",
 ]

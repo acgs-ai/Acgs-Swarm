@@ -99,6 +99,24 @@ def test_standalone_verifier_process(tmp_path) -> None:
     assert completed.returncode == 0
 
 
+def test_cli_store_binding_rejects_orphan(tmp_path) -> None:
+    from constitutional_swarm.governance_receipts_cli import main
+
+    store_path = tmp_path / "empty.jsonl"
+    store_path.write_text("", encoding="utf-8")
+    assert (
+        main(
+            [
+                "--settlement-store",
+                str(store_path),
+                "--assignment-id",
+                "ghost",
+            ]
+        )
+        == 1
+    )
+
+
 def test_dsse_projection_is_not_a_compliance_claim(tmp_path) -> None:
     mesh, assignment, _store = _settled_mesh(tmp_path)
     receipt_path = mesh._receipt_bundle_path(assignment.assignment_id)

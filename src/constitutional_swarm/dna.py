@@ -58,8 +58,9 @@ class DNAValidationResult:
 class AgentDNA:
     """Constitutional co-processor embedded in every agent.
 
-    Validates inputs and outputs locally using the ACGS Rust engine.
+    Validates inputs and outputs locally via acgs-lite.
     No network calls. No central bus. O(1) per validation.
+    There is no published Rust/nanosecond product claim.
 
     Usage:
         dna = AgentDNA.from_rules([...])

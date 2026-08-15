@@ -195,4 +195,12 @@ def test_vote_signature_is_not_a_receipt_signature(tmp_path) -> None:
         trusted_signers=_trusted(mesh),
     )
     assert verdict.valid is False
-    assert mesh._receipt_signing_private_key != mesh._request_signing_private_key
+    receipt_pub = mesh._receipt_signing_public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    request_pub = mesh._request_signing_public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    assert receipt_pub != request_pub
