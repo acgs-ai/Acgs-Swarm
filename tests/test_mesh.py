@@ -7,6 +7,7 @@ import sqlite3
 import time
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from acgs_lite import Constitution, ConstitutionalViolationError, Rule
@@ -39,7 +40,8 @@ UnauthorizedVoterError = _MESH_GLOBALS["UnauthorizedVoterError"]
 class _FailingSettlementStore:
     """Store test double that records the attempted write and then fails."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else Path("failing-store.jsonl")
         self.last_record: SettlementRecord | None = None
         self.pending: dict[str, SettlementRecord] = {}
 
@@ -63,7 +65,7 @@ class _FailingSettlementStore:
         return []
 
     def describe(self) -> dict[str, str]:
-        return {"backend": "failing"}
+        return {"backend": "failing", "path": str(self.path)}
 
 
 def _signed_vote(
@@ -958,9 +960,9 @@ class TestMeshAtScale:
         """Full validation (DNA pre-check + 3 peer DNA checks + Merkle proof
         + object creation + store updates) must stay under 10ms.
 
-        Raw DNA validation is 443ns. Full pipeline adds Python object
-        creation, dict storage, and proof computation. At 800 agents
-        this means ~8 seconds for a full mesh sweep — well within budget.
+        Raw DNA validation has no published nanosecond product pin (the
+        former 443ns figure is withdrawn). This test measures the full
+        Python pipeline, not a Rust microbenchmark.
         """
         mesh = ConstitutionalMesh(Constitution.default(), seed=7)
         for i in range(10):
@@ -1379,9 +1381,9 @@ class TestMeshSettlePersistenceIntegration:
         assert "content" not in records[0].assignment
 
     def test_settle_raises_persistence_error_but_result_remains_visible_in_process(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ) -> None:
-        store = _FailingSettlementStore()
+        store = _FailingSettlementStore(tmp_path / "failing.jsonl")
         mesh = ConstitutionalMesh(
             Constitution.default(),
             peers_per_validation=3,
@@ -1409,8 +1411,8 @@ class TestMeshSettlePersistenceIntegration:
         assert store.load_pending() != []
         assert store.last_record.assignment["assignment_id"] == assignment.assignment_id
 
-    def test_full_validation_raises_persistence_error_after_freeze(self) -> None:
-        store = _FailingSettlementStore()
+    def test_full_validation_raises_persistence_error_after_freeze(self, tmp_path) -> None:
+        store = _FailingSettlementStore(tmp_path / "failing.jsonl")
         mesh = ConstitutionalMesh(
             Constitution.default(),
             peers_per_validation=3,
