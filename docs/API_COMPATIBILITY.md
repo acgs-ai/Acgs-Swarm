@@ -24,9 +24,9 @@ not restored as eager default imports, because that would pull optional
 dependencies (`numpy`, `torch`, `bittensor`, LangGraph, SWE-bench) into
 every install.
 
-The next published version after this branch should be **1.1.0** (minor
-bump for an observable import-star change). This checkout does not
-publish a release.
+This change ships as **1.1.0** (minor bump for an observable import-star
+change). Publishing the GitHub release / PyPI artifacts is a separate
+human-gated step.
 
 ## Receipt identity (v0.1)
 

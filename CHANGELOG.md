@@ -6,6 +6,12 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-16
+
+Import-star and optional-dependency break relative to 1.0.0. See
+`docs/API_COMPATIBILITY.md` and `MIGRATION.md`. This tag does not
+itself publish to PyPI; `publish.yml` runs only after a GitHub Release.
+
 ### Fixed
 - Declare `jsonschema` and `pyyaml` on the `[dev]` extra so
   `make agent-check` / CI agent-operability can import
@@ -23,8 +29,7 @@ The format is based on Keep a Changelog.
   symbols remain available via lazy `__getattr__` or explicit submodule
   imports. `from constitutional_swarm import *` is now the stable façade
   only — an intentional import-star compatibility break. `MeshSnapshotStaleError`
-  is part of that façade. See `docs/API_COMPATIBILITY.md`. The next published
-  version should be 1.1.0.
+  is part of that façade. See `docs/API_COMPATIBILITY.md`.
 - Mesh settlement receipts now bind `action` / `decision` / policy and content
   hashes to the committed settlement, persist pending votes for crash recovery,
   and treat a receipt as completed evidence only when a settlement points at
@@ -171,6 +176,10 @@ The format is based on Keep a Changelog.
   repository (its own remote) is now the documented default git workflow, and the
   submodule `git add`/`git commit`-from-`packages/constitutional_swarm/` rules are
   scoped to the ACGS-monorepo checkout only.
+
+### Migration
+- See `MIGRATION.md` (v1.1.0 section) and `docs/API_COMPATIBILITY.md` for
+  the import-star / extras break.
 
 ## [1.0.0] - 2026-04-23
 

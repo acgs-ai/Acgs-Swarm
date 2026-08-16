@@ -1,3 +1,37 @@
+# Migrating to constitutional_swarm v1.1.0
+
+## Breaking: star-import surface is the eager façade only
+
+`from constitutional_swarm import *` now returns the stable façade
+(`constitutional_swarm.__all__`): AgentDNA, DAG/executor,
+ConstitutionalMesh, settlement stores, and the v0.1 receipt types.
+Research, eval, Bittensor, LangGraph, and benchmark names are no longer
+in the star-import set.
+
+`numpy` and `braintrust` are extras, not core `Requires-Dist`. A blank
+venv `pip install constitutional-swarm` no longer pulls them.
+
+### What still works
+
+```python
+from constitutional_swarm import AgentDNA, ConstitutionalMesh
+from constitutional_swarm import LegacyName          # lazy __getattr__
+import constitutional_swarm.swe_bench                # submodule import
+```
+
+### What changed
+
+```python
+# 1.0.0 — star-import dumped the research-heavy surface
+from constitutional_swarm import *    # included eval / bittensor / ...
+
+# 1.1.0 — star-import is the façade only
+from constitutional_swarm import *    # AgentDNA, mesh, settlements, receipts
+```
+
+Install optional stacks explicitly: `pip install constitutional-swarm[research]`,
+`[bittensor]`, `[langgraph]`, `[braintrust]`.
+
 # Migrating to constitutional_swarm v0.3.0
 
 ## Breaking: `register_agent()` removed

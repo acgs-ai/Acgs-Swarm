@@ -45,7 +45,8 @@ Index of architecture & product decisions. Detailed ADRs live in
 
 - `__all__` is the stable eager façade. Star-import no longer dumps research
   symbols. Legacy names stay lazy. Documented in `docs/API_COMPATIBILITY.md`.
-  Next published version should be 1.1.0.
+  Shipped as 1.1.0. Publishing GitHub/PyPI artifacts is a separate
+  human-gated step.
 - `receipt_digest` is the v0.1 payload digest (canonical statement identity),
   not the signed-envelope hash. Mesh receipts use key id `settlement-receipt`.
 
