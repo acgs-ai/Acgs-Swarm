@@ -22,7 +22,7 @@ patterns; everything in the codebase is an elaboration of one of them.
 
 | Pattern | Name | Embodied by | Core idea |
 |---|---|---|---|
-| **A** | Agent DNA | `dna.py` (`AgentDNA`) | Constitutional validation is *embedded in each agent's runtime path* (~443ns/check), not a remote gate. Unsafe outputs are caught locally before acceptance. |
+| **A** | Agent DNA | `dna.py` (`AgentDNA`) | Constitutional validation is *embedded in each agent's runtime path*, not a remote gate. Unsafe outputs are caught locally before acceptance. |
 | **B** | Stigmergic Swarm | `compiler.py`, `swarm.py`, `execution.py`, `artifact.py` | Tasks compile to a DAG; capable agents claim and complete nodes; coordination happens through a shared artifact store, **with no orchestrator**. |
 | **C** | Constitutional Mesh | `mesh/`, `settlement_store.py`, `governance_receipts*.py`, `quorum_certificate.py`, `validator_set.py` | Peers validate each other's outputs with **mandatory signed votes**; quorum settles decisions into durable, replayable evidence. |
 | **D** | Governance Manifold | `spectral_sphere.py` (production), `manifold.py` (baseline control), `swarm_ode.py` | Trust between agents is projected into a **bounded manifold**, guaranteeing bounded influence and compositional stability. |

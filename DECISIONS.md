@@ -41,6 +41,14 @@ Index of architecture & product decisions. Detailed ADRs live in
 
 ## Decisions log
 
+### 2026-08-15 — Public façade and receipt identity
+
+- `__all__` is the stable eager façade. Star-import no longer dumps research
+  symbols. Legacy names stay lazy. Documented in `docs/API_COMPATIBILITY.md`.
+  Next published version should be 1.1.0.
+- `receipt_digest` is the v0.1 payload digest (canonical statement identity),
+  not the signed-envelope hash. Mesh receipts use key id `settlement-receipt`.
+
 ### 2026-06-03 — Typecheck gate environment consistency
 
 The mypy gate ran only in a dev-only CI job, so type errors that surface only when

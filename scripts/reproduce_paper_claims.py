@@ -517,6 +517,7 @@ class ClaimEvidence:
     source: str
     measurements: dict[str, Any]
     note: str
+    status: str = "measured"
 
 
 ICLR_SOURCES = {
@@ -600,153 +601,144 @@ def _iclr_variance_rows() -> dict[str, dict[str, float | int]]:
 
 
 def _iclr_evidence() -> list[ClaimEvidence]:
-    variance = _iclr_variance_rows()
-    capacity_pct = 2656
-    capacity_multiple = capacity_pct / 100.0
-    dp_table = {
+    live_n10 = _retention_series(
+        kind="spectral",
+        n=10,
+        seed=42,
+        cycles=[10],
+        residual_alpha=0.1,
+    )
+    live_n50 = _retention_series(
+        kind="spectral",
+        n=50,
+        seed=42,
+        cycles=[10],
+        residual_alpha=0.1,
+    )
+    formula_sigma = {
         epsilon: {
-            "alpha_0": baseline,
-            "alpha_0_1": alpha_0_1,
-            "alpha_0_2": alpha_0_2,
-            "alpha_0_5": alpha_0_5,
-            "reduction_alpha_0_1_pct": _rounded(
-                (1 - alpha_0_1 / baseline) * 100,
-                1,
-            ),
-            "reduction_alpha_0_2_pct": _rounded(
-                (1 - alpha_0_2 / baseline) * 100,
-                1,
-            ),
-            "reduction_alpha_0_5_pct": _rounded(
-                (1 - alpha_0_5 / baseline) * 100,
-                1,
-            ),
+            alpha: _dp_sigma(epsilon=epsilon, alpha=alpha)
+            for alpha in (0.0, 0.1, 0.2, 0.5)
         }
-        for epsilon, baseline, alpha_0_1, alpha_0_2, alpha_0_5 in (
-            (1.0, 3.84, 3.46, 3.07, 1.92),
-            (2.0, 1.92, 1.73, 1.54, 0.96),
-            (4.0, 0.96, 0.86, 0.77, 0.48),
-            (8.0, 0.48, 0.43, 0.38, 0.24),
-        )
+        for epsilon in (1.0, 2.0, 4.0, 8.0)
     }
-    radius_sensitivity = {0.5: 71, 1.0: 142, 2.0: 287}
-    alpha_sensitivity = {0.1: 142, 0.5: 38}
-
     return [
         _iclr_claim(
             claim_id="ICLR-03",
             paper="ICLR 2027",
-            basis="topological_capacity_table",
-            passed=capacity_pct == 2656 and capacity_multiple > 26,
-            measurements={"capacity_pct": capacity_pct, "capacity_multiple": capacity_multiple},
-            note="Replays the Neural ODE capacity row used by abstract/conclusion claims.",
+            basis="withdrawn_topological_capacity",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_value": "2656%"},
+            note="Withdrawn: the paper forbids 2656% topological-capacity claims.",
         ),
         _iclr_claim(
             claim_id="ICLR-07",
             paper="ICLR 2027",
-            basis="topological_capacity_table",
-            passed=capacity_pct == 2656,
-            measurements={"capacity_pct": capacity_pct},
-            note="Same capacity datum referenced in the introduction contribution list.",
+            basis="withdrawn_topological_capacity",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_value": "2656%"},
+            note="Withdrawn with ICLR-03.",
         ),
         _iclr_claim(
             claim_id="ICLR-08",
             paper="ICLR 2027",
             basis="experiment_manifest",
-            passed={"swarm_sizes": [10, 50], "seeds": 30} == {"swarm_sizes": [10, 50], "seeds": 30},
-            measurements={"swarm_sizes": [10, 50], "seeds": 30},
-            note="Pins the stated deterministic experiment manifest.",
+            status="non_claim",
+            passed=False,
+            measurements={"default_harness_seeds": [42], "paper_stated_seeds": 30},
+            note="Manifest only. Default harness seed is not a 30-seed study.",
         ),
         _iclr_claim(
             claim_id="ICLR-09",
             paper="ICLR 2027",
-            basis="variance_table_consistency",
-            passed=all(float(row["k1"]) >= 0 for row in variance.values()),
-            measurements={"non_collapsed_stddev_upper_pct": 3, "rows": variance},
-            note="Pins the variance-retention table and its reported stddev bound.",
+            basis="variance_retention_live",
+            status="measured",
+            passed=live_n10["10"] * 100 > 5.0 and live_n50["10"] * 100 > 5.0,
+            measurements={
+                "metric": "entrywise_matrix_variance_retention_ratio",
+                "n10_k10_seed42": live_n10["10"],
+                "n50_k10_seed42": live_n50["10"],
+            },
+            note="Live SpectralSphere+residual retention; not a 142% SLA.",
         ),
         _iclr_claim(
             claim_id="ICLR-12",
             paper="ICLR 2027",
-            basis="variance_table_consistency",
-            passed=variance["spectral_only_n50"]["k1"] == 138
-            and variance["spectral_only_n50"]["k50"] == 0
-            and variance["spectral_only_n10"]["k50"] == 0,
-            measurements={
-                "spectral_only_n50": variance["spectral_only_n50"],
-                "spectral_only_n10": variance["spectral_only_n10"],
-            },
-            note="Checks the no-residual SpectralSphere collapse row.",
+            basis="spectral_only_live",
+            status="measured",
+            passed=_retention_series(
+                kind="spectral",
+                n=10,
+                seed=42,
+                cycles=[50],
+                residual_alpha=0.0,
+            )["50"]
+            < 0.05,
+            measurements={"note": "no-residual spectral retention at n=10,k=50,seed=42"},
+            note="Live no-residual collapse check; table constants 138/0 are not pinned.",
         ),
         _iclr_claim(
             claim_id="ICLR-13",
             paper="ICLR 2027",
-            basis="variance_table_consistency",
-            passed=variance["spectral_res_n10"]["k10"] < variance["spectral_res_n50"]["k10"]
-            and variance["spectral_res_n50"]["k10"] > 50,
+            basis="variance_retention_live",
+            status="measured",
+            passed=live_n10["10"] > 0.0 and live_n50["10"] > 0.0,
             measurements={
-                "n10_equilibrium_pct": variance["spectral_res_n10"]["k10"],
-                "n50_equilibrium_pct": variance["spectral_res_n50"]["k10"],
+                "n10_k10_seed42": live_n10["10"],
+                "n50_k10_seed42": live_n50["10"],
             },
-            note="Checks smaller-scale retention is lower and practical n=50 exceeds 50%.",
+            note="Live scale comparison; does not assert a 50% product threshold.",
         ),
         _iclr_claim(
             claim_id="ICLR-14",
             paper="ICLR 2027",
-            basis="topological_capacity_table",
-            passed=capacity_pct == 2656 and _rounded(capacity_multiple, 0) == 27,
-            measurements={"capacity_pct": capacity_pct, "capacity_multiple": capacity_multiple},
-            note="Checks the 2656 percent, about 26x capacity statement.",
+            basis="withdrawn_topological_capacity",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_value": "2656%"},
+            note="Withdrawn: 2656% / 26x capacity is not a live result.",
         ),
         _iclr_claim(
             claim_id="ICLR-15",
             paper="ICLR 2027",
-            basis="dp_table_consistency",
-            passed=dp_table[2.0]["alpha_0"] == 1.92
-            and dp_table[2.0]["alpha_0_1"] == 1.73
-            and all(_near(row["reduction_alpha_0_1_pct"], 10.0) for row in dp_table.values())
-            and all(_near(row["reduction_alpha_0_2_pct"], 20.0) for row in dp_table.values())
-            and all(_near(row["reduction_alpha_0_5_pct"], 50.0) for row in dp_table.values()),
-            measurements={
-                "dp_table": dp_table,
-                "formula_sigma_epsilon1_alpha0_delta1e_5": _rounded(
-                    _dp_sigma(epsilon=1.0, alpha=0.0)
-                ),
-            },
-            note=(
-                "Pins the published DP table and flags that its absolute sigma scale"
-                " differs from the stated delta=1e-5 Gaussian formula."
+            basis="dp_formula",
+            status="formula",
+            passed=all(
+                abs(1.0 - formula_sigma[eps][alpha] / formula_sigma[eps][0.0] - alpha) < 1e-12
+                for eps in formula_sigma
+                for alpha in (0.1, 0.2, 0.5)
             ),
+            measurements={"formula_sigma": formula_sigma, "producer": "_dp_sigma"},
+            note="Live Gaussian formula; published table scale is a separate calibration.",
         ),
         _iclr_claim(
             claim_id="ICLR-16",
             paper="ICLR 2027",
-            basis="ablation_table",
-            passed=radius_sensitivity == {0.5: 71, 1.0: 142, 2.0: 287},
-            measurements={"radius_sensitivity_pct": radius_sensitivity},
-            note="Pins radius-sensitivity ablation values.",
+            basis="ablation_not_rerun",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_values": {0.5: 71, 1.0: 142, 2.0: 287}},
+            note="Withdrawn exact radius-sensitivity percentages; not live-generated.",
         ),
         _iclr_claim(
             claim_id="ICLR-17",
             paper="ICLR 2027",
-            basis="ablation_table",
-            passed=alpha_sensitivity[0.1] == 142 and alpha_sensitivity[0.5] == 38,
-            measurements={"alpha_sensitivity_pct": alpha_sensitivity},
-            note="Pins residual-sensitivity ablation values.",
+            basis="ablation_not_rerun",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_values": {0.1: 142, 0.5: 38}},
+            note="Withdrawn exact alpha-sensitivity percentages.",
         ),
         _iclr_claim(
             claim_id="ICLR-19",
             paper="ICLR 2027",
-            basis="combined_table_consistency",
-            passed=variance["spectral_res_n50"]["k10"] == 142
-            and variance["spectral_res_n10"]["k10"] == 20
-            and capacity_pct == 2656,
-            measurements={
-                "n50_retention_pct": variance["spectral_res_n50"]["k10"],
-                "n10_retention_pct": variance["spectral_res_n10"]["k10"],
-                "capacity_pct": capacity_pct,
-            },
-            note="Checks the conclusion's combined SpectralSphere and ODE claim.",
+            basis="withdrawn_combined_capacity",
+            status="withdrawn",
+            passed=False,
+            measurements={"withdrawn_value": "2656%"},
+            note="Withdrawn combined 142%/20%/2656% conclusion pin.",
         ),
     ]
 
@@ -826,7 +818,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-09",
             paper="NDSS 2027",
             basis="privacy_composition_formula",
-            passed=True,
+            status="formula",
+            passed=10 * 1e-5 == 1e-4,
             measurements={
                 "epsilon_k_formula": "epsilon*sqrt(2*k*ln(1/delta))",
                 "delta_k_formula": "k*delta",
@@ -838,6 +831,7 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-10",
             paper="NDSS 2027",
             basis="spectral_noise_bound",
+            status="formula",
             passed=all(
                 sigma * math.sqrt(n) <= 1.0 + 1e-12
                 for n, sigma in [(10, 1 / math.sqrt(10)), (50, 1 / math.sqrt(50))]
@@ -852,8 +846,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-13",
             paper="NDSS 2027",
             basis="network_experiment_manifest",
-            passed={"N": [10, 50, 100, 500], "degree": 4, "gossip_peers": 3}
-            == {"N": [10, 50, 100, 500], "degree": 4, "gossip_peers": 3},
+            status="non_claim",
+            passed=False,
             measurements={"N": [10, 50, 100, 500], "degree": 4, "gossip_peers": 3},
             note="Pins the stated network topology and gossip setup.",
         ),
@@ -861,7 +855,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-14",
             paper="NDSS 2027",
             basis="protocol_correctness_table",
-            passed=all(row["acceptance_pct"] == 100 and row["eec"] for row in protocol.values()),
+            status="withdrawn",
+            passed=False,
             measurements={"seeds": 20, "protocol_rows": protocol},
             note="Checks protocol-correctness table rows.",
         ),
@@ -869,7 +864,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-15",
             paper="NDSS 2027",
             basis="protocol_correctness_table",
-            passed=protocol[500]["rounds_mean"] <= math.log2(500) + protocol[500]["rounds_std"],
+            status="withdrawn",
+            passed=False,
             measurements={
                 "false_acceptances": 0,
                 "n500_rounds": protocol[500],
@@ -881,24 +877,30 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-16",
             paper="NDSS 2027",
             basis="cid_integrity_table",
-            passed=1000 > 0,
+            status="withdrawn",
+            passed=False,
             measurements={"tampered_tuples_per_seed": 1000, "accepted_tampered_tuples": 0},
             note="Pins CID tamper-injection result.",
         ),
         _ndss_claim(
             claim_id="NDSS-17",
             paper="NDSS 2027",
-            basis="dp_accuracy_table",
-            passed=max(row["relative_error_pct"] for row in dp_rows.values()) == 0.23,
+            basis="dp_formula",
+            status="formula",
+            passed=abs(_dp_sigma(epsilon=2.0, alpha=0.1) - _dp_sigma(epsilon=1.0, alpha=0.1) / 2.0)
+            < 1e-12,
             measurements={"dp_rows": dp_rows},
             note="Checks exact DP accuracy table values and max relative error.",
         ),
         _ndss_claim(
             claim_id="NDSS-18",
             paper="NDSS 2027",
-            basis="dp_accuracy_table",
-            passed=max(row["relative_error_pct"] for row in dp_rows.values()) <= 0.23
-            and _rounded((1 - 1.73 / 1.92) * 100, 1) == 9.9,
+            basis="dp_formula",
+            status="formula",
+            passed=abs(
+                1.0 - _dp_sigma(epsilon=2.0, alpha=0.1) / _dp_sigma(epsilon=2.0, alpha=0.0) - 0.1
+            )
+            < 1e-12,
             measurements={
                 "max_relative_error_pct": max(
                     row["relative_error_pct"] for row in dp_rows.values()
@@ -912,7 +914,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
         _ndss_claim(
             claim_id="NDSS-20",
             paper="NDSS 2027",
-            basis="synthetic_swebench_routing_measurement",
+            basis="synthetic_routing_fixture",
+            status="measured",
             passed=bool(
                 fedsink_lift_over_sinkhorn >= 0.15
                 and all_swe_seeds_non_regressive
@@ -935,14 +938,15 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 "all_seeds_non_regressive": all_swe_seeds_non_regressive,
             },
             note=(
-                "Deterministic local SWE-bench-shaped evaluator; official SWE-bench "
-                "results are not claimed."
+                "Live synthetic routing fixture (4 agents x 64 tasks). "
+                "Not official SWE-bench."
             ),
         ),
         _ndss_claim(
             claim_id="NDSS-21",
             paper="NDSS 2027",
-            basis="synthetic_swebench_routing_diversity",
+            basis="synthetic_routing_fixture",
+            status="measured",
             passed=bool(
                 synthetic_boundary
                 and synthetic_swe["flat_routing_diversity_pct"] <= 1.0
@@ -969,16 +973,15 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 "agent_count": synthetic_swe["agent_count"],
             },
             note=(
-                "Measures explicit Sinkhorn-CRDT baseline routing diversity against "
-                "SpectralSphere/FedSink routing diversity in the local synthetic evaluator."
+                "Live synthetic routing diversity. Not official SWE-bench."
             ),
         ),
         _ndss_claim(
             claim_id="NDSS-22",
             paper="NDSS 2027",
             basis="latency_table",
-            passed=latency["total_excluding_zk_ms"] == 2.5
-            and latency["spectral_projection_ms"] == 1.2,
+            status="withdrawn",
+            passed=False,
             measurements={"latency_ms": latency},
             note="Pins protocol latency table values.",
         ),
@@ -986,8 +989,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-23",
             paper="NDSS 2027",
             basis="latency_scaling_formula",
-            passed=_rounded(governance_overhead_pct, 3) == 0.025
-            and _rounded(svd_n500_seconds, 1) == 1.2,
+            status="withdrawn",
+            passed=False,
             measurements={
                 "governance_overhead_pct_for_10s_task": governance_overhead_pct,
                 "svd_n500_seconds": svd_n500_seconds,
@@ -998,7 +1001,8 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             claim_id="NDSS-24",
             paper="NDSS 2027",
             basis="phase2_suite_historical_count",
-            passed=True,
+            status="non_claim",
+            passed=False,
             measurements={
                 "phase2_tests": 1018,
                 "expected_failures": 2,
@@ -1025,18 +1029,30 @@ def collect_evidence() -> list[ClaimEvidence]:
 
 
 def summary(evidence: list[ClaimEvidence]) -> dict[str, Any]:
-    failed = [item.claim_id for item in evidence if not item.passed]
-    by_paper: dict[str, dict[str, int]] = {}
+    scored = [item for item in evidence if item.status in {"measured", "formula"}]
+    failed = [item.claim_id for item in scored if not item.passed]
+    withdrawn = [item.claim_id for item in evidence if item.status == "withdrawn"]
+    non_claim = [item.claim_id for item in evidence if item.status == "non_claim"]
+    not_run = [item.claim_id for item in evidence if item.status == "not_run"]
+    by_status: dict[str, int] = {}
     for item in evidence:
-        stats = by_paper.setdefault(item.paper, {"total": 0, "passed": 0, "failed": 0})
-        stats["total"] += 1
+        by_status[item.status] = by_status.get(item.status, 0) + 1
+    by_paper: dict[str, dict[str, int]] = {}
+    for item in scored:
+        stats = by_paper.setdefault(item.paper, {"scored": 0, "passed": 0, "failed": 0})
+        stats["scored"] += 1
         stats["passed"] += int(item.passed)
         stats["failed"] += int(not item.passed)
     return {
         "total": len(evidence),
-        "passed": len(evidence) - len(failed),
+        "scored": len(scored),
+        "passed": len(scored) - len(failed),
         "failed": len(failed),
         "failed_claim_ids": failed,
+        "withdrawn_claim_ids": withdrawn,
+        "non_claim_ids": non_claim,
+        "not_run_ids": not_run,
+        "by_status": by_status,
         "by_paper": by_paper,
     }
 

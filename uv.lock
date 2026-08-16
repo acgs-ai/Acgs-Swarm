@@ -699,9 +699,7 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "acgs-lite" },
-    { name = "braintrust" },
     { name = "cryptography" },
-    { name = "numpy" },
     { name = "pydantic" },
 ]
 
@@ -709,13 +707,20 @@ dependencies = [
 bittensor = [
     { name = "bittensor" },
 ]
+braintrust = [
+    { name = "braintrust" },
+]
 dev = [
+    { name = "jsonschema" },
     { name = "mypy" },
+    { name = "numpy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 finetune = [
+    { name = "numpy" },
     { name = "peft" },
     { name = "torch" },
     { name = "transformers" },
@@ -742,10 +747,12 @@ langgraph-swarm = [
     { name = "langgraph-swarm" },
 ]
 latent = [
+    { name = "numpy" },
     { name = "torch" },
     { name = "transformers" },
 ]
 research = [
+    { name = "numpy" },
     { name = "torch" },
     { name = "transformers" },
 ]
@@ -765,13 +772,14 @@ requires-dist = [
     { name = "acgs-lite", specifier = ">=2.8.1" },
     { name = "anthropic", extras = ["vertex"], marker = "extra == 'vertex'", specifier = ">=0.84" },
     { name = "bittensor", marker = "extra == 'bittensor'", specifier = ">=7.0,<11" },
-    { name = "braintrust", specifier = "==0.31.0" },
+    { name = "braintrust", marker = "extra == 'braintrust'", specifier = "==0.31.0" },
     { name = "constitutional-swarm", extras = ["langgraph"], marker = "extra == 'langgraph-swarm'" },
     { name = "constitutional-swarm", extras = ["research"], marker = "extra == 'finetune'" },
     { name = "constitutional-swarm", extras = ["research"], marker = "extra == 'latent'" },
     { name = "cryptography", specifier = ">=44.0.2" },
     { name = "google-cloud-aiplatform", marker = "extra == 'vertex'", specifier = ">=1.50" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=0.3" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.18" },
     { name = "langchain", marker = "extra == 'langgraph'", specifier = ">=1.0,<2.0" },
     { name = "langchain-anthropic", marker = "extra == 'langgraph'", specifier = ">=1.0" },
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.0,<2.0" },
@@ -780,11 +788,13 @@ requires-dist = [
     { name = "langgraph-prebuilt", marker = "extra == 'langgraph'", specifier = ">=1.0.5" },
     { name = "langgraph-swarm", marker = "extra == 'langgraph-swarm'", specifier = ">=0.1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2,<3" },
-    { name = "numpy", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'research'", specifier = ">=1.24" },
     { name = "peft", marker = "extra == 'finetune'", specifier = ">=0.11" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.16" },
     { name = "sentence-transformers", marker = "extra == 'semantic'", specifier = ">=2.5" },
     { name = "torch", marker = "extra == 'research'", specifier = ">=2.0" },
@@ -792,7 +802,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'finetune'", specifier = ">=0.9" },
     { name = "websockets", marker = "extra == 'transport'", specifier = ">=12.0" },
 ]
-provides-extras = ["dev", "bittensor", "transport", "research", "latent", "finetune", "semantic", "vertex", "gemini", "langgraph", "langgraph-swarm"]
+provides-extras = ["dev", "braintrust", "bittensor", "transport", "research", "latent", "finetune", "semantic", "vertex", "gemini", "langgraph", "langgraph-swarm"]
 
 [[package]]
 name = "cryptography"

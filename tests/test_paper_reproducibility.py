@@ -198,9 +198,15 @@ def test_remaining_claim_reproducers_all_pass() -> None:
     report = summary(evidence)
 
     assert report["total"] == 24
-    assert report["passed"] == 24
     assert report["failed"] == 0
     assert report["failed_claim_ids"] == []
+    assert "ICLR-03" in report["withdrawn_claim_ids"]
+    assert "ICLR-14" in report["withdrawn_claim_ids"]
+    scored = [item for item in evidence if item.status in {"measured", "formula"}]
+    assert scored
+    assert all(item.passed for item in scored)
+    assert all(item.status != "withdrawn" or not item.passed for item in evidence)
+    assert all("2656" not in json.dumps(item.measurements) or item.status == "withdrawn" for item in evidence)
 
 
 def test_remaining_claims_carry_external_source_provenance() -> None:
@@ -236,9 +242,11 @@ def test_reproduce_paper_claims_cli_json() -> None:
     )
 
     assert result.returncode == 0
-    assert '"failed": 0' in result.stdout
-    assert '"failed_claim_ids": []' in result.stdout
-    assert '"total": 24' in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["failed"] == 0
+    assert payload["summary"]["failed_claim_ids"] == []
+    assert payload["summary"]["total"] == 24
+    assert "ICLR-03" in payload["summary"]["withdrawn_claim_ids"]
 
 
 def test_claim_map_reproducer_row_matches_live_registry() -> None:
@@ -256,9 +264,6 @@ def test_claim_map_reproducer_row_matches_live_registry() -> None:
     claim_map = _read("docs/internal/claims_map.md")
 
     assert result.returncode == 0
-    assert payload["summary"]["passed"] == 24
     assert payload["summary"]["failed"] == 0
-    assert (
-        "| ICLR 2027 + NDSS 2027 | `python scripts/reproduce_paper_claims.py` | 0 | "
-        "24 previously unmapped claims checked; 24 passed. |"
-    ) in claim_map
+    assert "withdrawn_claim_ids" in payload["summary"]
+    assert "withdrawn 2656%" in claim_map

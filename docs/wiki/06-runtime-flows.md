@@ -27,7 +27,7 @@ output is trusted.
 
 1. Build a DNA: `AgentDNA.default(agent_id=...)` or `.from_yaml(constitution)`.
 2. `result = agent.validate(text)` → `DNAValidationResult(valid, violations, risk)`.
-   Runs the constitution's matchers in ~443ns.
+   Runs the constitution's matchers inline (no published nanosecond product claim).
 3. Caller branches on `result.valid`; `constitutional_dna` can wrap a callable to
    do this automatically. A disabled DNA raises `DNADisabledError`.
 

@@ -22,7 +22,7 @@ TEST_MARKERS ?= not slow and not benchmark and not e2e and not research and not 
 PYTEST = $(UV) run --no-sync pytest tests/ --import-mode=importlib
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev test test-all lint format typecheck typecheck-coverage smoke verify agent-check agent-self-evolve clean
+.PHONY: help setup dev test test-all lint format typecheck typecheck-coverage smoke verify verify-wheel agent-check agent-self-evolve clean
 
 help: ## Show this help
 	@echo "constitutional-swarm — make targets:"
@@ -69,6 +69,9 @@ agent-self-evolve: ## Build offline self-evolution harnesses for every repo agen
 
 verify: lint typecheck agent-check typecheck-coverage smoke test ## Full local gate: lint -> typecheck -> registry/doc + coverage check -> smoke -> tests
 	@echo "OK: verify passed."
+
+verify-wheel: ## Build the wheel and install it into a blank venv (not the project .venv)
+	$(UV) run --no-sync python scripts/verify_isolated_wheel.py
 
 clean: ## Remove caches and build artifacts
 	rm -rf .pytest_cache .ruff_cache .benchmarks dist build *.egg-info src/*.egg-info

@@ -1,13 +1,13 @@
 """Constitutional Mesh — Byzantine-tolerant peer validation with cryptographic proof.
 
 The defensible core of constitutional_swarm. Every agent's output is validated by randomly
-assigned peers using the ACGS constitutional engine (443ns). No single
+assigned peers using the ACGS constitutional engine. No single
 validator bottleneck. Tolerates up to 1/3 faulty/malicious agents.
 
 Cryptographic proof chain:
   1. Producer creates output with constitutional hash
   2. Mesh assigns random peers (producer excluded — MACI)
-  3. Each peer validates via embedded DNA (443ns, Rust engine)
+  3. Each peer validates via embedded DNA (local acgs-lite engine)
   4. Votes are signed with the peer's Ed25519 private key
   5. Quorum result produces a Merkle proof linking:
      - Producer's output hash
@@ -16,13 +16,15 @@ Cryptographic proof chain:
   6. Anyone can verify the proof independently
 
 No competitor can replicate this: agents constitutionally validating
-each other's work, with cryptographic proof, at sub-microsecond cost.
+each other's work, with cryptographic proof. There is no published
+sub-microsecond product latency claim.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import random
 import threading
 import time
@@ -41,13 +43,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from constitutional_swarm.dna import AgentDNA
-from constitutional_swarm.manifold import GovernanceManifold
 from constitutional_swarm.mesh.exceptions import (
     AssignmentSettledError,
     DuplicateVoteError,
     InsufficientPeersError,
     InvalidVoteSignatureError,
     MeshHaltedError,
+    MeshSnapshotStaleError,
     RecoveredAssignmentError,
     RemoteVoteReplayError,
     SettlementPersistenceError,
@@ -76,7 +78,11 @@ from constitutional_swarm.settlement_store import (
 
 if TYPE_CHECKING:
     import constitutional_swarm.spectral_sphere as spectral_sphere_mod
-    from constitutional_swarm.remote_vote_transport import RemoteVoteClient, RemoteVoteResponse
+    from constitutional_swarm.manifold import GovernanceManifold
+    from constitutional_swarm.remote_vote_transport import (
+        RemoteVoteClient,
+        RemoteVoteResponse,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -100,7 +106,7 @@ class ConstitutionalMesh:
     - No single validator bottleneck
     - MACI-compliant (no self-validation)
     - Cryptographic proof chain for auditability
-    - Sub-microsecond per validation (443ns via Rust engine)
+    - Local validation via AgentDNA (full pipeline tests bound average latency under 10ms)
     """
 
     def __init__(
@@ -112,12 +118,14 @@ class ConstitutionalMesh:
         seed: int | None = None,
         use_manifold: bool = False,
         manifold_type: Literal["birkhoff", "spectral"] = "birkhoff",
+        trust_policy: Literal["uniform", "spectral", "birkhoff"] | Any = "uniform",
         shadow_spectral: bool = False,
         risk_scoring: bool = False,
         settlement_store_path: str | Path | None = None,
         settlement_store: SettlementStore | None = None,
         auto_reconcile: bool = True,
         request_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
+        receipt_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
     ) -> None:
         if quorum > peers_per_validation:
             raise ValueError(
@@ -127,6 +135,27 @@ class ConstitutionalMesh:
             raise ValueError(
                 f"manifold_type must be 'birkhoff' or 'spectral', got {manifold_type!r}"
             )
+        custom_policy = trust_policy if callable(trust_policy) else None
+        if custom_policy is None and trust_policy not in {
+            "uniform",
+            "spectral",
+            "birkhoff",
+        }:
+            raise ValueError(
+                "trust_policy must be 'uniform', 'spectral', 'birkhoff', or a callable, "
+                f"got {trust_policy!r}"
+            )
+        if custom_policy is not None:
+            resolved_policy = "custom"
+            use_manifold = False
+        elif use_manifold and trust_policy == "uniform":
+            # Legacy: use_manifold=True + default trust_policy keeps manifold_type.
+            resolved_policy = manifold_type
+        else:
+            resolved_policy = str(trust_policy)
+            use_manifold = resolved_policy in {"spectral", "birkhoff"}
+            if use_manifold:
+                manifold_type = resolved_policy  # type: ignore[assignment]
         self._constitution = constitution
         self._dna = AgentDNA(
             constitution=constitution,
@@ -146,18 +175,41 @@ class ConstitutionalMesh:
             if request_signing_private_key is None
             else self._coerce_private_key(request_signing_private_key)
         )
-        self._request_signing_public_key = self._request_signing_private_key.public_key()
+        self._request_signing_public_key = (
+            self._request_signing_private_key.public_key()
+        )
+        # Dedicated settlement-receipt key. Request/vote signatures use a
+        # different key and a different pre-image (colon-joined vote bytes vs
+        # canonical receipt payload). Callers may pass the same material, but
+        # the default is a distinct key.
+        self._receipt_signing_private_key = (
+            Ed25519PrivateKey.generate()
+            if receipt_signing_private_key is None
+            else self._coerce_private_key(receipt_signing_private_key)
+        )
+        self._receipt_signing_public_key = (
+            self._receipt_signing_private_key.public_key()
+        )
         self._assignments: dict[str, PeerAssignment] = {}
         self._votes: dict[str, list[ValidationVote]] = {}
         self._final_results: dict[str, MeshResult] = {}
         self._use_manifold = use_manifold
         self._manifold_type = manifold_type
-        self._manifold: GovernanceManifold | spectral_sphere_mod.SpectralSphereManifold | None = (
-            None
+        self._trust_policy = resolved_policy
+        self._custom_trust_policy = custom_policy
+        self._state_generation = 0
+        self._constitution_generation = 0
+        self._voter_dna: dict[str, tuple[int, str, AgentDNA]] = {}
+        self._manifold: (
+            GovernanceManifold | spectral_sphere_mod.SpectralSphereManifold | None
+        ) = None
+        self._shadow_spectral = (
+            use_manifold and manifold_type == "birkhoff" and shadow_spectral
         )
-        self._shadow_spectral = use_manifold and manifold_type == "birkhoff" and shadow_spectral
         if self._shadow_spectral:
-            self._shadow_manifold: spectral_sphere_mod.SpectralSphereManifold | None = None
+            self._shadow_manifold: spectral_sphere_mod.SpectralSphereManifold | None = (
+                None
+            )
             self._shadow_metrics: list[dict[str, float | str]] = []
         self._agent_indices: dict[str, int] = {}
         # Trust persistence: keyed by (from_agent_id, to_agent_id)
@@ -171,7 +223,9 @@ class ConstitutionalMesh:
         self._lock = threading.RLock()
         self._halted = False
         if settlement_store is not None and settlement_store_path is not None:
-            raise ValueError("Specify either settlement_store or settlement_store_path, not both")
+            raise ValueError(
+                "Specify either settlement_store or settlement_store_path, not both"
+            )
         self._settlement_store = settlement_store
         if self._settlement_store is None and settlement_store_path is not None:
             if str(settlement_store_path).endswith(".db"):
@@ -205,11 +259,13 @@ class ConstitutionalMesh:
         """
         with self._lock:
             self._halted = True
+            self._state_generation += 1
 
     def resume(self) -> None:
         """Resume mesh operations after a halt."""
         with self._lock:
             self._halted = False
+            self._state_generation += 1
 
     @property
     def is_halted(self) -> bool:
@@ -243,12 +299,15 @@ class ConstitutionalMesh:
         """
         with self._lock:
             self._agents[agent_id] = _AgentInfo(agent_id=agent_id, domain=domain)
-            self._agent_vote_public_keys[agent_id] = self._coerce_public_key(vote_public_key)
+            self._agent_vote_public_keys[agent_id] = self._coerce_public_key(
+                vote_public_key
+            )
             self._agent_vote_private_keys.pop(agent_id, None)
             if self._use_manifold and agent_id not in self._agent_indices:
                 self._agent_indices[agent_id] = len(self._agent_indices)
                 self._rebuild_manifold()
                 self._restore_archive_for_agent(agent_id)
+            self._state_generation += 1
 
     def register_local_signer(
         self,
@@ -271,6 +330,7 @@ class ConstitutionalMesh:
                 self._agent_indices[agent_id] = len(self._agent_indices)
                 self._rebuild_manifold()
                 self._restore_archive_for_agent(agent_id)
+            self._state_generation += 1
 
     def register_agent(self, *args: Any, **kwargs: Any) -> None:
         """Removed in v0.3.0. Use register_local_signer() or register_remote_agent()."""
@@ -300,12 +360,16 @@ class ConstitutionalMesh:
                     for existing_agent_id, _ in sorted(
                         self._agent_indices.items(), key=lambda item: item[1]
                     )
-                    if existing_agent_id != agent_id and existing_agent_id in self._agents
+                    if existing_agent_id != agent_id
+                    and existing_agent_id in self._agents
                 ]
                 self._agent_indices = {
-                    existing_agent_id: idx for idx, existing_agent_id in enumerate(remaining_ids)
+                    existing_agent_id: idx
+                    for idx, existing_agent_id in enumerate(remaining_ids)
                 }
                 self._rebuild_manifold()
+            self._voter_dna.pop(agent_id, None)
+            self._state_generation += 1
 
     def rotate_constitution(
         self,
@@ -333,6 +397,9 @@ class ConstitutionalMesh:
                 agent_id="mesh-validator",
                 risk_scoring=self._risk_scoring,
             )
+            self._constitution_generation += 1
+            self._state_generation += 1
+            self._voter_dna.clear()
             if self._use_manifold:
                 if preserve_trust:
                     self._rebuild_manifold()
@@ -344,6 +411,38 @@ class ConstitutionalMesh:
                         self._shadow_metrics = []
                     self._trust_store = {}
                     self._rebuild_manifold()
+
+    def _voter_dna_locked(self, voter_id: str) -> AgentDNA:
+        """Return voter DNA bound to the current constitution identity.
+
+        The cache stores ``(generation, constitution_hash, dna)``. A cached
+        object whose constitution hash no longer matches, or that was disabled
+        or replaced, is discarded so an externally mutated AgentDNA cannot
+        ride an already-validated cache entry.
+        """
+        constitution_hash = self._constitution.hash
+        cached = self._voter_dna.get(voter_id)
+        if cached is not None:
+            generation, stored_hash, dna = cached
+            if (
+                generation == self._constitution_generation
+                and stored_hash == constitution_hash
+                and dna.constitution.hash == constitution_hash
+                and not dna.is_disabled
+            ):
+                return dna
+            self._voter_dna.pop(voter_id, None)
+        dna = AgentDNA(
+            constitution=self._constitution,
+            agent_id=voter_id,
+            strict=False,
+        )
+        self._voter_dna[voter_id] = (
+            self._constitution_generation,
+            constitution_hash,
+            dna,
+        )
+        return dna
 
     def get_reputation(self, agent_id: str) -> float:
         """Get an agent's reputation score."""
@@ -363,62 +462,165 @@ class ConstitutionalMesh:
     ) -> PeerAssignment:
         """Request peer validation of a producer's output.
 
-        Step 1: Constitutional DNA pre-check (443ns). Catches obvious
-                violations before wasting peer time.
-        Step 2: Select random peers, excluding the producer (MACI).
-        Step 3: Return assignment with cryptographic content hash.
+        DNA validation and trust projection run outside the mesh lock.
+        The assignment is committed only after re-checking halt,
+        membership, and constitution generation.
 
         Raises:
             ConstitutionalViolationError: Content violates constitution.
             InsufficientPeersError: Not enough peers available.
             KeyError: Producer not registered.
             MeshHaltedError: Mesh is halted.
+            MeshSnapshotStaleError: Snapshot became invalid and retries exhausted.
         """
+        last_stale: MeshSnapshotStaleError | None = None
+        for _ in range(3):
+            try:
+                return self._request_validation_once(producer_id, content, artifact_id)
+            except MeshSnapshotStaleError as exc:
+                last_stale = exc
+        assert last_stale is not None
+        raise last_stale
+
+    def _request_validation_once(
+        self,
+        producer_id: str,
+        content: str,
+        artifact_id: str,
+    ) -> PeerAssignment:
         with self._lock:
             self._check_halted()
             if producer_id not in self._agents:
                 raise KeyError(f"Producer {producer_id} not registered")
-
-            # Step 1: DNA pre-check — fail fast on constitutional violations.
-            # When risk_scoring is enabled, the result carries a semantic risk
-            # score that drives adaptive peer selection in Step 2.
-            dna_result = self._dna.validate(content)
-
-            # Step 2: Select peers (exclude producer — MACI).
-            # Adaptive scaling: high-risk content (score >= 0.5) gets extra
-            # peers up to max available, increasing Byzantine fault tolerance.
+            dna = self._dna
             available = [aid for aid in self._agents if aid != producer_id]
-            base_needed = min(self._peers_per_validation, len(available))
-            if self._risk_scoring and dna_result.risk_score >= 0.8:
-                # critical — use all available peers
-                needed = len(available)
-            elif self._risk_scoring and dna_result.risk_score >= 0.5:
-                # high — one extra peer
-                needed = min(base_needed + 1, len(available))
-            else:
-                needed = base_needed
-            if needed < self._quorum:
-                raise InsufficientPeersError(
-                    f"Need {self._quorum} peers for quorum, only {needed} available"
-                )
-            peers = tuple(self._select_peers(available, needed, producer_id))
+            snapshot = self._routing_snapshot_locked()
+            snapshot_hash = snapshot["constitution_hash"]
+            trust_raw = snapshot["trust"]
+            agent_indices = dict(self._agent_indices)
 
-            # Step 3: Create assignment with content hash
-            content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
-            assignment = PeerAssignment(
-                assignment_id=uuid.uuid4().hex[:12],
-                producer_id=producer_id,
-                artifact_id=artifact_id,
-                content=content,
-                content_hash=content_hash,
-                peers=peers,
-                constitutional_hash=self.constitutional_hash,
-                timestamp=time.time(),
+        dna_result = dna.validate(content)
+        base_needed = min(self._peers_per_validation, len(available))
+        if self._risk_scoring and dna_result.risk_score >= 0.8:
+            needed = len(available)
+        elif self._risk_scoring and dna_result.risk_score >= 0.5:
+            needed = min(base_needed + 1, len(available))
+        else:
+            needed = base_needed
+        if needed < self._quorum:
+            raise InsufficientPeersError(
+                f"Need {self._quorum} peers for quorum, only {needed} available"
             )
+        peers = tuple(
+            self._select_peers_unlocked(
+                available,
+                needed,
+                producer_id,
+                trust_raw=trust_raw,
+                agent_indices=agent_indices,
+            )
+        )
+
+        content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
+        assignment = PeerAssignment(
+            assignment_id=uuid.uuid4().hex[:12],
+            producer_id=producer_id,
+            artifact_id=artifact_id,
+            content=content,
+            content_hash=content_hash,
+            peers=peers,
+            constitutional_hash=snapshot_hash,
+            timestamp=time.time(),
+        )
+
+        with self._lock:
+            self._check_halted()
+            if not self._routing_snapshot_matches_locked(snapshot):
+                raise MeshSnapshotStaleError(
+                    "mesh membership, constitution, reputation, trust, DNA, "
+                    "or policy changed during validation"
+                )
+            if producer_id not in self._agents:
+                raise MeshSnapshotStaleError(
+                    f"Producer {producer_id} unregistered during validation"
+                )
+            missing = [peer for peer in peers if peer not in self._agents]
+            if missing:
+                raise MeshSnapshotStaleError(
+                    f"Assigned peers unregistered during validation: {missing}"
+                )
+            if assignment.constitutional_hash != self.constitutional_hash:
+                raise MeshSnapshotStaleError(
+                    "constitution hash changed during validation"
+                )
             self._assignments[assignment.assignment_id] = assignment
             self._votes[assignment.assignment_id] = []
             self._agents[producer_id].validations_received += 1
             return assignment
+
+    def _copy_raw_trust_locked(self) -> list[list[float]] | None:
+        if not self._use_manifold or self._manifold is None:
+            return None
+        raw = getattr(self._manifold, "_raw_trust", None)
+        if raw is None:
+            return None
+        return [list(row) for row in raw]
+
+    def _routing_snapshot_locked(self) -> dict[str, Any]:
+        """Capture every input that can invalidate snapshot-compute-commit."""
+        return {
+            "generation": self._state_generation,
+            "constitution_generation": self._constitution_generation,
+            "constitution_hash": self.constitutional_hash,
+            "dna_id": id(self._dna),
+            "dna_hash": self._dna.hash,
+            "dna_disabled": self._dna.is_disabled,
+            "policy_id": id(self._custom_trust_policy),
+            "agents": frozenset(self._agents),
+            "reputations": {
+                agent_id: info.reputation for agent_id, info in self._agents.items()
+            },
+            "trust": self._copy_raw_trust_locked(),
+        }
+
+    def _routing_snapshot_matches_locked(self, snapshot: dict[str, Any]) -> bool:
+        current = self._routing_snapshot_locked()
+        return current == snapshot
+
+    def _select_peers_unlocked(
+        self,
+        available: list[str],
+        needed: int,
+        producer_id: str,
+        *,
+        trust_raw: list[list[float]] | None,
+        agent_indices: dict[str, int] | None = None,
+    ) -> list[str]:
+        indices = self._agent_indices if agent_indices is None else agent_indices
+        if self._custom_trust_policy is not None:
+            # Detached, immutable inputs: the callable must not observe live
+            # mesh state and cannot mutate the snapshot peer list in place.
+            selected = self._custom_trust_policy(
+                tuple(available), int(needed), str(producer_id)
+            )
+            return list(selected)[:needed]
+        if not self._use_manifold or trust_raw is None or producer_id not in indices:
+            return list(self._rng.sample(available, k=needed))
+        detached = self._build_manifold(len(trust_raw), self._manifold_type)
+        detached._raw_trust = trust_raw  # type: ignore[attr-defined]
+        if hasattr(detached, "_projected"):
+            detached._projected = None  # type: ignore[attr-defined]
+        proj = detached.project()
+        if not getattr(proj, "converged", True):
+            return list(self._rng.sample(available, k=needed))
+        producer_idx = indices[producer_id]
+        trust_row = proj.matrix[producer_idx]
+        weight_map: dict[str, float] = {}
+        for aid in available:
+            idx = indices.get(aid)
+            weight = trust_row[idx] if idx is not None else 0.01
+            weight_map[aid] = max(weight, 0.01)
+        return self._sample_weighted_peers(available, needed, weight_map)
 
     def submit_vote(
         self,
@@ -450,16 +652,22 @@ class ConstitutionalMesh:
                     f"Assignment {assignment_id} is already durably settled"
                 )
             if assignment_id in self._final_results:
-                raise AssignmentSettledError(f"Assignment {assignment_id} is already settled")
+                raise AssignmentSettledError(
+                    f"Assignment {assignment_id} is already settled"
+                )
             if voter_id not in assignment.peers:
                 raise UnauthorizedVoterError(
                     f"{voter_id} is not assigned to validation {assignment_id}"
                 )
             if voter_id not in self._agents:
-                raise UnauthorizedVoterError(f"{voter_id} is not a registered mesh agent")
+                raise UnauthorizedVoterError(
+                    f"{voter_id} is not a registered mesh agent"
+                )
             public_key = self._agent_vote_public_keys.get(voter_id)
             if public_key is None:
-                raise UnauthorizedVoterError(f"{voter_id} has no registered vote public key")
+                raise UnauthorizedVoterError(
+                    f"{voter_id} has no registered vote public key"
+                )
             try:
                 public_key.verify(
                     bytes.fromhex(signature),
@@ -565,21 +773,27 @@ class ConstitutionalMesh:
                 settled=True,
                 settled_at=settled_at,
             )
-            pending_record = self._build_settlement_record(assignment, final)
+            pending_record = replace(
+                self._build_settlement_record(assignment, final),
+                votes=self._vote_dicts(list(self._votes.get(assignment_id, []))),
+            )
             recovered_assignment = replace(assignment, is_recovered=True)
             settled_record = self._build_settlement_record(recovered_assignment, final)
+            settled_votes = list(self._votes.get(assignment_id, []))
         # Persist outside the lock — store I/O must not block mesh operations.
         # A durable pending marker is written first so startup reconciliation can
         # recover frozen-but-not-yet-durable settlements after a crash.
         try:
             if self._settlement_store is not None:
                 self._settlement_store.mark_pending(pending_record)
+                self._maybe_crash("after-pending")
             with self._lock:
                 existing = self._final_results.get(assignment_id)
                 if existing is not None:
                     return existing
                 self._final_results[assignment_id] = final
-            self._persist_settlement_record(settled_record)
+            self._persist_settlement_record(settled_record, votes=settled_votes)
+            self._maybe_crash("after-append")
             if self._settlement_store is not None:
                 self._settlement_store.clear_pending(assignment_id)
             with self._lock:
@@ -613,12 +827,8 @@ class ConstitutionalMesh:
                     "use prepare_remote_vote() and submit_vote() for remote peers"
                 )
             content = assignment.content
+            voter_dna = self._voter_dna_locked(voter_id)
 
-        voter_dna = AgentDNA(
-            constitution=self._constitution,
-            agent_id=voter_id,
-            strict=False,
-        )
         result = voter_dna.validate(content)
 
         if result.valid:
@@ -700,7 +910,9 @@ class ConstitutionalMesh:
 
         _Client: type[RemoteVoteClient] | None
         try:
-            from constitutional_swarm.remote_vote_transport import RemoteVoteClient as _Client
+            from constitutional_swarm.remote_vote_transport import (
+                RemoteVoteClient as _Client,
+            )
         except ImportError:
             _Client = None
 
@@ -729,7 +941,9 @@ class ConstitutionalMesh:
                     " to collect_remote_votes()."
                 )
             request = self.prepare_remote_vote(assignment_id, peer_id)
-            response = await client.request_vote(route[0], route[1], request, timeout=timeout)
+            response = await client.request_vote(
+                route[0], route[1], request, timeout=timeout
+            )
             self._submit_remote_vote_response(assignment_id, peer_id, response)
 
         result = self.get_result(assignment_id)
@@ -756,7 +970,9 @@ class ConstitutionalMesh:
             timeout=timeout,
         )
 
-    def prepare_remote_vote(self, assignment_id: str, voter_id: str) -> RemoteVoteRequest:
+    def prepare_remote_vote(
+        self, assignment_id: str, voter_id: str
+    ) -> RemoteVoteRequest:
         """Build a signable vote request for a public-key-only remote peer."""
         with self._lock:
             assignment = self._assignments.get(assignment_id)
@@ -769,7 +985,9 @@ class ConstitutionalMesh:
                 )
             public_key = self._agent_vote_public_keys.get(voter_id)
             if public_key is None:
-                raise UnauthorizedVoterError(f"{voter_id} has no registered vote public key")
+                raise UnauthorizedVoterError(
+                    f"{voter_id} has no registered vote public key"
+                )
             voter_public_key = public_key.public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw,
@@ -883,7 +1101,9 @@ class ConstitutionalMesh:
         if abs(current_time - float(request.timestamp)) > replay_window_seconds:
             raise ValueError("Remote vote request timestamp is outside replay window")
         try:
-            public_key = ConstitutionalMesh._coerce_public_key(request.request_signer_public_key)
+            public_key = ConstitutionalMesh._coerce_public_key(
+                request.request_signer_public_key
+            )
             public_key.verify(
                 bytes.fromhex(request.request_signature),
                 ConstitutionalMesh.build_remote_vote_request_payload(
@@ -939,7 +1159,9 @@ class ConstitutionalMesh:
             total_votes = sum(len(v) for v in self._votes.values())
             settled = len(self._final_results)
         pending_settlements = (
-            0 if self._settlement_store is None else self._settlement_store.pending_count()
+            0
+            if self._settlement_store is None
+            else self._settlement_store.pending_count()
         )
         settlement_storage = (
             {"enabled": False, "backend": None, "pending": 0}
@@ -997,8 +1219,12 @@ class ConstitutionalMesh:
                 "count": len(metrics),
                 "birkhoff_variance": _summarize_metric(metrics, "birkhoff_variance"),
                 "spectral_variance": _summarize_metric(metrics, "spectral_variance"),
-                "birkhoff_spectral_norm": _summarize_metric(metrics, "birkhoff_spectral_norm"),
-                "spectral_spectral_norm": _summarize_metric(metrics, "spectral_spectral_norm"),
+                "birkhoff_spectral_norm": _summarize_metric(
+                    metrics, "birkhoff_spectral_norm"
+                ),
+                "spectral_spectral_norm": _summarize_metric(
+                    metrics, "spectral_spectral_norm"
+                ),
             }
 
     def _select_peers(
@@ -1018,27 +1244,19 @@ class ConstitutionalMesh:
         Falls back to uniform random sampling when the manifold is
         disabled, not yet converged, or the producer is not indexed.
         """
-        if (
-            not self._use_manifold
-            or self._manifold is None
-            or producer_id not in self._agent_indices
-        ):
-            return list(self._rng.sample(available, k=needed))
+        return self._select_peers_unlocked(
+            available,
+            needed,
+            producer_id,
+            trust_raw=self._copy_raw_trust_locked(),
+        )
 
-        proj = self._manifold.project()
-        if not getattr(proj, "converged", True):
-            return list(self._rng.sample(available, k=needed))
-
-        producer_idx = self._agent_indices[producer_id]
-        trust_row = proj.matrix[producer_idx]
-
-        # Build {agent_id: weight} dict — O(1) lookup, no index() calls
-        weight_map: dict[str, float] = {}
-        for aid in available:
-            idx = self._agent_indices.get(aid)
-            w = trust_row[idx] if idx is not None else 0.01
-            weight_map[aid] = max(w, 0.01)  # floor to prevent zero-weight exclusion
-
+    def _sample_weighted_peers(
+        self,
+        available: list[str],
+        needed: int,
+        weight_map: dict[str, float],
+    ) -> list[str]:
         if needed >= len(available):
             return list(available)
 
@@ -1121,7 +1339,9 @@ class ConstitutionalMesh:
 
     def _restore_trust_from_store(
         self,
-        manifold: GovernanceManifold | spectral_sphere_mod.SpectralSphereManifold | None = None,
+        manifold: GovernanceManifold
+        | spectral_sphere_mod.SpectralSphereManifold
+        | None = None,
     ) -> None:
         """Replay _trust_store into a freshly built manifold instance."""
         target = self._manifold if manifold is None else manifold
@@ -1177,7 +1397,9 @@ class ConstitutionalMesh:
             while len(self._trust_archive) >= self._TRUST_ARCHIVE_MAX:
                 oldest = min(
                     self._trust_archive,
-                    key=lambda aid: min(ts for _, ts in self._trust_archive[aid].values()),
+                    key=lambda aid: min(
+                        ts for _, ts in self._trust_archive[aid].values()
+                    ),
                 )
                 del self._trust_archive[oldest]
             self._trust_archive[agent_id] = entries
@@ -1211,6 +1433,8 @@ class ConstitutionalMesh:
             import constitutional_swarm.spectral_sphere as spectral_sphere_mod_local
 
             return spectral_sphere_mod_local.SpectralSphereManifold(num_agents=n, r=1.0)
+        from constitutional_swarm.manifold import GovernanceManifold
+
         return GovernanceManifold(n)
 
     # -- Internal ----------------------------------------------------------
@@ -1244,6 +1468,7 @@ class ConstitutionalMesh:
                 agent.reputation = min(2.0, agent.reputation + 0.01)
             else:
                 agent.reputation = max(0.0, agent.reputation - 0.05)
+            self._state_generation += 1
 
         if first_settlement:
             self._settled_assignments.add(assignment_id)
@@ -1260,6 +1485,7 @@ class ConstitutionalMesh:
                         else:
                             self._manifold.update_trust(producer_idx, voter_idx, -0.5)
                     self._manifold.project()
+                    self._state_generation += 1
                     shadow = getattr(self, "_shadow_manifold", None)
                     if shadow is not None:
                         try:
@@ -1278,7 +1504,9 @@ class ConstitutionalMesh:
                                     "birkhoff_variance": _trust_variance(
                                         self._manifold.trust_matrix
                                     ),
-                                    "spectral_variance": _trust_variance(shadow.trust_matrix),
+                                    "spectral_variance": _trust_variance(
+                                        shadow.trust_matrix
+                                    ),
                                     "birkhoff_spectral_norm": _matrix_spectral_norm(
                                         self._manifold.trust_matrix
                                     ),
@@ -1353,15 +1581,110 @@ class ConstitutionalMesh:
             timestamp=timestamp,
         )
 
-    def _persist_settlement(self, assignment: PeerAssignment, result: MeshResult) -> None:
+    def _persist_settlement(
+        self, assignment: PeerAssignment, result: MeshResult
+    ) -> None:
         """Append a settled assignment/result snapshot to disk when configured."""
-        self._persist_settlement_record(self._build_settlement_record(assignment, result))
+        votes = list(self._votes.get(assignment.assignment_id, []))
+        self._persist_settlement_record(
+            self._build_settlement_record(assignment, result),
+            votes=votes,
+        )
 
-    def _persist_settlement_record(self, record: SettlementRecord) -> None:
-        """Append a pre-built settlement record when configured."""
+    def _persist_settlement_record(
+        self,
+        record: SettlementRecord,
+        *,
+        votes: list[Any] | None = None,
+    ) -> None:
+        """Append a pre-built settlement record when configured.
+
+        When a store is configured, also emit a v0.1 receipt bound to the
+        protocol settlement digest. Receipt write happens first so a settlement
+        is never marked as having verifiable evidence unless the receipt exists.
+        """
         if self._settlement_store is None:
             return
-        self._settlement_store.append(record)
+        from cryptography.hazmat.primitives import serialization
+
+        from constitutional_swarm.governance_receipts import (
+            GovernanceReceiptBundle,
+            SignatureRecord,
+            build_receipt,
+            payload_canonical_bytes,
+            receipt_from_mesh_settlement,
+        )
+        from constitutional_swarm.settlement_evidence import (
+            RECEIPT_SIGNER_KEY_ID,
+            committed_receipt_index,
+            evidence_lock,
+            receipt_path_for,
+            store_filesystem_path,
+            write_receipt_atomic,
+        )
+
+        assignment_id = str(record.assignment["assignment_id"])
+        try:
+            unsigned = receipt_from_mesh_settlement(record, votes or [])
+            payload_bytes = payload_canonical_bytes(unsigned.payload)
+            signing_key = self._receipt_signing_private_key
+            signing_public = self._receipt_signing_public_key
+            signature = signing_key.sign(payload_bytes)
+            public_hex = signing_public.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            ).hex()
+            receipt = build_receipt(
+                payload=unsigned.payload,
+                signatures=[
+                    SignatureRecord(
+                        key_id=RECEIPT_SIGNER_KEY_ID,
+                        algorithm="ed25519",
+                        public_key_hex=public_hex,
+                        signature_hex=signature.hex(),
+                    )
+                ],
+            )
+        except Exception as exc:
+            raise SettlementPersistenceError(
+                f"Settlement {assignment_id} receipt could not be built"
+            ) from exc
+        bound = replace(record, receipt_digest=receipt.payload_digest)
+        if store_filesystem_path(self._settlement_store) is None:
+            # In-memory adapters have no receipt file; still persist the pointer.
+            self._settlement_store.append(bound)
+            return
+        receipt_path = receipt_path_for(self._settlement_store, assignment_id)
+        with evidence_lock(self._settlement_store):
+            referenced = committed_receipt_index(self._settlement_store)
+            if assignment_id in referenced:
+                # A committed pointer already exists. Do not replace the file.
+                self._settlement_store.append(bound)
+                return
+            try:
+                write_receipt_atomic(
+                    receipt_path,
+                    GovernanceReceiptBundle(receipts=[receipt]),
+                )
+                self._maybe_crash("after-receipt")
+            except Exception as exc:
+                raise SettlementPersistenceError(
+                    f"Settlement {assignment_id} receipt could not be persisted"
+                ) from exc
+            try:
+                self._settlement_store.append(bound)
+            except Exception:
+                still_referenced = committed_receipt_index(self._settlement_store)
+                if assignment_id not in still_referenced:
+                    receipt_path.unlink(missing_ok=True)
+                raise
+
+    def _receipt_bundle_path(self, assignment_id: str) -> Path:
+        from constitutional_swarm.settlement_evidence import receipt_path_for
+
+        if self._settlement_store is None:
+            return Path(f"mesh-settlements.jsonl.{assignment_id}.receipt.json")
+        return receipt_path_for(self._settlement_store, assignment_id)
 
     def _load_settlements(self) -> None:
         """Load settled assignments/results from disk when configured."""
@@ -1398,7 +1721,10 @@ class ConstitutionalMesh:
         pending_records = self._settlement_store.load_pending()
         logger.info(
             "Pending settlement reconciliation started",
-            extra={"settlement_backend": backend, "pending_records": len(pending_records)},
+            extra={
+                "settlement_backend": backend,
+                "pending_records": len(pending_records),
+            },
         )
         report = ReconciliationReport()
 
@@ -1414,10 +1740,14 @@ class ConstitutionalMesh:
                         "Persisted settlement constitutional hash does not match current mesh"
                     )
 
+                installed = False
                 with self._lock:
-                    existing_assignment = self._assignments.get(assignment.assignment_id)
+                    existing_assignment = self._assignments.get(
+                        assignment.assignment_id
+                    )
                     if assignment.is_recovered or (
-                        existing_assignment is not None and existing_assignment.is_recovered
+                        existing_assignment is not None
+                        and existing_assignment.is_recovered
                     ):
                         self._settlement_store.clear_pending(assignment.assignment_id)
                         report = ReconciliationReport(
@@ -1428,9 +1758,14 @@ class ConstitutionalMesh:
                             errors=errors,
                         )
                         continue
+                if not record.votes:
+                    raise ValueError("pending settlement has no authentic votes")
+                recovered_votes = self._authenticated_vote_dicts(list(record.votes))
+                with self._lock:
                     self._assignments.setdefault(assignment.assignment_id, assignment)
                     self._votes.setdefault(assignment.assignment_id, [])
                     self._final_results.setdefault(assignment.assignment_id, result)
+                    installed = True
 
                 report = ReconciliationReport(
                     attempted=report.attempted + 1,
@@ -1439,15 +1774,28 @@ class ConstitutionalMesh:
                     failed=report.failed,
                     errors=errors,
                 )
-                self._persist_settlement_record(
-                    self._build_settlement_record(
-                        replace(assignment, is_recovered=True),
-                        result,
+                try:
+                    self._persist_settlement_record(
+                        self._build_settlement_record(
+                            replace(assignment, is_recovered=True),
+                            result,
+                        ),
+                        votes=recovered_votes,
                     )
-                )
+                except Exception:
+                    if installed:
+                        with self._lock:
+                            self._final_results.pop(assignment.assignment_id, None)
+                            current = self._assignments.get(assignment.assignment_id)
+                            if current is assignment:
+                                self._assignments.pop(assignment.assignment_id, None)
+                    raise
                 with self._lock:
                     current_assignment = self._assignments.get(assignment.assignment_id)
-                    if current_assignment is not None and not current_assignment.is_recovered:
+                    if (
+                        current_assignment is not None
+                        and not current_assignment.is_recovered
+                    ):
                         self._assignments[assignment.assignment_id] = replace(
                             current_assignment,
                             is_recovered=True,
@@ -1485,6 +1833,70 @@ class ConstitutionalMesh:
         if self._settlement_store is None:
             return None
         return str(self._settlement_store.describe().get("backend"))
+
+    def _maybe_crash(self, point: str) -> None:
+        if getattr(self, "_settle_crash_point", None) == point:
+            os._exit(17)
+
+    def _public_key_hex(self, voter_id: str) -> str | None:
+        public_key = self._agent_vote_public_keys.get(voter_id)
+        if public_key is None:
+            return None
+        return public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+
+    def _vote_dicts(self, votes: list[Any]) -> tuple[dict[str, Any], ...]:
+        payload: list[dict[str, Any]] = []
+        for vote in votes:
+            if isinstance(vote, dict):
+                item = dict(vote)
+                if not item.get("public_key_hex"):
+                    item["public_key_hex"] = self._public_key_hex(str(item.get("voter_id", "")))
+                payload.append(item)
+                continue
+            payload.append(
+                {
+                    "assignment_id": vote.assignment_id,
+                    "voter_id": vote.voter_id,
+                    "approved": vote.approved,
+                    "reason": vote.reason,
+                    "signature": vote.signature,
+                    "constitutional_hash": vote.constitutional_hash,
+                    "content_hash": vote.content_hash,
+                    "timestamp": vote.timestamp,
+                    "public_key_hex": self._public_key_hex(vote.voter_id),
+                }
+            )
+        return tuple(payload)
+
+    def _authenticated_vote_dicts(self, votes: list[Any]) -> list[Any]:
+        authenticated: list[dict[str, Any]] = []
+        for vote in self._vote_dicts(votes):
+            public_hex = vote.get("public_key_hex")
+            signature = vote.get("signature")
+            if not public_hex or not signature:
+                raise ValueError("pending vote missing public key or signature")
+            try:
+                public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(public_hex)))
+                public_key.verify(
+                    bytes.fromhex(str(signature)),
+                    self._vote_payload_bytes(
+                        assignment_id=str(vote.get("assignment_id", "")),
+                        voter_id=str(vote.get("voter_id", "")),
+                        approved=bool(vote.get("approved")),
+                        reason=str(vote.get("reason", "")),
+                        constitutional_hash=str(vote.get("constitutional_hash", "")),
+                        content_hash=str(vote.get("content_hash", "")),
+                    ),
+                )
+            except (ValueError, InvalidSignature) as exc:
+                raise ValueError(
+                    f"pending vote {vote.get('voter_id')} is not authentic"
+                ) from exc
+            authenticated.append(vote)
+        return authenticated
 
     def _build_settlement_record(
         self, assignment: PeerAssignment, result: MeshResult
@@ -1576,7 +1988,11 @@ class ConstitutionalMesh:
             constitutional_hash=str(data["constitutional_hash"]),
             proof=self._deserialize_proof(data.get("proof")),
             settled=bool(data.get("settled", False)),
-            settled_at=(float(data["settled_at"]) if data.get("settled_at") is not None else None),
+            settled_at=(
+                float(data["settled_at"])
+                if data.get("settled_at") is not None
+                else None
+            ),
         )
 
     def sign_vote(
@@ -1599,7 +2015,9 @@ class ConstitutionalMesh:
                 raise KeyError(f"Assignment {assignment_id} not found")
             signing_key = self._agent_vote_private_keys.get(voter_id)
             if signing_key is None:
-                raise UnauthorizedVoterError(f"{voter_id} has no registered vote signing key")
+                raise UnauthorizedVoterError(
+                    f"{voter_id} has no registered vote signing key"
+                )
             return signing_key.sign(
                 self._vote_payload_bytes(
                     assignment_id=assignment_id,
@@ -1689,7 +2107,9 @@ class ConstitutionalMesh:
         return Ed25519PublicKey.from_public_bytes(raw)
 
     @staticmethod
-    def _coerce_private_key(value: Ed25519PrivateKey | bytes | str) -> Ed25519PrivateKey:
+    def _coerce_private_key(
+        value: Ed25519PrivateKey | bytes | str,
+    ) -> Ed25519PrivateKey:
         if isinstance(value, Ed25519PrivateKey):
             return value
         raw = bytes.fromhex(value) if isinstance(value, str) else value
@@ -1705,7 +2125,5 @@ class ConstitutionalMesh:
         constitutional_hash: str,
         content_hash: str,
     ) -> bytes:
-        payload = (
-            f"{assignment_id}:{voter_id}:{approved}:{reason}:{constitutional_hash}:{content_hash}"
-        )
+        payload = f"{assignment_id}:{voter_id}:{approved}:{reason}:{constitutional_hash}:{content_hash}"
         return payload.encode("utf-8")

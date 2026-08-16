@@ -201,7 +201,7 @@ class TestJudgmentConversion:
         bt_syn.artifact_hash = "art-hash-01"
         bt_syn.dna_valid = True
         bt_syn.dna_violations = ["none"]
-        bt_syn.dna_latency_ns = 443
+        bt_syn.dna_latency_ns = 443  # synthetic fixture, not a published latency claim
         bt_syn.miner_uid = "miner-42"
         bt_syn.miner_constitution_hash = "hash-a"
 

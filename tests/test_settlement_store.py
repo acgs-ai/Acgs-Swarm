@@ -1,6 +1,7 @@
 import json
 import threading
 import warnings
+from pathlib import Path
 
 import constitutional_swarm.settlement_store as settlement_store
 from constitutional_swarm import JSONLSettlementStore, SettlementRecord
@@ -85,3 +86,146 @@ class TestJSONLSettlementStoreLocking:
             pass
 
         assert calls == [(_FakeMSVCRT.LK_LOCK, 1), (_FakeMSVCRT.LK_UNLCK, 1)]
+
+
+class TestJSONLSettlementStoreIndex:
+    """Duplicate detection must not rescan the whole log on every append."""
+
+    def test_first_append_on_empty_file(self, tmp_path):
+        store = JSONLSettlementStore(tmp_path / "settlements.jsonl")
+        store.append(_make_record("a"))
+        assert [record.assignment["assignment_id"] for record in store.load_all()] == ["a"]
+
+    def test_sequential_appends_do_not_rescan_each_time(self, tmp_path):
+        store = JSONLSettlementStore(tmp_path / "settlements.jsonl")
+        for index in range(200):
+            store.append(_make_record(f"id-{index}"))
+        # Empty-start appends should never walk the log; only an explicit load
+        # (or an invalidated index) increments scan_passes.
+        assert store.scan_passes == 0
+        assert store.json_decode_count == 0
+        assert len(store.load_all()) == 200
+        assert store.scan_passes == 1
+        assert store.json_decode_count == 200
+
+    def test_same_process_duplicate_fails_closed(self, tmp_path):
+        store = JSONLSettlementStore(tmp_path / "settlements.jsonl")
+        store.append(_make_record("dup"))
+        try:
+            store.append(_make_record("dup"))
+        except settlement_store.DuplicateSettlementError as exc:
+            assert "dup" in str(exc)
+        else:
+            raise AssertionError("expected DuplicateSettlementError")
+        assert store.scan_passes == 0
+
+    def test_restart_detects_duplicate(self, tmp_path):
+        path = tmp_path / "settlements.jsonl"
+        JSONLSettlementStore(path).append(_make_record("persist"))
+        restarted = JSONLSettlementStore(path)
+        try:
+            restarted.append(_make_record("persist"))
+        except settlement_store.DuplicateSettlementError:
+            pass
+        else:
+            raise AssertionError("expected DuplicateSettlementError after restart")
+        assert restarted.scan_passes == 1
+        restarted.append(_make_record("next"))
+        assert restarted.scan_passes == 1
+
+    def test_external_append_invalidates_index(self, tmp_path):
+        path = tmp_path / "settlements.jsonl"
+        store = JSONLSettlementStore(path)
+        store.append(_make_record("local"))
+        payload = {
+            "assignment": {"assignment_id": "external"},
+            "result": {"ok": True},
+            "constitutional_hash": "abc123",
+            "schema_version": 1,
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        store.append(_make_record("after-external"))
+        try:
+            store.append(_make_record("external"))
+        except settlement_store.DuplicateSettlementError:
+            pass
+        else:
+            raise AssertionError("external assignment must be visible after invalidation")
+        ids = {record.assignment["assignment_id"] for record in store.load_all()}
+        assert ids == {"local", "external", "after-external"}
+
+    def test_mid_file_corruption_fails_closed(self, tmp_path):
+        path = tmp_path / "settlements.jsonl"
+        good = {
+            "assignment": {"assignment_id": "1"},
+            "result": {},
+            "constitutional_hash": "",
+            "schema_version": 1,
+        }
+        path.write_text(
+            json.dumps(good) + "\nnot-json\n" + json.dumps(good | {"assignment": {"assignment_id": "3"}}) + "\n",
+            encoding="utf-8",
+        )
+        store = JSONLSettlementStore(path)
+        try:
+            store.append(_make_record("4"))
+        except json.JSONDecodeError:
+            pass
+        else:
+            raise AssertionError("mid-file corruption must fail closed")
+
+    def test_injected_write_failure_does_not_commit_index(self, tmp_path, monkeypatch):
+        path = tmp_path / "settlements.jsonl"
+        store = JSONLSettlementStore(path)
+        store.append(_make_record("ok"))
+        original_open = Path.open
+
+        def _boom(self, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            handle = original_open(self, *args, **kwargs)
+            if mode == "a":
+                handle.write('{"assignment":{"assignment_id":"torn"')
+                handle.flush()
+                raise OSError("injected crash during append")
+            return handle
+
+        monkeypatch.setattr(Path, "open", _boom)
+        try:
+            store.append(_make_record("torn"))
+        except OSError:
+            pass
+        else:
+            raise AssertionError("injected crash did not fire")
+        monkeypatch.undo()
+
+        recovered = JSONLSettlementStore(path)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            recovered.append(_make_record("after-crash"))
+        ids = [record.assignment["assignment_id"] for record in recovered.load_all()]
+        assert ids == ["ok", "after-crash"]
+
+    def test_append_survives_torn_write_then_continues(self, tmp_path):
+        path = tmp_path / "settlements.jsonl"
+        store = JSONLSettlementStore(path)
+        store.append(_make_record("ok"))
+        # Durable effect of a crash mid-append: a terminal line with no newline.
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"assignment":{"assignment_id":"torn"')
+
+        recovered = JSONLSettlementStore(path)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            recovered.append(_make_record("after-crash"))
+        ids = [record.assignment["assignment_id"] for record in recovered.load_all()]
+        assert ids == ["ok", "after-crash"]
+
+    def test_scale_scan_passes_are_linear(self, tmp_path):
+        store = JSONLSettlementStore(tmp_path / "settlements.jsonl")
+        for index in range(1000):
+            store.append(_make_record(f"n-{index}"))
+        assert store.scan_passes == 0
+        store.load_all()
+        assert store.scan_passes == 1
+        assert store.json_decode_count == 1000

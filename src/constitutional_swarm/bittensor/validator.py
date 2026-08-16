@@ -160,7 +160,7 @@ class ConstitutionalValidator:
           4. Return ValidationSynapse with proof
 
         The mesh internally:
-          a. Runs DNA pre-check on the judgment content (443ns)
+          a. Runs DNA pre-check on the judgment content
           b. Assigns random peers (excluding the miner — MACI)
           c. Each peer validates via their own DNA
           d. Quorum decides acceptance

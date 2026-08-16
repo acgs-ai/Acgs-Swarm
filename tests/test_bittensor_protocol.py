@@ -138,7 +138,7 @@ class TestJudgmentSynapse:
             artifact_hash="abc123",
             constitutional_hash="608508a9bd224290",
             dna_valid=True,
-            dna_latency_ns=443,
+            dna_latency_ns=443,  # synthetic fixture, not a published latency claim
             domain="privacy",
         )
         assert synapse.dna_valid is True

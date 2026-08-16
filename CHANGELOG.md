@@ -6,7 +6,43 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- Declare `jsonschema` and `pyyaml` on the `[dev]` extra so
+  `make agent-check` / CI agent-operability can import
+  `scripts/agent_check.py` after `numpy`/`braintrust` left the default
+  extra graph.
+- Concurrent `full_validation` thread-safety test retries
+  `MeshSnapshotStaleError`. Reputation settlement is supposed to
+  invalidate in-flight routing snapshots; zero stale errors is not
+  part of the contract.
+
+### Changed
+- Default `import constitutional_swarm` now eager-loads only the governance
+  runtime surface (AgentDNA, DAG/executor, ConstitutionalMesh, settlement
+  stores, v0.1 receipts). Research, Bittensor, LangGraph, eval, and benchmark
+  symbols remain available via lazy `__getattr__` or explicit submodule
+  imports. `from constitutional_swarm import *` is now the stable façade
+  only — an intentional import-star compatibility break. `MeshSnapshotStaleError`
+  is part of that façade. See `docs/API_COMPATIBILITY.md`. The next published
+  version should be 1.1.0.
+- Mesh settlement receipts now bind `action` / `decision` / policy and content
+  hashes to the committed settlement, persist pending votes for crash recovery,
+  and treat a receipt as completed evidence only when a settlement points at
+  its payload digest.
+- `braintrust` is an optional extra (`[braintrust]`), not a core dependency.
+- `numpy` is no longer a core runtime dependency; it ships with `[dev]` and
+  `[research]`.
+- Paper-claim registry statuses are now `measured` / `formula` / `non_claim` /
+  `withdrawn`. Withdrawn 2656% and hardcoded latency pins no longer count as
+  reproduction passes.
+
 ### Added
+- Isolated-wheel packaging gate: `scripts/verify_isolated_wheel.py` /
+  `make verify-wheel` installs the built wheel into a blank venv.
+- `acgs-verify-receipts --settlement-store --assignment-id` starts
+  verification from a committed settlement pointer.
+- SQLite settlements persist a nullable `receipt_digest` pointer with
+  idempotent migration of older databases.
 - Agent self-evolution harness: `constitutional_swarm.agent_self_evolve` / `acgs-agent-self-evolve` discovers every operational agent manifest and vendored persona template, emits offline per-agent mutation scopes/guardrails/probes/suggestions, and is wired through `make agent-self-evolve`, `tools/registry.yaml`, a script wrapper, and a runbook.
 - Byzantine tamper-fraction census: `byzantine_census.estimate_tampered_fraction`
   turns a screened sample (`n_screened`, `n_tampered`) into a point estimate plus a

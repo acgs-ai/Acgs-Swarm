@@ -119,7 +119,7 @@ class TestAgentDNA:
             dna.validate("analyze code quality")
         elapsed = time.perf_counter_ns() - start
         avg_ns = elapsed // n
-        # Must be under 50us — we expect ~443ns locally. Loose bound tolerates
+        # Must be under 50us in this unit-test environment. Loose bound tolerates
         # shared-runner jitter; regression would still show orders of magnitude.
         assert avg_ns < 50_000, f"Too slow: {avg_ns}ns avg"
 

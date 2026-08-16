@@ -20,7 +20,7 @@ The safe set is S = {h : h·v_viol ≤ τ}; the hook maintains h ∈ S.
 Relationship to existing DNA layer
 -----------------------------------
 The existing dna.py (AgentDNA.validate) operates on the output string via
-Aho-Corasick pattern matching (~443ns, post-generation). LatentDNAWrapper is
+Aho-Corasick pattern matching (post-generation). LatentDNAWrapper is
 the pre-generation layer. In production, both run in sequence:
 
     [token generation → BODES hook] → [sampled token] → [AgentDNA.validate]

@@ -15,9 +15,7 @@ authors = [{name = "ACGS Team", email = "hello@acgs.dev"}]
 # and related). Shipped in acgs-lite v2.8.1 via PRs #9 and #10.
 dependencies = [
   "acgs-lite>=2.8.1",
-  "braintrust==0.31.0",
   "cryptography>=44.0.2",
-  "numpy>=1.24",
   "pydantic>=2,<3",
 ]
 
@@ -38,7 +36,21 @@ PyPI = "https://pypi.org/project/constitutional-swarm/"
 # PERF402, RUF100, ...) and flips the lint gate red with 54 findings on a tree
 # that is clean under 0.15.x (uv.lock pins 0.15.12). Same env-consistency
 # rationale as the mypy bound; raise deliberately alongside a lint-clean pass.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4,<0.16", "mypy>=2,<3"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.4,<0.16",
+  "mypy>=2,<3",
+  "numpy>=1.24",
+  # scripts/agent_check.py (make agent-check / CI agent-operability) imports
+  # these directly. They used to arrive transitively via numpy/braintrust and
+  # vanished once those left the default extra graph.
+  "jsonschema>=4.18",
+  "pyyaml>=6.0",
+]
+# Observability for testnet/eval scripts only (scripts/testnet_deploy.py).
+# Not imported by the runtime; pytest still disables the plugin via addopts.
+braintrust = ["braintrust==0.31.0"]
 # bittensor bounded below 11: v11 removed the miner/validator networking stack
 # (axon/dendrite/synapse) that synapse_adapter.py, axon_server.py, and
 # dendrite_client.py build on (bt.Synapse access raises AttributeError).
@@ -47,7 +59,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.4,<0.16", "mypy>=2,<3"]
 bittensor = ["bittensor>=7.0,<11"]
 transport = ["websockets>=12.0"]
 # research: MCFS research stack (latent DNA steering, swarm ODE dynamics)
-research = ["torch>=2.0", "transformers>=4.40"]
+research = ["torch>=2.0", "transformers>=4.40", "numpy>=1.24"]
 # deprecated alias — use research instead
 latent = ["constitutional-swarm[research]"]
 # finetune: trainer stack for the extended-refusal fine-tuning *reference recipe*
@@ -148,7 +160,8 @@ follow_imports_for_stubs = true
 checked = ["transport"]
 
 [tool.constitutional_swarm.typecheck_coverage.excepted]
-dev = "tooling only (pytest/ruff/mypy); not imported by src/"
+dev = "tooling only (pytest/ruff/mypy/numpy/jsonschema/pyyaml for tests + agent-check); not imported by the default runtime"
+braintrust = "optional testnet/eval telemetry; pytest disables the plugin; not imported by src/"
 bittensor = "bittensor ships no py.typed; installing adds no coverage over ignore_missing_imports"
 research = "torch/transformers are heavy and crash mypy; low value-to-cost — follow_imports=skip if ever gated"
 latent = "deprecated alias of research"
