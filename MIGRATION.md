@@ -15,7 +15,7 @@ venv `pip install constitutional-swarm` no longer pulls them.
 
 ```python
 from constitutional_swarm import AgentDNA, ConstitutionalMesh
-from constitutional_swarm import LegacyName          # lazy __getattr__
+from constitutional_swarm import EvolutionLog        # lazy __getattr__
 import constitutional_swarm.swe_bench                # submodule import
 ```
 

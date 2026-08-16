@@ -9,8 +9,8 @@ The format is based on Keep a Changelog.
 ## [1.1.0] - 2026-08-16
 
 Import-star and optional-dependency break relative to 1.0.0. See
-`docs/API_COMPATIBILITY.md` and `MIGRATION.md`. This tag does not
-itself publish to PyPI; `publish.yml` runs only after a GitHub Release.
+`docs/API_COMPATIBILITY.md` and `MIGRATION.md`. This metadata cut does
+not publish to PyPI; `publish.yml` runs only after a GitHub Release.
 
 ### Fixed
 - Declare `jsonschema` and `pyyaml` on the `[dev]` extra so
