@@ -321,7 +321,13 @@ def test_private_vote_rejects_same_voter_key_with_rotated_nullifier() -> None:
         choice=BallotChoice.YEA,
     )
 
-    result = tally([c1, c2], [r1, r2], epoch=b"epoch", subject=b"subject")
+    result = tally(
+        [c1, c2],
+        [r1, r2],
+        epoch=b"epoch",
+        subject=b"subject",
+        eligible_voters=frozenset({_pubkey_bytes(sk)}),
+    )
 
     assert len(result.accepted) == 1
     assert any(reason == "duplicate voter" for _, reason in result.rejected)
