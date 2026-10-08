@@ -304,14 +304,29 @@ The largest subpackage; a full incentive subnet. By role:
   `.remaining_epsilon`, `.summary`), `PrivacyBudgetExhausted`.
 
 ### `private_vote.py` — commit-reveal private voting
-- **Surface:** `PrivateBallotBox` (`.submit_commit`, `.close_commit_phase`,
-  `.submit_reveal`, `.tally`), `build_commit`/`build_reveal`/`tally`,
-  `compute_nullifier`, `CommitRecord`/`RevealRecord`/`PrivateTally`,
-  `BallotChoice`, validity provers (`HashCommitmentProver`, `ZKSnarkProver`
-  marker); errors `DoubleVoteError`, `InvalidCommitError`, `InvalidRevealError`,
+- **Surface:** construct `PrivateBallotBox` with `epoch`, `subject`,
+  `eligible_voters=frozenset(raw Ed25519 public keys)`, optional `provers`, and
+  `strict_v2`; then use `.submit_commit`, `.close_commit_phase`,
+  `.submit_reveal`, and `.tally(require_all_revealed=...)`. The box policy
+  cannot be overridden at tally time. The pure `tally(...)` function likewise
+  requires `eligible_voters`; `build_commit` and `build_reveal` construct the
+  two record types. `compute_nullifier` is keyword-only:
+  `compute_nullifier(voter_pub=..., epoch=..., subject=...)`. Other types are
+  `CommitRecord`, `RevealRecord`, `PrivateTally`, `BallotChoice`,
+  `HashCommitmentProver`, and the future-backend `ZKSnarkProver` protocol;
+  errors are `DoubleVoteError`, `InvalidCommitError`, `InvalidRevealError`, and
   `MissingRevealError`.
-- **Logic:** commit phase hides votes; reveal phase validates against commits;
-  **nullifiers** block double-voting per epoch; tally is deterministic.
+- **Logic:** commit/reveal records bind the registered voter key, epoch, and
+  subject. The public nullifier is recomputable from those values and prevents
+  a registered key from voting twice; it does not hide the key, establish a
+  person's identity, or provide Sybil resistance. `acgs-commit-sig-v2`
+  signatures also bind `version`, `proof_scheme`, and `validity_proof`. A
+  relayer can still withhold or strip fields, but any alteration invalidates
+  the signature and the receiver rejects the record. Strict mode requires a
+  registered verifier that advertises validity assurance and therefore rejects
+  the `HashCommitmentProver` wire-format scaffold. Construct the box with
+  `provers=None` when no verifier is needed. Regenerate ballots created with
+  the older nullifier, commitment, or commit-signature formats.
 
 ### `federated_bridge.py` — cross-org credential gate
 - **Surface:** `FederatedConstitutionBridge` (`.register_credential`, `.gate`,

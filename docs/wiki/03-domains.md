@@ -126,9 +126,17 @@ can blow up (one agent dominates) or collapse (everyone identical). The fix:
 - **`privacy_accountant.py`:** session-scoped RDP moments accountant for
   (ε,δ)-differential privacy; raises `PrivacyBudgetExhausted` when the cumulative
   ε-budget is spent.
-- **`private_vote.py`:** commit-reveal private voting with **nullifiers** to
-  prevent double-voting (`DoubleVoteError`), optional validity proofs (hash
-  commitment now, ZK-SNARK marker for later), and a deterministic `tally`.
+- **`private_vote.py`:** commit-reveal voting for an explicit
+  `eligible_voters=frozenset(raw Ed25519 public keys)`. Its keyword-only
+  `compute_nullifier(voter_pub=..., epoch=..., subject=...)` produces a public,
+  recomputable tag that limits each registered key to one ballot per
+  epoch/subject; the key is not proof of a person's identity or Sybil
+  resistance. Commit signatures use the `acgs-commit-sig-v2` domain and bind
+  the record version, proof scheme, and proof bytes. The ballot box fixes its
+  verifier and `strict_v2` policy at construction; strict mode rejects the
+  `HashCommitmentProver` scaffold because it provides no validity assurance.
+  Older ballots must be regenerated for the new commitment, nullifier, and
+  commit-signature formats.
 - **`federated_bridge.py`:** cross-organizational FCHP layer — verifiable
   `AgentCredential`s gate access across org boundaries with an audit log.
 - Protocol-level detail: [`docs/maci_dp_protocol.md`](../maci_dp_protocol.md).
