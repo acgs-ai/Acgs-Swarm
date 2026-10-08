@@ -34,11 +34,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
+
+from ._staging import _StagedBatch
+
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Decision type enum (from Q&A §2)
@@ -295,7 +302,7 @@ class AuditBatch:
 
     def compliance_rate(self) -> float:
         if not self._entries:
-            return 1.0
+            raise ValueError("compliance rate requires at least one entry")
         passed = sum(1 for e in self._entries if e.compliance_passed)
         return passed / len(self._entries)
 
@@ -409,39 +416,60 @@ class ArweaveAuditLogger:
         chain_submitter: AuditChainSubmitter | None = None,
         batch_size: int = 100,
     ) -> None:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
         self._constitutional_hash = constitutional_hash
         self._arweave = arweave_client
         self._chain_submitter = chain_submitter
         self._batch_size = batch_size
-        self._pending: list[AuditLogEntry] = []
+        self._pending: _StagedBatch[AuditLogEntry] = _StagedBatch()
         self._receipts: list[AuditLogReceipt] = []
+        self._state_lock = threading.RLock()
+        self._flush_guard = threading.Lock()
         # Retry state: if Phase 1 (Arweave upload) succeeded but Phase 2
         # (chain submit) failed, we cache the batch + tx_id to reuse on
         # retry instead of creating a ghost orphaned upload on Arweave.
         self._retry_state: tuple[AuditBatch, str] | None = None
+        self._staged_batch: AuditBatch | None = None
+        self._last_flush_error: Exception | None = None
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return self._pending.pending_count
 
     @property
     def receipts(self) -> list[AuditLogReceipt]:
-        return list(self._receipts)
+        with self._state_lock:
+            return list(self._receipts)
+
+    @property
+    def last_flush_error(self) -> Exception | None:
+        """Most recent external auto/explicit flush error, cleared on success."""
+        with self._state_lock:
+            return self._last_flush_error
 
     def add_entry(self, entry: AuditLogEntry) -> AuditLogReceipt | None:
         """Add an audit log entry. Auto-flushes when batch is full.
 
         Raises ValueError if entry's constitutional_hash doesn't match.
         Returns AuditLogReceipt if a flush occurred, else None.
+
+        The entry is accepted once appended. If an automatic external upload
+        or submit fails, this method logs the failure, leaves the stable batch
+        pending, records it in ``last_flush_error``, and returns None. A later
+        explicit ``flush()`` retries and propagates any external failure.
         """
         if entry.constitutional_hash != self._constitutional_hash:
             raise ValueError(
                 f"Entry constitutional hash mismatch: "
                 f"expected={self._constitutional_hash} got={entry.constitutional_hash}"
             )
-        self._pending.append(entry)
-        if len(self._pending) >= self._batch_size:
-            return self.flush()
+        with self._state_lock:
+            self._pending.append(entry)
+            should_flush = self._pending.pending_count >= self._batch_size
+        if should_flush:
+            return self._flush(auto=True)
         return None
 
     def flush(self) -> AuditLogReceipt | None:
@@ -451,65 +479,97 @@ class ArweaveAuditLogger:
         Arweave upload AND chain submission succeed.  If either fails,
         entries remain in ``_pending`` so the caller can retry.
 
+        One call processes exactly the stable prefix staged at its start.
+        Entries appended during external I/O remain queued, even if that suffix
+        reaches ``batch_size``; call ``flush()`` again (or add another entry)
+        to process the suffix.
+
         Returns AuditLogReceipt, or None if no pending entries.
         """
-        if not self._pending:
-            return None
+        return self._flush(auto=False)
 
-        # Reuse a previous successful Arweave upload when retrying after
-        # a chain submission failure.  This prevents ghost orphaned uploads
-        # accumulating on Arweave with no corresponding chain anchor.
-        if self._retry_state is not None:
-            batch, tx_id = self._retry_state
-        else:
-            batch = AuditBatch(
-                batch_id=uuid.uuid4().hex[:12],
-                constitutional_hash=self._constitutional_hash,
-                entries=list(self._pending),
-            )
+    def _flush(self, *, auto: bool) -> AuditLogReceipt | None:
+        if not self._flush_guard.acquire(blocking=False):
+            if auto:
+                return None
+            raise RuntimeError("flush already in progress")
+        try:
+            with self._state_lock:
+                entries = self._pending.stage()
+                if not entries:
+                    return None
+                if self._staged_batch is None:
+                    self._staged_batch = AuditBatch(
+                        batch_id=uuid.uuid4().hex[:12],
+                        constitutional_hash=self._constitutional_hash,
+                        entries=list(entries),
+                    )
+                batch = self._staged_batch
+                retry_state = self._retry_state
 
-            # Phase 1: Upload full batch JSON to Arweave.
-            # On failure the entries stay in _pending for retry.
-            batch_json = json.dumps(batch.to_dict()).encode()
-            tx_id = self._arweave.upload(
-                batch_json,
-                tags={
-                    "constitutional_hash": self._constitutional_hash,
-                    "batch_id": batch.batch_id,
-                    "batch_root": batch.batch_root,
-                    "App-Name": "ACGS-constitutional-swarm",
-                },
-            )
-            # Phase 1 succeeded — cache for potential Phase 2 retry.
-            self._retry_state = (batch, tx_id)
+            if retry_state is not None:
+                batch, tx_id = retry_state
+            else:
+                batch_json = json.dumps(batch.to_dict()).encode()
+                try:
+                    tx_id = self._arweave.upload(
+                        batch_json,
+                        tags={
+                            "constitutional_hash": self._constitutional_hash,
+                            "batch_id": batch.batch_id,
+                            "batch_root": batch.batch_root,
+                            "App-Name": "ACGS-constitutional-swarm",
+                        },
+                    )
+                except Exception as exc:
+                    with self._state_lock:
+                        self._last_flush_error = exc
+                    if auto:
+                        logger.exception(
+                            "automatic audit-log upload failed; entry remains pending"
+                        )
+                        return None
+                    raise
+                with self._state_lock:
+                    self._retry_state = (batch, tx_id)
 
-        # Phase 2: Anchor batch_root on-chain (optional).
-        # On failure the entries stay in _pending and _retry_state is
-        # preserved so the next flush() reuses the same batch + tx_id.
-        block_height: int | None = None
-        if self._chain_submitter is not None:
-            block_height = self._chain_submitter.submit(
+            block_height: int | None = None
+            if self._chain_submitter is not None:
+                try:
+                    block_height = self._chain_submitter.submit(
+                        batch_root=batch.batch_root,
+                        constitutional_hash=self._constitutional_hash,
+                        proof_count=batch.entry_count,
+                    )
+                except Exception as exc:
+                    with self._state_lock:
+                        self._last_flush_error = exc
+                    if auto:
+                        logger.exception(
+                            "automatic audit-log chain submit failed; entry remains pending"
+                        )
+                        return None
+                    raise
+
+            receipt = AuditLogReceipt(
+                receipt_id=uuid.uuid4().hex[:8],
+                batch_id=batch.batch_id,
                 batch_root=batch.batch_root,
+                arweave_tx_id=tx_id,
+                entry_count=batch.entry_count,
                 constitutional_hash=self._constitutional_hash,
-                proof_count=batch.entry_count,
+                created_at=time.time(),
+                block_height=block_height,
             )
-
-        # Both phases succeeded — clear pending entries and retry state.
-        self._pending = []
-        self._retry_state = None
-
-        receipt = AuditLogReceipt(
-            receipt_id=uuid.uuid4().hex[:8],
-            batch_id=batch.batch_id,
-            batch_root=batch.batch_root,
-            arweave_tx_id=tx_id,
-            entry_count=batch.entry_count,
-            constitutional_hash=self._constitutional_hash,
-            created_at=time.time(),
-            block_height=block_height,
-        )
-        self._receipts.append(receipt)
-        return receipt
+            with self._state_lock:
+                self._receipts.append(receipt)
+                self._pending.commit()
+                self._retry_state = None
+                self._staged_batch = None
+                self._last_flush_error = None
+            return receipt
+        finally:
+            self._flush_guard.release()
 
     def fetch_batch(self, receipt: AuditLogReceipt) -> AuditBatch:
         """Reconstruct an AuditBatch from Arweave using a receipt."""
@@ -517,17 +577,19 @@ class ArweaveAuditLogger:
         return AuditBatch.from_dict(json.loads(raw))
 
     def summary(self) -> dict[str, Any]:
-        return {
-            "constitutional_hash": self._constitutional_hash,
-            "batch_size": self._batch_size,
-            "pending": self._pending_count_safe(),
-            "total_flushed": sum(r.entry_count for r in self._receipts),
-            "batches_stored": len(self._receipts),
-            "latest_block": (self._receipts[-1].block_height if self._receipts else None),
-        }
+        with self._state_lock:
+            return {
+                "constitutional_hash": self._constitutional_hash,
+                "batch_size": self._batch_size,
+                "pending": self._pending.pending_count,
+                "total_flushed": sum(r.entry_count for r in self._receipts),
+                "batches_stored": len(self._receipts),
+                "latest_block": (self._receipts[-1].block_height if self._receipts else None),
+            }
 
     def _pending_count_safe(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return self._pending.pending_count
 
 
 # ---------------------------------------------------------------------------
