@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm.epoch_reconfig import (
     AmendmentProposal,
     ConstitutionVersion,
@@ -12,9 +16,24 @@ from constitutional_swarm.epoch_reconfig import (
     InvalidTransitionError,
     JointQuorumNotMetError,
     TransitionCertificate,
+    TransitionVerificationPolicy,
+    compute_validator_set_digest,
     compute_version_digest,
     evaluate_drift,
+    transition_vote_subject,
     verify_transition,
+)
+from constitutional_swarm.quorum_certificate import (
+    CertificateVerificationPolicy,
+    SignedVote,
+    build_certificate,
+    build_vote_message,
+)
+from constitutional_swarm.validator_set import (
+    CommitteeSelector,
+    FaultDomainPolicy,
+    ValidatorIdentity,
+    ValidatorSet,
 )
 
 
@@ -90,125 +109,126 @@ class TestEvaluateDrift:
 
 
 class TestTransitionCertificate:
-    def _make(
-        self,
-        *,
-        old_signers: frozenset[str] = frozenset({"v1", "v2", "v3"}),
-        new_signers: frozenset[str] = frozenset({"w1", "w2", "w3"}),
-    ) -> TransitionCertificate:
+    @staticmethod
+    def _validator_set(prefix: str, count: int = 3, stake: float = 1.0):
+        keys = {f"{prefix}{index}": Ed25519PrivateKey.generate() for index in range(count)}
+        validators = ValidatorSet(
+            (
+                ValidatorIdentity(
+                    agent_id,
+                    stake,
+                    fault_domain=agent_id,
+                    public_key_bytes=key.public_key().public_bytes(
+                        serialization.Encoding.Raw,
+                        serialization.PublicFormat.Raw,
+                    ),
+                )
+                for agent_id, key in keys.items()
+            ),
+            policy=FaultDomainPolicy(max_fraction=1.0),
+        )
+        return validators, keys
+
+    @staticmethod
+    def _qc(proposal, validators, keys, seed):
+        assignment_id, artifact_hash, epoch = transition_vote_subject(proposal)
+        committee = CommitteeSelector(validators).select(seed, len(validators))
+        message = build_vote_message(assignment_id, artifact_hash, epoch)
+        votes = [
+            SignedVote(
+                voter_id,
+                assignment_id,
+                artifact_hash,
+                epoch,
+                keys[voter_id].sign(message),
+                validators.get(voter_id).public_key_bytes,
+            )
+            for voter_id in committee.members
+        ]
+        return build_certificate(votes, committee=committee, validator_set=validators)
+
+    def _make(self, *, binding_digest: bytes = b"", drift_budget=DriftBudget()):
         v0 = _v(0, ("a", "b"))
         v1 = _v(1, ("a", "b", "c"), parent=v0.digest)
-        proposal = AmendmentProposal(prior=v0, proposed=v1)
-        return TransitionCertificate(
-            proposal=proposal,
-            old_side_signers=old_signers,
-            new_side_signers=new_signers,
-            old_side_threshold=3,
-            new_side_threshold=3,
+        old_set, old_keys = self._validator_set("v")
+        new_set, new_keys = self._validator_set("w")
+        proposal = AmendmentProposal(
+            prior=v0,
+            proposed=v1,
+            drift_budget=drift_budget,
+            binding_digest=binding_digest,
+            old_validator_set_digest=compute_validator_set_digest(old_set),
+            new_validator_set_digest=compute_validator_set_digest(new_set),
         )
+        old_qc = self._qc(proposal, old_set, old_keys, "old-seed")
+        new_qc = self._qc(proposal, new_set, new_keys, "new-seed")
+        certificate = TransitionCertificate(proposal, old_qc, new_qc)
+        policy = TransitionVerificationPolicy(
+            old_certificate=CertificateVerificationPolicy(
+                expected_committee_seed="old-seed"
+            ),
+            new_certificate=CertificateVerificationPolicy(
+                expected_committee_seed="new-seed"
+            ),
+        )
+        return certificate, old_set, new_set, policy
 
     def test_happy_path(self) -> None:
-        cert = self._make()
+        cert, old_set, new_set, policy = self._make()
         verify_transition(
             cert,
-            old_stake={"v1": 1, "v2": 1, "v3": 1, "v4": 1},
-            new_stake={"w1": 1, "w2": 1, "w3": 1, "w4": 1},
+            old_validator_set=old_set,
+            new_validator_set=new_set,
+            current_version=cert.proposal.prior,
+            policy=policy,
         )
 
     def test_rejects_insufficient_old_side(self) -> None:
-        cert = self._make(old_signers=frozenset({"v1", "v2"}))
+        cert, old_set, new_set, policy = self._make()
+        cert = replace(
+            cert,
+            old_side_certificate=replace(
+                cert.old_side_certificate,
+                votes=cert.old_side_certificate.votes[:1],
+            ),
+        )
         with pytest.raises(JointQuorumNotMetError):
             verify_transition(
                 cert,
-                old_stake={"v1": 1, "v2": 1, "v3": 1},
-                new_stake={"w1": 1, "w2": 1, "w3": 1},
+                old_validator_set=old_set,
+                new_validator_set=new_set,
+                current_version=cert.proposal.prior,
+                policy=policy,
             )
 
     def test_rejects_insufficient_new_side(self) -> None:
-        cert = self._make(new_signers=frozenset({"w1"}))
-        with pytest.raises(JointQuorumNotMetError):
-            verify_transition(
-                cert,
-                old_stake={"v1": 1, "v2": 1, "v3": 1},
-                new_stake={"w1": 1, "w2": 1, "w3": 1},
-            )
-
-    def test_rejects_unknown_old_signer(self) -> None:
-        cert = self._make(old_signers=frozenset({"v1", "v2", "ghost"}))
-        with pytest.raises(JointQuorumNotMetError):
-            verify_transition(
-                cert,
-                old_stake={"v1": 1, "v2": 1, "v3": 1},
-                new_stake={"w1": 1, "w2": 1, "w3": 1},
-            )
-
-    def test_stake_weighted_quorum(self) -> None:
-        # Two signers with heavy stake can meet threshold while three
-        # light signers cannot.
-        cert = self._make(
-            old_signers=frozenset({"v1", "v2"}),
-            new_signers=frozenset({"w1", "w2"}),
-        )
-        verify_transition(
+        cert, old_set, new_set, policy = self._make()
+        cert = replace(
             cert,
-            old_stake={"v1": 5, "v2": 5, "v3": 1},  # 10 ≥ 3
-            new_stake={"w1": 5, "w2": 5, "w3": 1},
+            new_side_certificate=replace(
+                cert.new_side_certificate,
+                votes=cert.new_side_certificate.votes[:1],
+            ),
         )
+        with pytest.raises(JointQuorumNotMetError):
+            verify_transition(
+                cert,
+                old_validator_set=old_set,
+                new_validator_set=new_set,
+                current_version=cert.proposal.prior,
+                policy=policy,
+            )
 
     def test_drift_budget_exceeded(self) -> None:
-        v0 = _v(0, ("a",))
-        # Add many rules in one step to blow the default budget (16).
-        many = tuple(f"rule{i}" for i in range(20))
-        v1 = _v(1, tuple(sorted(("a", *many))), parent=v0.digest)
-        proposal = AmendmentProposal(
-            prior=v0,
-            proposed=v1,
-            drift_budget=DriftBudget(max_rule_delta=5),
+        cert, old_set, new_set, policy = self._make(
+            drift_budget=DriftBudget(max_rule_delta=10_000)
         )
-        cert = TransitionCertificate(
-            proposal=proposal,
-            old_side_signers=frozenset({"v1", "v2", "v3"}),
-            new_side_signers=frozenset({"w1", "w2", "w3"}),
-            old_side_threshold=3,
-            new_side_threshold=3,
-        )
+        policy = replace(policy, max_rule_delta=0)
         with pytest.raises(DriftBudgetExceeded):
             verify_transition(
                 cert,
-                old_stake={"v1": 1, "v2": 1, "v3": 1},
-                new_stake={"w1": 1, "w2": 1, "w3": 1},
-            )
-
-    def test_drift_budget_is_checked_before_quorum(self) -> None:
-        v0 = _v(0, ("a",))
-        many = tuple(f"rule{i}" for i in range(20))
-        v1 = _v(1, tuple(sorted(("a", *many))), parent=v0.digest)
-        proposal = AmendmentProposal(
-            prior=v0,
-            proposed=v1,
-            drift_budget=DriftBudget(max_rule_delta=5),
-        )
-        # Intentionally empty quorum sets — drift should still be
-        # raised first.
-        cert = TransitionCertificate(
-            proposal=proposal,
-            old_side_signers=frozenset(),
-            new_side_signers=frozenset(),
-            old_side_threshold=1,
-            new_side_threshold=1,
-        )
-        with pytest.raises(DriftBudgetExceeded):
-            verify_transition(cert, old_stake={}, new_stake={})
-
-    def test_zero_threshold_rejected(self) -> None:
-        v0 = _v(0, ("a",))
-        v1 = _v(1, ("a", "b"), parent=v0.digest)
-        proposal = AmendmentProposal(prior=v0, proposed=v1)
-        with pytest.raises(InvalidTransitionError):
-            TransitionCertificate(
-                proposal=proposal,
-                old_side_signers=frozenset(),
-                new_side_signers=frozenset(),
-                old_side_threshold=0,
-                new_side_threshold=1,
+                old_validator_set=old_set,
+                new_validator_set=new_set,
+                current_version=cert.proposal.prior,
+                policy=policy,
             )

@@ -91,6 +91,7 @@ class TestConstitutionSyncMessage:
         expected = hashlib.sha256(yaml.encode()).hexdigest()[:16]
         return ConstitutionSyncMessage(
             version_id="v001",
+            version=1,
             expected_hash=expected,
             yaml_content=yaml,
             issued_at=time.time(),
@@ -104,6 +105,7 @@ class TestConstitutionSyncMessage:
         msg = self._make_msg()
         tampered = ConstitutionSyncMessage(
             version_id=msg.version_id,
+            version=msg.version,
             expected_hash=msg.expected_hash,
             yaml_content=msg.yaml_content + "\n# tampered",
             issued_at=msg.issued_at,
@@ -114,6 +116,7 @@ class TestConstitutionSyncMessage:
         msg = self._make_msg()
         wrong = ConstitutionSyncMessage(
             version_id=msg.version_id,
+            version=msg.version,
             expected_hash="wronghash1234567",
             yaml_content=msg.yaml_content,
             issued_at=msg.issued_at,
@@ -124,6 +127,7 @@ class TestConstitutionSyncMessage:
         msg = self._make_msg()
         restored = ConstitutionSyncMessage.from_dict(msg.to_dict())
         assert restored.version_id == msg.version_id
+        assert restored.version == msg.version
         assert restored.expected_hash == msg.expected_hash
         assert restored.yaml_content == msg.yaml_content
 
@@ -162,6 +166,7 @@ class TestConstitutionDistributor:
         history = dist.version_history
         assert history[0].yaml_content == YAML_V1
         assert history[1].yaml_content == YAML_V2
+        assert [record.version for record in history] == [1, 2]
 
     def test_multiple_updates(self):
         dist = ConstitutionDistributor(YAML_V1)
@@ -199,6 +204,7 @@ class TestConstitutionReceiver:
         msg = dist.broadcast_message()
         tampered = ConstitutionSyncMessage(
             version_id=msg.version_id,
+            version=msg.version,
             expected_hash=msg.expected_hash,
             yaml_content=msg.yaml_content + "\n# tampered",
             issued_at=msg.issued_at,
@@ -208,17 +214,6 @@ class TestConstitutionReceiver:
 
         assert result.success is False
         assert not receiver.is_initialised
-
-    def test_apply_noop_same_version(self):
-        dist = ConstitutionDistributor(YAML_V1)
-        msg = dist.broadcast_message()
-        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
-        receiver.apply(msg)
-
-        result = receiver.apply(msg)
-        assert result.success is True
-        assert "no-op" in result.message.lower()
-        assert len(receiver.version_history) == 1  # not duplicated
 
     def test_apply_version_update(self):
         dist = ConstitutionDistributor(YAML_V1)

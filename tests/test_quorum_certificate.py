@@ -18,6 +18,7 @@ import json
 
 import pytest
 from constitutional_swarm.quorum_certificate import (
+    CertificateVerificationPolicy,
     InsufficientQuorumError,
     InvalidCertificateError,
     QuorumCertificate,
@@ -410,7 +411,7 @@ class TestBuildCertificate:
             _sign(rogue_sk, "asgn", "hash-accept", 1),
             rogue_pk,
         )
-        with pytest.raises(InvalidCertificateError, match="not a member"):
+        with pytest.raises(InvalidCertificateError, match="committee"):
             build_certificate(
                 [*votes, rogue_vote],
                 committee=committee,
@@ -445,15 +446,14 @@ class TestBuildCertificate:
         with pytest.raises(InvalidCertificateError, match="signature"):
             build_certificate([tampered, *votes[1:]], committee=committee, validator_set=vs)
 
-    def test_duplicate_voter_deduped(self):
+    def test_duplicate_voter_rejected(self):
         vs, committee, votes, _, _ = _make_committee_and_votes()
-        qc = build_certificate(
-            [votes[0], votes[0], *votes[1:]],
-            committee=committee,
-            validator_set=vs,
-        )
-        # first duplicate wins, rest unchanged
-        assert len(qc.votes) == 5
+        with pytest.raises(InvalidCertificateError, match="duplicate"):
+            build_certificate(
+                [votes[0], votes[0], *votes[1:]],
+                committee=committee,
+                validator_set=vs,
+            )
 
 
 class TestSerialization:
@@ -540,23 +540,35 @@ class TestConflictDetection:
         ]
         qc_a = build_certificate(votes_a, committee=committee, validator_set=vs)
         qc_b = build_certificate(votes_b, committee=committee, validator_set=vs)
-        ev = detect_conflict(qc_a, qc_b)
+        ev = detect_conflict(qc_a, qc_b, validator_set=vs)
         assert ev is not None
-        assert ev.is_slashable()
+        assert ev.is_slashable(validator_set=vs)
         # All 5 signers equivocated → all 5 slashable
         assert ev.equivocators == frozenset(committee.members)
 
     def test_same_artifact_is_not_conflict(self):
         vs, committee, votes, _, _ = _make_committee_and_votes()
         qc = build_certificate(votes, committee=committee, validator_set=vs)
-        assert detect_conflict(qc, qc) is None
+        assert detect_conflict(qc, qc, validator_set=vs) is None
 
     def test_different_epoch_is_not_conflict(self):
-        vs1, c1, v1, *_ = _make_committee_and_votes(artifact_hash="hash-A", epoch=1)
-        vs2, c2, v2, *_ = _make_committee_and_votes(artifact_hash="hash-B", epoch=2)
-        qc1 = build_certificate(v1, committee=c1, validator_set=vs1)
-        qc2 = build_certificate(v2, committee=c2, validator_set=vs2)
-        assert detect_conflict(qc1, qc2) is None
+        vs, committee, v1, sks, pks = _make_committee_and_votes(
+            artifact_hash="hash-A", epoch=1
+        )
+        v2 = [
+            SignedVote(
+                voter_id=aid,
+                assignment_id="asgn",
+                artifact_hash="hash-B",
+                epoch=2,
+                signature=_sign(sks[aid], "asgn", "hash-B", 2),
+                public_key_bytes=pks[aid],
+            )
+            for aid in committee.members
+        ]
+        qc1 = build_certificate(v1, committee=committee, validator_set=vs)
+        qc2 = build_certificate(v2, committee=committee, validator_set=vs)
+        assert detect_conflict(qc1, qc2, validator_set=vs) is None
 
     def test_different_assignment_is_not_conflict(self):
         # Two QCs for different assignment_ids with different artifact_hashes
@@ -580,7 +592,7 @@ class TestConflictDetection:
         c2 = sel.select("seed", committee_size=5)
         qc_a = build_certificate(votes_a, committee=committee, validator_set=vs)
         qc_b = build_certificate(votes_b, committee=c2, validator_set=vs)
-        assert detect_conflict(qc_a, qc_b) is None
+        assert detect_conflict(qc_a, qc_b, validator_set=vs) is None
 
     def test_partial_overlap_slashes_only_equivocators(self):
         """If only some voters signed both QCs, only they are slashable."""
@@ -595,12 +607,10 @@ class TestConflictDetection:
         vs = ValidatorSet(idents, policy=FaultDomainPolicy(max_fraction=0.5))
         sel = CommitteeSelector(vs)
 
-        # Committee 1 signs artifact A; committee 2 signs artifact B.
-        # We hand-build overlapping committees to force a shared signer.
-        c1 = sel.select("seed", committee_size=4)
-        c2 = sel.select("seed-other", committee_size=4)
-        shared = set(c1.members) & set(c2.members)
-        assert shared, "test setup must have at least one shared signer"
+        committee = sel.select("seed", committee_size=4)
+        members_a = committee.members[:3]
+        members_b = committee.members[1:]
+        shared = set(members_a) & set(members_b)
 
         def _sign_set(members, artifact, epoch=1):
             return [
@@ -616,15 +626,23 @@ class TestConflictDetection:
             ]
 
         qc_a = build_certificate(
-            _sign_set(c1.members, "hash-A"),
-            committee=c1,
+            _sign_set(members_a, "hash-A"),
+            committee=committee,
             validator_set=vs,
         )
         qc_b = build_certificate(
-            _sign_set(c2.members, "hash-B"),
-            committee=c2,
+            _sign_set(members_b, "hash-B"),
+            committee=committee,
             validator_set=vs,
         )
-        ev = detect_conflict(qc_a, qc_b)
+        ev = detect_conflict(
+            qc_a,
+            qc_b,
+            validator_set=vs,
+            policy=CertificateVerificationPolicy(
+                committee_size=4,
+                expected_committee_seed="seed",
+            ),
+        )
         assert ev is not None
         assert ev.equivocators == shared
