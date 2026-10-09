@@ -22,6 +22,7 @@ Roadmap reference: 08-subnet-implementation-roadmap.md § Phase 2.1
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -30,6 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from ._merkle import compute_merkle_root, is_digest
 from ._staging import _StagedBatch
 
 logger = logging.getLogger(__name__)
@@ -174,11 +176,38 @@ class AnchorRecord:
     def verify_membership(self, proof: ProofEvidence) -> bool:
         """Verify that a proof was included in this batch.
 
-        Re-computes the Merkle root from stored leaf hashes with the
-        candidate proof swapped in, then compares to the batch root.
-        Returns True if the proof's leaf is in the stored leaves.
+        Re-computes the Merkle root from stored leaf hashes, validates all
+        record counts and types, then checks the candidate's constitution,
+        proof ID, and leaf membership.
         """
-        return proof.membership_leaf() in set(self.leaf_hashes)
+        if type(proof) is not ProofEvidence:
+            return False
+        if (
+            type(self.proof_count) is not int
+            or self.proof_count < 0
+            or type(self.proof_ids) is not tuple
+            or type(self.leaf_hashes) is not tuple
+            or self.proof_count != len(self.leaf_hashes)
+            or len(self.proof_ids) != self.proof_count
+            or any(type(proof_id) is not str for proof_id in self.proof_ids)
+            or any(type(leaf_hash) is not str for leaf_hash in self.leaf_hashes)
+            or not is_digest(self.batch_root)
+            or type(self.constitutional_hash) is not str
+            or type(proof.proof_id) is not str
+            or type(proof.constitutional_hash) is not str
+            or proof.constitutional_hash != self.constitutional_hash
+        ):
+            return False
+        try:
+            recomputed_root = _compute_merkle_root(list(self.leaf_hashes))
+            candidate_leaf = proof.membership_leaf()
+        except (TypeError, ValueError):
+            return False
+        return (
+            hmac.compare_digest(recomputed_root, self.batch_root)
+            and proof.proof_id in set(self.proof_ids)
+            and candidate_leaf in set(self.leaf_hashes)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,28 +228,8 @@ class AnchorRecord:
 
 
 def _compute_merkle_root(leaves: list[str]) -> str:
-    """Compute a binary Merkle root over a list of leaf hashes.
-
-    Leaves are sorted for determinism. Odd-length levels are padded
-    by duplicating the last leaf (standard Bitcoin-style padding).
-    Returns the SHA-256 hex root.
-    """
-    if not leaves:
-        return hashlib.sha256(b"").hexdigest()
-
-    layer = sorted(leaves)
-
-    while len(layer) > 1:
-        next_layer: list[str] = []
-        # Pad odd-length layers
-        if len(layer) % 2 == 1:
-            layer.append(layer[-1])
-        for i in range(0, len(layer), 2):
-            combined = layer[i] + layer[i + 1]
-            next_layer.append(hashlib.sha256(combined.encode()).hexdigest())
-        layer = next_layer
-
-    return layer[0]
+    """Compute the shared count-committed root over sorted leaf digests."""
+    return compute_merkle_root(sorted(leaves))
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +327,8 @@ class ChainAnchor:
         Raises ValueError if the proof's constitutional hash does not
         match the anchor's expected hash.
         """
+        if type(proof) is not ProofEvidence:
+            raise TypeError("proof must be an exact ProofEvidence instance")
         if proof.constitutional_hash != self._constitutional_hash:
             raise ValueError(
                 f"Proof constitutional hash mismatch: "
@@ -412,7 +423,3 @@ class ChainAnchor:
                 if self._history
                 else None,
             }
-
-    def _pending_count_safe(self) -> int:
-        with self._state_lock:
-            return self._pending.pending_count
