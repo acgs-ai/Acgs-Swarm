@@ -1525,6 +1525,28 @@ def _validate_complete_answer_matrix(
         raise ValueError(msg)
 
 
+def _hypergeometric_upper_tail(
+    population_size: int,
+    marked_count: int,
+    draw_count: int,
+    observed_overlap: int,
+) -> float:
+    """Return P(X >= observed_overlap) for a hypergeometric random variable."""
+
+    maximum_overlap = min(marked_count, draw_count)
+    if observed_overlap <= 0:
+        return 1.0
+    if observed_overlap > maximum_overlap:
+        return 0.0
+    denominator = math.comb(population_size, draw_count)
+    return sum(
+        math.comb(marked_count, overlap)
+        * math.comb(population_size - marked_count, draw_count - overlap)
+        for overlap in range(observed_overlap, maximum_overlap + 1)
+        if 0 <= draw_count - overlap <= population_size - marked_count
+    ) / denominator
+
+
 def validate_answer_matrix(
     protocol: ForensicBenchmarkProtocol,
     answers: Sequence[ReviewerAnswer],
@@ -1674,21 +1696,25 @@ def validate_answer_matrix(
                     )
                 )
 
-    vectors_by_reviewer: dict[str, dict[tuple[str, str, str], str]] = {}
+    vectors_by_reviewer: dict[
+        str, dict[tuple[str, str, str], tuple[str, str]]
+    ] = {}
     for reviewer_id in reviewer_ids:
         vectors_by_reviewer[reviewer_id] = {
             (
                 answer.incident_id,
                 answer.artifact_condition,
                 answer.question_id,
-            ): answer.answer.strip().casefold()
+            ): (
+                answer.answer.strip().casefold(),
+                answer.ground_truth.strip().casefold(),
+            )
             for answer in answers
             if answer.reviewer_id == reviewer_id
         }
     expected_vector_size = protocol.incident_count * len(FORENSIC_QUESTIONNAIRE)
-    identical_pairs: list[tuple[str, str]] = []
-    near_duplicate_pairs: list[tuple[str, str, int, int, float]] = []
     sorted_reviewers = sorted(vectors_by_reviewer)
+    comparable_pairs: list[tuple[str, str]] = []
     for index, left in enumerate(sorted_reviewers):
         for right in sorted_reviewers[index + 1 :]:
             left_vector = vectors_by_reviewer[left]
@@ -1699,41 +1725,70 @@ def validate_answer_matrix(
                 or left_vector.keys() != right_vector.keys()
             ):
                 continue
-            compared_count = len(left_vector)
-            matching_count = sum(
-                left_vector[cell] == right_vector[cell] for cell in left_vector
-            )
-            if matching_count == compared_count:
-                identical_pairs.append((left, right))
-                continue
-            agreement_ratio = matching_count / compared_count
-            if agreement_ratio > 0.95:
-                near_duplicate_pairs.append(
-                    (left, right, matching_count, compared_count, agreement_ratio)
+            comparable_pairs.append((left, right))
+
+    suspicious_pairs: list[tuple[str, str, int, int, int, float, float]] = []
+    pair_count = len(comparable_pairs)
+    for left, right in comparable_pairs:
+        left_vector = vectors_by_reviewer[left]
+        right_vector = vectors_by_reviewer[right]
+        left_wrong = {
+            cell for cell, (answer, truth) in left_vector.items() if answer != truth
+        }
+        right_wrong = {
+            cell for cell, (answer, truth) in right_vector.items() if answer != truth
+        }
+        shared_identical_wrong = sum(
+            cell in right_wrong and left_vector[cell][0] == right_vector[cell][0]
+            for cell in left_wrong
+        )
+        if not shared_identical_wrong:
+            continue
+        raw_probability = _hypergeometric_upper_tail(
+            len(left_vector),
+            len(left_wrong),
+            len(right_wrong),
+            shared_identical_wrong,
+        )
+        corrected_probability = min(1.0, raw_probability * pair_count)
+        if corrected_probability <= 0.05:
+            suspicious_pairs.append(
+                (
+                    left,
+                    right,
+                    shared_identical_wrong,
+                    len(left_wrong),
+                    len(right_wrong),
+                    raw_probability,
+                    corrected_probability,
                 )
-    diagnostics = []
-    if identical_pairs:
-        rendered_pairs = ", ".join(f"{left}/{right}" for left, right in identical_pairs)
-        diagnostics.append(
-            ResultValidationIssue(
-                code="identical_reviewer_answer_vectors",
-                message=(
-                    "reviewers submitted identical normalized answer vectors; investigate "
-                    f"possible answer copying: {rendered_pairs}"
-                ),
             )
-        )
-    if near_duplicate_pairs:
+
+    diagnostics = []
+    if suspicious_pairs:
         rendered_pairs = ", ".join(
-            f"{left}/{right} ({matching}/{compared}, {ratio:.3%})"
-            for left, right, matching, compared, ratio in near_duplicate_pairs
+            (
+                f"{left}/{right} (shared_identical_wrong={shared}, "
+                f"errors={left_errors}/{right_errors}, raw_p={raw_p:.3g}, "
+                f"corrected_p={corrected_p:.3g})"
+            )
+            for (
+                left,
+                right,
+                shared,
+                left_errors,
+                right_errors,
+                raw_p,
+                corrected_p,
+            ) in suspicious_pairs
         )
         diagnostics.append(
             ResultValidationIssue(
-                code="near_duplicate_reviewer_answer_vectors",
+                code="implausible_shared_wrong_answers",
                 message=(
-                    "reviewers agreed on more than 95% of a complete comparable "
-                    "normalized answer vector; investigate possible answer copying: "
+                    "reviewers share statistically implausible identical wrong answers "
+                    "under a hypergeometric overlap model with Bonferroni correction "
+                    f"across {pair_count} comparable pairs; investigate copying: "
                     f"{rendered_pairs}"
                 ),
             )

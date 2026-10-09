@@ -40,7 +40,7 @@ from constitutional_swarm.mesh import ConstitutionalMesh, MeshResult
 from constitutional_swarm.mesh.vote_envelope import (
     VoteSignerRegistry,
     normalize_voter_id,
-    verify_vote_envelopes,
+    verify_assignment_vote_envelopes,
     vote_envelope_hash,
 )
 
@@ -224,9 +224,15 @@ class ConstitutionalValidator:
         config: ValidatorConfig,
         *,
         vote_registry: VoteSignerRegistry | None = None,
+        assigner_private_key: Ed25519PrivateKey | bytes | str | None = None,
+        assigner_id: str = "mesh-assigner",
+        request_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
     ) -> None:
         self._config = config
         self._constitution = Constitution.from_yaml(config.constitution_path)
+        self._assigner_private_key = _vote_private_key(assigner_private_key)
+        self._assigner_id = normalize_voter_id(assigner_id)
+        self._request_signing_private_key = _vote_private_key(request_signing_private_key)
         self._mesh = ConstitutionalMesh(
             self._constitution,
             peers_per_validation=config.peers_per_validation,
@@ -234,6 +240,9 @@ class ConstitutionalValidator:
             use_manifold=config.use_manifold,
             complete_evidence=config.complete_evidence,
             vote_registry=vote_registry,
+            assigner_private_key=self._assigner_private_key,
+            assigner_id=self._assigner_id,
+            request_signing_private_key=self._request_signing_private_key,
             evidence_mode=(
                 "single_operator_dev" if config.single_operator_dev else "independent"
             ),
@@ -273,6 +282,9 @@ class ConstitutionalValidator:
                 use_manifold=self._config.use_manifold,
                 complete_evidence=self._config.complete_evidence,
                 vote_registry=self._mesh.vote_registry,
+                assigner_private_key=self._assigner_private_key,
+                assigner_id=self._assigner_id,
+                request_signing_private_key=self._request_signing_private_key,
                 evidence_mode=(
                     "single_operator_dev"
                     if self._config.single_operator_dev
@@ -612,12 +624,14 @@ class ConstitutionalValidator:
             mesh = self._mesh
             vote_registry = mesh.vote_registry
         authoritative_result = mesh.get_result(result.assignment_id)
-        expected_assigned_peers = tuple(
-            envelope.voter_id for envelope in authoritative_result.vote_envelopes
-        )
         if result.constitutional_hash != current_constitutional_hash:
             raise ValueError("mesh result constitution does not match validator constitution")
-        verified_envelopes = verify_vote_envelopes(
+        if result.signed_assignment is None:
+            raise ValueError("mesh result is missing its signed assignment")
+        if result.signed_assignment != authoritative_result.signed_assignment:
+            raise ValueError("signed assignment differs from authoritative mesh evidence")
+        verified_envelopes = verify_assignment_vote_envelopes(
+            result.signed_assignment,
             result.vote_envelopes,
             vote_registry,
             task_id=judgment.task_id,
@@ -626,7 +640,6 @@ class ConstitutionalValidator:
             artifact_id=judgment.artifact_hash,
             content_hash=content_hash,
             constitutional_hash=result.constitutional_hash,
-            expected_assigned_peers=expected_assigned_peers,
             require_independent=not self._config.single_operator_dev,
         )
         if verified_envelopes != authoritative_result.vote_envelopes:
@@ -635,7 +648,7 @@ class ConstitutionalValidator:
             envelope.decision == "approved" for envelope in verified_envelopes
         )
         votes_against = len(verified_envelopes) - votes_for
-        signed_quorum = verified_envelopes[0].quorum
+        signed_quorum = result.signed_assignment.quorum
         strict_majority = len(verified_envelopes) // 2 + 1
         expected_quorum = max(self._config.quorum, strict_majority)
         if signed_quorum != expected_quorum:
@@ -685,5 +698,6 @@ class ConstitutionalValidator:
             proof_content_hash=proof.content_hash,
             constitutional_hash=current_constitutional_hash,
             vote_envelopes=verified_envelopes,
+            signed_assignment=result.signed_assignment,
             trust_update=self._mesh.manifold_summary() or {},
         )

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from typing import Any
 
 import pytest
 from acgs_lite import Constitution
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm import (
     ConstitutionalMesh,
     SQLiteSettlementStore,
@@ -13,6 +16,8 @@ from constitutional_swarm import (
     bundle_from_json,
     verify_bundle,
 )
+from constitutional_swarm.mesh import RemoteVoteRequest
+from constitutional_swarm.remote_vote_transport import LocalRemotePeer, RemoteVoteResponse
 from constitutional_swarm.settlement_store import DuplicateSettlementError, normalize_receipt_digest
 
 _DIGEST = "ab" * 32
@@ -127,18 +132,55 @@ def test_supplied_digest_is_not_silently_dropped(tmp_path) -> None:
 
 def test_sqlite_settlement_receipt_verifies(tmp_path) -> None:
     store = SQLiteSettlementStore(tmp_path / "s.db")
+    constitution = Constitution.default()
     mesh = ConstitutionalMesh(
-        Constitution.default(),
+        constitution,
         seed=42,
         settlement_store=store,
+        peers_per_validation=3,
         quorum=3,
-        evidence_mode="single_operator_dev",
+        evidence_mode="independent",
     )
-    for index in range(4):
-        mesh.register_local_signer(f"agent-{index:02d}")
-    assignment = mesh.request_validation("agent-00", "summarize notes", "art")
-    for voter in assignment.peers:
-        mesh.validate_and_vote(assignment.assignment_id, voter)
+    mesh.register_remote_agent(
+        "producer", vote_public_key=Ed25519PrivateKey.generate().public_key()
+    )
+    peers = {}
+    routes = {}
+    for index in range(3):
+        voter_id = f"remote-voter-{index}"
+        peer = LocalRemotePeer(
+            agent_id=voter_id,
+            constitution=constitution,
+            trusted_request_signers={mesh.get_request_signing_public_key()},
+            trusted_assigners=mesh.vote_registry.frozen_copy(),
+        )
+        peers[voter_id] = peer
+        routes[voter_id] = (voter_id, 9000 + index)
+        mesh.register_remote_agent(voter_id, vote_public_key=peer.public_key_hex)
+
+    class InMemoryRemoteVoteClient:
+        async def request_vote(
+            self,
+            host: str,
+            port: int,
+            request: RemoteVoteRequest,
+            *,
+            timeout: float = 5.0,
+            ssl_context: Any = None,
+        ) -> RemoteVoteResponse:
+            del port, timeout, ssl_context
+            return peers[host].handle_vote_request(request)
+
+    result = asyncio.run(
+        mesh.full_validation_remote(
+            "producer",
+            "summarize notes",
+            "art",
+            peer_routes=routes,
+            client=InMemoryRemoteVoteClient(),
+        )
+    )
+    assignment = mesh._assignments[result.assignment_id]
     loaded = store.get(assignment.assignment_id)
     assert loaded is not None
     assert loaded.receipt_digest

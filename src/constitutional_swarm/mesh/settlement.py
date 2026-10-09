@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from constitutional_swarm.mesh.vote_envelope import (
+    SignedAssignment,
     VoteEnvelope,
     compute_vote_envelope_root_from_hashes,
 )
@@ -91,6 +92,7 @@ class MeshResult:
     settled: bool = False
     settled_at: float | None = None
     vote_envelopes: tuple[VoteEnvelope, ...] = ()
+    signed_assignment: SignedAssignment | None = None
 
 
 @dataclass(frozen=True, slots=True)

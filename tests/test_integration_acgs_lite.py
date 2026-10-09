@@ -133,6 +133,7 @@ async def test_remote_validation_e2e_preserves_acgs_lite_constitution_contract()
         agent_id="peer-remote",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
 
     mesh.register_local_signer("producer", domain="governance")

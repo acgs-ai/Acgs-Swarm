@@ -8,10 +8,11 @@ import csv
 import hashlib
 import hmac
 import json
+import stat
 import sys
 import time
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
 from constitutional_swarm.forensic_benchmark import (
@@ -1961,10 +1962,64 @@ def _study_readiness_report(
     }
 
 
+def _first_symlink_component(pack_dir: Path, relative_path: str) -> Path | None:
+    candidate = pack_dir
+    for part in PurePosixPath(relative_path).parts:
+        candidate /= part
+        if candidate.is_symlink():
+            return candidate
+    return None
+
+
 def _verify_reviewer_manifest(pack_dir: Path) -> dict[str, object]:
     manifest_path = pack_dir / "reviewer_manifest.json"
-    manifest = json.loads(manifest_path.read_text())
     issues: list[dict[str, str]] = []
+    if manifest_path.is_symlink():
+        return {
+            "valid": False,
+            "checked_files": 0,
+            "issues": [
+                {
+                    "code": "symlink_packet_file",
+                    "message": "reviewer_manifest.json must be a regular packet file",
+                }
+            ],
+        }
+    if not manifest_path.is_file():
+        return {
+            "valid": False,
+            "checked_files": 0,
+            "issues": [
+                {
+                    "code": "invalid_reviewer_manifest",
+                    "message": "reviewer_manifest.json must be a regular packet file",
+                }
+            ],
+        }
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "valid": False,
+            "checked_files": 0,
+            "issues": [
+                {
+                    "code": "invalid_reviewer_manifest",
+                    "message": f"reviewer_manifest.json could not be loaded: {exc}",
+                }
+            ],
+        }
+    if not isinstance(manifest, dict):
+        return {
+            "valid": False,
+            "checked_files": 0,
+            "issues": [
+                {
+                    "code": "invalid_manifest_shape",
+                    "message": "reviewer_manifest.json must contain an object",
+                }
+            ],
+        }
     files = manifest.get("files", {})
     if not isinstance(files, dict):
         return {
@@ -1978,9 +2033,41 @@ def _verify_reviewer_manifest(pack_dir: Path) -> dict[str, object]:
             ],
         }
 
-    for relative_path, expected in files.items():
-        path = pack_dir / str(relative_path)
-        if not path.exists():
+    canonical_files: dict[str, object] = {}
+    for raw_relative_path, expected in files.items():
+        relative_path = str(raw_relative_path)
+        parsed_path = PurePosixPath(relative_path)
+        if (
+            not isinstance(raw_relative_path, str)
+            or parsed_path.is_absolute()
+            or "\\" in relative_path
+            or relative_path != parsed_path.as_posix()
+            or any(part in {"", ".", ".."} for part in parsed_path.parts)
+        ):
+            issues.append(
+                {
+                    "code": "invalid_manifest_path",
+                    "message": f"{relative_path} is not a canonical relative POSIX path",
+                }
+            )
+            continue
+        canonical_files[relative_path] = expected
+
+    for relative_path, expected in canonical_files.items():
+        path = pack_dir / relative_path
+        symlink_component = _first_symlink_component(pack_dir, relative_path)
+        if symlink_component is not None:
+            component = symlink_component.relative_to(pack_dir).as_posix()
+            issues.append(
+                {
+                    "code": "symlink_packet_file",
+                    "message": (
+                        f"{relative_path} traverses symlink packet member {component}"
+                    ),
+                }
+            )
+            continue
+        if not path.is_file():
             issues.append(
                 {
                     "code": "missing_manifest_file",
@@ -1988,7 +2075,24 @@ def _verify_reviewer_manifest(pack_dir: Path) -> dict[str, object]:
                 }
             )
             continue
-        content = path.read_bytes()
+        if not isinstance(expected, dict):
+            issues.append(
+                {
+                    "code": "invalid_manifest_entry",
+                    "message": f"{relative_path} manifest entry must be an object",
+                }
+            )
+            continue
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            issues.append(
+                {
+                    "code": "packet_file_read_error",
+                    "message": f"{relative_path} could not be read: {exc}",
+                }
+            )
+            continue
         actual_sha = hashlib.sha256(content).hexdigest()
         if actual_sha != expected.get("sha256"):
             issues.append(
@@ -2015,16 +2119,115 @@ def _verify_reviewer_manifest(pack_dir: Path) -> dict[str, object]:
         )
     return {
         "valid": not issues,
-        "checked_files": len(files),
+        "checked_files": len(canonical_files),
         "issues": issues,
     }
 
 
+def _reviewer_packet_inventory_issues(pack_dir: Path) -> list[dict[str, str]]:
+    manifest_path = pack_dir / "reviewer_manifest.json"
+    expected_files = {"reviewer_manifest.json"}
+    try:
+        manifest_mode = manifest_path.lstat().st_mode
+    except OSError:
+        manifest_mode = None
+    if manifest_mode is not None and stat.S_ISREG(manifest_mode):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, dict) and isinstance(manifest.get("files"), dict):
+            for raw_relative_path in manifest["files"]:
+                if not isinstance(raw_relative_path, str):
+                    continue
+                parsed_path = PurePosixPath(raw_relative_path)
+                if (
+                    parsed_path.is_absolute()
+                    or "\\" in raw_relative_path
+                    or raw_relative_path != parsed_path.as_posix()
+                    or any(part in {"", ".", ".."} for part in parsed_path.parts)
+                ):
+                    continue
+                expected_files.add(raw_relative_path)
+
+    expected_directories: set[str] = set()
+    for relative_path in expected_files:
+        parent_parts = PurePosixPath(relative_path).parts[:-1]
+        expected_directories.update(
+            "/".join(parent_parts[:index])
+            for index in range(1, len(parent_parts) + 1)
+        )
+
+    issues: list[dict[str, str]] = []
+    for path in pack_dir.rglob("*"):
+        relative_path = path.relative_to(pack_dir).as_posix()
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            issues.append(
+                {
+                    "code": "unlisted_packet_entry",
+                    "message": f"{relative_path} could not be classified: {exc}",
+                }
+            )
+            continue
+        if stat.S_ISLNK(mode):
+            issues.append(
+                {
+                    "code": "symlink_packet_file",
+                    "message": f"{relative_path} must be a regular packet file",
+                }
+            )
+            if relative_path not in expected_files:
+                issues.append(
+                    {
+                        "code": "unlisted_packet_file",
+                        "message": (
+                            f"{relative_path} is present but not listed in the manifest"
+                        ),
+                    }
+                )
+        elif stat.S_ISREG(mode):
+            if relative_path not in expected_files:
+                issues.append(
+                    {
+                        "code": "unlisted_packet_file",
+                        "message": (
+                            f"{relative_path} is present but not listed in the manifest"
+                        ),
+                    }
+                )
+        elif stat.S_ISDIR(mode):
+            if relative_path not in expected_directories:
+                issues.append(
+                    {
+                        "code": "unlisted_packet_entry",
+                        "message": (
+                            f"{relative_path} is present but is not required by a "
+                            "manifest file"
+                        ),
+                    }
+                )
+        else:
+            issues.append(
+                {
+                    "code": "unlisted_packet_entry",
+                    "message": (
+                        f"{relative_path} is neither a regular file nor a directory"
+                    ),
+                }
+            )
+    return _deduplicate_issues(issues)
+
+
 def _audit_reviewer_packet(packet_dir: Path) -> dict[str, object]:
     manifest_verdict = _verify_reviewer_manifest(packet_dir)
+    inventory_issues = _reviewer_packet_inventory_issues(packet_dir)
     issues: list[dict[str, str]] = []
 
     for path in sorted(packet_dir.rglob("*")):
+        if path.is_symlink():
+            continue
         if not path.is_file():
             continue
         relative_path = path.relative_to(packet_dir).as_posix()
@@ -2049,6 +2252,14 @@ def _audit_reviewer_packet(packet_dir: Path) -> dict[str, object]:
         try:
             text = path.read_text()
         except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            issues.append(
+                {
+                    "code": "packet_file_read_error",
+                    "message": f"{relative_path} could not be read: {exc}",
+                }
+            )
             continue
         try:
             document = json.loads(text)
@@ -2080,12 +2291,20 @@ def _audit_reviewer_packet(packet_dir: Path) -> dict[str, object]:
         if isinstance(raw_manifest_issues, list)
         else []
     )
-    top_level_issues = _deduplicate_issues([*manifest_issues, *privacy_issues])
+    top_level_issues = _deduplicate_issues(
+        [*manifest_issues, *inventory_issues, *privacy_issues]
+    )
     privacy_verdict = {"valid": not privacy_issues, "issues": privacy_issues}
+    inventory_verdict = {"valid": not inventory_issues, "issues": inventory_issues}
     return {
-        "valid": bool(manifest_verdict["valid"] and privacy_verdict["valid"]),
+        "valid": bool(
+            manifest_verdict["valid"]
+            and inventory_verdict["valid"]
+            and privacy_verdict["valid"]
+        ),
         "issues": top_level_issues,
         "manifest": manifest_verdict,
+        "inventory": inventory_verdict,
         "privacy": privacy_verdict,
     }
 

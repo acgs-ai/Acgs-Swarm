@@ -786,7 +786,9 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from constitutional_swarm.mesh.vote_envelope import (
         compute_vote_envelope_root,
+        sign_assignment,
         sign_vote_envelope,
+        signed_assignment_digest,
         vote_envelope_hash,
     )
 
@@ -807,6 +809,21 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
     assignment_id = "assignment-proof"
     content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
     assigned_peers = tuple(f"c14-test-voter-{index}" for index in range(5))
+    signed_assignment = sign_assignment(
+        Ed25519PrivateKey.from_private_bytes(hashlib.sha256(b"c14-test-assigner").digest()),
+        task_id=case.synapse.task_id,
+        assignment_id=assignment_id,
+        assigner_id="c14-test-assigner",
+        producer_id=judgment.miner_uid,
+        artifact_id=judgment.artifact_hash,
+        content_hash=content_hash,
+        constitutional_hash=owner.constitution_hash,
+        assigned_peers=assigned_peers,
+        quorum=3,
+        selection_seed="c4-proof-bound-selection",
+        issued_at=1.0,
+    )
+    assignment_digest = signed_assignment_digest(signed_assignment)
     envelopes = tuple(
         sign_vote_envelope(
             Ed25519PrivateKey.from_private_bytes(
@@ -825,6 +842,7 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
             issued_at=float(index + 1),
             assigned_peers=assigned_peers,
             quorum=3,
+            assignment_digest=assignment_digest,
         )
         for index in range(5)
     )
@@ -866,6 +884,7 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
         constitutional_hash=owner.constitution_hash,
         timestamp=proof.timestamp,
         vote_envelopes=envelopes,
+        signed_assignment=signed_assignment,
     )
     return case, judgment, validation
 

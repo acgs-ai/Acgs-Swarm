@@ -17,8 +17,19 @@ if str(SRC_ROOT) not in sys.path:
 
 from acgs_lite import Constitution  # noqa: E402
 from constitutional_swarm import AgentDNA  # noqa: E402
-from constitutional_swarm.mesh import MeshProof, RemoteVoteRequest, ValidationVote  # noqa: E402
+from constitutional_swarm.mesh import (  # noqa: E402
+    ConstitutionalMesh,
+    MeshProof,
+    RemoteVoteRequest,
+    ValidationVote,
+)
 from constitutional_swarm.mesh.settlement import _compute_merkle_root  # noqa: E402
+from constitutional_swarm.mesh.vote_envelope import (  # noqa: E402
+    canonical_signed_assignment_bytes,
+    sign_assignment,
+    signed_assignment_digest,
+    signed_assignment_to_dict,
+)
 from constitutional_swarm.protocol import (  # noqa: E402
     canonical_content_hash,
     canonical_timestamp,
@@ -39,6 +50,9 @@ from constitutional_swarm.settlement_store import (  # noqa: E402
     SettlementRecord,
 )
 from constitutional_swarm.spectral_sphere import SpectralSphereManifold  # noqa: E402
+from constitutional_swarm.remote_vote_transport.protocol import (  # noqa: E402
+    encode_remote_vote_request,
+)
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
@@ -334,6 +348,78 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
         },
         "replay_rejection.json": replay_error,
         "spectral_sphere_snapshot.json": _spectral_fixture(),
+    }
+
+
+def build_vnext_fixture_corpus() -> dict[str, dict[str, Any]]:
+    """Build opt-in v3 assignment fixtures without changing frozen v1 outputs."""
+    content_hash = legacy_content_hash(CONTENT)
+    voter_key = _private_key(1)
+    request_key = _private_key(2)
+    assigner_key = _private_key(3)
+    signed_assignment = sign_assignment(
+        assigner_key,
+        task_id=ARTIFACT_ID,
+        assignment_id=ASSIGNMENT_ID,
+        assigner_id="fixture-assigner",
+        producer_id=PRODUCER_ID,
+        artifact_id=ARTIFACT_ID,
+        content_hash=content_hash,
+        constitutional_hash=CONSTITUTIONAL_HASH,
+        assigned_peers=(VOTER_ID,),
+        quorum=1,
+        selection_seed="rust-fixture-selection-seed",
+        issued_at=REQUEST_TIMESTAMP,
+    )
+    request_payload = ConstitutionalMesh.build_remote_vote_request_payload(
+        assignment_id=ASSIGNMENT_ID,
+        voter_id=VOTER_ID,
+        producer_id=PRODUCER_ID,
+        artifact_id=ARTIFACT_ID,
+        content=CONTENT,
+        content_hash=content_hash,
+        constitutional_hash=CONSTITUTIONAL_HASH,
+        voter_public_key=_public_key_hex(voter_key),
+        nonce=NONCE,
+        timestamp=REQUEST_TIMESTAMP,
+        task_id=ARTIFACT_ID,
+        assigned_peers=(VOTER_ID,),
+        quorum=1,
+        protocol_version=3,
+        signed_assignment=signed_assignment,
+    )
+    request = RemoteVoteRequest(
+        assignment_id=ASSIGNMENT_ID,
+        voter_id=VOTER_ID,
+        producer_id=PRODUCER_ID,
+        artifact_id=ARTIFACT_ID,
+        content=CONTENT,
+        content_hash=content_hash,
+        constitutional_hash=CONSTITUTIONAL_HASH,
+        voter_public_key=_public_key_hex(voter_key),
+        nonce=NONCE,
+        timestamp=REQUEST_TIMESTAMP,
+        request_signer_public_key=_public_key_hex(request_key),
+        request_signature=request_key.sign(request_payload).hex(),
+        task_id=ARTIFACT_ID,
+        assigned_peers=(VOTER_ID,),
+        quorum=1,
+        protocol_version=3,
+        signed_assignment=signed_assignment,
+    )
+    return {
+        "signed_assignment_v1.json": {
+            "assignment": signed_assignment_to_dict(signed_assignment),
+            "canonical_bytes_hex": canonical_signed_assignment_bytes(
+                signed_assignment,
+                include_signature=True,
+            ).hex(),
+            "digest": signed_assignment_digest(signed_assignment),
+        },
+        "remote_vote_request_v3.json": {
+            "canonical_signing_bytes_hex": request_payload.hex(),
+            "wire_json": encode_remote_vote_request(request),
+        },
     }
 
 

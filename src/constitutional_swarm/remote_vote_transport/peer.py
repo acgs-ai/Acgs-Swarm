@@ -14,9 +14,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
 from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
+    VoteSignerRegistryView,
     key_id_for_public_key,
     normalize_voter_id,
     sign_vote_envelope,
+    signed_assignment_digest,
+    verify_signed_assignment,
 )
 from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
 
@@ -41,6 +45,7 @@ class LocalRemotePeer:
         vote_private_key: Ed25519PrivateKey | bytes | str | None = None,
         strict: bool = False,
         trusted_request_signers: set[str] | None = None,
+        trusted_assigners: VoteSignerRegistryView,
         allow_untrusted_request_signers: bool = False,
         replay_window_seconds: float = 300.0,
     ) -> None:
@@ -64,6 +69,9 @@ class LocalRemotePeer:
         for public_key in trusted_request_signers or set():
             key_id_for_public_key(public_key)
             self._trusted_request_signers.add(public_key)
+        if not isinstance(trusted_assigners, FrozenVoteSignerRegistry):
+            raise TypeError("trusted_assigners must be an immutable registry snapshot")
+        self._trusted_assigners = trusted_assigners
         self._replay_window_seconds = replay_window_seconds
         self._request_nonce_caches: dict[str, OrderedDict[str, float]] = {}
         self._request_nonce_cache: OrderedDict[str, float] = OrderedDict()
@@ -99,6 +107,24 @@ class LocalRemotePeer:
         local_constitutional_hash = self._constitutional_hash
         if request.constitutional_hash != local_constitutional_hash:
             raise ValueError("Remote vote request constitutional hash does not match local constitution")
+        if request.signed_assignment is None:
+            raise ValueError("Remote vote request is missing its signed assignment")
+        assignment = verify_signed_assignment(
+            request.signed_assignment,
+            self._trusted_assigners,
+            task_id=request.task_id or request.artifact_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
+            content_hash=request.content_hash,
+            constitutional_hash=request.constitutional_hash,
+        )
+        if self.agent_id not in assignment.assigned_peers:
+            raise ValueError("Remote peer is not a member of the signed assignment")
+        if request.assigned_peers != assignment.assigned_peers:
+            raise ValueError("Remote vote request electorate does not match signed assignment")
+        if request.quorum != assignment.quorum:
+            raise ValueError("Remote vote request quorum does not match signed assignment")
         if (
             request.request_signer_public_key not in self._trusted_request_signers
         ):
@@ -142,6 +168,7 @@ class LocalRemotePeer:
             assigned_peers=request.assigned_peers,
             quorum=request.quorum,
             evidence_mode=request.evidence_mode,
+            assignment_digest=signed_assignment_digest(assignment),
         )
         return RemoteVoteResponse(envelope)
 

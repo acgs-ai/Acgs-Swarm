@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 PROFILE_VERSION: Final = "acgs.local.intoto-dsse-shaped.v0.1"
 PAYLOAD_TYPE: Final = "application/vnd.acgs.governance-receipt.v0.1+json"
 CANONICALIZATION_ALGORITHM: Final = "json-sort-keys-separators-v0"
-VOTE_EVIDENCE_VERSION: Final = "constitutional-swarm.vote-envelope.v2"
+VOTE_EVIDENCE_VERSION: Final = "constitutional-swarm.vote-envelope.v3"
 MIN_RECEIPT_QUORUM: Final = 3
 _LOWER_HEX_32_RE = re.compile(r"^[0-9a-f]{64}$")
 _LOWER_HEX_64_RE = re.compile(r"^[0-9a-f]{128}$")
@@ -93,7 +93,7 @@ class SignerTrustGrant(BaseModel):
 
     identity_id: str = Field(min_length=1)
     public_key_hex: str
-    roles: frozenset[Literal["validator", "coordinator", "settlement"]]
+    roles: frozenset[Literal["assigner", "validator", "coordinator", "settlement"]]
 
     @field_validator("identity_id")
     @classmethod
@@ -113,10 +113,16 @@ class SignerTrustGrant(BaseModel):
     @classmethod
     def require_roles(
         cls,
-        value: frozenset[Literal["validator", "coordinator", "settlement"]],
-    ) -> frozenset[Literal["validator", "coordinator", "settlement"]]:
+        value: frozenset[
+            Literal["assigner", "validator", "coordinator", "settlement"]
+        ],
+    ) -> frozenset[
+        Literal["assigner", "validator", "coordinator", "settlement"]
+    ]:
         if not value:
             raise ValueError("at least one signer role is required")
+        if "assigner" in value and "validator" in value:
+            raise ValueError("assigner and validator roles are mutually exclusive")
         return value
 
 
@@ -135,6 +141,7 @@ class ReceiptPayload(BaseModel):
     validator_votes: list[ValidatorVote]
     vote_envelopes: list[dict[str, Any]] | None = None
     assigned_peers: list[str] | None = None
+    signed_assignment: dict[str, Any] | None = None
     rejected_alternative: str = Field(min_length=1)
     previous_receipt_hash: str | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
@@ -230,6 +237,7 @@ class VerificationVerdict(BaseModel):
     profile_version: str | None = None
     receipt_count: int = 0
     signature_status: Literal["valid", "invalid", "unverifiable", "not_checked"]
+    evidence_policy: Literal["proof_grade", "development"] = "proof_grade"
     issues: list[ReceiptIssue] = Field(default_factory=list)
     receipt_hashes: list[str] = Field(default_factory=list)
 
@@ -321,6 +329,8 @@ def _payload_mapping(payload: ReceiptPayload) -> dict[str, Any]:
         data.pop("vote_envelopes", None)
     if data.get("assigned_peers") is None:
         data.pop("assigned_peers", None)
+    if data.get("signed_assignment") is None:
+        data.pop("signed_assignment", None)
     return data
 
 
@@ -352,6 +362,8 @@ def receipt_hash(receipt: GovernanceReceipt) -> str:
         data["payload"].pop("vote_envelopes", None)
     if data["payload"].get("assigned_peers") is None:
         data["payload"].pop("assigned_peers", None)
+    if data["payload"].get("signed_assignment") is None:
+        data["payload"].pop("signed_assignment", None)
     return sha256_hex(canonical_json_bytes(data))
 
 
@@ -430,20 +442,26 @@ def _vote_registry_from_grants(grants: Mapping[str, SignerTrustGrant]) -> Any:
 
     registry = VoteSignerRegistry()
     for trust_key_id, grant in grants.items():
+        roles = set()
         if "validator" in grant.roles:
+            roles.add("voter")
+        if "assigner" in grant.roles:
+            roles.add("assigner")
+        if roles:
             derived_key_id = registry.register(
                 grant.identity_id,
                 bytes.fromhex(grant.public_key_hex),
-                roles=frozenset({"voter"}),
+                roles=frozenset(roles),
             )
             if trust_key_id != derived_key_id:
                 raise ValueError(
-                    "validator trust registry key ID must equal the public-key fingerprint"
+                    "vote trust registry key ID must equal the public-key fingerprint"
                 )
     return registry
 
 
 def _verify_bound_vote_envelopes(
+    raw_assignment: Mapping[str, Any],
     raw_envelopes: list[Any] | tuple[Any, ...],
     grants: Mapping[str, SignerTrustGrant],
     *,
@@ -455,10 +473,12 @@ def _verify_bound_vote_envelopes(
     constitutional_hash: str,
     expected_assigned_peers: list[str] | tuple[str, ...] | None = None,
     expected_quorum: int | None = None,
+    require_independent_votes: bool = True,
 ) -> tuple[Any, ...]:
     from constitutional_swarm.mesh.vote_envelope import (
         VoteEnvelope,
-        verify_vote_envelopes,
+        signed_assignment_from_dict,
+        verify_assignment_vote_envelopes,
         vote_envelope_from_dict,
     )
 
@@ -470,7 +490,9 @@ def _verify_bound_vote_envelopes(
         else vote_envelope_from_dict(dict(envelope))
         for envelope in raw_envelopes
     )
-    return verify_vote_envelopes(
+    assignment = signed_assignment_from_dict(raw_assignment)
+    return verify_assignment_vote_envelopes(
+        assignment,
         envelopes,
         _vote_registry_from_grants(grants),
         task_id=task_id,
@@ -481,7 +503,7 @@ def _verify_bound_vote_envelopes(
         constitutional_hash=constitutional_hash,
         expected_assigned_peers=expected_assigned_peers,
         expected_quorum=expected_quorum,
-        require_independent=False,
+        require_independent=require_independent_votes,
     )
 
 
@@ -492,6 +514,7 @@ def receipt_from_mesh_settlement(
     previous_receipt_hash: str | None = None,
     signatures: list[SignatureRecord] | None = None,
     trusted_signers: Mapping[str, Any] | None = None,
+    require_independent_votes: bool = True,
 ) -> GovernanceReceipt:
     """Project verified mesh VoteEnvelopes onto the proof-grade receipt profile.
 
@@ -514,6 +537,9 @@ def receipt_from_mesh_settlement(
         raise ValueError("settlement is missing vote-envelope subject bindings")
     if not votes:
         raise ValueError("at least one signed vote envelope is required")
+    raw_signed_assignment = assignment.get("signed_assignment")
+    if not isinstance(raw_signed_assignment, Mapping):
+        raise ValueError("settlement signed assignment evidence is required")
     assigned_peers = _canonical_assigned_peers(
         assignment.get("peers"),
         producer_id=producer_id,
@@ -523,6 +549,7 @@ def receipt_from_mesh_settlement(
         raise ValueError("settlement assignment quorum must be an integer")
     grants = _parse_trust_grants(trusted_signers)
     envelopes = _verify_bound_vote_envelopes(
+        raw_signed_assignment,
         votes,
         grants,
         task_id=task_id,
@@ -533,6 +560,7 @@ def receipt_from_mesh_settlement(
         constitutional_hash=constitutional_hash,
         expected_assigned_peers=assigned_peers,
         expected_quorum=raw_assignment_quorum,
+        require_independent_votes=require_independent_votes,
     )
     quorum = envelopes[0].quorum
     if quorum < MIN_RECEIPT_QUORUM:
@@ -614,6 +642,7 @@ def receipt_from_mesh_settlement(
         validator_votes=validator_votes,
         vote_envelopes=envelope_dicts,
         assigned_peers=assigned_peers,
+        signed_assignment=dict(raw_signed_assignment),
         rejected_alternative="execute-without-settlement",
         previous_receipt_hash=previous_receipt_hash,
         metadata={
@@ -656,6 +685,8 @@ def build_receipt(
 def _receipt_vote_evidence_issues(
     receipt: GovernanceReceipt,
     grants: Mapping[str, SignerTrustGrant],
+    *,
+    require_independent_votes: bool,
 ) -> list[tuple[str, str]]:
     payload = receipt.payload
     if not payload.vote_envelopes:
@@ -663,6 +694,13 @@ def _receipt_vote_evidence_issues(
             (
                 "vote_envelope_missing",
                 "proof-grade receipt requires original signed vote envelopes",
+            )
+        ]
+    if payload.signed_assignment is None:
+        return [
+            (
+                "vote_assignment_missing",
+                "proof-grade receipt requires the authenticated signed assignment",
             )
         ]
     if payload.metadata.get("vote_evidence_version") != VOTE_EVIDENCE_VERSION:
@@ -735,6 +773,7 @@ def _receipt_vote_evidence_issues(
         ]
     try:
         envelopes = _verify_bound_vote_envelopes(
+            payload.signed_assignment,
             payload.vote_envelopes,
             grants,
             task_id=bindings["task_id"],
@@ -745,6 +784,7 @@ def _receipt_vote_evidence_issues(
             constitutional_hash=payload.policy_hash,
             expected_assigned_peers=assigned_peers,
             expected_quorum=quorum,
+            require_independent_votes=require_independent_votes,
         )
     except (TypeError, ValueError) as exc:
         return [("vote_electorate_invalid", f"vote envelope verification failed: {exc}")]
@@ -816,6 +856,7 @@ def verify_bundle(
     report_mode: bool = False,
     trusted_signers: Mapping[str, Any] | None = None,
     expected_signer_role: Literal["validator", "coordinator", "settlement"] | None = None,
+    require_independent_votes: bool = True,
 ) -> VerificationVerdict:
     """Verify a receipt bundle.
 
@@ -914,7 +955,11 @@ def verify_bundle(
                 )
             )
 
-        for code, message in _receipt_vote_evidence_issues(receipt, signer_registry):
+        for code, message in _receipt_vote_evidence_issues(
+            receipt,
+            signer_registry,
+            require_independent_votes=require_independent_votes,
+        ):
             issues.append(
                 ReceiptIssue(code=code, message=message, receipt_id=receipt_id)
             )
@@ -962,6 +1007,7 @@ def verify_bundle(
         profile_version=bundle.profile_version,
         receipt_count=len(bundle.receipts),
         signature_status=aggregate_signature_status,  # type: ignore[arg-type]
+        evidence_policy="proof_grade" if require_independent_votes else "development",
         issues=issues,
         receipt_hashes=hashes,
     )
@@ -1112,12 +1158,14 @@ def benchmark_summary(
     command_line: str,
     trusted_signers: Mapping[str, Any] | None = None,
     expected_signer_role: Literal["validator", "coordinator", "settlement"] | None = None,
+    require_independent_votes: bool = True,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     verdict = verify_bundle(
         bundle,
         trusted_signers=trusted_signers,
         expected_signer_role=expected_signer_role,
+        require_independent_votes=require_independent_votes,
     )
     elapsed = time.perf_counter() - started
     return {
@@ -1125,6 +1173,7 @@ def benchmark_summary(
         "healthcare_compliance_claimed": False,
         "production_grade_governance_claimed": False,
         "verifier_valid": verdict.valid,
+        "evidence_policy": verdict.evidence_policy,
         "verifier_seconds": elapsed,
         "reconstructability": {
             "correct_answers": correct_answers,

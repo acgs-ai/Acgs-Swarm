@@ -51,6 +51,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=("validator", "coordinator", "settlement"),
         help="Verifier-selected required signer role for non-settlement receipts.",
     )
+    parser.add_argument(
+        "--allow-dev-evidence",
+        action="store_true",
+        help=(
+            "Allow single-operator development vote evidence for direct bundle "
+            "verification; output is labelled evidence_policy=development."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -58,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.trusted_signers is not None:
             trusted_signers = json.loads(args.trusted_signers.read_text())
         if args.settlement_store is not None:
+            if args.allow_dev_evidence:
+                raise ValueError(
+                    "--allow-dev-evidence cannot be used with --settlement-store"
+                )
             if not args.assignment_id:
                 raise ValueError("--assignment-id is required with --settlement-store")
             if args.bundle is None:
@@ -94,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
                 report_mode=args.report_mode,
                 trusted_signers=trusted_signers,
                 expected_signer_role=args.expected_signer_role,
+                require_independent_votes=not args.allow_dev_evidence,
             )
     except Exception as exc:
         print(
@@ -102,6 +115,11 @@ def main(argv: list[str] | None = None) -> int:
                     valid=False,
                     mode="report" if args.report_mode else "fail_closed",
                     signature_status="not_checked",
+                    evidence_policy=(
+                        "development"
+                        if args.allow_dev_evidence and args.settlement_store is None
+                        else "proof_grade"
+                    ),
                     issues=[
                         ReceiptIssue(
                             code="bundle_parse_error",

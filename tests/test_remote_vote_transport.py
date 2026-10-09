@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 import json
 import ssl
-from dataclasses import asdict
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -26,11 +26,29 @@ from constitutional_swarm.remote_vote_transport import (
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from constitutional_swarm.mesh.vote_envelope import sign_vote_envelope
+from constitutional_swarm.mesh.vote_envelope import (
+    sign_vote_envelope,
+    signed_assignment_digest,
+)
 
 websockets = pytest.importorskip(
     "websockets", reason="websockets not installed — skip remote vote transport tests"
 )
+
+
+def _standalone_request() -> RemoteVoteRequest:
+    constitution = Constitution.default()
+    mesh = ConstitutionalMesh(
+        constitution,
+        peers_per_validation=1,
+        quorum=1,
+        seed=19,
+        evidence_mode="single_operator_dev",
+    )
+    mesh.register_local_signer("producer")
+    mesh.register_local_signer("peer-1")
+    assignment = mesh.request_validation("producer", "safe content", "art-1")
+    return mesh.prepare_remote_vote(assignment.assignment_id, "peer-1")
 
 
 def _signed_response(
@@ -55,6 +73,11 @@ def _signed_response(
         assigned_peers=request.assigned_peers or (voter_id or request.voter_id,),
         quorum=request.quorum or 1,
         evidence_mode=request.evidence_mode,
+        assignment_digest=(
+            signed_assignment_digest(request.signed_assignment)
+            if request.signed_assignment is not None
+            else ""
+        ),
     )
     return RemoteVoteResponse(envelope)
 
@@ -74,6 +97,7 @@ def remote_transport_context() -> dict[str, Any]:
         agent_id="peer-remote",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
     mesh.register_local_signer("producer")
     mesh.register_remote_agent("peer-remote", vote_public_key=remote_peer.public_key_hex)
@@ -135,39 +159,13 @@ class _FakeConnectContext:
 
 
 def test_remote_vote_request_round_trip() -> None:
-    request = RemoteVoteRequest(
-        assignment_id="assign-1",
-        voter_id="peer-1",
-        producer_id="producer-1",
-        artifact_id="art-1",
-        content="safe content",
-        content_hash="abc123",
-        constitutional_hash="const-hash",
-        voter_public_key="deadbeef",
-        nonce="nonce-1",
-        timestamp=1234.5,
-        request_signer_public_key="feedface",
-        request_signature="cafebabe",
-    )
+    request = _standalone_request()
     decoded = decode_remote_vote_request(encode_remote_vote_request(request))
     assert decoded == request
 
 
 def test_remote_vote_response_round_trip() -> None:
-    request = RemoteVoteRequest(
-        assignment_id="assign-1",
-        voter_id="peer-1",
-        producer_id="producer-1",
-        artifact_id="art-1",
-        content="safe content",
-        content_hash="abc123",
-        constitutional_hash="const-hash",
-        voter_public_key="deadbeef",
-        nonce="nonce-1",
-        timestamp=1234.5,
-        request_signer_public_key="feedface",
-        request_signature="cafebabe",
-    )
+    request = _standalone_request()
     response = _signed_response(request)
     decoded = decode_remote_vote_response(encode_remote_vote_response(response))
     assert decoded == response
@@ -190,6 +188,7 @@ async def test_remote_vote_server_round_trip() -> None:
         agent_id="peer-1",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
     mesh.register_local_signer("producer")
     mesh.register_remote_agent("peer-1", vote_public_key=peer.public_key_hex)
@@ -216,6 +215,7 @@ async def test_full_validation_remote_collects_remote_and_local_votes() -> None:
         agent_id="peer-remote",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
 
     mesh.register_local_signer("producer")
@@ -262,6 +262,7 @@ def test_remote_peer_rejects_tampered_content_hash() -> None:
         agent_id="peer-1",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
     mesh.register_local_signer("producer")
     mesh.register_remote_agent("peer-1", vote_public_key=peer.public_key_hex)
@@ -270,18 +271,9 @@ def test_remote_peer_rejects_tampered_content_hash() -> None:
     assignment = mesh.request_validation("producer", "safe content", "art-2")
     request = mesh.prepare_remote_vote(assignment.assignment_id, "peer-1")
     tampered_content = "tampered content"
-    tampered = RemoteVoteRequest(
-        assignment_id=request.assignment_id,
-        voter_id=request.voter_id,
-        producer_id=request.producer_id,
-        artifact_id=request.artifact_id,
+    tampered = replace(
+        request,
         content=tampered_content,
-        content_hash=request.content_hash,
-        constitutional_hash=request.constitutional_hash,
-        voter_public_key=request.voter_public_key,
-        nonce=request.nonce,
-        timestamp=request.timestamp,
-        request_signer_public_key=request.request_signer_public_key,
         request_signature=request_signer.sign(
             ConstitutionalMesh.build_remote_vote_request_payload(
                 assignment_id=request.assignment_id,
@@ -292,19 +284,17 @@ def test_remote_peer_rejects_tampered_content_hash() -> None:
                 content_hash=request.content_hash,
                 constitutional_hash=request.constitutional_hash,
                 voter_public_key=request.voter_public_key,
-                    nonce=request.nonce,
-                    timestamp=request.timestamp,
-                    task_id=request.task_id,
-                    assigned_peers=request.assigned_peers,
-                    quorum=request.quorum,
-                    evidence_mode=request.evidence_mode,
-                )
-            ).hex(),
-            task_id=request.task_id,
-            assigned_peers=request.assigned_peers,
-            quorum=request.quorum,
-            evidence_mode=request.evidence_mode,
-        )
+                nonce=request.nonce,
+                timestamp=request.timestamp,
+                task_id=request.task_id,
+                assigned_peers=request.assigned_peers,
+                quorum=request.quorum,
+                evidence_mode=request.evidence_mode,
+                protocol_version=request.protocol_version,
+                signed_assignment=request.signed_assignment,
+            )
+        ).hex(),
+    )
     with pytest.raises(ValueError, match="content does not match"):
         peer.handle_vote_request(tampered)
 
@@ -321,6 +311,7 @@ def test_remote_peer_rejects_untrusted_request_signer() -> None:
         agent_id="peer-1",
         constitution=constitution,
         trusted_request_signers={trusted_mesh.get_request_signing_public_key()},
+        trusted_assigners=untrusted_mesh.vote_registry.frozen_copy(),
     )
     untrusted_mesh.register_local_signer("producer")
     untrusted_mesh.register_remote_agent("peer-1", vote_public_key=peer.public_key_hex)
@@ -367,30 +358,17 @@ class TestDecodeRemoteVoteRequestErrors:
             "timestamp",
             "request_signer_public_key",
             "request_signature",
+            "task_id",
+            "assigned_peers",
+            "quorum",
+            "evidence_mode",
+            "protocol_version",
+            "signed_assignment",
         ],
     )
     def test_missing_required_field(self, missing_field: str) -> None:
-        full_payload = {
-            "assignment_id": "a",
-            "voter_id": "v",
-            "producer_id": "p",
-            "artifact_id": "art",
-            "content": "c",
-            "content_hash": "ch",
-            "constitutional_hash": "const",
-            "voter_public_key": "vpk",
-            "nonce": "nonce-1",
-            "timestamp": 1234.5,
-            "request_signer_public_key": "rspk",
-            "request_signature": "rs",
-            "task_id": "task",
-            "assigned_peers": ["v"],
-            "quorum": 1,
-            "evidence_mode": "independent",
-            "protocol_version": 2,
-        }
+        full_payload = json.loads(encode_remote_vote_request(_standalone_request()))
         del full_payload[missing_field]
-        import json
 
         with pytest.raises(ValueError, match=f"missing {missing_field}"):
             decode_remote_vote_request(json.dumps(full_payload))
@@ -436,6 +414,7 @@ class TestLocalRemotePeerValidation:
             agent_id="peer-1",
             constitution=constitution,
             trusted_request_signers={mesh.get_request_signing_public_key()},
+            trusted_assigners=mesh.vote_registry.frozen_copy(),
         )
         mesh.register_local_signer("producer")
         mesh.register_remote_agent("peer-1", vote_public_key=peer.public_key_hex)
@@ -447,38 +426,15 @@ class TestLocalRemotePeerValidation:
 
     def test_rejects_wrong_voter_id(self) -> None:
         peer, request = self._make_peer_and_request()
-        wrong_voter = RemoteVoteRequest(
-            assignment_id=request.assignment_id,
-            voter_id="wrong-peer",
-            producer_id=request.producer_id,
-            artifact_id=request.artifact_id,
-            content=request.content,
-            content_hash=request.content_hash,
-            constitutional_hash=request.constitutional_hash,
-            voter_public_key=request.voter_public_key,
-            nonce=request.nonce,
-            timestamp=request.timestamp,
-            request_signer_public_key=request.request_signer_public_key,
-            request_signature=request.request_signature,
-        )
+        wrong_voter = replace(request, voter_id="wrong-peer")
         with pytest.raises(ValueError, match="intended for wrong-peer"):
             peer.handle_vote_request(wrong_voter)
 
     def test_rejects_mismatched_pubkey(self) -> None:
         peer, request = self._make_peer_and_request()
-        wrong_key = RemoteVoteRequest(
-            assignment_id=request.assignment_id,
-            voter_id=request.voter_id,
-            producer_id=request.producer_id,
-            artifact_id=request.artifact_id,
-            content=request.content,
-            content_hash=request.content_hash,
-            constitutional_hash=request.constitutional_hash,
+        wrong_key = replace(
+            request,
             voter_public_key="0000000000000000000000000000000000000000000000000000000000000000",
-            nonce=request.nonce,
-            timestamp=request.timestamp,
-            request_signer_public_key=request.request_signer_public_key,
-            request_signature=request.request_signature,
         )
         with pytest.raises(ValueError, match="public key does not match"):
             peer.handle_vote_request(wrong_key)
@@ -501,20 +457,7 @@ async def test_remote_vote_client_connection_timeout_propagates() -> None:
     assignment = mesh.request_validation("producer", "content", "art-timeout")
 
     # Build a valid request (voter_id is just needed for the dataclass; server ignores it here).
-    request = RemoteVoteRequest(
-        assignment_id=assignment.assignment_id,
-        voter_id="peer-1",
-        producer_id="producer",
-        artifact_id="art-timeout",
-        content="content",
-        content_hash=assignment.content_hash,
-        constitutional_hash=assignment.constitutional_hash,
-        voter_public_key="00" * 32,
-        nonce="nonce-timeout",
-        timestamp=1234.5,
-        request_signer_public_key="00" * 32,
-        request_signature="00" * 64,
-    )
+    request = mesh.prepare_remote_vote(assignment.assignment_id, "peer-1")
 
     fake_ws = _FakeClientWebSocket(recv_error=TimeoutError())
     client = RemoteVoteClient()
@@ -564,23 +507,13 @@ async def test_remote_vote_server_pubkey_mismatch_raises_value_error(
 ) -> None:
     peer = remote_transport_context["peer"]
     request = remote_transport_context["request"]
-    bad_request = RemoteVoteRequest(
-        assignment_id=request.assignment_id,
-        voter_id=request.voter_id,
-        producer_id=request.producer_id,
-        artifact_id=request.artifact_id,
-        content=request.content,
-        content_hash=request.content_hash,
-        constitutional_hash=request.constitutional_hash,
+    bad_request = replace(
+        request,
         voter_public_key="00" * 32,
-        nonce=request.nonce,
-        timestamp=request.timestamp,
-        request_signer_public_key=request.request_signer_public_key,
-        request_signature=request.request_signature,
     )
 
     server = RemoteVoteServer(peer.handle_vote_request)
-    websocket = _FakeServerWebSocket([json.dumps(asdict(bad_request), separators=(",", ":"))])
+    websocket = _FakeServerWebSocket([encode_remote_vote_request(bad_request)])
 
     with pytest.raises(ValueError, match="public key does not match"):
         await server._handle_connection(websocket)

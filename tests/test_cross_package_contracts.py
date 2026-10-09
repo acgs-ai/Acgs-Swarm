@@ -111,6 +111,7 @@ async def test_top_level_remote_validation_contract_returns_verified_mesh_result
         agent_id="peer-remote",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
 
     mesh.register_local_signer("producer", domain="contract")

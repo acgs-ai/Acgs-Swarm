@@ -35,6 +35,7 @@ def _build_signed_request(
         agent_id="peer-remote",
         constitution=constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
         replay_window_seconds=300.0,
     )
     mesh.register_local_signer("producer")
@@ -56,6 +57,8 @@ def _build_signed_request(
             task_id=assignment.task_id,
             assigned_peers=assignment.peers,
             quorum=2,
+            protocol_version=3,
+            signed_assignment=assignment.signed_assignment,
         )
     ).hex()
     return (
@@ -77,6 +80,8 @@ def _build_signed_request(
             task_id=assignment.task_id,
             assigned_peers=assignment.peers,
             quorum=2,
+            protocol_version=3,
+            signed_assignment=assignment.signed_assignment,
         ),
     )
 

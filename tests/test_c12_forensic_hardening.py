@@ -877,7 +877,7 @@ def test_result_bundle_rehashes_actual_files_and_recomputes_statistics(tmp_path)
     assert verdict.command_metadata == replication.command_line
     assert {diagnostic.code for diagnostic in verdict.provenance_diagnostics} == {
         "authenticated_provenance_unavailable",
-        "identical_reviewer_answer_vectors",
+        "implausible_shared_wrong_answers",
         "unauthenticated_command_metadata",
     }
     assert bundle.answer_evidence.answers_sha256 == hashlib.sha256(

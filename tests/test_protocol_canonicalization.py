@@ -60,7 +60,10 @@ def test_canonical_remote_request_payload_is_versioned_and_separate_from_legacy(
         "quorum": 1,
     }
 
-    canonical = ConstitutionalMesh.build_remote_vote_request_payload(**payload)
+    canonical = ConstitutionalMesh.build_remote_vote_request_payload(
+        **payload,
+        protocol_version=2,
+    )
     legacy_payload = {
         key: value
         for key, value in payload.items()

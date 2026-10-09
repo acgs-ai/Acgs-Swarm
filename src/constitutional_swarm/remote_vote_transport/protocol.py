@@ -6,15 +6,17 @@ import json
 import math
 import os
 import ssl
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from typing import Literal
+from urllib.parse import urlsplit
 
 from constitutional_swarm.mesh.vote_envelope import (
     VoteEnvelope,
+    signed_assignment_from_dict,
+    signed_assignment_to_dict,
     vote_envelope_from_dict,
     vote_envelope_to_dict,
 )
-from typing import Literal
-from urllib.parse import urlsplit
 
 from constitutional_swarm.mesh import RemoteVoteRequest
 
@@ -133,7 +135,29 @@ class RemoteVoteResponse:
 
 
 def encode_remote_vote_request(request: RemoteVoteRequest) -> str:
-    return json.dumps(asdict(request), separators=(",", ":"), allow_nan=False)
+    if request.protocol_version != 3 or request.signed_assignment is None:
+        raise ValueError("Remote vote request requires protocol version 3 signed assignment")
+    payload = {
+        "artifact_id": request.artifact_id,
+        "assigned_peers": list(request.assigned_peers),
+        "assignment_id": request.assignment_id,
+        "constitutional_hash": request.constitutional_hash,
+        "content": request.content,
+        "content_hash": request.content_hash,
+        "evidence_mode": request.evidence_mode,
+        "nonce": request.nonce,
+        "producer_id": request.producer_id,
+        "protocol_version": request.protocol_version,
+        "quorum": request.quorum,
+        "request_signature": request.request_signature,
+        "request_signer_public_key": request.request_signer_public_key,
+        "signed_assignment": signed_assignment_to_dict(request.signed_assignment),
+        "task_id": request.task_id,
+        "timestamp": request.timestamp,
+        "voter_id": request.voter_id,
+        "voter_public_key": request.voter_public_key,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
@@ -148,6 +172,7 @@ def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
         "content_hash", "constitutional_hash", "voter_public_key", "nonce",
         "timestamp", "request_signer_public_key", "request_signature", "task_id",
         "assigned_peers", "quorum", "evidence_mode", "protocol_version",
+        "signed_assignment",
     }
     missing = expected - set(payload)
     extra = set(payload) - expected
@@ -158,7 +183,8 @@ def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
     if extra:
         raise ValueError("Malformed remote vote request: exact versioned schema required")
     string_fields = expected - {
-        "timestamp", "assigned_peers", "quorum", "protocol_version"
+        "timestamp", "assigned_peers", "quorum", "protocol_version",
+        "signed_assignment",
     }
     if any(not isinstance(payload[name], str) for name in string_fields):
         raise ValueError("Malformed remote vote request: string field has invalid type")
@@ -170,7 +196,9 @@ def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
         raise ValueError("Malformed remote vote request: assigned_peers must be strings")
     if type(payload["quorum"]) is not int:
         raise ValueError("Malformed remote vote request: quorum must be an integer")
-    if type(payload["protocol_version"]) is not int or payload["protocol_version"] != 2:
+    if not isinstance(payload["signed_assignment"], dict):
+        raise ValueError("Malformed remote vote request: signed_assignment must be an object")
+    if type(payload["protocol_version"]) is not int or payload["protocol_version"] != 3:
         raise ValueError("Malformed remote vote request: unsupported protocol version")
     try:
         return RemoteVoteRequest(
@@ -185,6 +213,7 @@ def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
             assigned_peers=tuple(payload["assigned_peers"]), quorum=payload["quorum"],
             evidence_mode=payload["evidence_mode"],
             protocol_version=payload["protocol_version"],
+            signed_assignment=signed_assignment_from_dict(payload["signed_assignment"]),
         )
     except KeyError as exc:
         raise ValueError(f"Malformed remote vote request: missing {exc.args[0]}") from exc

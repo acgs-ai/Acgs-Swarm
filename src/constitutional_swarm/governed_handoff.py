@@ -50,7 +50,13 @@ IMMUTABLE_PROTECTED_ROOTS: frozenset[str] = frozenset(
 )
 CODE_OWNED_PROTECTED_PATHS: tuple[str, ...] = (
     ".env",
+    ".env.*",
+    ".env~",
+    "**/.env",
+    "**/.env.*",
+    "**/.env~",
     ".envrc",
+    "**/.envrc",
     ".pre-commit-config.yaml",
     "secrets",
     "secrets/**",

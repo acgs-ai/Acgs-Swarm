@@ -36,10 +36,11 @@ from constitutional_swarm.mesh import (
     UnauthorizedVoterError,
 )
 from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
     VoteSignerRegistry,
     compute_vote_envelope_root,
     normalize_voter_id,
-    verify_vote_envelopes,
+    verify_assignment_vote_envelopes,
     vote_envelope_hash,
 )
 
@@ -181,7 +182,7 @@ class PrecedentCascade:
         consensus_threshold: float = 0.8,
         min_consensus_miners: int = 3,
         seed: int | None = None,
-        vote_registry: VoteSignerRegistry | None = None,
+        vote_registry: VoteSignerRegistry | FrozenVoteSignerRegistry | None = None,
     ) -> None:
         if (
             isinstance(consensus_threshold, bool)
@@ -259,6 +260,18 @@ class PrecedentCascade:
         else:
             return candidate
 
+        return self._record_stage_result(candidate, result)
+
+    def _record_stage_result(
+        self,
+        candidate: PrecedentCandidate,
+        result: CascadeResult,
+    ) -> PrecedentCandidate:
+        """Apply one stage result while preserving issuance and metric invariants."""
+        if self._issued.get(candidate.candidate_id) is not candidate:
+            raise ValueError("candidate is not the current instance issued by this cascade")
+        if result.stage is not candidate.current_stage:
+            raise ValueError("cascade result does not match the candidate's current stage")
         updated = candidate.with_result(result)
         if updated.alive:
             self._issued[candidate.candidate_id] = updated
@@ -268,15 +281,14 @@ class PrecedentCascade:
 
         # Track funnel
         if result.passed:
-            if stage == CascadeStage.DNA_PRECHECK:
+            if result.stage == CascadeStage.DNA_PRECHECK:
                 self._metrics.passed_dna += 1
-            elif stage == CascadeStage.MESH_VALIDATION:
+            elif result.stage == CascadeStage.MESH_VALIDATION:
                 self._metrics.passed_mesh += 1
-            elif stage == CascadeStage.MULTI_MINER_CONSENSUS:
+            elif result.stage == CascadeStage.MULTI_MINER_CONSENSUS:
                 self._metrics.passed_consensus += 1
-            elif stage == CascadeStage.CONSTITUTIONAL_COMPATIBILITY:
+            elif result.stage == CascadeStage.CONSTITUTIONAL_COMPATIBILITY:
                 self._metrics.passed_compatibility += 1
-
         return updated
 
     def run_full_cascade(
@@ -292,6 +304,34 @@ class PrecedentCascade:
             candidate = self.advance(candidate)
             if not candidate.alive:
                 break
+        return candidate
+
+    async def run_full_cascade_remote(
+        self,
+        judgment: str,
+        reasoning: str,
+        domain: str,
+        miner_uid: str,
+        *,
+        peer_routes: dict[str, tuple[str, int]],
+        client: Any | None = None,
+        timeout: float = 5.0,
+    ) -> PrecedentCandidate:
+        """Run the cascade with independent remote voters at mesh validation."""
+        candidate = self.submit(judgment, reasoning, domain, miner_uid)
+        candidate = self.advance(candidate)
+        if not candidate.alive:
+            return candidate
+
+        mesh_result = await self._stage_mesh_remote(
+            candidate,
+            peer_routes=peer_routes,
+            client=client,
+            timeout=timeout,
+        )
+        candidate = self._record_stage_result(candidate, mesh_result)
+        while candidate.alive and len(candidate.stage_results) < len(STAGE_ORDER):
+            candidate = self.advance(candidate)
         return candidate
 
     def accept(self, candidate: PrecedentCandidate) -> ConstitutionDelta | None:
@@ -399,6 +439,67 @@ class PrecedentCascade:
                 detail=f"mesh error: {type(exc).__name__}",
             )
 
+    async def _stage_mesh_remote(
+        self,
+        candidate: PrecedentCandidate,
+        *,
+        peer_routes: dict[str, tuple[str, int]],
+        client: Any | None,
+        timeout: float,
+    ) -> CascadeResult:
+        """Stage 2 using public-key-only peers through the remote vote path."""
+        start = time.perf_counter_ns()
+        if self._mesh is None:
+            return CascadeResult(
+                stage=CascadeStage.MESH_VALIDATION,
+                passed=False,
+                latency_ns=time.perf_counter_ns() - start,
+                detail="no mesh configured",
+            )
+        try:
+            assignment = self._mesh.request_validation(
+                producer_id=candidate.miner_uid,
+                content=candidate.judgment_text,
+                artifact_id=candidate.candidate_id,
+                task_id=candidate.candidate_id,
+            )
+            result = await self._mesh.collect_remote_votes(
+                assignment.assignment_id,
+                peer_routes=peer_routes,
+                client=client,
+                timeout=timeout,
+            )
+            self._mesh_results[candidate.candidate_id] = result
+            passed = self._valid_mesh_result(candidate, result)
+            return CascadeResult(
+                stage=CascadeStage.MESH_VALIDATION,
+                passed=passed,
+                latency_ns=time.perf_counter_ns() - start,
+                detail=(
+                    f"votes: {result.votes_for}/{result.votes_for + result.votes_against}"
+                    if passed
+                    else "invalid or unbound mesh settlement"
+                ),
+            )
+        except (
+            ImportError,
+            InsufficientPeersError,
+            InvalidVoteSignatureError,
+            KeyError,
+            MeshHaltedError,
+            MeshSnapshotStaleError,
+            SettlementPersistenceError,
+            TimeoutError,
+            UnauthorizedVoterError,
+            ValueError,
+        ) as exc:
+            return CascadeResult(
+                stage=CascadeStage.MESH_VALIDATION,
+                passed=False,
+                latency_ns=time.perf_counter_ns() - start,
+                detail=f"mesh error: {type(exc).__name__}",
+            )
+
     def _stage_consensus(self, candidate: PrecedentCandidate) -> CascadeResult:
         """Stage 3: enforce miner count and approval ratio on the mesh result."""
         start = time.perf_counter_ns()
@@ -439,7 +540,12 @@ class PrecedentCascade:
         establish signed task or candidate provenance.
         """
         proof = result.proof
-        if proof is None or proof.protocol_version != 2 or self._vote_registry is None:
+        if (
+            proof is None
+            or proof.protocol_version != 2
+            or self._vote_registry is None
+            or result.signed_assignment is None
+        ):
             return False
         if (
             proof.task_id != candidate.candidate_id
@@ -451,7 +557,8 @@ class PrecedentCascade:
             candidate.judgment_text.encode("utf-8")
         ).hexdigest()[:32]
         try:
-            envelopes = verify_vote_envelopes(
+            envelopes = verify_assignment_vote_envelopes(
+                result.signed_assignment,
                 result.vote_envelopes,
                 self._vote_registry,
                 task_id=proof.task_id,
@@ -460,16 +567,20 @@ class PrecedentCascade:
                 artifact_id=proof.artifact_id,
                 content_hash=expected_content_hash,
                 constitutional_hash=self._constitution.hash,
-                expected_quorum=result.vote_envelopes[0].quorum
-                if result.vote_envelopes
-                else None,
                 require_independent=True,
             )
         except (IndexError, TypeError, ValueError):
             return False
+        electorate_size = len(result.signed_assignment.assigned_peers)
+        quorum = result.signed_assignment.quorum
+        if (
+            electorate_size < self._min_consensus_miners
+            or quorum <= electorate_size // 2
+            or quorum / electorate_size < self._consensus_threshold
+        ):
+            return False
         votes_for = sum(envelope.approved for envelope in envelopes)
         votes_against = len(envelopes) - votes_for
-        quorum = envelopes[0].quorum
         accepted = votes_for >= quorum and votes_for > votes_against
         expected_root = compute_vote_envelope_root(
             task_id=proof.task_id,

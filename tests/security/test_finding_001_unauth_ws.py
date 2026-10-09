@@ -22,12 +22,17 @@ import ssl
 
 import pytest
 from constitutional_swarm.mesh import RemoteVoteRequest
-from constitutional_swarm.mesh.vote_envelope import VoteEnvelope, canonical_assigned_peers_hash
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteEnvelope,
+    canonical_assigned_peers_hash,
+    sign_assignment,
+)
 from constitutional_swarm.remote_vote_transport import (
     RemoteVoteClient,
     RemoteVoteResponse,
     encode_remote_vote_response,
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 FINDING_ID = "SEC-001"
 SEVERITY = "HIGH"
@@ -40,6 +45,20 @@ websockets = pytest.importorskip(
 
 
 def _minimal_request() -> RemoteVoteRequest:
+    signed_assignment = sign_assignment(
+        Ed25519PrivateKey.generate(),
+        task_id="test-task",
+        assignment_id="test-assignment",
+        assigner_id="test-assigner",
+        producer_id="test-producer",
+        artifact_id="test-artifact",
+        content_hash="0" * 64,
+        constitutional_hash="0" * 16,
+        assigned_peers=("test-voter",),
+        quorum=1,
+        selection_seed="test-seed",
+        issued_at=1234.5,
+    )
     return RemoteVoteRequest(
         assignment_id="test-assignment",
         voter_id="test-voter",
@@ -56,6 +75,8 @@ def _minimal_request() -> RemoteVoteRequest:
         task_id="test-task",
         assigned_peers=("test-voter",),
         quorum=1,
+        protocol_version=3,
+        signed_assignment=signed_assignment,
     )
 
 

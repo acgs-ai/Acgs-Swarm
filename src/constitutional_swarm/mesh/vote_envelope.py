@@ -9,8 +9,9 @@ import re
 import threading
 import unicodedata
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, replace
+from types import MappingProxyType
+from typing import Any, Literal, Protocol
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -18,13 +19,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-VOTE_ENVELOPE_PROTOCOL_VERSION = 2
-_VOTE_DOMAIN = b"constitutional-swarm.vote-envelope.v2\x00"
+SIGNED_ASSIGNMENT_PROTOCOL_VERSION = 1
+VOTE_ENVELOPE_PROTOCOL_VERSION = 3
+_ASSIGNMENT_DOMAIN = b"constitutional-swarm.signed-assignment.v1\x00"
+_ASSIGNMENT_DIGEST_DOMAIN = b"constitutional-swarm.signed-assignment-digest.v1\x00"
+_VOTE_DOMAIN_V2 = b"constitutional-swarm.vote-envelope.v2\x00"
+_VOTE_DOMAIN_V3 = b"constitutional-swarm.vote-envelope.v3\x00"
 _ROOT_DOMAIN = b"constitutional-swarm.vote-envelope-root.v2\x00"
 _ASSIGNED_PEERS_DOMAIN = b"constitutional-swarm.assigned-peers.v1\x00"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HEX128 = re.compile(r"[0-9a-f]{128}")
-_FIELDS = (
+_V2_FIELDS = (
     "protocol_version",
     "voter_id",
     "key_id",
@@ -44,6 +49,35 @@ _FIELDS = (
     "issued_at",
     "signature",
 )
+_V3_FIELDS = (*_V2_FIELDS[:-1], "assignment_digest", "signature")
+_ASSIGNMENT_FIELDS = (
+    "protocol_version", "task_id", "assignment_id", "assigner_id", "key_id",
+    "producer_id", "artifact_id", "content_hash", "constitutional_hash",
+    "assigned_peers", "quorum", "selection_seed", "issued_at", "signature",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SignedAssignment:
+    """Authority-signed, immutable electorate selection."""
+
+    protocol_version: int
+    task_id: str
+    assignment_id: str
+    assigner_id: str
+    key_id: str
+    producer_id: str
+    artifact_id: str
+    content_hash: str
+    constitutional_hash: str
+    assigned_peers: tuple[str, ...]
+    quorum: int
+    selection_seed: str
+    issued_at: float
+    signature: str
+
+    def __post_init__(self) -> None:
+        _validate_assignment(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +100,7 @@ class VoteEnvelope:
     nonce: str
     issued_at: float
     signature: str
+    assignment_digest: str = ""
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -140,20 +175,151 @@ class _Grant:
     roles: frozenset[str]
 
 
-class VoteSignerRegistry:
-    def __init__(self, *, frozen: bool = False) -> None:
-        self._identities: dict[str, _Grant] = {}
-        self._keys: dict[str, str] = {}
-        self._lock = threading.RLock()
-        self._frozen = frozen
+class VoteSignerRegistryView(Protocol):
+    """Read-only trust-root surface required by vote evidence verifiers."""
+
+    def authorize(
+        self, voter_id: str, key_id: str, *, role: str = "voter"
+    ) -> Ed25519PublicKey: ...
+
+    def trust_grants(self, *, role: str = "validator") -> dict[str, dict[str, object]]: ...
+
+    def validate_trust_root(self) -> None: ...
+
+
+_VOTING_ROLES = frozenset({"voter", "validator"})
+
+
+def _validate_registry_grants(grants: Sequence[_Grant]) -> tuple[_Grant, ...]:
+    """Validate canonical registry state and assignment-authority separation."""
+    copied = tuple(grants)
+    identities: dict[str, _Grant] = {}
+    key_material: dict[bytes, _Grant] = {}
+    for grant in copied:
+        if not isinstance(grant, _Grant):
+            raise TypeError("vote signer grants must be registry grants")
+        if grant.identity != normalize_voter_id(grant.identity):
+            raise ValueError("vote signer identity must use its canonical normalized form")
+        if grant.key_id != key_id_for_public_key(grant.key):
+            raise ValueError("vote signer key ID must equal the public-key fingerprint")
+        if not isinstance(grant.roles, frozenset):
+            raise TypeError("vote signer grant roles must be an immutable frozenset")
+        if not grant.roles or any(
+            not isinstance(role, str) or not role.strip() or role != role.strip().casefold()
+            for role in grant.roles
+        ):
+            raise ValueError("vote signer roles must be non-empty canonical strings")
+        if "assigner" in grant.roles and grant.roles & _VOTING_ROLES:
+            raise ValueError(
+                "assigner and voter/validator roles are mutually exclusive"
+            )
+        if grant.identity in identities:
+            raise ValueError("vote signer identities must be unique")
+        raw_key = grant.key.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        existing = key_material.get(raw_key)
+        if existing is not None:
+            crosses_authority_boundary = (
+                "assigner" in existing.roles and bool(grant.roles & _VOTING_ROLES)
+            ) or (
+                "assigner" in grant.roles and bool(existing.roles & _VOTING_ROLES)
+            )
+            if crosses_authority_boundary:
+                raise ValueError(
+                    "assigner key must not be used by a voter/validator identity"
+                )
+            raise ValueError("vote signer public keys must be unique")
+        identities[grant.identity] = grant
+        key_material[raw_key] = grant
+    return copied
+
+
+def _validate_registry_indexes(
+    grants: Sequence[_Grant],
+    identities: Mapping[str, _Grant],
+    keys: Mapping[str, str],
+) -> None:
+    validated = _validate_registry_grants(grants)
+    expected_identities = {grant.identity: grant for grant in validated}
+    expected_keys = {grant.key_id: grant.identity for grant in validated}
+    if dict(identities) != expected_identities:
+        raise ValueError("vote signer identity index does not match registry grants")
+    if dict(keys) != expected_keys:
+        raise ValueError("vote signer key index does not match registry grants")
+
+
+def _export_trust_grants(
+    grants: Sequence[_Grant], *, role: str
+) -> dict[str, dict[str, object]]:
+    required = role.strip().casefold()
+    return {
+        grant.key_id: {
+            "identity_id": grant.identity,
+            "public_key_hex": grant.key.public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ).hex(),
+            "roles": [required],
+        }
+        for grant in grants
+        if required in grant.roles
+    }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class FrozenVoteSignerRegistry:
+    """Immutable public-key trust-root snapshot with no mutation capability."""
+
+    _grants: tuple[_Grant, ...]
+    _identities: Mapping[str, _Grant]
+    _keys: Mapping[str, str]
+
+    def __init__(self, grants: Sequence[_Grant]) -> None:
+        copied = _validate_registry_grants(grants)
+        identities = {grant.identity: grant for grant in copied}
+        keys = {grant.key_id: grant.identity for grant in copied}
+        object.__setattr__(self, "_grants", copied)
+        object.__setattr__(self, "_identities", MappingProxyType(identities))
+        object.__setattr__(self, "_keys", MappingProxyType(keys))
 
     @property
     def frozen(self) -> bool:
-        return self._frozen
+        return True
 
-    def _require_mutable(self) -> None:
-        if self._frozen:
-            raise ValueError("vote signer registry is frozen")
+    def authorize(
+        self, voter_id: str, key_id: str, *, role: str = "voter"
+    ) -> Ed25519PublicKey:
+        identity, role = normalize_voter_id(voter_id), role.strip().casefold()
+        _hex(key_id, _HEX64, "key_id")
+        grant = self._identities.get(identity)
+        if grant is None or grant.key_id != key_id:
+            raise ValueError("vote signer identity and key are not authorized")
+        if role not in grant.roles:
+            raise ValueError(f"vote signer is not authorized for role {role!r}")
+        return grant.key
+
+    def trust_grants(self, *, role: str = "validator") -> dict[str, dict[str, object]]:
+        return _export_trust_grants(self._grants, role=role)
+
+    def validate_trust_root(self) -> None:
+        _validate_registry_indexes(self._grants, self._identities, self._keys)
+
+    def frozen_copy(self) -> FrozenVoteSignerRegistry:
+        """Return this immutable snapshot for safe snapshot chaining."""
+        return self
+
+
+class VoteSignerRegistry:
+    def __init__(self) -> None:
+        self._identities: dict[str, _Grant] = {}
+        self._keys: dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def frozen(self) -> bool:
+        return False
 
     def register(
         self,
@@ -162,7 +328,6 @@ class VoteSignerRegistry:
         *,
         roles: Collection[str] = frozenset({"voter"}),
     ) -> str:
-        self._require_mutable()
         if isinstance(roles, (str, bytes)):
             raise TypeError("roles must be a collection of role names")
         if any(not isinstance(role, str) or not role.strip() for role in roles):
@@ -184,7 +349,15 @@ class VoteSignerRegistry:
                 raise ValueError(
                     "public key is already registered to another voter identity"
                 )
-            self._identities[identity] = _Grant(identity, key_id, key, role_set)
+            candidate = _Grant(identity, key_id, key, role_set)
+            _validate_registry_grants(
+                tuple(
+                    candidate if grant.identity == identity else grant
+                    for grant in self._identities.values()
+                )
+                + (() if old is not None else (candidate,))
+            )
+            self._identities[identity] = candidate
             self._keys[key_id] = identity
         return key_id
 
@@ -203,7 +376,6 @@ class VoteSignerRegistry:
 
     def unregister(self, voter_id: str) -> None:
         """Remove one explicitly managed signer identity."""
-        self._require_mutable()
         identity = normalize_voter_id(voter_id)
         with self._lock:
             grant = self._identities.pop(identity, None)
@@ -218,7 +390,6 @@ class VoteSignerRegistry:
         roles: Collection[str] = frozenset({"voter"}),
     ) -> str:
         """Atomically install or rotate one identity after all checks pass."""
-        self._require_mutable()
         if isinstance(roles, (str, bytes)):
             raise TypeError("roles must be a collection of role names")
         if any(not isinstance(role, str) or not role.strip() for role in roles):
@@ -235,39 +406,38 @@ class VoteSignerRegistry:
                     "public key is already registered to another voter identity"
                 )
             old = self._identities.get(identity)
+            candidate = _Grant(identity, key_id, key, role_set)
+            _validate_registry_grants(
+                tuple(
+                    candidate if grant.identity == identity else grant
+                    for grant in self._identities.values()
+                )
+                + (() if old is not None else (candidate,))
+            )
             if old is not None and old.key_id != key_id:
                 self._keys.pop(old.key_id, None)
-            self._identities[identity] = _Grant(identity, key_id, key, role_set)
+            self._identities[identity] = candidate
             self._keys[key_id] = identity
         return key_id
 
     def trust_grants(self, *, role: str = "validator") -> dict[str, dict[str, object]]:
         """Export immutable public grants for consumers of verified vote evidence."""
-        required = role.strip().casefold()
         with self._lock:
             grants = tuple(self._identities.values())
-        return {
-            grant.key_id: {
-                "identity_id": grant.identity,
-                "public_key_hex": grant.key.public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                ).hex(),
-                "roles": [required],
-            }
-            for grant in grants
-            if required in grant.roles
-        }
+        return _export_trust_grants(grants, role=role)
 
-    def frozen_copy(self) -> VoteSignerRegistry:
-        """Return an immutable public-key-only snapshot of this trust root."""
-        snapshot = VoteSignerRegistry()
+    def validate_trust_root(self) -> None:
         with self._lock:
             grants = tuple(self._identities.values())
-        for grant in grants:
-            snapshot.register(grant.identity, grant.key, roles=grant.roles)
-        snapshot._frozen = True
-        return snapshot
+            identities = dict(self._identities)
+            keys = dict(self._keys)
+        _validate_registry_indexes(grants, identities, keys)
+
+    def frozen_copy(self) -> FrozenVoteSignerRegistry:
+        """Return an immutable public-key-only snapshot of this trust root."""
+        with self._lock:
+            grants = tuple(self._identities.values())
+        return FrozenVoteSignerRegistry(grants)
 
 
 def _canonical_assigned_peers(peers: Sequence[str]) -> tuple[str, ...]:
@@ -290,8 +460,121 @@ def canonical_assigned_peers_hash(peers: Sequence[str]) -> str:
     return hashlib.sha256(_ASSIGNED_PEERS_DOMAIN + payload).hexdigest()
 
 
+def _validate_assignment(item: object) -> SignedAssignment:
+    if not isinstance(item, SignedAssignment):
+        raise ValueError("signed assignment is required")
+    if type(item.protocol_version) is not int or item.protocol_version != 1:
+        raise ValueError("unsupported signed assignment protocol version")
+    if item.assigner_id != normalize_voter_id(item.assigner_id):
+        raise ValueError("assigner_id must use its canonical normalized form")
+    _hex(item.key_id, _HEX64, "key_id")
+    for name in (
+        "task_id", "assignment_id", "producer_id", "artifact_id", "content_hash",
+        "constitutional_hash", "selection_seed",
+    ):
+        if not isinstance(getattr(item, name), str) or not getattr(item, name):
+            raise ValueError(f"{name} must be a non-empty string")
+    canonical_peers = _canonical_assigned_peers(item.assigned_peers)
+    if item.assigned_peers != canonical_peers:
+        raise ValueError("assigned_peers must be normalized and sorted")
+    if item.producer_id != normalize_voter_id(item.producer_id):
+        raise ValueError("producer_id must use its canonical normalized form")
+    if item.producer_id in canonical_peers:
+        raise ValueError("producer_id must not be included in assigned_peers")
+    if item.assigner_id in canonical_peers:
+        raise ValueError("assigner_id must not be included in assigned_peers")
+    if type(item.quorum) is not int or not 1 <= item.quorum <= len(canonical_peers):
+        raise ValueError("quorum must be within the assigned electorate")
+    if item.quorum <= len(canonical_peers) // 2:
+        raise ValueError("quorum must be a strict majority of assigned_peers")
+    if type(item.issued_at) is not float or not math.isfinite(item.issued_at):
+        raise ValueError("issued_at must be a finite float")
+    _hex(item.signature, _HEX128, "signature")
+    return item
+
+
+def signed_assignment_to_dict(item: SignedAssignment) -> dict[str, object]:
+    _validate_assignment(item)
+    result = {name: getattr(item, name) for name in _ASSIGNMENT_FIELDS}
+    result["assigned_peers"] = list(item.assigned_peers)
+    return result
+
+
+def signed_assignment_from_dict(data: Mapping[str, object]) -> SignedAssignment:
+    if set(data) != set(_ASSIGNMENT_FIELDS):
+        raise ValueError("signed assignment schema fields mismatch")
+    values: dict[str, Any] = dict(data)
+    peers = values["assigned_peers"]
+    if not isinstance(peers, (list, tuple)) or any(not isinstance(peer, str) for peer in peers):
+        raise TypeError("assigned_peers must be a sequence of strings")
+    values["assigned_peers"] = tuple(peers)
+    for name in set(_ASSIGNMENT_FIELDS) - {"protocol_version", "assigned_peers", "quorum", "issued_at"}:
+        if not isinstance(values[name], str):
+            raise TypeError(f"{name} must be a string")
+    if type(values["protocol_version"]) is not int or type(values["quorum"]) is not int or type(values["issued_at"]) is not float:
+        raise TypeError("invalid signed assignment scalar type")
+    return _validate_assignment(SignedAssignment(**values))
+
+
+def canonical_signed_assignment_bytes(item: SignedAssignment, *, include_signature: bool = False) -> bytes:
+    payload = signed_assignment_to_dict(item)
+    if not include_signature:
+        payload.pop("signature")
+    return _ASSIGNMENT_DOMAIN + json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+def signed_assignment_digest(assignment: SignedAssignment | Mapping[str, object]) -> str:
+    item = signed_assignment_from_dict(assignment) if isinstance(assignment, Mapping) else _validate_assignment(assignment)
+    return hashlib.sha256(_ASSIGNMENT_DIGEST_DOMAIN + canonical_signed_assignment_bytes(item, include_signature=True)).hexdigest()
+
+
+def sign_assignment(
+    private_key: Ed25519PrivateKey | bytes | str, *, task_id: str,
+    assignment_id: str, assigner_id: str, producer_id: str, artifact_id: str,
+    content_hash: str, constitutional_hash: str, assigned_peers: Sequence[str],
+    quorum: int, selection_seed: str, issued_at: float, key_id: str | None = None,
+    protocol_version: int = SIGNED_ASSIGNMENT_PROTOCOL_VERSION,
+) -> SignedAssignment:
+    key = _private(private_key)
+    derived = key_id_for_public_key(key.public_key())
+    if key_id is not None and _hex(key_id, _HEX64, "key_id") != derived:
+        raise ValueError("key_id does not match the assignment signing key")
+    unsigned = SignedAssignment(
+        protocol_version, task_id, assignment_id, normalize_voter_id(assigner_id),
+        derived, normalize_voter_id(producer_id), artifact_id, content_hash, constitutional_hash,
+        _canonical_assigned_peers(assigned_peers), quorum, selection_seed, issued_at,
+        "0" * 128,
+    )
+    return replace(
+        unsigned,
+        signature=key.sign(canonical_signed_assignment_bytes(unsigned)).hex(),
+    )
+
+
+def verify_signed_assignment(
+    assignment: SignedAssignment | Mapping[str, object], registry: VoteSignerRegistryView,
+    *, task_id: str, assignment_id: str, producer_id: str, artifact_id: str,
+    content_hash: str, constitutional_hash: str,
+) -> SignedAssignment:
+    item = signed_assignment_from_dict(assignment) if isinstance(assignment, Mapping) else _validate_assignment(assignment)
+    registry.validate_trust_root()
+    key = registry.authorize(item.assigner_id, item.key_id, role="assigner")
+    for name, expected in {
+        "task_id": task_id, "assignment_id": assignment_id, "producer_id": producer_id,
+        "artifact_id": artifact_id, "content_hash": content_hash,
+        "constitutional_hash": constitutional_hash,
+    }.items():
+        if getattr(item, name) != expected:
+            raise ValueError(f"signed assignment {name} binding does not match")
+    try:
+        key.verify(bytes.fromhex(item.signature), canonical_signed_assignment_bytes(item))
+    except (InvalidSignature, ValueError) as exc:
+        raise ValueError("signed assignment signature is invalid") from exc
+    return item
+
+
 def _validate(item: VoteEnvelope) -> VoteEnvelope:
-    if type(item.protocol_version) is not int or item.protocol_version != 2:
+    if type(item.protocol_version) is not int or item.protocol_version not in {2, 3}:
         raise ValueError("unsupported vote envelope protocol version")
     if item.voter_id != normalize_voter_id(item.voter_id):
         raise ValueError("voter_id must use its canonical normalized form")
@@ -323,19 +606,26 @@ def _validate(item: VoteEnvelope) -> VoteEnvelope:
     if type(item.issued_at) is not float or not math.isfinite(item.issued_at):
         raise ValueError("issued_at must be a finite float")
     _hex(item.signature, _HEX128, "signature")
+    if item.protocol_version == 3:
+        _hex(item.assignment_digest, _HEX64, "assignment_digest")
+    elif item.assignment_digest:
+        raise ValueError("legacy vote envelope must not contain assignment_digest")
     return item
 
 
 def vote_envelope_to_dict(item: VoteEnvelope) -> dict[str, object]:
     _validate(item)
-    return {name: getattr(item, name) for name in _FIELDS}
+    fields = _V3_FIELDS if item.protocol_version == 3 else _V2_FIELDS
+    return {name: getattr(item, name) for name in fields}
 
 
 def vote_envelope_from_dict(data: Mapping[str, object]) -> VoteEnvelope:
-    if set(data) != set(_FIELDS):
+    fields = _V3_FIELDS if data.get("protocol_version") == 3 else _V2_FIELDS
+    if set(data) != set(fields):
         raise ValueError("vote envelope schema fields mismatch")
     values: dict[str, Any] = dict(data)
-    for name in set(_FIELDS) - {
+    values.setdefault("assignment_digest", "")
+    for name in set(fields) - {
         "protocol_version",
         "issued_at",
         "assigned_peer_count",
@@ -360,7 +650,7 @@ def canonical_vote_envelope_bytes(
     if not include_signature:
         payload.pop("signature")
     return (
-        _VOTE_DOMAIN
+        (_VOTE_DOMAIN_V3 if item.protocol_version == 3 else _VOTE_DOMAIN_V2)
         + json.dumps(
             payload,
             sort_keys=True,
@@ -388,6 +678,7 @@ def sign_vote_envelope(
     assigned_peers: Sequence[str],
     quorum: int,
     evidence_mode: Literal["independent", "single_operator_dev"] = "independent",
+    assignment_digest: str = "",
     key_id: str | None = None,
     protocol_version: int = VOTE_ENVELOPE_PROTOCOL_VERSION,
 ) -> VoteEnvelope:
@@ -415,6 +706,7 @@ def sign_vote_envelope(
         nonce,
         issued_at,
         "0" * 128,
+        assignment_digest,
     )
     signature = key.sign(canonical_vote_envelope_bytes(unsigned)).hex()
     return VoteEnvelope(
@@ -436,12 +728,13 @@ def sign_vote_envelope(
         nonce,
         issued_at,
         signature,
+        assignment_digest,
     )
 
 
 def verify_vote_envelope(
     envelope: VoteEnvelope | Mapping[str, object],
-    registry: VoteSignerRegistry,
+    registry: VoteSignerRegistryView,
     *,
     task_id: str,
     assignment_id: str,
@@ -451,6 +744,7 @@ def verify_vote_envelope(
     constitutional_hash: str,
     required_role: str = "voter",
     replay_guard: Any | None = None,
+    expected_assignment_digest: str | None = None,
 ) -> VoteEnvelope:
     item = (
         vote_envelope_from_dict(envelope)
@@ -468,6 +762,8 @@ def verify_vote_envelope(
     }.items():
         if getattr(item, name) != expected:
             raise ValueError(f"vote envelope {name} binding does not match")
+    if expected_assignment_digest is not None and item.assignment_digest != expected_assignment_digest:
+        raise ValueError("vote envelope assignment digest does not match")
     try:
         key.verify(bytes.fromhex(item.signature), canonical_vote_envelope_bytes(item))
     except (InvalidSignature, ValueError) as exc:
@@ -479,7 +775,7 @@ def verify_vote_envelope(
 
 def verify_vote_envelopes(
     envelopes: Sequence[VoteEnvelope | Mapping[str, object]],
-    registry: VoteSignerRegistry,
+    registry: VoteSignerRegistryView,
     *,
     task_id: str,
     assignment_id: str,
@@ -492,6 +788,12 @@ def verify_vote_envelopes(
     expected_quorum: int | None = None,
     require_independent: bool = True,
 ) -> tuple[VoteEnvelope, ...]:
+    """Verify raw signatures and self-described electorate metadata.
+
+    This is a low-level historical primitive, not proof-grade authorization.
+    Public consumers must use :func:`verify_assignment_vote_envelopes` so the
+    electorate and quorum come from a trusted assignment authority.
+    """
     decoded = tuple(
         vote_envelope_from_dict(item) if isinstance(item, Mapping) else _validate(item)
         for item in envelopes
@@ -545,6 +847,60 @@ def verify_vote_envelopes(
         for e in decoded
     )
     return result
+
+
+def verify_assignment_vote_envelopes(
+    signed_assignment: SignedAssignment | Mapping[str, object],
+    envelopes: Sequence[VoteEnvelope | Mapping[str, object]],
+    registry: VoteSignerRegistryView, *, task_id: str, assignment_id: str,
+    producer_id: str, artifact_id: str, content_hash: str, constitutional_hash: str,
+    require_independent: bool = True, required_role: str = "voter",
+    expected_assigned_peers: Sequence[str] | None = None,
+    expected_quorum: int | None = None,
+) -> tuple[VoteEnvelope, ...]:
+    assignment = verify_signed_assignment(
+        signed_assignment, registry, task_id=task_id, assignment_id=assignment_id,
+        producer_id=producer_id, artifact_id=artifact_id, content_hash=content_hash,
+        constitutional_hash=constitutional_hash,
+    )
+    decoded = tuple(vote_envelope_from_dict(item) if isinstance(item, Mapping) else _validate(item) for item in envelopes)
+    if any(item.protocol_version != 3 for item in decoded):
+        raise ValueError("proof-grade vote evidence requires protocol version 3")
+    digest = signed_assignment_digest(assignment)
+    if any(item.assignment_digest != digest for item in decoded):
+        raise ValueError("vote envelope assignment digest does not match")
+    if expected_assigned_peers is not None and _canonical_assigned_peers(expected_assigned_peers) != assignment.assigned_peers:
+        raise ValueError("signed assignment electorate does not match expected peers")
+    if expected_quorum is not None and expected_quorum != assignment.quorum:
+        raise ValueError("signed assignment quorum does not match expected quorum")
+    verified = verify_vote_envelopes(
+        decoded, registry, task_id=task_id, assignment_id=assignment_id,
+        producer_id=producer_id, artifact_id=artifact_id, content_hash=content_hash,
+        constitutional_hash=constitutional_hash, required_role=required_role,
+        expected_assigned_peers=assignment.assigned_peers,
+        expected_quorum=assignment.quorum, require_independent=require_independent,
+    )
+    assigner_key = registry.authorize(
+        assignment.assigner_id,
+        assignment.key_id,
+        role="assigner",
+    )
+    assigner_key_bytes = assigner_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    for item in verified:
+        voter_key = registry.authorize(
+            item.voter_id,
+            item.key_id,
+            role=required_role,
+        )
+        if item.key_id == assignment.key_id or voter_key.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        ) == assigner_key_bytes:
+            raise ValueError("assigner key must not be used by a voter identity")
+    return verified
 
 
 def vote_envelope_hash(envelope: VoteEnvelope | Mapping[str, object]) -> str:
@@ -612,16 +968,27 @@ def compute_vote_envelope_root_from_hashes(
 
 
 __all__ = [
+    "SIGNED_ASSIGNMENT_PROTOCOL_VERSION",
     "VOTE_ENVELOPE_PROTOCOL_VERSION",
+    "FrozenVoteSignerRegistry",
+    "SignedAssignment",
     "VoteEnvelope",
     "VoteSignerRegistry",
+    "VoteSignerRegistryView",
     "canonical_assigned_peers_hash",
+    "canonical_signed_assignment_bytes",
     "canonical_vote_envelope_bytes",
     "compute_vote_envelope_root",
     "compute_vote_envelope_root_from_hashes",
     "key_id_for_public_key",
     "normalize_voter_id",
+    "sign_assignment",
     "sign_vote_envelope",
+    "signed_assignment_digest",
+    "signed_assignment_from_dict",
+    "signed_assignment_to_dict",
+    "verify_assignment_vote_envelopes",
+    "verify_signed_assignment",
     "verify_vote_envelope",
     "verify_vote_envelopes",
     "vote_envelope_from_dict",

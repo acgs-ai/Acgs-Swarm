@@ -82,7 +82,7 @@ def test_golden_payload_canonical_bytes_are_deterministic() -> None:
     assert first == second
     assert (
         payload_digest(payload)
-        == "8b088578b0aa6663b748059f9bdf657f2cd210f35f14350b7f7403e4e25cd6af"
+        == "3bff909aa47919dd0947380e456ea1fea01e60036badabe5d9b247f031f254be"
     )
 
 

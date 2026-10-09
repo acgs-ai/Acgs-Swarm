@@ -45,11 +45,13 @@ from typing import Any
 
 from constitutional_swarm.bittensor.protocol import EscalationType
 from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
+    SignedAssignment,
     VoteEnvelope,
     VoteSignerRegistry,
     compute_vote_envelope_root,
     normalize_voter_id,
-    verify_vote_envelopes,
+    verify_assignment_vote_envelopes,
 )
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ class PrecedentRecord:
     artifact_id: str = ""
     content_hash: str = ""
     vote_envelopes: tuple[VoteEnvelope, ...] = ()
+    signed_assignment: SignedAssignment | None = None
 
     @classmethod
     def create(
@@ -155,6 +158,7 @@ class PrecedentRecord:
         artifact_id: str = "",
         content_hash: str = "",
         vote_envelopes: tuple[VoteEnvelope, ...] = (),
+        signed_assignment: SignedAssignment | None = None,
     ) -> PrecedentRecord:
         total_votes = votes_for + votes_against
         grade = votes_for / total_votes if total_votes > 0 else 0.0
@@ -179,6 +183,7 @@ class PrecedentRecord:
             artifact_id=artifact_id,
             content_hash=content_hash,
             vote_envelopes=tuple(vote_envelopes),
+            signed_assignment=signed_assignment,
         )
 
 
@@ -288,7 +293,7 @@ class PrecedentStore:
         auto_resolve_threshold: float = 0.85,
         min_votes_for_precedent: int = 3,
         min_total_validators: int = 5,
-        vote_registry: VoteSignerRegistry | None = None,
+        vote_registry: VoteSignerRegistry | FrozenVoteSignerRegistry | None = None,
     ) -> None:
         if (
             isinstance(min_votes_for_precedent, bool)
@@ -328,7 +333,7 @@ class PrecedentStore:
         return self._constitutional_hash
 
     @property
-    def vote_registry(self) -> VoteSignerRegistry | None:
+    def vote_registry(self) -> FrozenVoteSignerRegistry | None:
         """Return the independently provisioned voter trust registry."""
         return self._vote_registry
 
@@ -380,6 +385,7 @@ class PrecedentStore:
             content_hash=record.content_hash,
             constitutional_hash=record.constitutional_hash,
             vote_envelopes=record.vote_envelopes,
+            signed_assignment=record.signed_assignment,
         )
 
     def verify_validation_evidence(
@@ -397,12 +403,15 @@ class PrecedentStore:
         content_hash: str,
         constitutional_hash: str,
         vote_envelopes: Sequence[VoteEnvelope],
+        signed_assignment: SignedAssignment | None,
     ) -> tuple[VoteEnvelope, ...]:
         """Verify complete signed evidence for either validation outcome."""
         if self._vote_registry is None:
             raise ValueError("signed vote envelope admission requires a trust registry")
         if not vote_envelopes:
             raise ValueError("signed vote envelope evidence is required")
+        if signed_assignment is None:
+            raise ValueError("signed assignment evidence is required")
         if not assignment_id:
             raise ValueError("vote envelope assignment ID is required")
         if not artifact_id:
@@ -413,7 +422,8 @@ class PrecedentStore:
         if content_hash != expected_content_hash:
             raise ValueError("precedent content hash does not bind the recorded judgment")
 
-        verified = verify_vote_envelopes(
+        verified = verify_assignment_vote_envelopes(
+            signed_assignment,
             vote_envelopes,
             self._vote_registry,
             task_id=task_id,
@@ -423,8 +433,8 @@ class PrecedentStore:
             content_hash=content_hash,
             constitutional_hash=constitutional_hash,
         )
-        electorate_size = verified[0].assigned_peer_count
-        signed_quorum = verified[0].quorum
+        electorate_size = len(signed_assignment.assigned_peers)
+        signed_quorum = signed_assignment.quorum
         if electorate_size < self._min_total_validators:
             raise ValueError(
                 "signed electorate is too small for precedent admission: "
@@ -531,6 +541,7 @@ class PrecedentStore:
             ambiguous_dimensions=tuple(record.ambiguous_dimensions),
             miner_uid=normalize_voter_id(record.miner_uid),
             vote_envelopes=tuple(verified),
+            signed_assignment=record.signed_assignment,
         )
         with self._lock:
             existing = self._records.get(record.precedent_id)
@@ -751,6 +762,7 @@ class PrecedentStore:
             record,
             impact_vector=dict(record.impact_vector),
             vote_envelopes=tuple(record.vote_envelopes),
+            signed_assignment=record.signed_assignment,
         )
 
     def _active_records_by_id_locked(

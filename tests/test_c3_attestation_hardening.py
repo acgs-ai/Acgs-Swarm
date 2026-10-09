@@ -560,20 +560,25 @@ def c3_transport_request(
     from dataclasses import replace
 
     from constitutional_swarm import ConstitutionalMesh, LocalRemotePeer
+    from constitutional_swarm.mesh.vote_envelope import sign_assignment
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     request_signer = Ed25519PrivateKey.generate()
+    assigner_key = Ed25519PrivateKey.generate()
     mesh = ConstitutionalMesh(
         request_constitution,
         peers_per_validation=2,
         quorum=2,
         seed=341,
+        assigner_private_key=assigner_key,
+        assigner_id="c3-transport-assigner",
         request_signing_private_key=request_signer,
     )
     peer = LocalRemotePeer(
         agent_id="peer-remote",
         constitution=peer_constitution,
         trusted_request_signers={mesh.get_request_signing_public_key()},
+        trusted_assigners=mesh.vote_registry.frozen_copy(),
     )
     mesh.register_local_signer("producer")
     mesh.register_remote_agent("peer-remote", vote_public_key=peer.public_key_hex)
@@ -582,6 +587,22 @@ def c3_transport_request(
     request = mesh.prepare_remote_vote(assignment.assignment_id, "peer-remote")
     if request_content is not None:
         content_hash = hashlib.sha256(request_content.encode("utf-8")).hexdigest()[:32]
+        original_assignment = request.signed_assignment
+        assert original_assignment is not None
+        signed_assignment = sign_assignment(
+            assigner_key,
+            task_id=original_assignment.task_id,
+            assignment_id=original_assignment.assignment_id,
+            assigner_id=original_assignment.assigner_id,
+            producer_id=original_assignment.producer_id,
+            artifact_id=original_assignment.artifact_id,
+            content_hash=content_hash,
+            constitutional_hash=original_assignment.constitutional_hash,
+            assigned_peers=original_assignment.assigned_peers,
+            quorum=original_assignment.quorum,
+            selection_seed=original_assignment.selection_seed,
+            issued_at=original_assignment.issued_at,
+        )
         signature = request_signer.sign(
             ConstitutionalMesh.build_remote_vote_request_payload(
                 assignment_id=request.assignment_id,
@@ -599,12 +620,14 @@ def c3_transport_request(
                 quorum=request.quorum,
                 evidence_mode=request.evidence_mode,
                 protocol_version=request.protocol_version,
+                signed_assignment=signed_assignment,
             )
         ).hex()
         request = replace(
             request,
             content=request_content,
             content_hash=content_hash,
+            signed_assignment=signed_assignment,
             request_signature=signature,
         )
     return peer, request
@@ -802,14 +825,31 @@ class TestC3Transport:
 
         from acgs_lite import Constitution
         from constitutional_swarm import ConstitutionalMesh, LocalRemotePeer
+        from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
         constitution = Constitution.default()
-        trusted_mesh = ConstitutionalMesh(constitution, seed=341)
-        untrusted_mesh = ConstitutionalMesh(constitution, seed=342)
+        trusted_mesh = ConstitutionalMesh(
+            constitution, seed=341, assigner_id="trusted-assigner"
+        )
+        untrusted_mesh = ConstitutionalMesh(
+            constitution, seed=342, assigner_id="untrusted-assigner"
+        )
+        assignment_authorities = VoteSignerRegistry()
+        assignment_authorities.register(
+            "trusted-assigner",
+            trusted_mesh.get_assigner_public_key(),
+            roles={"assigner"},
+        )
+        assignment_authorities.register(
+            "untrusted-assigner",
+            untrusted_mesh.get_assigner_public_key(),
+            roles={"assigner"},
+        )
         peer = LocalRemotePeer(
             agent_id="peer-remote",
             constitution=constitution,
             trusted_request_signers={trusted_mesh.get_request_signing_public_key()},
+            trusted_assigners=assignment_authorities.frozen_copy(),
         )
 
         def prepare_request(mesh, artifact_id):
@@ -1022,12 +1062,31 @@ def c3_receipt_payload(
         for index in range(3)
     ]
     from constitutional_swarm.mesh.vote_envelope import (
+        sign_assignment,
         sign_vote_envelope,
+        signed_assignment_digest,
+        signed_assignment_to_dict,
         vote_envelope_to_dict,
     )
 
     assigned_peers = tuple(vote.validator_id for vote in validator_votes)
     quorum = max(3, len(assigned_peers) // 2 + 1) if len(assigned_peers) >= 3 else len(assigned_peers) // 2 + 1
+    assigner_key = Ed25519PrivateKey.from_private_bytes(bytes([30]) * 32)
+    signed_assignment = sign_assignment(
+        assigner_key,
+        task_id="c3-task",
+        assignment_id="c3-assignment",
+        assigner_id="c3-assigner",
+        producer_id="c3-producer",
+        artifact_id="release governed artifact",
+        content_hash="sha256:c3-artifact",
+        constitutional_hash="sha256:c3-policy",
+        assigned_peers=assigned_peers,
+        quorum=quorum,
+        selection_seed="c3-selection-seed",
+        issued_at=0.0,
+    )
+    assignment_digest = signed_assignment_digest(signed_assignment)
     envelopes = []
     for index, vote in enumerate(validator_votes):
         if vote.decision == "abstain":
@@ -1052,6 +1111,7 @@ def c3_receipt_payload(
                     issued_at=float(index + 1),
                     assigned_peers=assigned_peers,
                     quorum=quorum,
+                    assignment_digest=assignment_digest,
                 )
             )
         )
@@ -1069,6 +1129,7 @@ def c3_receipt_payload(
         validator_votes=validator_votes,
         vote_envelopes=envelopes or None,
         assigned_peers=list(assigned_peers),
+        signed_assignment=signed_assignment_to_dict(signed_assignment),
         rejected_alternative="release without governance evidence",
         metadata={
             "assignment_id": "c3-assignment",
@@ -1080,7 +1141,7 @@ def c3_receipt_payload(
             "quorum": str(quorum),
             "signer_role": "settlement",
             "task_id": "c3-task",
-            "vote_evidence_version": "constitutional-swarm.vote-envelope.v2",
+            "vote_evidence_version": "constitutional-swarm.vote-envelope.v3",
         },
     )
 
@@ -1110,6 +1171,18 @@ def c3_receipt_signed_bundle(
             "public_key_hex": public_hex,
             "roles": ["settlement"],
         }
+    }
+    from constitutional_swarm.mesh.vote_envelope import key_id_for_public_key
+
+    assigner_key = Ed25519PrivateKey.from_private_bytes(bytes([30]) * 32)
+    assigner_public_key = assigner_key.public_key()
+    trusted[key_id_for_public_key(assigner_public_key)] = {
+        "identity_id": "c3-assigner",
+        "public_key_hex": assigner_public_key.public_bytes(
+            encoding=c3_receipt_serialization.Encoding.Raw,
+            format=c3_receipt_serialization.PublicFormat.Raw,
+        ).hex(),
+        "roles": ["assigner"],
     }
     for envelope in payload.vote_envelopes or []:
         voter_id = str(envelope["voter_id"])
@@ -1547,6 +1620,12 @@ class TestC3Receipts:
                 "roles": ["settlement"],
             }
         }
+        assigner_public_key = bytes.fromhex(mesh.get_assigner_public_key())
+        trusted_signers[key_id_for_public_key(assigner_public_key)] = {
+            "identity_id": mesh.assigner_id,
+            "public_key_hex": mesh.get_assigner_public_key(),
+            "roles": ["assigner"],
+        }
         for voter_id, voter_key in voter_keys.items():
             public_key = voter_key.public_key()
             trusted_signers[key_id_for_public_key(public_key)] = {
@@ -1555,7 +1634,13 @@ class TestC3Receipts:
                 "roles": ["validator"],
             }
         assert bundle.receipts[0].payload.decision == "approved"
-        assert verify_receipt_bundle(bundle, trusted_signers=trusted_signers).valid is True
+        verdict = verify_receipt_bundle(
+            bundle,
+            trusted_signers=trusted_signers,
+            require_independent_votes=False,
+        )
+        assert verdict.valid is True
+        assert verdict.evidence_policy == "development"
 
     def test_tie_capable_mesh_configuration_fails_before_persistence(
         self, tmp_path: Path

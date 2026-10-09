@@ -100,6 +100,9 @@ def test_retry_pending_settlements_skips_recovered_entries(tmp_path, store_facto
         settlement_store=store,
         quorum=3,
         vote_registry=writer.vote_registry,
+        evidence_mode="single_operator_dev",
+        assigner_private_key=writer._assigner_private_key,
+        assigner_id=writer.assigner_id,
     )
     store.mark_pending(replace(recovered_record, is_recovered=False))
 
@@ -129,6 +132,9 @@ def test_recovered_assignment_round_trips_from_store(tmp_path, store_factory) ->
         settlement_store=store,
         quorum=3,
         vote_registry=writer.vote_registry,
+        evidence_mode="single_operator_dev",
+        assigner_private_key=writer._assigner_private_key,
+        assigner_id=writer.assigner_id,
     )
     restored = reader.get_result(assignment_id)
 

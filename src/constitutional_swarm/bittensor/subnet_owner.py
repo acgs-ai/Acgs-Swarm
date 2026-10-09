@@ -38,6 +38,7 @@ from constitutional_swarm.bittensor.synapses import (
 )
 from constitutional_swarm.compiler import DAGCompiler, GoalSpec
 from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
     VoteSignerRegistry,
     normalize_voter_id,
     vote_envelope_hash,
@@ -86,7 +87,7 @@ class SubnetOwner:
         *,
         dag_compiler: DAGCompiler | None = None,
         precedent_store: PrecedentStore | None = None,
-        vote_registry: VoteSignerRegistry | None = None,
+        vote_registry: VoteSignerRegistry | FrozenVoteSignerRegistry | None = None,
     ) -> None:
         self._constitution = Constitution.from_yaml(constitution_path)
         self._compiler = dag_compiler or DAGCompiler()
@@ -104,10 +105,12 @@ class SubnetOwner:
                 precedent_store.vote_registry is None
                 or precedent_store.vote_registry.trust_grants(role="voter")
                 != vote_registry.trust_grants(role="voter")
+                or precedent_store.vote_registry.trust_grants(role="assigner")
+                != vote_registry.trust_grants(role="assigner")
             )
         ):
             raise ValueError(
-                "PrecedentStore and owner voter trust grants must match"
+                "PrecedentStore and owner voter/assigner trust grants must match"
             )
         self._precedent_store = precedent_store or PrecedentStore(
             self._constitution.hash,
@@ -240,6 +243,7 @@ class SubnetOwner:
             content_hash=validation.proof_content_hash,
             constitutional_hash=expected_hash,
             vote_envelopes=validation.vote_envelopes,
+            signed_assignment=validation.signed_assignment,
         )
         self._verify_validation_proof(judgment, validation)
         if validation.accepted:
@@ -260,6 +264,7 @@ class SubnetOwner:
                 artifact_id=judgment.artifact_hash,
                 content_hash=validation.proof_content_hash,
                 vote_envelopes=validation.vote_envelopes,
+                signed_assignment=validation.signed_assignment,
             )
             precedent = self._precedent_store.admit(precedent)
 
@@ -300,6 +305,8 @@ class SubnetOwner:
         validation: ValidationSynapse,
     ) -> None:
         vote_hashes = validation.proof_vote_hashes
+        if validation.signed_assignment is None:
+            raise ValueError("validation proof signed assignment is required")
         if not validation.assignment_id:
             raise ValueError("validation proof assignment ID is required")
         if not validation.proof_root_hash or not validation.proof_content_hash:

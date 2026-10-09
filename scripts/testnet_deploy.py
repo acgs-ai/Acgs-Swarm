@@ -11,7 +11,8 @@ Usage:
 
     # Start validator
     python scripts/testnet_deploy.py validator --wallet-name <name> --wallet-hotkey <key> \
-        --constitution constitution.yaml --netuid <id>
+        --constitution constitution.yaml --authorized-voters voters.json \
+        --authority-keys authority-keys.json --netuid <id>
 
 Requirements:
     pip install "bittensor>=7.0,<11"
@@ -26,7 +27,10 @@ import sys
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 BRAINTRUST_PROJECT = "acgs-swarm"
 
@@ -41,6 +45,64 @@ class _AuthorizedVoter:
     ) -> None:
         self.public_key = public_key
         self.route = route
+
+
+class _AuthorityKeys:
+    __slots__ = ("assigner_id", "assigner_private_key", "request_signing_private_key")
+
+    def __init__(
+        self,
+        *,
+        assigner_id: str,
+        assigner_private_key: Ed25519PrivateKey,
+        request_signing_private_key: Ed25519PrivateKey,
+    ) -> None:
+        self.assigner_id = assigner_id
+        self.assigner_private_key = assigner_private_key
+        self.request_signing_private_key = request_signing_private_key
+
+
+def _load_authority_keys(path: str) -> _AuthorityKeys:
+    """Load preprovisioned assignment and request-signing authority keys."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("an authority key file is required")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"authority key file is unreadable: {path}") from exc
+    expected = {
+        "assigner_id",
+        "assigner_private_key_hex",
+        "request_signing_private_key_hex",
+    }
+    if not isinstance(document, Mapping) or set(document) != expected:
+        raise ValueError(
+            "authority key file must contain only assigner_id, "
+            "assigner_private_key_hex, and request_signing_private_key_hex"
+        )
+    from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
+
+    assigner_id = document["assigner_id"]
+    if not isinstance(assigner_id, str):
+        raise ValueError("authority assigner_id must be a string")
+
+    def _private_key(name: str) -> Ed25519PrivateKey:
+        value = document[name]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"authority {name} must be 64 lowercase hex chars")
+        return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(value))
+
+    return _AuthorityKeys(
+        assigner_id=normalize_voter_id(assigner_id),
+        assigner_private_key=_private_key("assigner_private_key_hex"),
+        request_signing_private_key=_private_key("request_signing_private_key_hex"),
+    )
 
 
 def _load_authorized_voter_keys(path: str) -> dict[str, _AuthorizedVoter]:
@@ -121,8 +183,15 @@ def _build_validator_runtime(
     *,
     peers: int = 5,
     quorum: int = 3,
+    assigner_private_key: Ed25519PrivateKey | None = None,
+    assigner_id: str = "testnet-validator-assigner",
+    request_signing_private_key: Ed25519PrivateKey | None = None,
 ):
-    """Build separated validator and frozen owner voter trust roots."""
+    """Build separated validator and frozen owner voter trust roots.
+
+    The CLI always supplies preprovisioned authority keys. Ephemeral defaults
+    exist only for local test helpers that call this constructor directly.
+    """
     from constitutional_swarm.bittensor.protocol import ValidatorConfig
     from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
     from constitutional_swarm.bittensor.validator import ConstitutionalValidator
@@ -140,12 +209,30 @@ def _build_validator_runtime(
             f"validator runtime requires at least {required_signers} authorized voter "
             "identities so the judgment producer can be excluded"
         )
+    assigner_private_key = assigner_private_key or Ed25519PrivateKey.generate()
+    request_signing_private_key = (
+        request_signing_private_key or Ed25519PrivateKey.generate()
+    )
+    assigner_public_key = assigner_private_key.public_key()
     validator_registry = VoteSignerRegistry()
+    validator_registry.register(
+        assigner_id,
+        assigner_public_key,
+        roles={"assigner"},
+    )
     validator = ConstitutionalValidator(
         config,
         vote_registry=validator_registry,
+        assigner_private_key=assigner_private_key,
+        assigner_id=assigner_id,
+        request_signing_private_key=request_signing_private_key,
     )
     owner_registry = VoteSignerRegistry()
+    owner_registry.register(
+        assigner_id,
+        assigner_public_key,
+        roles={"assigner"},
+    )
     for identity, grant in voter_keys.items():
         if not isinstance(grant, _AuthorizedVoter) or not isinstance(
             grant.public_key, Ed25519PublicKey
@@ -706,6 +793,7 @@ def cmd_miner(args: argparse.Namespace) -> None:
 def cmd_validator(args: argparse.Namespace) -> None:
     """Start a constitutional governance validator on testnet."""
     voter_keys = _load_authorized_voter_keys(getattr(args, "authorized_voters", ""))
+    authority_keys = _load_authority_keys(getattr(args, "authority_keys", ""))
     if not os.path.exists(args.constitution):
         raise ValueError(f"constitution file not found: {args.constitution}")
     validator, owner = _build_validator_runtime(
@@ -713,6 +801,9 @@ def cmd_validator(args: argparse.Namespace) -> None:
         voter_keys,
         peers=args.peers,
         quorum=args.quorum,
+        assigner_private_key=authority_keys.assigner_private_key,
+        assigner_id=authority_keys.assigner_id,
+        request_signing_private_key=authority_keys.request_signing_private_key,
     )
     _check_bittensor()
     import asyncio
@@ -901,6 +992,15 @@ def main() -> None:
             "JSON public voter grants containing identity_id, public_key_hex, vote_host, "
             "and vote_port; each identity_id must equal the remote voter's authenticated "
             "Bittensor axon hotkey, and at least --peers + 1 identities are required"
+        ),
+    )
+    val.add_argument(
+        "--authority-keys",
+        required=True,
+        help=(
+            "JSON secret key file containing assigner_id, assigner_private_key_hex, "
+            "and request_signing_private_key_hex; provision matching public keys to "
+            "remote voters before startup"
         ),
     )
     val.add_argument("--netuid", type=int, required=True)

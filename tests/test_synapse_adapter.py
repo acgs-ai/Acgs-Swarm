@@ -581,7 +581,6 @@ rules:
 
         # Setup
         owner_registry = VoteSignerRegistry()
-        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
         client = ValidatorDendriteClient(constitution_path=constitution_path)
 
         async def deliberate(task, ctx, meta):
@@ -618,6 +617,7 @@ rules:
             tuple(f"e2e-miner-{i}" for i in range(3))
             + tuple(f"extra-peer-{i}" for i in range(3)),
         )
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
         # Step 1: Package case
         case = owner.package_case(

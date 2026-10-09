@@ -807,6 +807,9 @@ class TestC7MeshCapacity:
             settlement_store_path=path,
             max_settled_results=1,
             vote_registry=writer.vote_registry,
+            assigner_private_key=writer._assigner_private_key,
+            assigner_id=writer.assigner_id,
+            evidence_mode="single_operator_dev",
         )
 
         assert len(reader._final_results) == 1
@@ -1260,6 +1263,7 @@ class TestC7Runtime:
 
 class TestC7ResumeMeshReview:
     _vote_registries = {}
+    _assigner_credentials = {}
 
     class _CapturingStore:
         def __init__(self, *, fail_append=False, block_mark_pending=False, block_append=False):
@@ -1308,18 +1312,28 @@ class TestC7ResumeMeshReview:
     @classmethod
     def _pending_record(cls, constitution, artifact_id):
         import pytest
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
         from constitutional_swarm.mesh import ConstitutionalMesh, SettlementPersistenceError
         from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
         store = cls._CapturingStore(fail_append=True)
         registry = VoteSignerRegistry()
+        assigner_private_key = Ed25519PrivateKey.generate()
+        assigner_id = "c7-test-assigner"
+        registry.register(
+            assigner_id,
+            assigner_private_key.public_key(),
+            roles={"assigner"},
+        )
         mesh = ConstitutionalMesh(
             constitution,
             seed=917,
             quorum=3,
             settlement_store=store,
             vote_registry=registry,
+            assigner_private_key=assigner_private_key,
+            assigner_id=assigner_id,
             evidence_mode="single_operator_dev",
         )
         for agent_id in ("a", "b", "c", "d"):
@@ -1328,12 +1342,27 @@ class TestC7ResumeMeshReview:
             mesh.full_validation("a", "safe output", artifact_id)
         assert len(store.pending) == 1
         record = next(iter(store.pending.values()))
-        cls._vote_registries[str(record.assignment["assignment_id"])] = registry
+        assignment_id = str(record.assignment["assignment_id"])
+        cls._vote_registries[assignment_id] = registry
+        cls._assigner_credentials[assignment_id] = (
+            mesh._assigner_private_key,
+            mesh.assigner_id,
+        )
         return record
 
     @classmethod
     def _registry_for(cls, record):
         return cls._vote_registries[str(record.assignment["assignment_id"])]
+
+    @classmethod
+    def _assigner_kwargs_for(cls, record):
+        private_key, assigner_id = cls._assigner_credentials[
+            str(record.assignment["assignment_id"])
+        ]
+        return {
+            "assigner_private_key": private_key,
+            "assigner_id": assigner_id,
+        }
 
     @staticmethod
     def _store(kind, path):
@@ -1413,6 +1442,8 @@ class TestC7ResumeMeshReview:
             settlement_store=store,
             auto_reconcile=False,
             vote_registry=self._registry_for(record),
+            **self._assigner_kwargs_for(record),
+            evidence_mode="single_operator_dev",
         )
         reports = []
 
@@ -1457,6 +1488,8 @@ class TestC7ResumeMeshReview:
                 settlement_store=store,
                 auto_reconcile=False,
                 vote_registry=self._registry_for(current_record),
+                **self._assigner_kwargs_for(current_record),
+                evidence_mode="single_operator_dev",
             )
 
             assert mesh.get_result(current_id).constitutional_hash == current.hash
@@ -1586,6 +1619,8 @@ class TestC7ResumeMeshReview:
                 settlement_store=store,
                 auto_reconcile=False,
                 vote_registry=self._registry_for(record),
+                **self._assigner_kwargs_for(record),
+                evidence_mode="single_operator_dev",
             )
             reports = []
 
@@ -1633,6 +1668,8 @@ class TestC7ResumeMeshReview:
             settlement_store=store,
             auto_reconcile=False,
             vote_registry=self._registry_for(pending),
+            **self._assigner_kwargs_for(pending),
+            evidence_mode="single_operator_dev",
         )
         conflicting = replace(
             pending,

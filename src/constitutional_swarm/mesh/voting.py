@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
+from constitutional_swarm.mesh.vote_envelope import SignedAssignment
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationVote:
@@ -58,4 +60,5 @@ class RemoteVoteRequest:
     assigned_peers: tuple[str, ...] = ()
     quorum: int = 0
     evidence_mode: Literal["independent", "single_operator_dev"] = "independent"
-    protocol_version: int = 2
+    protocol_version: int = 3
+    signed_assignment: SignedAssignment | None = None

@@ -23,7 +23,10 @@ from constitutional_swarm.governance_receipts import (
 )
 from constitutional_swarm.mesh.vote_envelope import (
     key_id_for_public_key,
+    sign_assignment,
     sign_vote_envelope,
+    signed_assignment_digest,
+    signed_assignment_to_dict,
     vote_envelope_to_dict,
 )
 
@@ -43,6 +46,8 @@ _VOTER_SEEDS = {
 }
 _ASSIGNED_PEERS = tuple(_VOTER_SEEDS)
 _FIXTURE_QUORUM = 3
+_ASSIGNER_ID = "fixture-assignment-authority"
+_ASSIGNER_SEED = 100
 
 
 def _private_key(seed_byte: int) -> Ed25519PrivateKey:
@@ -89,6 +94,12 @@ def fixture_trusted_signers() -> dict[str, dict[str, object]]:
             "public_key_hex": _public_key_hex(private_key),
             "roles": ["validator"],
         }
+    assigner_key = _private_key(_ASSIGNER_SEED)
+    trusted[key_id_for_public_key(assigner_key.public_key())] = {
+        "identity_id": _ASSIGNER_ID,
+        "public_key_hex": _public_key_hex(assigner_key),
+        "roles": ["assigner"],
+    }
     return trusted
 
 
@@ -120,6 +131,21 @@ def _proof_grade_payload(
         raise ValueError(
             "proof-grade fixture votes must cover the complete deterministic electorate"
         )
+    signed_assignment = sign_assignment(
+        _private_key(_ASSIGNER_SEED),
+        task_id=task_id,
+        assignment_id=assignment_id,
+        assigner_id=_ASSIGNER_ID,
+        producer_id=producer_id,
+        artifact_id=artifact_id,
+        content_hash=content_hash,
+        constitutional_hash="sha256:policy001",
+        assigned_peers=_ASSIGNED_PEERS,
+        quorum=_FIXTURE_QUORUM,
+        selection_seed=f"{receipt_id}-selection-seed",
+        issued_at=0.0,
+    )
+    assignment_digest = signed_assignment_digest(signed_assignment)
     envelopes = []
     for index, vote in enumerate(validator_votes):
         if vote.decision == "abstain":
@@ -141,6 +167,7 @@ def _proof_grade_payload(
             assigned_peers=_ASSIGNED_PEERS,
             quorum=_FIXTURE_QUORUM,
             evidence_mode="independent",
+            assignment_digest=assignment_digest,
         )
         envelopes.append(vote_envelope_to_dict(envelope))
     proof_metadata = {
@@ -167,6 +194,7 @@ def _proof_grade_payload(
         validator_votes=list(validator_votes),
         vote_envelopes=envelopes,
         assigned_peers=list(_ASSIGNED_PEERS),
+        signed_assignment=signed_assignment_to_dict(signed_assignment),
         rejected_alternative=rejected_alternative,
         previous_receipt_hash=previous_receipt_hash,
         metadata=proof_metadata,

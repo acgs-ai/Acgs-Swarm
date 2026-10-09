@@ -7,6 +7,23 @@ before the implementation exists without breaking test-module collection.
 import pytest
 
 
+def _c14_external_assigner(registry):  # type: ignore[no-untyped-def]
+    """Provision the stable assignment authority required by an external registry."""
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(b"c14-external-registry-assigner").digest()
+    )
+    if not registry.trust_grants(role="assigner"):
+        registry.register("c14-external-assigner", key.public_key(), roles={"assigner"})
+    return {
+        "assigner_private_key": key,
+        "assigner_id": "c14-external-assigner",
+    }
+
+
 def _c14_precedent_constitution_file(tmp_path):  # type: ignore[no-untyped-def]
     path = tmp_path / "c14-precedent-constitution.yaml"
     path.write_text(
@@ -32,6 +49,7 @@ def _c14_precedent_pipeline(tmp_path, *, approved=True):  # type: ignore[no-unty
     from constitutional_swarm.mesh.vote_envelope import (
         VoteSignerRegistry,
         sign_vote_envelope,
+        signed_assignment_digest,
     )
     from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
 
@@ -57,6 +75,12 @@ def _c14_precedent_pipeline(tmp_path, *, approved=True):  # type: ignore[no-unty
             private_key.public_key(),
             roles={"voter", "validator"},
         )
+    for grant in validator.mesh.vote_registry.trust_grants(role="assigner").values():
+        owner_registry.register(
+            str(grant["identity_id"]),
+            bytes.fromhex(str(grant["public_key_hex"])),
+            roles={"assigner"},
+        )
     owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
     class ExternalVoteClient:
@@ -79,6 +103,7 @@ def _c14_precedent_pipeline(tmp_path, *, approved=True):  # type: ignore[no-unty
                     assigned_peers=request.assigned_peers,
                     quorum=request.quorum,
                     evidence_mode=request.evidence_mode,
+                    assignment_digest=signed_assignment_digest(request.signed_assignment),
                 )
             )
 
@@ -372,6 +397,14 @@ def c14_precedent_test_registry():
     from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
     registry = VoteSignerRegistry()
+    assigner_key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(b"c14-test-assigner").digest()
+    )
+    registry.register(
+        "c14-test-assigner",
+        assigner_key.public_key(),
+        roles={"assigner"},
+    )
     for index in range(32):
         private_key = Ed25519PrivateKey.from_private_bytes(
             hashlib.sha256(f"c14-test-voter-{index}".encode()).digest()
@@ -404,7 +437,9 @@ def c14_precedent_signed_record(
     from constitutional_swarm.mesh.vote_envelope import (
         compute_vote_envelope_root,
         normalize_voter_id,
+        sign_assignment,
         sign_vote_envelope,
+        signed_assignment_digest,
     )
 
     escalation_type = escalation_type or EscalationType.CONSTITUTIONAL_CONFLICT
@@ -418,6 +453,24 @@ def c14_precedent_signed_record(
     approvals = votes_for if valid_counts else 3
     assigned_peers = tuple(f"c14-test-voter-{index}" for index in range(total))
     quorum = total // 2 + 1
+    assigner_key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(b"c14-test-assigner").digest()
+    )
+    signed_assignment = sign_assignment(
+        assigner_key,
+        task_id=task_id,
+        assignment_id=assignment_id,
+        assigner_id="c14-test-assigner",
+        producer_id=normalize_voter_id(miner_uid),
+        artifact_id=artifact_id,
+        content_hash=content_hash,
+        constitutional_hash=constitutional_hash,
+        assigned_peers=assigned_peers,
+        quorum=quorum,
+        selection_seed=f"c14-selection-{task_id}",
+        issued_at=0.0,
+    )
+    assignment_digest = signed_assignment_digest(signed_assignment)
     envelopes = []
     for index in range(total):
         private_key = Ed25519PrivateKey.from_private_bytes(
@@ -439,6 +492,7 @@ def c14_precedent_signed_record(
                 issued_at=float(index + 1),
                 assigned_peers=assigned_peers,
                 quorum=quorum,
+                assignment_digest=assignment_digest,
             )
         )
     root = compute_vote_envelope_root(
@@ -468,6 +522,7 @@ def c14_precedent_signed_record(
         artifact_id=artifact_id,
         content_hash=content_hash,
         vote_envelopes=tuple(envelopes),
+        signed_assignment=signed_assignment,
     )
 
 
@@ -488,6 +543,12 @@ def c14_trust_validator_voters(registry, validator, voter_ids) -> None:
             voter_id,
             bytes.fromhex(validator.mesh.get_vote_public_key(voter_id)),
         )
+    for grant in validator.mesh.vote_registry.trust_grants(role="assigner").values():
+        registry.register(
+            str(grant["identity_id"]),
+            bytes.fromhex(str(grant["public_key_hex"])),
+            roles={"assigner"},
+        )
 
 
 def test_c14_precedent_direct_store_rejects_judgment_tamper() -> None:
@@ -505,11 +566,8 @@ def test_c14_precedent_direct_store_rejects_judgment_tamper() -> None:
 def test_c14_precedent_direct_store_rejects_producer_self_vote() -> None:
     import pytest
 
-    record = c14_precedent_signed_record(miner_uid="c14-test-voter-0")
-    store = c14_precedent_test_store()
     with pytest.raises(ValueError, match="producer|self"):
-        store.admit(record)
-    assert store.size == 0
+        c14_precedent_signed_record(miner_uid="c14-test-voter-0")
 
 
 def test_c14_cycle2_vote_envelope_binds_complete_electorate() -> None:
@@ -551,6 +609,7 @@ def test_c14_cycle2_vote_envelope_binds_complete_electorate() -> None:
             assigned_peers=peers,
             quorum=3,
             evidence_mode="independent",
+            protocol_version=2,
         )
         for index, (peer, key) in enumerate(zip(peers, keys, strict=True))
     )
@@ -588,7 +647,7 @@ def test_c14_cycle2_frozen_vote_registry_is_public_only_and_immutable() -> None:
     before = frozen.trust_grants(role="voter")
     registry.replace("cycle2-voter", Ed25519PrivateKey.generate().public_key())
     assert frozen.trust_grants(role="voter") == before
-    with pytest.raises(ValueError, match="frozen"):
+    with pytest.raises(AttributeError):
         frozen.unregister("cycle2-voter")
 
 
@@ -750,6 +809,7 @@ def c14_receipt_vote_envelope():
         issued_at=1.0,
         assigned_peers=["c14-validator"],
         quorum=1,
+        protocol_version=2,
     )
     grant = {
         "identity_id": "c14-validator",
@@ -764,7 +824,7 @@ def test_c14_receipt_rejects_unverified_inline_vote_evidence():
 
     from constitutional_swarm.governance_receipts import receipt_from_mesh_settlement
 
-    with pytest.raises(ValueError, match="vote envelope"):
+    with pytest.raises(ValueError, match="signed assignment"):
         receipt_from_mesh_settlement(
             c14_receipt_record(),
             [
@@ -1262,6 +1322,7 @@ def test_c14_vote_envelope_canonical_encoding_separates_field_partitions():
         issued_at=1.0,
         assigned_peers=("validator-a",),
         quorum=1,
+        protocol_version=2,
     )
     left = sign_vote_envelope(
         key, task_id="task:assignment", assignment_id="one", **common
@@ -1286,6 +1347,7 @@ def test_c14_remote_request_canonical_encoding_separates_field_partitions():
         nonce="nonce",
         timestamp=1.0,
         task_id="task",
+        protocol_version=2,
     )
     left = ConstitutionalMesh.build_remote_vote_request_payload(
         assignment_id="assign:voter",
@@ -1308,27 +1370,28 @@ def test_c14_remote_request_decoder_rejects_schema_and_scalar_confusion():
     import json
     import pytest
 
-    from constitutional_swarm import RemoteVoteRequest
+    from acgs_lite import Constitution
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from constitutional_swarm import ConstitutionalMesh
     from constitutional_swarm.remote_vote_transport import (
         decode_remote_vote_request,
         encode_remote_vote_request,
     )
 
-    request = RemoteVoteRequest(
-        assignment_id="assignment",
-        voter_id="voter",
-        producer_id="producer",
-        artifact_id="artifact",
-        content="safe",
-        content_hash="a" * 32,
-        constitutional_hash="b" * 64,
-        voter_public_key="c" * 64,
-        nonce="nonce",
-        timestamp=1.0,
-        request_signer_public_key="d" * 64,
-        request_signature="e" * 128,
-        task_id="task",
+    mesh = ConstitutionalMesh(Constitution.default(), seed=1337)
+    mesh.register_local_signer("producer")
+    mesh.register_remote_agent(
+        "voter",
+        vote_public_key=Ed25519PrivateKey.generate().public_key(),
     )
+    for voter_id in ("voter-two", "voter-three"):
+        mesh.register_remote_agent(
+            voter_id,
+            vote_public_key=Ed25519PrivateKey.generate().public_key(),
+        )
+    assignment = mesh.request_validation("producer", "safe", "artifact", task_id="task")
+    request = mesh.prepare_remote_vote(assignment.assignment_id, "voter")
     payload = json.loads(encode_remote_vote_request(request))
     for mutation in (
         {**payload, "protocol_version": 99},
@@ -1354,6 +1417,7 @@ def test_c14_remote_peer_authorizes_before_allocating_nonce_state():
         agent_id="remote",
         constitution=constitution,
         trusted_request_signers={trusted.get_request_signing_public_key()},
+        trusted_assigners=attacker.vote_registry.frozen_copy(),
     )
     attacker.register_local_signer("producer")
     attacker.register_remote_agent("remote", vote_public_key=peer.public_key_hex)
@@ -1372,28 +1436,34 @@ def test_c14_remote_peer_rejects_noncanonical_signer_fingerprint():
     from acgs_lite import Constitution
 
     from constitutional_swarm import LocalRemotePeer
+    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
     with pytest.raises(ValueError, match="canonical lowercase hex"):
         LocalRemotePeer(
             agent_id="remote",
             constitution=Constitution.default(),
             trusted_request_signers={"AA" * 32},
+            trusted_assigners=VoteSignerRegistry().frozen_copy(),
         )
 
 
 def test_c14_remote_peer_partitions_nonce_caches_per_authorized_signer():
     import pytest
     from acgs_lite import Constitution
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     from constitutional_swarm import ConstitutionalMesh, LocalRemotePeer
     from constitutional_swarm.mesh import RemoteVoteReplayError
 
     constitution = Constitution.default()
+    assigner_key = Ed25519PrivateKey.generate()
     meshes = [
         ConstitutionalMesh(
             constitution,
             seed=420 + index,
             evidence_mode="single_operator_dev",
+            assigner_private_key=assigner_key,
+            assigner_id="shared-remote-assigner",
         )
         for index in range(2)
     ]
@@ -1403,6 +1473,7 @@ def test_c14_remote_peer_partitions_nonce_caches_per_authorized_signer():
         trusted_request_signers={
             mesh.get_request_signing_public_key() for mesh in meshes
         },
+        trusted_assigners=meshes[0].vote_registry.frozen_copy(),
     )
     requests = []
     for mesh in meshes:
@@ -1446,6 +1517,7 @@ def test_c14_mesh_recovery_requires_verified_envelopes_and_explicit_registry(
         complete_evidence=True,
         settlement_store=valid_store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=430,
         evidence_mode="single_operator_dev",
     )
@@ -1461,7 +1533,9 @@ def test_c14_mesh_recovery_requires_verified_envelopes_and_explicit_registry(
         complete_evidence=True,
         settlement_store=valid_store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=431,
+        evidence_mode="single_operator_dev",
     ).get_result(result.assignment_id)
     assert recovered.vote_envelopes == result.vote_envelopes
 
@@ -1485,7 +1559,9 @@ def test_c14_mesh_recovery_requires_verified_envelopes_and_explicit_registry(
         complete_evidence=True,
         settlement_store=forged_store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=432,
+        evidence_mode="single_operator_dev",
     )
     with pytest.raises(KeyError, match="not found"):
         forged_reader.get_result(result.assignment_id)
@@ -1516,6 +1592,7 @@ def test_c14_pending_recovery_reverifies_original_envelopes(tmp_path):
         constitution,
         settlement_store=store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=440,
         quorum=3,
         evidence_mode="single_operator_dev",
@@ -1532,8 +1609,10 @@ def test_c14_pending_recovery_reverifies_original_envelopes(tmp_path):
         constitution,
         settlement_store=store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=441,
         quorum=3,
+        evidence_mode="single_operator_dev",
     )
     recovered = reader.get_result(str(pending[0].assignment["assignment_id"]))
     assert recovered.settled is True
@@ -1630,39 +1709,35 @@ def test_c14_risk_expanded_assignment_requires_actual_peer_majority():
 
 
 def test_c14_remote_request_rejects_nonfinite_timestamp_before_nonce_state():
+    from dataclasses import replace
     import json
     from collections import OrderedDict
 
     import pytest
+    from acgs_lite import Constitution
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    from constitutional_swarm import ConstitutionalMesh, RemoteVoteRequest
+    from constitutional_swarm import ConstitutionalMesh
     from constitutional_swarm.remote_vote_transport import (
         decode_remote_vote_request,
         encode_remote_vote_request,
     )
 
-    fields = dict(
-        assignment_id="assignment",
-        voter_id="voter",
-        producer_id="producer",
-        artifact_id="artifact",
-        content="safe",
-        content_hash="a" * 32,
-        constitutional_hash="b" * 64,
-        voter_public_key="c" * 64,
-        nonce="nonce",
-        request_signer_public_key="d" * 64,
-        request_signature="e" * 128,
-        task_id="task",
-        assigned_peers=("voter",),
-        quorum=1,
-        evidence_mode="independent",
-    )
+    mesh = ConstitutionalMesh(Constitution.default(), seed=1701)
+    mesh.register_local_signer("producer")
+    for voter_id in ("voter", "voter-two", "voter-three"):
+        mesh.register_remote_agent(
+            voter_id,
+            vote_public_key=Ed25519PrivateKey.generate().public_key(),
+        )
+    assignment = mesh.request_validation("producer", "safe", "artifact", task_id="task")
+    valid_request = mesh.prepare_remote_vote(assignment.assignment_id, "voter")
+    valid_payload = json.loads(encode_remote_vote_request(valid_request))
     for timestamp in (float("nan"), float("inf"), float("-inf")):
-        request = RemoteVoteRequest(timestamp=timestamp, **fields)
+        request = replace(valid_request, timestamp=timestamp)
         with pytest.raises(ValueError):
             encode_remote_vote_request(request)
-        payload = {**fields, "timestamp": timestamp, "protocol_version": 2}
+        payload = {**valid_payload, "timestamp": timestamp}
         with pytest.raises(ValueError, match="finite float"):
             decode_remote_vote_request(json.dumps(payload))
         nonce_cache = OrderedDict()
@@ -1767,6 +1842,7 @@ def test_c14_receipt_preserves_empty_reason_envelope_and_projects_display_text()
         issued_at=envelope.issued_at,
         assigned_peers=peers,
         quorum=3,
+        assignment_digest=envelope.assignment_digest,
     )
     grants.pop(envelopes[0].key_id)
     grants[voter_key_id] = voter_grant
@@ -1818,6 +1894,7 @@ def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
         quorum=3,
         settlement_store=source,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=470,
         evidence_mode="single_operator_dev",
     )
@@ -1844,6 +1921,7 @@ def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
             quorum=3,
             settlement_store=missing_store,
             vote_registry=registry,
+            **_c14_external_assigner(registry),
         )
 
     legacy_store = JSONLSettlementStore(tmp_path / "legacy.jsonl")
@@ -1855,6 +1933,7 @@ def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
         quorum=3,
         settlement_store=legacy_store,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
     )
     with pytest.raises(KeyError, match="not found"):
         reader.get_result(result.assignment_id)
@@ -1872,6 +1951,7 @@ def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
         quorum=5,
         settlement_store=mode_tampered,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
     )
     with pytest.raises(KeyError, match="not found"):
         reader.get_result(result.assignment_id)
@@ -2045,7 +2125,7 @@ def test_c14_testnet_provisioning_separates_frozen_owner_trust(tmp_path):
     assert owner_registry.trust_grants(role="validator") != (
         validator.mesh.vote_registry.trust_grants(role="validator")
     )
-    with pytest.raises(ValueError, match="frozen"):
+    with pytest.raises(AttributeError):
         owner_registry.replace("validator-2", replacement)
 
 
@@ -2179,7 +2259,10 @@ async def test_c14_testnet_dispatch_accepts_canonical_authenticated_identity(mon
 @pytest.mark.asyncio
 async def test_c14_testnet_authenticated_dispatch_admits_configured_voter(tmp_path, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from constitutional_swarm.mesh.vote_envelope import sign_vote_envelope
+    from constitutional_swarm.mesh.vote_envelope import (
+        sign_vote_envelope,
+        signed_assignment_digest,
+    )
     from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
 
     deploy = _c14_load_testnet_deploy_module()
@@ -2230,6 +2313,7 @@ async def test_c14_testnet_authenticated_dispatch_admits_configured_voter(tmp_pa
                     assigned_peers=request.assigned_peers,
                     quorum=request.quorum,
                     evidence_mode=request.evidence_mode,
+                    assignment_digest=signed_assignment_digest(request.signed_assignment),
                 )
             )
 
@@ -2309,7 +2393,7 @@ def test_c14_shipped_fixture_binds_signed_producer_to_declared_executor():
             assert len(envelopes) == len(expected_peers)
             assert {envelope["voter_id"] for envelope in envelopes} == set(expected_peers)
             assert {envelope["producer_id"] for envelope in envelopes} == {producer_id}
-            assert {envelope["protocol_version"] for envelope in envelopes} == {2}
+            assert {envelope["protocol_version"] for envelope in envelopes} == {3}
             assert {envelope["assigned_peer_count"] for envelope in envelopes} == {4}
             assert {envelope["quorum"] for envelope in envelopes} == {3}
             assert {envelope["evidence_mode"] for envelope in envelopes} == {
@@ -2319,7 +2403,7 @@ def test_c14_shipped_fixture_binds_signed_producer_to_declared_executor():
                 canonical_assigned_peers_hash(expected_peers)
             }
             assert payload.metadata["vote_evidence_version"] == (
-                "constitutional-swarm.vote-envelope.v2"
+                "constitutional-swarm.vote-envelope.v3"
             )
             assert payload.metadata["signer_role"] == "settlement"
             for signature in receipt.signatures:
@@ -2501,6 +2585,7 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
     args = argparse.Namespace(
         constitution=str(constitution),
         authorized_voters="unused.json",
+        authority_keys="unused-authority.json",
         peers=5,
         quorum=3,
         wallet_name="validator",
@@ -2531,6 +2616,15 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
                 return [response(tampered=tampered)]
 
         monkeypatch.setattr(deploy, "_check_bittensor", lambda: None)
+        monkeypatch.setattr(
+            deploy,
+            "_load_authority_keys",
+            lambda _path: SimpleNamespace(
+                assigner_id="test-assigner",
+                assigner_private_key=object(),
+                request_signing_private_key=object(),
+            ),
+        )
         monkeypatch.setattr(
                 deploy,
                 "_load_authorized_voter_keys",
@@ -2882,6 +2976,7 @@ def test_c14_single_operator_dev_evidence_is_rejected_by_default_owner(tmp_path)
             bytes.fromhex(validator.mesh.get_vote_public_key(voter_id)),
             roles={"voter", "validator"},
         )
+    c14_trust_validator_voters(owner_registry, validator, ())
     owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
     case = owner.package_case("safe dev-mode action", "governance")
     judgment = JudgmentSynapse(
@@ -2931,6 +3026,7 @@ async def test_c14_default_validator_collects_independent_remote_votes(tmp_path)
     from constitutional_swarm.mesh.vote_envelope import (
         VoteSignerRegistry,
         sign_vote_envelope,
+        signed_assignment_digest,
     )
     from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
 
@@ -2956,6 +3052,12 @@ async def test_c14_default_validator_collects_independent_remote_votes(tmp_path)
             roles={"voter", "validator"},
         )
         routes[voter_id] = (voter_id, 9000 + index)
+    for grant in validator.mesh.vote_registry.trust_grants(role="assigner").values():
+        owner_registry.register(
+            str(grant["identity_id"]),
+            bytes.fromhex(str(grant["public_key_hex"])),
+            roles={"assigner"},
+        )
     owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
     class ExternalVoteClient:
@@ -2977,6 +3079,7 @@ async def test_c14_default_validator_collects_independent_remote_votes(tmp_path)
                 assigned_peers=request.assigned_peers,
                 quorum=request.quorum,
                 evidence_mode=request.evidence_mode,
+                assignment_digest=signed_assignment_digest(request.signed_assignment),
             )
             return RemoteVoteResponse(envelope)
 
@@ -3008,11 +3111,27 @@ def _c14_v2_receipt_electorate(
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    from constitutional_swarm.mesh.vote_envelope import key_id_for_public_key, sign_vote_envelope
+    from constitutional_swarm.mesh.vote_envelope import (
+        key_id_for_public_key,
+        sign_vote_envelope,
+        signed_assignment_digest,
+    )
 
     peers = [f"c14-v2-validator-{index}" for index in range(len(decisions))]
+    signed_assignment = _c14_receipt_signed_assignment(peers, quorum=quorum)
     envelopes = []
-    grants = {}
+    assigner_public_key = _c14_receipt_assigner_key().public_key()
+    assigner_key_id = key_id_for_public_key(assigner_public_key)
+    grants = {
+        assigner_key_id: {
+            "identity_id": "c14-v2-assigner",
+            "public_key_hex": assigner_public_key.public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ).hex(),
+            "roles": ["assigner"],
+        }
+    }
     for index, (peer, approved) in enumerate(zip(peers, decisions, strict=True)):
         private_key = Ed25519PrivateKey.generate()
         public_key = private_key.public_key()
@@ -3043,12 +3162,43 @@ def _c14_v2_receipt_electorate(
                 assigned_peers=peers,
                 quorum=quorum,
                 evidence_mode="independent",
+                assignment_digest=signed_assignment_digest(signed_assignment),
             )
         )
     return peers, envelopes, grants
 
 
+def _c14_receipt_assigner_key():  # type: ignore[no-untyped-def]
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(b"c14-v2-receipt-assigner").digest()
+    )
+
+
+def _c14_receipt_signed_assignment(peers, *, quorum):  # type: ignore[no-untyped-def]
+    from constitutional_swarm.mesh.vote_envelope import sign_assignment
+
+    return sign_assignment(
+        _c14_receipt_assigner_key(),
+        task_id="c14-v2-task",
+        assignment_id="c14-v2-assignment",
+        assigner_id="c14-v2-assigner",
+        producer_id="c14-v2-producer",
+        artifact_id="c14-v2-artifact",
+        content_hash="c" * 64,
+        constitutional_hash="d" * 64,
+        assigned_peers=peers,
+        quorum=quorum,
+        selection_seed="c14-v2-selection-seed",
+        issued_at=1.0,
+    )
+
+
 def _c14_v2_receipt_record(peers, *, accepted=True, quorum=3):
+    from constitutional_swarm.mesh.vote_envelope import signed_assignment_to_dict
     from constitutional_swarm.settlement_store import SettlementRecord
 
     return SettlementRecord(
@@ -3060,6 +3210,9 @@ def _c14_v2_receipt_record(peers, *, accepted=True, quorum=3):
             "content_hash": "c" * 64,
             "peers": list(peers),
             "quorum": quorum,
+            "signed_assignment": signed_assignment_to_dict(
+                _c14_receipt_signed_assignment(peers, quorum=quorum)
+            ),
         },
         result={"accepted": accepted},
         constitutional_hash="d" * 64,
@@ -3306,7 +3459,9 @@ def test_c14_cycle2_cascade_accepts_bound_v2_evidence_and_rejects_candidate_repl
     from constitutional_swarm.mesh.vote_envelope import (
         VoteSignerRegistry,
         compute_vote_envelope_root,
+        sign_assignment,
         sign_vote_envelope,
+        signed_assignment_digest,
         vote_envelope_hash,
     )
 
@@ -3324,11 +3479,27 @@ def test_c14_cycle2_cascade_accepts_bound_v2_evidence_and_rejects_candidate_repl
     )
     peers = ("cascade-voter-1", "cascade-voter-2", "cascade-voter-3")
     registry = VoteSignerRegistry()
+    assigner_key = Ed25519PrivateKey.generate()
+    registry.register("cascade-assigner", assigner_key.public_key(), roles={"assigner"})
     keys = {}
     for peer in peers:
         keys[peer] = Ed25519PrivateKey.generate()
         registry.register(peer, keys[peer].public_key(), roles={"voter", "validator"})
     content_hash = hashlib.sha256(candidate.judgment_text.encode()).hexdigest()[:32]
+    signed_assignment = sign_assignment(
+        assigner_key,
+        task_id=candidate.candidate_id,
+        assignment_id="assignment-bound-v2",
+        assigner_id="cascade-assigner",
+        producer_id=candidate.miner_uid,
+        artifact_id=candidate.candidate_id,
+        content_hash=content_hash,
+        constitutional_hash=constitution.hash,
+        assigned_peers=peers,
+        quorum=3,
+        selection_seed="c14-cascade-selection",
+        issued_at=1_800_000_000.0,
+    )
     envelopes = tuple(
         sign_vote_envelope(
             keys[peer],
@@ -3344,8 +3515,9 @@ def test_c14_cycle2_cascade_accepts_bound_v2_evidence_and_rejects_candidate_repl
             nonce=f"nonce-{peer}",
             issued_at=1_800_000_000.0,
             assigned_peers=peers,
-            quorum=2,
+            quorum=3,
             evidence_mode="independent",
+            assignment_digest=signed_assignment_digest(signed_assignment),
         )
         for peer in peers
     )
@@ -3385,6 +3557,7 @@ def test_c14_cycle2_cascade_accepts_bound_v2_evidence_and_rejects_candidate_repl
         settled=True,
         settled_at=time.time(),
         vote_envelopes=ordered,
+        signed_assignment=signed_assignment,
     )
     cascade = PrecedentCascade(constitution, vote_registry=registry)
 
@@ -3416,6 +3589,7 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
         quorum=4,
         settlement_store=source,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         evidence_mode="single_operator_dev",
         seed=481,
     )
@@ -3432,7 +3606,9 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
         quorum=5,
         settlement_store=source,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
         seed=482,
+        evidence_mode="single_operator_dev",
     ).get_result(result.assignment_id)
     assert recovered.accepted is True
     assert recovered.votes_for == 5
@@ -3453,6 +3629,8 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
             quorum=5,
             settlement_store=hash_tampered,
             vote_registry=registry,
+            **_c14_external_assigner(registry),
+            evidence_mode="single_operator_dev",
         )
 
     quorum_tampered = JSONLSettlementStore(tmp_path / "quorum-tampered.jsonl")
@@ -3465,6 +3643,8 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
         quorum=5,
         settlement_store=quorum_tampered,
         vote_registry=registry,
+        **_c14_external_assigner(registry),
+        evidence_mode="single_operator_dev",
     )
     with pytest.raises(KeyError, match="not found"):
         reader.get_result(result.assignment_id)

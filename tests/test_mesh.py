@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm.mesh.vote_envelope import (
     VoteSignerRegistry,
     sign_vote_envelope,
+    signed_assignment_digest,
     verify_vote_envelope,
 )
 
@@ -44,6 +45,17 @@ UnauthorizedVoterError = _MESH_GLOBALS["UnauthorizedVoterError"]
 
 def _test_mesh(*args, **kwargs) -> ConstitutionalMesh:
     kwargs.setdefault("evidence_mode", "single_operator_dev")
+    registry = kwargs.get("vote_registry")
+    if registry is not None and "assigner_private_key" not in kwargs:
+        assigner_key = getattr(registry, "_test_assigner_private_key", None)
+        if assigner_key is None:
+            assigner_key = Ed25519PrivateKey.generate()
+            registry.register(
+                "test-mesh-assigner", assigner_key.public_key(), roles={"assigner"}
+            )
+            registry._test_assigner_private_key = assigner_key
+        kwargs["assigner_private_key"] = assigner_key
+        kwargs["assigner_id"] = "test-mesh-assigner"
     if "settlement_store" in kwargs or "settlement_store_path" in kwargs:
         kwargs["quorum"] = max(3, kwargs.get("quorum", 3))
     return ConstitutionalMesh(*args, **kwargs)
@@ -628,6 +640,7 @@ class TestVoting:
         assignment = mesh.request_validation("producer", "safe work", "art-ext-1")
         request = mesh.prepare_remote_vote(assignment.assignment_id, "peer-1")
         assert isinstance(request, RemoteVoteRequest)
+        assert request.signed_assignment is not None
         envelope = sign_vote_envelope(
             signer_key,
             voter_id=request.voter_id,
@@ -644,6 +657,7 @@ class TestVoting:
             assigned_peers=request.assigned_peers,
             quorum=request.quorum,
             evidence_mode=request.evidence_mode,
+            assignment_digest=signed_assignment_digest(request.signed_assignment),
         )
         vote = mesh.submit_vote_envelope(envelope)
         assert vote.approved is True

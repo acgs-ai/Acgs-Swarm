@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from constitutional_swarm.mesh.vote_envelope import VoteEnvelope
+from constitutional_swarm.mesh.vote_envelope import SignedAssignment, VoteEnvelope
 
 _SYNAPSE_HASH_DOMAIN = b"constitutional-swarm.bittensor-synapse.v1\x00"
 
@@ -129,11 +129,17 @@ class ValidationSynapse:
     authenticity_score: float = 0.0
     timestamp: float = field(default_factory=time.time)
     vote_envelopes: tuple[VoteEnvelope, ...] = ()
+    signed_assignment: SignedAssignment | None = None
 
     @property
     def is_verified(self) -> bool:
         """Report whether all structural proof components are present."""
-        return bool(self.proof_root_hash and self.proof_vote_hashes and self.vote_envelopes)
+        return bool(
+            self.proof_root_hash
+            and self.proof_vote_hashes
+            and self.vote_envelopes
+            and self.signed_assignment is not None
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

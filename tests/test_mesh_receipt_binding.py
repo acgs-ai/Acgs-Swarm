@@ -54,8 +54,13 @@ def test_settlement_emits_verifiable_v0_1_receipt(tmp_path) -> None:
     assert bundle.receipts[0].payload.evidence_hashes["settlement"] == settlement_canonical_digest(
         record
     )
-    verdict = verify_bundle(bundle, trusted_signers=_trusted_signers(mesh))
+    verdict = verify_bundle(
+        bundle,
+        trusted_signers=_trusted_signers(mesh),
+        require_independent_votes=False,
+    )
     assert verdict.valid, verdict.issues
+    assert verdict.evidence_policy == "development"
     assert "local" in bundle.receipts[0].payload.metadata["claim"]
 
 
@@ -89,8 +94,10 @@ def test_standalone_verifier_process(tmp_path) -> None:
                 "from constitutional_swarm import bundle_from_json, verify_bundle;"
                 f"bundle=bundle_from_json(Path({str(receipt_path)!r}).read_text());"
                 f"trusted={_trusted_signers(mesh)!r};"
-                "verdict=verify_bundle(bundle, trusted_signers=trusted);"
-                "raise SystemExit(0 if verdict.valid else 1)"
+                "verdict=verify_bundle(bundle, trusted_signers=trusted,"
+                " require_independent_votes=False);"
+                "raise SystemExit(0 if verdict.valid and "
+                "verdict.evidence_policy == 'development' else 1)"
             ),
         ],
         check=False,

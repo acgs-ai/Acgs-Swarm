@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+from constitutional_swarm.mesh.vote_envelope import SignedAssignment
+
 
 @dataclass(frozen=True, slots=True)
 class PeerAssignment:
@@ -25,6 +27,7 @@ class PeerAssignment:
     assigned_peer_count: int = 0
     quorum: int = 0
     evidence_mode: Literal["independent", "single_operator_dev"] | None = None
+    signed_assignment: SignedAssignment | None = None
 
 
 @dataclass

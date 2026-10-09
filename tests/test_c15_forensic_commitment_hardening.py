@@ -572,7 +572,7 @@ def test_honest_anchored_result_bundle_is_valid_with_provenance_diagnostics(
     assert verdict.independence_verified is False
     assert {item.code for item in verdict.provenance_diagnostics} == {
         "authenticated_provenance_unavailable",
-        "identical_reviewer_answer_vectors",
+        "implausible_shared_wrong_answers",
         "unauthenticated_command_metadata",
     }
 
@@ -716,9 +716,7 @@ def test_answer_matrix_rejects_alternate_condition_for_assigned_reviewer() -> No
     protocol = ForensicBenchmarkProtocol.model_validate(pack.protocol)
     honest_verdict = validate_answer_matrix(protocol, answers)
     assert honest_verdict.valid is True
-    assert "identical_reviewer_answer_vectors" in {
-        item.code for item in honest_verdict.provenance_diagnostics
-    }
+    assert honest_verdict.provenance_diagnostics == []
     alternate = next(condition for condition in BASELINES if condition != answers[0].artifact_condition)
     answers[0] = answers[0].model_copy(update={"artifact_condition": alternate})
     verdict = validate_answer_matrix(protocol, answers)
@@ -1210,22 +1208,21 @@ def _complete_six_reviewer_answers(
     return ForensicBenchmarkProtocol.model_validate(pack.protocol), answers
 
 
-def test_answer_matrix_reports_near_duplicate_complete_reviewer_vectors() -> None:
+def test_answer_matrix_reports_implausible_shared_wrong_answers() -> None:
     def answer_for(
         reviewer_id: str,
         incident_id: str,
         question_id: str,
         ground_truth: str,
     ) -> str:
-        if reviewer_id in {"reviewer-1", "reviewer-4"}:
-            return ground_truth
-        return f"{reviewer_id}:{incident_id}:{question_id}"
+        incident_number = int(incident_id.removeprefix("incident-"))
+        if reviewer_id == "reviewer-1" and incident_number <= 20:
+            return f"copied:{incident_id}:{question_id}"
+        if reviewer_id == "reviewer-4" and 3 < incident_number <= 20:
+            return f"copied:{incident_id}:{question_id}"
+        return ground_truth
 
     protocol, answers = _complete_six_reviewer_answers(answer_for=answer_for)
-    changed = next(
-        index for index, answer in enumerate(answers) if answer.reviewer_id == "reviewer-4"
-    )
-    answers[changed] = answers[changed].model_copy(update={"answer": "one-cell-tweak"})
 
     verdict = validate_answer_matrix(protocol, answers)
 
@@ -1234,11 +1231,13 @@ def test_answer_matrix_reports_near_duplicate_complete_reviewer_vectors() -> Non
         diagnostic.code: diagnostic.message
         for diagnostic in verdict.provenance_diagnostics
     }
-    assert "near_duplicate_reviewer_answer_vectors" in diagnostics
+    assert "implausible_shared_wrong_answers" in diagnostics
     assert "reviewer-1/reviewer-4" in diagnostics[
-        "near_duplicate_reviewer_answer_vectors"
+        "implausible_shared_wrong_answers"
     ]
-    assert "349/350" in diagnostics["near_duplicate_reviewer_answer_vectors"]
+    assert "shared_identical_wrong=119" in diagnostics[
+        "implausible_shared_wrong_answers"
+    ]
 
 
 def test_answer_matrix_does_not_flag_independent_noisy_reviewer_vectors() -> None:
@@ -1251,12 +1250,9 @@ def test_answer_matrix_does_not_flag_independent_noisy_reviewer_vectors() -> Non
     verdict = validate_answer_matrix(protocol, answers)
 
     assert verdict.valid is True
-    assert not {
-        "identical_reviewer_answer_vectors",
-        "near_duplicate_reviewer_answer_vectors",
-    }.intersection(
+    assert "implausible_shared_wrong_answers" not in {
         diagnostic.code for diagnostic in verdict.provenance_diagnostics
-    )
+    }
 
 
 def _cycle2_cli(*args: object) -> subprocess.CompletedProcess[str]:
