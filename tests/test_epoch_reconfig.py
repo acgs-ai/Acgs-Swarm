@@ -17,6 +17,7 @@ from constitutional_swarm.epoch_reconfig import (
     JointQuorumNotMetError,
     TransitionCertificate,
     TransitionVerificationPolicy,
+    build_transition_side_certificate,
     compute_validator_set_digest,
     compute_version_digest,
     evaluate_drift,
@@ -145,7 +146,16 @@ class TestTransitionCertificate:
             )
             for voter_id in committee.members
         ]
-        return build_certificate(votes, committee=committee, validator_set=validators)
+        certificate = build_certificate(
+            votes,
+            committee=committee,
+            validator_set=validators,
+        )
+        return build_transition_side_certificate(
+            certificate,
+            validator_set=validators,
+            threshold_fraction=2 / 3,
+        )
 
     def _make(self, *, binding_digest: bytes = b"", drift_budget=DriftBudget()):
         v0 = _v(0, ("a", "b"))
@@ -221,7 +231,7 @@ class TestTransitionCertificate:
 
     def test_drift_budget_exceeded(self) -> None:
         cert, old_set, new_set, policy = self._make(
-            drift_budget=DriftBudget(max_rule_delta=10_000)
+            drift_budget=DriftBudget(max_rule_delta=0)
         )
         policy = replace(policy, max_rule_delta=0)
         with pytest.raises(DriftBudgetExceeded):

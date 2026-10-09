@@ -15,6 +15,7 @@ import constitutional_swarm.bittensor.constitution_sync as sync_module
 from constitutional_swarm.bittensor.constitution_sync import (
     ConstitutionDistributor,
     ConstitutionReceiver,
+    ConstitutionSyncMessage,
 )
 from constitutional_swarm.epoch_reconfig import (
     AmendmentProposal,
@@ -27,6 +28,7 @@ from constitutional_swarm.epoch_reconfig import (
     TransitionCertificate,
     TransitionVerificationPolicy,
     build_transition_message,
+    build_transition_side_certificate,
     compute_validator_set_digest,
     transition_vote_subject,
     verify_transition,
@@ -58,6 +60,7 @@ from constitutional_swarm.validator_set import (
     ValidatorSet,
 )
 from tests.test_constitution_sync_governed import (
+    _SYNC_SIGNING_KEY,
     YAML_BOOT as _SYNC_YAML_BOOT,
     YAML_E1 as _SYNC_YAML_E1,
     YAML_E2 as _SYNC_YAML_E2,
@@ -172,7 +175,11 @@ def _transition_qc(proposal, validator_set, keys, seed, voter_ids=None):
         committee=committee,
         validator_set=validator_set,
     )
-    return qc
+    return build_transition_side_certificate(
+        qc,
+        validator_set=validator_set,
+        threshold_fraction=2 / 3,
+    )
 
 
 def _proposal(
@@ -348,7 +355,7 @@ def test_cross_seed_disjoint_committees_are_not_slashable() -> None:
     )
 
 
-def test_transition_ignores_artifact_drift_budget_and_fails_closed() -> None:
+def test_transition_enforces_pinned_drift_budget_and_fails_closed() -> None:
     prior = ConstitutionVersion(0, ("rule-0",))
     proposed = ConstitutionVersion(
         1,
@@ -357,7 +364,7 @@ def test_transition_ignores_artifact_drift_budget_and_fails_closed() -> None:
     )
     validator_set, keys = _validators(3)
     proposal = _proposal(
-        prior, proposed, validator_set, validator_set, DriftBudget(10_000)
+        prior, proposed, validator_set, validator_set, DriftBudget(1)
     )
     committee = CommitteeSelector(validator_set).select("transition-seed", 3)
     assignment_id, artifact_hash, epoch = transition_vote_subject(proposal)
@@ -374,6 +381,11 @@ def test_transition_ignores_artifact_drift_budget_and_fails_closed() -> None:
         ],
         committee=committee,
         validator_set=validator_set,
+    )
+    qc = build_transition_side_certificate(
+        qc,
+        validator_set=validator_set,
+        threshold_fraction=2 / 3,
     )
     certificate = TransitionCertificate(proposal, qc, qc)
     qc_policy = CertificateVerificationPolicy(
@@ -449,7 +461,7 @@ def test_transition_rejects_reused_old_qc_for_substituted_successor() -> None:
         )
 
 
-def test_transition_verification_uses_one_registry_snapshot() -> None:
+def test_transition_verification_rejects_registry_subclasses() -> None:
     prior = ConstitutionVersion(0, ("rule-0",))
     proposed = ConstitutionVersion(1, ("rule-0", "rule-1"), prior.digest)
     trusted_old, _ = _validator_set("old-")
@@ -476,7 +488,7 @@ def test_transition_verification_uses_one_registry_snapshot() -> None:
             expected_committee_seed="new-seed"
         ),
     )
-    with pytest.raises(JointQuorumNotMetError):
+    with pytest.raises(InvalidTransitionError, match="concrete ValidatorSet"):
         verify_transition(
             TransitionCertificate(proposal, old_qc, new_qc),
             old_validator_set=ChangingValidatorSet(trusted_old, evil_old),
@@ -592,7 +604,7 @@ def test_transition_checks_drift_before_invalid_joint_quorum() -> None:
     proposed = ConstitutionVersion(1, ("rule-0", "rule-1"), prior.digest)
     validator_set, keys = _validators(3)
     proposal = _proposal(
-        prior, proposed, validator_set, validator_set, DriftBudget(10_000)
+        prior, proposed, validator_set, validator_set, DriftBudget(0)
     )
     qc = _transition_qc(proposal, validator_set, keys, "seed")
     empty_qc = replace(qc, votes=())
@@ -958,7 +970,9 @@ def test_all_admission_gates_select_only_explicitly_admitted(monkeypatch, gate) 
 def test_sync_rejects_replay_of_old_signed_message_after_newer_version() -> None:
     key = Ed25519PrivateKey.generate()
     trusted_keys = {"owner": _public_key(key)}
-    distributor = ConstitutionDistributor("rules:\n  - first\n", issuer_id="owner")
+    distributor = ConstitutionDistributor(
+        "rules:\n  - first\n", key, issuer_id="owner"
+    )
     receiver = ConstitutionReceiver("validator", trusted_issuer_keys=trusted_keys)
 
     first = distributor.broadcast_message()
@@ -989,7 +1003,9 @@ def test_sync_rejects_replay_of_old_signed_message_after_newer_version() -> None
 def test_sync_rejects_seen_hash_with_new_sequence_and_signature() -> None:
     key = Ed25519PrivateKey.generate()
     trusted_keys = {"owner": _public_key(key)}
-    distributor = ConstitutionDistributor("rules:\n  - first\n", issuer_id="owner")
+    distributor = ConstitutionDistributor(
+        "rules:\n  - first\n", key, issuer_id="owner"
+    )
     receiver = ConstitutionReceiver("validator", trusted_issuer_keys=trusted_keys)
 
     first = distributor.broadcast_message()
@@ -1000,7 +1016,7 @@ def test_sync_rejects_seen_hash_with_new_sequence_and_signature() -> None:
         first,
         version_id="new-id",
         version=first.version + 1,
-        issued_at=first.issued_at + 0.001,
+        issued_at=first.issued_at + 1,
         signature=None,
     )
     replay = replace(replay, signature=key.sign(replay.signing_payload()))
@@ -1014,7 +1030,9 @@ def test_sync_rejects_seen_hash_with_new_sequence_and_signature() -> None:
 def test_sync_rejects_non_increasing_sequence_with_fresh_content() -> None:
     key = Ed25519PrivateKey.generate()
     trusted_keys = {"owner": _public_key(key)}
-    distributor = ConstitutionDistributor("rules:\n  - first\n", issuer_id="owner")
+    distributor = ConstitutionDistributor(
+        "rules:\n  - first\n", key, issuer_id="owner"
+    )
     receiver = ConstitutionReceiver("validator", trusted_issuer_keys=trusted_keys)
 
     first = distributor.broadcast_message()
@@ -1036,7 +1054,9 @@ def test_sync_rejects_non_increasing_sequence_with_fresh_content() -> None:
 def test_sync_sequence_is_covered_by_issuer_signature() -> None:
     key = Ed25519PrivateKey.generate()
     public_key = _public_key(key)
-    distributor = ConstitutionDistributor("rules:\n  - first\n", issuer_id="owner")
+    distributor = ConstitutionDistributor(
+        "rules:\n  - first\n", key, issuer_id="owner"
+    )
     msg = distributor.broadcast_message()
     signed = replace(msg, signature=key.sign(msg.signing_payload()))
 
@@ -1049,10 +1069,10 @@ def test_sync_sequence_is_covered_by_issuer_signature() -> None:
 @pytest.mark.parametrize(
     ("issued_at_case", "error_fragment"),
     [
-        ("nan", "finite"),
-        ("infinite", "finite"),
+        ("nan", "integer"),
+        ("infinite", "integer"),
         ("negative", "positive"),
-        ("boolean", "finite"),
+        ("boolean", "integer"),
         ("stale", "stale"),
         ("future", "future"),
     ],
@@ -1060,21 +1080,31 @@ def test_sync_sequence_is_covered_by_issuer_signature() -> None:
 def test_sync_rejects_invalid_stale_or_future_issued_at(
     monkeypatch: pytest.MonkeyPatch, issued_at_case: str, error_fragment: str
 ) -> None:
-    fixed_now = 1_000_000.0
-    monkeypatch.setattr(sync_module.time, "time", lambda: fixed_now)
+    fixed_now = 1_000_000_000_000_000
+    monkeypatch.setattr(sync_module.time, "time_ns", lambda: fixed_now)
     issued_at = {
         "nan": float("nan"),
         "infinite": float("inf"),
-        "negative": -1.0,
+        "negative": -1,
         "boolean": True,
-        "stale": fixed_now - 60.0,
-        "future": fixed_now + 60.0,
+        "stale": fixed_now - 60_000_000_000,
+        "future": fixed_now + 60_000_000_000,
     }[issued_at_case]
     key = Ed25519PrivateKey.generate()
     trusted_keys = {"owner": _public_key(key)}
-    distributor = ConstitutionDistributor("rules:\n  - first\n", issuer_id="owner")
-    msg = replace(distributor.broadcast_message(), issued_at=issued_at, signature=None)
-    msg = replace(msg, signature=key.sign(msg.signing_payload()))
+    distributor = ConstitutionDistributor(
+        "rules:\n  - first\n", key, issuer_id="owner"
+    )
+    valid = distributor.broadcast_message()
+    msg = object.__new__(ConstitutionSyncMessage)
+    for field in ConstitutionSyncMessage.__slots__:
+        object.__setattr__(
+            msg,
+            field,
+            issued_at if field == "issued_at" else getattr(valid, field),
+        )
+    if type(issued_at) is int and issued_at > 0:
+        object.__setattr__(msg, "signature", key.sign(msg.signing_payload()))
     receiver = ConstitutionReceiver(
         "validator",
         trusted_issuer_keys=trusted_keys,
@@ -1089,7 +1119,8 @@ def test_sync_rejects_invalid_stale_or_future_issued_at(
 
 
 def test_governed_concurrent_successors_commit_at_most_one() -> None:
-    distributor = ConstitutionDistributor("rules:\n  - base\n")
+    sync_key = Ed25519PrivateKey.generate()
+    distributor = ConstitutionDistributor("rules:\n  - base\n", sync_key)
     current = ConstitutionVersion(0, ("base",))
     old_set, old_keys = _validators(3)
     new_set, new_keys = _validators(3)
@@ -1103,7 +1134,7 @@ def test_governed_concurrent_successors_commit_at_most_one() -> None:
     )
     receiver = ConstitutionReceiver(
         "validator",
-        allow_unsigned=True,
+        trusted_issuer_keys={"subnet-owner": _public_key(sync_key)},
         governed_validator_set=old_set,
         governed_policy=policy,
         governed_version=current,
@@ -1118,7 +1149,7 @@ def test_governed_concurrent_successors_commit_at_most_one() -> None:
         version_id="successor-b",
         expected_hash=hashlib.sha256(yaml_b.encode()).hexdigest()[:16],
         yaml_content=yaml_b,
-        issued_at=msg_a.issued_at + 0.001,
+        issued_at=msg_a.issued_at + 1,
     )
 
     def certificate_for(msg, rule: str) -> TransitionCertificate:
@@ -1219,7 +1250,7 @@ def test_invalid_governed_yaml_fails_closed(invalid_yaml: str) -> None:
     [
         lambda msg: replace(msg, version_id="tampered-id"),
         lambda msg: replace(msg, version=msg.version + 1),
-        lambda msg: replace(msg, issued_at=msg.issued_at + 0.001),
+        lambda msg: replace(msg, issued_at=msg.issued_at + 1),
         lambda msg: replace(msg, issuer_id="tampered-owner"),
         lambda msg: replace(msg, block_height=999),
         lambda msg: replace(msg, description="tampered-description"),
@@ -1289,7 +1320,7 @@ def test_governed_sync_accepts_certified_late_delivery(
     assert "replay" in replay.message.lower() or "version" in replay.message.lower()
 
 
-def test_governed_sync_allows_certified_content_reversion_at_higher_version() -> None:
+def test_governed_sync_rejects_certified_content_reversion_at_higher_version() -> None:
     dist, receiver, prior, old_set, old_keys, new_set, new_keys = _sync_setup()
     dist.update(_SYNC_YAML_E1)
     first = dist.broadcast_message()
@@ -1309,9 +1340,10 @@ def test_governed_sync_allows_certified_content_reversion_at_higher_version() ->
 
     result = _sync_apply(receiver, reverted, cert2, new_set, next_set, version1)
 
-    assert result.success
-    assert receiver.active_yaml == _SYNC_YAML_BOOT
-    assert receiver.active_epoch == 2
+    assert not result.success
+    assert "replay" in result.message.lower() or "downgrade" in result.message.lower()
+    assert receiver.active_yaml == _SYNC_YAML_E1
+    assert receiver.active_epoch == 1
 
 
 def test_governed_sync_uses_version_order_when_timestamp_moves_backward() -> None:
@@ -1326,7 +1358,15 @@ def test_governed_sync_uses_version_order_when_timestamp_moves_backward() -> Non
 
     next_set, next_keys = _validators(3)
     dist.update(_SYNC_YAML_E2)
-    second = replace(dist.broadcast_message(), issued_at=first.issued_at - 1.0)
+    unsigned_second = replace(
+        dist.broadcast_message(),
+        issued_at=first.issued_at - 1,
+        signature=None,
+    )
+    second = replace(
+        unsigned_second,
+        signature=_SYNC_SIGNING_KEY.sign(unsigned_second.signing_payload()),
+    )
     version2 = _sync_version(2, ("privacy-01", "safety-01"), version1.digest)
     cert2 = _sync_certificate(
         version1, version2, second, new_set, new_keys, next_set, next_keys
@@ -1339,8 +1379,12 @@ def test_governed_sync_uses_version_order_when_timestamp_moves_backward() -> Non
 
 
 def test_governed_sync_fails_closed_without_registry_and_policy_anchors() -> None:
-    dist = ConstitutionDistributor(_SYNC_YAML_BOOT)
-    receiver = ConstitutionReceiver("validator", allow_unsigned=True)
+    sync_key = Ed25519PrivateKey.generate()
+    dist = ConstitutionDistributor(_SYNC_YAML_BOOT, sync_key)
+    receiver = ConstitutionReceiver(
+        "validator",
+        trusted_issuer_keys={"subnet-owner": _public_key(sync_key)},
+    )
     assert receiver.apply(dist.broadcast_message()).success
     prior = _sync_version(0, ())
     old_set, old_keys = _validators(3)
@@ -1493,7 +1537,15 @@ def test_governed_sync_rejects_policy_weakening() -> None:
 def test_governed_sync_still_rejects_future_timestamp() -> None:
     dist, receiver, prior, old_set, old_keys, new_set, new_keys = _sync_setup()
     dist.update(_SYNC_YAML_E1)
-    msg = replace(dist.broadcast_message(), issued_at=time.time() + 31.0)
+    unsigned = replace(
+        dist.broadcast_message(),
+        issued_at=time.time_ns() + 31_000_000_000,
+        signature=None,
+    )
+    msg = replace(
+        unsigned,
+        signature=_SYNC_SIGNING_KEY.sign(unsigned.signing_payload()),
+    )
     proposed = _sync_version(1, ("safety-01",), prior.digest)
     cert = _sync_certificate(
         prior, proposed, msg, old_set, old_keys, new_set, new_keys
@@ -1506,7 +1558,9 @@ def test_governed_sync_still_rejects_future_timestamp() -> None:
 
 
 @pytest.mark.parametrize("side", ["old", "new"])
-def test_governed_sync_normalizes_malformed_qc_signatures(side: str) -> None:
+def test_governed_sync_rejects_malformed_qc_signatures_at_construction(
+    side: str,
+) -> None:
     dist, receiver, prior, old_set, old_keys, new_set, new_keys = _sync_setup()
     dist.update(_SYNC_YAML_E1)
     msg = dist.broadcast_message()
@@ -1517,28 +1571,29 @@ def test_governed_sync_normalizes_malformed_qc_signatures(side: str) -> None:
     qc = cert.old_side_certificate if side == "old" else cert.new_side_certificate
     malformed_vote = replace(qc.votes[0], signature="not-bytes")
     malformed_qc = replace(qc, votes=(malformed_vote, *qc.votes[1:]))
-    malformed_cert = replace(
-        cert,
-        old_side_certificate=(
-            malformed_qc if side == "old" else cert.old_side_certificate
-        ),
-        new_side_certificate=(
-            malformed_qc if side == "new" else cert.new_side_certificate
-        ),
-    )
-
-    result = _sync_apply(
-        receiver, msg, malformed_cert, old_set, new_set, prior
-    )
-
-    assert not result.success
-    assert "certificate rejected" in result.message.lower()
+    with pytest.raises(InvalidTransitionError, match="signature must be 64 bytes"):
+        replace(
+            cert,
+            old_side_certificate=(
+                malformed_qc if side == "old" else cert.old_side_certificate
+            ),
+            new_side_certificate=(
+                malformed_qc if side == "new" else cert.new_side_certificate
+            ),
+        )
 
 
 def test_sync_normalizes_malformed_issuer_signature() -> None:
     key = Ed25519PrivateKey.generate()
-    dist = ConstitutionDistributor(_SYNC_YAML_BOOT, issuer_id="owner")
-    msg = replace(dist.broadcast_message(), signature="not-bytes")
+    dist = ConstitutionDistributor(_SYNC_YAML_BOOT, key, issuer_id="owner")
+    valid = dist.broadcast_message()
+    msg = object.__new__(ConstitutionSyncMessage)
+    for field in ConstitutionSyncMessage.__slots__:
+        object.__setattr__(
+            msg,
+            field,
+            "not-bytes" if field == "signature" else getattr(valid, field),
+        )
     receiver = ConstitutionReceiver(
         "validator", trusted_issuer_keys={"owner": _public_key(key)}
     )

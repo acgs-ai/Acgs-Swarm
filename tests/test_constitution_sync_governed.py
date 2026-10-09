@@ -18,6 +18,7 @@ from constitutional_swarm.epoch_reconfig import (
     DriftBudget,
     TransitionCertificate,
     TransitionVerificationPolicy,
+    build_transition_side_certificate,
     compute_validator_set_digest,
     transition_vote_subject,
 )
@@ -37,6 +38,13 @@ from constitutional_swarm.validator_set import (
 YAML_BOOT = "name: boot\nrules: []\n"
 YAML_E1 = "name: ctx-v1\nrules:\n  - safety-01\n"
 YAML_E2 = "name: ctx-v2\nrules:\n  - privacy-01\n  - safety-01\n"
+_SYNC_SIGNING_KEY = Ed25519PrivateKey.generate()
+_SYNC_TRUSTED_KEYS = {
+    "subnet-owner": _SYNC_SIGNING_KEY.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+}
 
 
 def _version(
@@ -111,8 +119,16 @@ def _certificate(
     )
     return TransitionCertificate(
         proposal,
-        _qc(proposal, old_validators, old_keys, "old-seed"),
-        _qc(proposal, new_validators, new_keys, "new-seed"),
+        build_transition_side_certificate(
+            _qc(proposal, old_validators, old_keys, "old-seed"),
+            validator_set=old_validators,
+            threshold_fraction=_policy().old_certificate.threshold_fraction,
+        ),
+        build_transition_side_certificate(
+            _qc(proposal, new_validators, new_keys, "new-seed"),
+            validator_set=new_validators,
+            threshold_fraction=_policy().new_certificate.threshold_fraction,
+        ),
     )
 
 
@@ -149,13 +165,13 @@ def _apply(
 
 
 def _setup(*, policy: TransitionVerificationPolicy | None = None):
-    distributor = ConstitutionDistributor(YAML_BOOT)
+    distributor = ConstitutionDistributor(YAML_BOOT, _SYNC_SIGNING_KEY)
     prior = _version(0, ())
     old_validators, old_keys = _validator_set("old-")
     new_validators, new_keys = _validator_set("new-")
     receiver = ConstitutionReceiver(
         "validator",
-        allow_unsigned=True,
+        trusted_issuer_keys=_SYNC_TRUSTED_KEYS,
         governed_validator_set=old_validators,
         governed_policy=policy or _policy(),
         governed_version=prior,
@@ -409,7 +425,9 @@ def test_summary_includes_active_epoch() -> None:
 
 
 def test_legacy_apply_does_not_set_governed_epoch() -> None:
-    dist = ConstitutionDistributor(YAML_E1)
-    receiver = ConstitutionReceiver("validator", allow_unsigned=True)
+    dist = ConstitutionDistributor(YAML_E1, _SYNC_SIGNING_KEY)
+    receiver = ConstitutionReceiver(
+        "validator", trusted_issuer_keys=_SYNC_TRUSTED_KEYS
+    )
     assert receiver.apply(dist.broadcast_message()).success
     assert receiver.active_epoch is None
