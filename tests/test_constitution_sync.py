@@ -6,6 +6,8 @@ import hashlib
 import time
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm.bittensor.constitution_sync import (
     ConstitutionDistributor,
     ConstitutionReceiver,
@@ -43,6 +45,22 @@ rules:
       - PII
       - personal
 """
+
+_SIGNING_KEY = Ed25519PrivateKey.generate()
+_TRUSTED_KEYS = {
+    "subnet-owner": _SIGNING_KEY.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+}
+
+
+def _distributor(yaml_content: str) -> ConstitutionDistributor:
+    return ConstitutionDistributor(yaml_content, _SIGNING_KEY)
+
+
+def _receiver(node_id: str) -> ConstitutionReceiver:
+    return ConstitutionReceiver(node_id, trusted_issuer_keys=_TRUSTED_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +106,14 @@ class TestConstitutionVersionRecord:
 
 class TestConstitutionSyncMessage:
     def _make_msg(self, yaml: str = YAML_V1) -> ConstitutionSyncMessage:
-        expected = hashlib.sha256(yaml.encode()).hexdigest()[:16]
+        digest = hashlib.sha256(yaml.encode()).digest()
         return ConstitutionSyncMessage(
             version_id="v001",
             version=1,
-            expected_hash=expected,
+            expected_hash=digest.hex()[:16],
+            content_digest=digest,
             yaml_content=yaml,
-            issued_at=time.time(),
+            issued_at=time.time_ns(),
         )
 
     def test_verify_valid(self):
@@ -107,21 +126,23 @@ class TestConstitutionSyncMessage:
             version_id=msg.version_id,
             version=msg.version,
             expected_hash=msg.expected_hash,
+            content_digest=msg.content_digest,
             yaml_content=msg.yaml_content + "\n# tampered",
             issued_at=msg.issued_at,
         )
         assert tampered.verify() is False
 
-    def test_verify_wrong_hash(self):
+    def test_reject_wrong_hash_shape(self):
         msg = self._make_msg()
-        wrong = ConstitutionSyncMessage(
-            version_id=msg.version_id,
-            version=msg.version,
-            expected_hash="wronghash1234567",
-            yaml_content=msg.yaml_content,
-            issued_at=msg.issued_at,
-        )
-        assert wrong.verify() is False
+        with pytest.raises(ValueError, match="expected_hash"):
+            ConstitutionSyncMessage(
+                version_id=msg.version_id,
+                version=msg.version,
+                expected_hash="wronghash1234567",
+                content_digest=msg.content_digest,
+                yaml_content=msg.yaml_content,
+                issued_at=msg.issued_at,
+            )
 
     def test_to_dict_from_dict_roundtrip(self):
         msg = self._make_msg()
@@ -129,7 +150,9 @@ class TestConstitutionSyncMessage:
         assert restored.version_id == msg.version_id
         assert restored.version == msg.version
         assert restored.expected_hash == msg.expected_hash
+        assert restored.content_digest == msg.content_digest
         assert restored.yaml_content == msg.yaml_content
+        assert restored.wire_version == 2
 
 
 # ---------------------------------------------------------------------------
@@ -139,29 +162,32 @@ class TestConstitutionSyncMessage:
 
 class TestConstitutionDistributor:
     def test_initial_version(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         assert dist.active_hash
         assert len(dist.version_history) == 1
 
     def test_broadcast_message_passes_verify(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         msg = dist.broadcast_message()
         assert msg.verify() is True
+        assert msg.signature is not None
+        assert len(msg.signature) == 64
+        assert msg.verify_signature(_TRUSTED_KEYS)
 
     def test_update_creates_new_version(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         v1_hash = dist.active_hash
         dist.update(YAML_V2, description="Added privacy rule")
         assert dist.active_hash != v1_hash
         assert len(dist.version_history) == 2
 
     def test_update_same_content_raises(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         with pytest.raises(ValueError, match="unchanged"):
             dist.update(YAML_V1)
 
     def test_version_history_ordered(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         dist.update(YAML_V2)
         history = dist.version_history
         assert history[0].yaml_content == YAML_V1
@@ -169,7 +195,7 @@ class TestConstitutionDistributor:
         assert [record.version for record in history] == [1, 2]
 
     def test_multiple_updates(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         for i in range(3):
             extra_yaml = YAML_V1 + f"\n  # update {i}"
             dist.update(extra_yaml)
@@ -183,16 +209,16 @@ class TestConstitutionDistributor:
 
 class TestConstitutionReceiver:
     def test_uninitialised(self):
-        r = ConstitutionReceiver("miner-01", allow_unsigned=True)
+        r = _receiver("miner-01")
         assert not r.is_initialised
         assert r.active_hash == ""
         assert r.active_yaml == ""
 
     def test_apply_valid_message(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         msg = dist.broadcast_message()
 
-        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
+        receiver = _receiver("miner-01")
         result = receiver.apply(msg)
 
         assert result.success is True
@@ -200,24 +226,25 @@ class TestConstitutionReceiver:
         assert receiver.active_hash == dist.active_hash
 
     def test_apply_tampered_message(self):
-        dist = ConstitutionDistributor(YAML_V1)
+        dist = _distributor(YAML_V1)
         msg = dist.broadcast_message()
         tampered = ConstitutionSyncMessage(
             version_id=msg.version_id,
             version=msg.version,
             expected_hash=msg.expected_hash,
+            content_digest=msg.content_digest,
             yaml_content=msg.yaml_content + "\n# tampered",
             issued_at=msg.issued_at,
         )
-        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
+        receiver = _receiver("miner-01")
         result = receiver.apply(tampered)
 
         assert result.success is False
         assert not receiver.is_initialised
 
     def test_apply_version_update(self):
-        dist = ConstitutionDistributor(YAML_V1)
-        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
+        dist = _distributor(YAML_V1)
+        receiver = _receiver("miner-01")
         receiver.apply(dist.broadcast_message())
 
         dist.update(YAML_V2)
@@ -228,22 +255,23 @@ class TestConstitutionReceiver:
         assert len(receiver.version_history) == 2
 
     def test_verify_task_hash_matches(self):
-        dist = ConstitutionDistributor(YAML_V1)
-        receiver = ConstitutionReceiver("miner-01", allow_unsigned=True)
+        dist = _distributor(YAML_V1)
+        receiver = _receiver("miner-01")
         receiver.apply(dist.broadcast_message())
 
-        assert receiver.verify_task_hash(dist.active_hash) is True
+        full_digest = hashlib.sha256(YAML_V1.encode()).hexdigest()
+        assert receiver.verify_task_hash(full_digest) is True
         assert receiver.verify_task_hash("wrong_hash") is False
 
     def test_summary(self):
-        receiver = ConstitutionReceiver("miner-42")
+        receiver = _receiver("miner-42")
         s = receiver.summary()
         assert s["node_id"] == "miner-42"
         assert s["is_initialised"] is False
 
     def test_multiple_receivers_stay_in_sync(self):
-        dist = ConstitutionDistributor(YAML_V1)
-        miners = [ConstitutionReceiver(f"miner-{i:02d}", allow_unsigned=True) for i in range(5)]
+        dist = _distributor(YAML_V1)
+        miners = [_receiver(f"miner-{i:02d}") for i in range(5)]
 
         msg = dist.broadcast_message()
         for m in miners:

@@ -236,11 +236,14 @@ def test_axon_blacklist_and_priority_fail_closed_without_trusted_hotkey() -> Non
 
 def test_constitution_sync_rejects_unsigned_message_by_default() -> None:
     yaml_content = "constitutional_hash: attacker\n"
+    content_digest = hashlib.sha256(yaml_content.encode()).digest()
     msg = ConstitutionSyncMessage(
         version_id="v-attacker",
-        expected_hash=hashlib.sha256(yaml_content.encode()).hexdigest()[:16],
+        version=1,
+        expected_hash=content_digest.hex()[:16],
+        content_digest=content_digest,
         yaml_content=yaml_content,
-        issued_at=time.time(),
+        issued_at=time.time_ns(),
         issuer_id="attacker",
     )
     receiver = ConstitutionReceiver("miner-1")
