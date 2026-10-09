@@ -2904,9 +2904,19 @@ class ConstitutionalMesh:
     @staticmethod
     def _coerce_public_key(value: Ed25519PublicKey | bytes | str) -> Ed25519PublicKey:
         if isinstance(value, Ed25519PublicKey):
-            return value
-        raw = bytes.fromhex(value) if isinstance(value, str) else value
-        return Ed25519PublicKey.from_public_bytes(raw)
+            raw = value.public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+        else:
+            raw = (
+                bytes.fromhex(str.__str__(value))
+                if isinstance(value, str)
+                else value
+            )
+        if not isinstance(raw, bytes):
+            raise TypeError("invalid public key type")
+        return Ed25519PublicKey.from_public_bytes(bytes(raw))
 
     @staticmethod
     def _coerce_private_key(

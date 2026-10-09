@@ -75,7 +75,10 @@ def test_c16_registry_frozen_snapshot_is_detached_from_source_and_exports() -> N
     import pytest
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+    from constitutional_swarm.mesh.vote_envelope import (
+        VoteSignerRegistry,
+        key_id_for_public_key,
+    )
 
     original_key = Ed25519PrivateKey.generate().public_key()
     replacement_key = Ed25519PrivateKey.generate().public_key()
@@ -93,7 +96,16 @@ def test_c16_registry_frozen_snapshot_is_detached_from_source_and_exports() -> N
     )
     registry.unregister("registry-voter")
 
-    assert frozen.authorize("registry-voter", original_key_id) is original_key
+    frozen_key = frozen.authorize("registry-voter", original_key_id)
+    assert frozen_key is not original_key
+    assert frozen_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ) == original_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    assert key_id_for_public_key(frozen_key) == original_key_id
     assert frozen.trust_grants(role="validator") == {
         original_key_id: {
             "identity_id": "registry-voter",
@@ -1694,14 +1706,26 @@ def test_c16_register_rejects_assigner_and_voter_roles() -> None:
 
 
 def test_c16_replace_rejects_assigner_and_validator_roles_atomically() -> None:
-    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+    from constitutional_swarm.mesh.vote_envelope import (
+        VoteSignerRegistry,
+        key_id_for_public_key,
+    )
 
     key = Ed25519PrivateKey.generate().public_key()
     registry = VoteSignerRegistry()
     original_key_id = registry.register("voter", key, roles={"voter", "validator"})
     with pytest.raises(ValueError, match="assigner.*voter|voter.*assigner"):
         registry.replace("voter", key, roles={"assigner", "validator"})
-    assert registry.authorize("voter", original_key_id, role="voter") is key
+    retained_key = registry.authorize("voter", original_key_id, role="voter")
+    assert retained_key is not key
+    assert retained_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ) == key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    assert key_id_for_public_key(retained_key) == original_key_id
 
 
 def test_c16_frozen_registry_rejects_assigner_and_voter_roles() -> None:
@@ -1843,6 +1867,16 @@ def test_c16_proof_verifier_compares_actual_assigner_and_voter_keys() -> None:
             assert identity in {"shared-key-assigner", "shared-key-voter"}
             assert requested_key_id == key_id
             assert role in {"assigner", "voter"}
+            return shared_key.public_key()
+
+        def public_key_for_identity(self, identity):
+            assert identity in {
+                "shared-key-assigner",
+                "shared-key-producer",
+                "shared-key-voter",
+            }
+            if identity == "shared-key-producer":
+                return None
             return shared_key.public_key()
 
         def trust_grants(self, *, role="validator"):

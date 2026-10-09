@@ -16,7 +16,7 @@ from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
 from constitutional_swarm.mesh.vote_envelope import (
     FrozenVoteSignerRegistry,
     VoteSignerRegistryView,
-    key_id_for_public_key,
+    _public,
     normalize_voter_id,
     sign_vote_envelope,
     signed_assignment_digest,
@@ -67,9 +67,17 @@ class LocalRemotePeer:
         self._public_key = self._private_key.public_key()
         self._trusted_request_signers = set()
         for public_key in trusted_request_signers or set():
-            key_id_for_public_key(public_key)
-            self._trusted_request_signers.add(public_key)
-        if not isinstance(trusted_assigners, FrozenVoteSignerRegistry):
+            canonical_input = (
+                str.__str__(public_key) if isinstance(public_key, str) else public_key
+            )
+            canonical_key = _public(canonical_input)
+            self._trusted_request_signers.add(
+                canonical_key.public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw,
+                ).hex()
+            )
+        if type(trusted_assigners) is not FrozenVoteSignerRegistry:
             raise TypeError("trusted_assigners must be an immutable registry snapshot")
         self._trusted_assigners = trusted_assigners
         self._replay_window_seconds = replay_window_seconds
@@ -125,6 +133,8 @@ class LocalRemotePeer:
             raise ValueError("Remote vote request electorate does not match signed assignment")
         if request.quorum != assignment.quorum:
             raise ValueError("Remote vote request quorum does not match signed assignment")
+        if type(request.request_signer_public_key) is not str:
+            raise ValueError("Remote vote request signer public key must be an exact string")
         if (
             request.request_signer_public_key not in self._trusted_request_signers
         ):
