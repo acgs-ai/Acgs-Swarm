@@ -101,8 +101,13 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   DSSE: `governance_receipts_dsse.py` — `to_in_toto_statement`,
   `to_dsse_envelope`/`verify_dsse_envelope`, `DsseSigner`, `pae`.
 - **Logic:** receipts hash-link a payload + detached signatures; `verify_bundle`
-  re-derives digests and checks signatures with **no trust in the producer**
-  (verifier-first profile, ADR `acgs_v0_1_verifier_first_scope.md`).
+  re-derives digests and checks signatures against caller-supplied trusted keys
+  with **no trust in the producer** (verifier-first profile, ADR
+  `acgs_v0_1_verifier_first_scope.md`). Report mode preserves diagnostics but is
+  still fail-closed: unsigned, untrusted, or otherwise unverifiable bundles have
+  `valid: false`. Validator IDs are stripped and case-folded before blank and
+  duplicate checks, so spelling or whitespace variants cannot count as distinct
+  validators.
 
 ### `quorum_certificate.py` — accountable-safety quorum
 - **Surface:** `QuorumCertificate` (`.to_dict`/`.from_dict`, `.qc_id`),
@@ -128,19 +133,24 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `build_bundle`, `verify_bundle`, `BundleSigner`, `AuditLogger`, `TaskSpec`,
   `RunResult`, `Action`.
 - **Logic (hardened — see `DECISIONS.md` 2026-06-03):**
-  - `build_bundle(signer=, constitutional_version=)` Ed25519-signs a
-    domain-separated attestation (`BUNDLE_SIG_DOMAIN`) binding chain_hash +
-    constitution_hash + version pin + final_state + task identity.
-  - `verify_bundle(..., trusted_public_keys=...)` **requires** a valid signature
-    for `ok` when a trust anchor is supplied; trust derives only from
-    out-of-band keys, never the bundle-embedded key.
+  - Schema v2 `build_bundle(signer=, constitutional_version=)` Ed25519-signs a
+    domain-separated canonical attestation (`BUNDLE_SIG_DOMAIN`) over every
+    bundle payload field except the `signature` block.
+  - `verify_bundle(..., trusted_public_keys=...)` replays the embedded
+    `audit_events`, re-derives all verifier-facing summaries, and compares them
+    with the signed payload. The bundle's `audit_path` remains signed provenance;
+    verification never opens that path or substitutes its contents for the
+    embedded evidence.
+  - `ok` requires a valid signature under an out-of-band trust anchor. An
+    unsigned bundle or a call without trusted public keys is diagnostic-only and
+    returns `ok: false`; the bundle-embedded key is never a trust anchor.
   - The `tool_call` gate is **default-DENY allowlist**
-    (`DEFAULT_COMMAND_ALLOWLIST = python, python3, pytest`); the constitution may
+    (`DEFAULT_COMMAND_ALLOWLIST = true, echo`); the constitution may
     extend but never weaken it.
   - `_intake` **fails closed** if the constitution declares a
     `constitutional_version`/`hash` ≠ the pinned `608508a9bd224290`.
-- **⚠** Backward compatible: with no signer/anchor, `verify_bundle` still returns
-  `ok` on chain-consistency and runs are honestly reported `signed: false`.
+- **⚠** Schema v1 and unanchored bundles remain readable for diagnostics, but
+  cannot produce `ok: true`; regenerate and sign them as schema v2 evidence.
 
 ### `protocol.py` — canonical protocol encoders
 - **Purpose:** the canonical-byte boundary for a future Rust core.
