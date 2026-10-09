@@ -24,7 +24,10 @@ def _clean_generator(_state):
 class _CleanDNA:
     """DNA validator stub that reports no violations and low risk."""
 
+    hash = CONSTITUTIONAL_HASH
+
     class _Result:
+        valid = True
         violations = ()
         risk_score = 0.0
 
@@ -35,7 +38,10 @@ class _CleanDNA:
 class _RiskyDNA:
     """DNA validator stub that reports risk_score >= 0.3 -> reject."""
 
+    hash = CONSTITUTIONAL_HASH
+
     class _Result:
+        valid = True
         violations = ()
         risk_score = 0.5
 

@@ -32,6 +32,8 @@ class _StreamState(TypedDict, total=False):
     other: str
     governance_status: str
     settled: bool
+    risk_score: float
+    violations: list[str]
 
 
 def _build_settling_graph() -> Any:
@@ -39,6 +41,9 @@ def _build_settling_graph() -> Any:
 
     def produce(state: _StreamState) -> dict:
         return {"patch": "diff --git a b", "governed": True}
+
+    def validate(state: _StreamState) -> dict:
+        return {"governed": True, "risk_score": 0.0, "violations": []}
 
     def settle(state: _StreamState) -> dict:
         return {
@@ -49,9 +54,11 @@ def _build_settling_graph() -> Any:
 
     builder = StateGraph(_StreamState)
     builder.add_node("produce", produce)
+    builder.add_node("validate", validate)
     builder.add_node("settle", settle)
     builder.add_edge(START, "produce")
-    builder.add_edge("produce", "settle")
+    builder.add_edge("produce", "validate")
+    builder.add_edge("validate", "settle")
     builder.add_edge("settle", END)
     return builder.compile()
 

@@ -57,15 +57,14 @@ class TestConstitutionalHashGuard:
 
 class TestFailClosedGuard:
     def test_accepts_clean_state(self) -> None:
-        state = {"violations": [], "risk_score": 0.0}
+        state = {"violations": [], "risk_score": 0.0, "governed": True}
         assert fail_closed_guard(state) == "accept"
 
     def test_accepts_clean_state_with_missing_fields(self) -> None:
-        # Both fields absent -> defaults of [] and 0.0 -> accept
-        assert fail_closed_guard({}) == "accept"
+        assert fail_closed_guard({}) == "reject"
 
     def test_accepts_state_just_below_threshold(self) -> None:
-        state = {"violations": [], "risk_score": 0.29999}
+        state = {"violations": [], "risk_score": 0.29999, "governed": True}
         assert fail_closed_guard(state) == "accept"
 
     def test_rejects_on_violations_only(self) -> None:
@@ -92,8 +91,8 @@ class TestFailClosedGuard:
         assert fail_closed_guard(state) == "reject"
 
     def test_none_risk_score_coerces_to_zero(self) -> None:
-        state = {"violations": [], "risk_score": None}
-        assert fail_closed_guard(state) == "accept"
+        state = {"violations": [], "risk_score": None, "governed": True}
+        assert fail_closed_guard(state) == "reject"
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +237,10 @@ def test_guards_callable_when_langgraph_module_absent(monkeypatch: pytest.Monkey
     """
     monkeypatch.setitem(sys.modules, "langgraph", None)
     assert constitutional_hash_guard({"constitutional_hash": CONSTITUTIONAL_HASH}) == "ok"
-    assert fail_closed_guard({"violations": [], "risk_score": 0.0}) == "accept"
+    assert (
+        fail_closed_guard({"violations": [], "risk_score": 0.0, "governed": True})
+        == "accept"
+    )
     assert (
         quorum_guard({"peer_votes": dict.fromkeys(("a", "b", "c", "d", "e"), "accept")})
         == "settled"
