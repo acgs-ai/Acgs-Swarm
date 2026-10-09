@@ -21,11 +21,14 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
+import stat
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
+from typing import TextIO
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -62,12 +65,63 @@ class _AuthorityKeys:
         self.request_signing_private_key = request_signing_private_key
 
 
+@contextmanager
+def _open_authority_key_file(path: str) -> Iterator[TextIO]:
+    """Open and validate a private authority file from one descriptor.
+
+    ``O_NOFOLLOW`` protects only the final path component. Operators must keep
+    every parent directory under trusted control.
+    """
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    except AttributeError as exc:
+        raise ValueError(
+            "secure authority key file opening is unsupported on this platform"
+        ) from exc
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if exc.errno == errno.ELOOP:
+            raise ValueError(
+                f"authority key file must be a regular file and not a symlink: {path}"
+            ) from exc
+        raise ValueError(f"authority key file is unreadable: {path}") from exc
+
+    try:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(
+                f"authority key file must be a regular file and not a symlink: {path}"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(
+                f"authority key file must be owned by the current effective user: {path}"
+            )
+        if metadata.st_mode & 0o077:
+            raise ValueError(
+                f"authority key file grants group or other permissions: {path}"
+            )
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            yield handle
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _load_authority_keys(path: str) -> _AuthorityKeys:
-    """Load preprovisioned assignment and request-signing authority keys."""
+    """Load preprovisioned assignment and request-signing authority keys.
+
+    The secure open protects only the final component from symlink traversal;
+    operators must keep parent directories under trusted control.
+    """
     if not isinstance(path, str) or not path.strip():
         raise ValueError("an authority key file is required")
     try:
-        with open(path, encoding="utf-8") as handle:
+        with _open_authority_key_file(path) as handle:
             document = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"authority key file is unreadable: {path}") from exc

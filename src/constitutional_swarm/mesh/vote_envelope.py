@@ -111,7 +111,7 @@ class VoteEnvelope:
 
 
 def normalize_voter_id(value: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError("voter_id must be a string")
     value = unicodedata.normalize("NFKC", value)
     value = (
@@ -123,23 +123,25 @@ def normalize_voter_id(value: str) -> str:
 
 
 def _hex(value: str, pattern: re.Pattern[str], name: str) -> str:
-    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+    if type(value) is not str or pattern.fullmatch(value) is None:
         raise ValueError(f"{name} must be canonical lowercase hex")
     return value
 
 
 def _public(value: Ed25519PublicKey | bytes | str) -> Ed25519PublicKey:
     if isinstance(value, Ed25519PublicKey):
-        return value
-    raw = (
-        bytes.fromhex(_hex(value, _HEX64, "public key"))
-        if isinstance(value, str)
-        else value
-    )
+        raw = value.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    elif isinstance(value, str):
+        raw = bytes.fromhex(_hex(str.__str__(value), _HEX64, "public key"))
+    else:
+        raw = value
     if not isinstance(raw, bytes):
         raise TypeError("invalid public key type")
     try:
-        return Ed25519PublicKey.from_public_bytes(raw)
+        return Ed25519PublicKey.from_public_bytes(bytes(raw))
     except ValueError as exc:
         raise ValueError("public key must contain exactly 32 Ed25519 bytes") from exc
 
@@ -182,6 +184,10 @@ class VoteSignerRegistryView(Protocol):
         self, voter_id: str, key_id: str, *, role: str = "voter"
     ) -> Ed25519PublicKey: ...
 
+    def public_key_for_identity(
+        self, identity: str
+    ) -> Ed25519PublicKey | None: ...
+
     def trust_grants(self, *, role: str = "validator") -> dict[str, dict[str, object]]: ...
 
     def validate_trust_root(self) -> None: ...
@@ -195,17 +201,25 @@ def _validate_registry_grants(grants: Sequence[_Grant]) -> tuple[_Grant, ...]:
     copied = tuple(grants)
     identities: dict[str, _Grant] = {}
     key_material: dict[bytes, _Grant] = {}
+    canonical: list[_Grant] = []
     for grant in copied:
-        if not isinstance(grant, _Grant):
-            raise TypeError("vote signer grants must be registry grants")
+        if type(grant) is not _Grant:
+            raise TypeError("vote signer grants must be exact registry grants")
+        if type(grant.roles) is not frozenset:
+            raise TypeError("vote signer grant roles must be an immutable frozenset")
+        if (
+            type(grant.identity) is not str
+            or type(grant.key_id) is not str
+            or any(type(role) is not str for role in grant.roles)
+        ):
+            raise TypeError("vote signer identity, key ID, and roles must be exact strings")
+        grant = _Grant(grant.identity, grant.key_id, _public(grant.key), grant.roles)
         if grant.identity != normalize_voter_id(grant.identity):
             raise ValueError("vote signer identity must use its canonical normalized form")
         if grant.key_id != key_id_for_public_key(grant.key):
             raise ValueError("vote signer key ID must equal the public-key fingerprint")
-        if not isinstance(grant.roles, frozenset):
-            raise TypeError("vote signer grant roles must be an immutable frozenset")
         if not grant.roles or any(
-            not isinstance(role, str) or not role.strip() or role != role.strip().casefold()
+            not role.strip() or role != role.strip().casefold()
             for role in grant.roles
         ):
             raise ValueError("vote signer roles must be non-empty canonical strings")
@@ -233,7 +247,8 @@ def _validate_registry_grants(grants: Sequence[_Grant]) -> tuple[_Grant, ...]:
             raise ValueError("vote signer public keys must be unique")
         identities[grant.identity] = grant
         key_material[raw_key] = grant
-    return copied
+        canonical.append(grant)
+    return tuple(canonical)
 
 
 def _validate_registry_indexes(
@@ -300,6 +315,10 @@ class FrozenVoteSignerRegistry:
             raise ValueError(f"vote signer is not authorized for role {role!r}")
         return grant.key
 
+    def public_key_for_identity(self, identity: str) -> Ed25519PublicKey | None:
+        grant = self._identities.get(normalize_voter_id(identity))
+        return None if grant is None else grant.key
+
     def trust_grants(self, *, role: str = "validator") -> dict[str, dict[str, object]]:
         return _export_trust_grants(self._grants, role=role)
 
@@ -330,13 +349,14 @@ class VoteSignerRegistry:
     ) -> str:
         if isinstance(roles, (str, bytes)):
             raise TypeError("roles must be a collection of role names")
-        if any(not isinstance(role, str) or not role.strip() for role in roles):
+        role_values = tuple(roles)
+        if any(type(role) is not str or not role.strip() for role in role_values):
             raise ValueError("signer roles must be non-empty strings")
         identity, key = normalize_voter_id(voter_id), _public(public_key)
         key_id = key_id_for_public_key(key)
         role_set = frozenset(
             role.strip().casefold()
-            for role in roles
+            for role in role_values
             if role.strip()
         )
         if not role_set:
@@ -374,6 +394,12 @@ class VoteSignerRegistry:
                 raise ValueError(f"vote signer is not authorized for role {role!r}")
             return grant.key
 
+    def public_key_for_identity(self, identity: str) -> Ed25519PublicKey | None:
+        normalized = normalize_voter_id(identity)
+        with self._lock:
+            grant = self._identities.get(normalized)
+            return None if grant is None else grant.key
+
     def unregister(self, voter_id: str) -> None:
         """Remove one explicitly managed signer identity."""
         identity = normalize_voter_id(voter_id)
@@ -392,11 +418,12 @@ class VoteSignerRegistry:
         """Atomically install or rotate one identity after all checks pass."""
         if isinstance(roles, (str, bytes)):
             raise TypeError("roles must be a collection of role names")
-        if any(not isinstance(role, str) or not role.strip() for role in roles):
+        role_values = tuple(roles)
+        if any(type(role) is not str or not role.strip() for role in role_values):
             raise ValueError("signer roles must be non-empty strings")
         identity, key = normalize_voter_id(voter_id), _public(public_key)
         key_id = key_id_for_public_key(key)
-        role_set = frozenset(role.strip().casefold() for role in roles)
+        role_set = frozenset(role.strip().casefold() for role in role_values)
         if not role_set:
             raise ValueError("signer roles must not be empty")
         with self._lock:
@@ -558,7 +585,22 @@ def verify_signed_assignment(
 ) -> SignedAssignment:
     item = signed_assignment_from_dict(assignment) if isinstance(assignment, Mapping) else _validate_assignment(assignment)
     registry.validate_trust_root()
-    key = registry.authorize(item.assigner_id, item.key_id, role="assigner")
+    key = _public(registry.authorize(item.assigner_id, item.key_id, role="assigner"))
+    if item.assigner_id == normalize_voter_id(item.producer_id):
+        raise ValueError(
+            "signed assignment assigner identity must differ from producer identity"
+        )
+    producer_key = registry.public_key_for_identity(item.producer_id)
+    if producer_key is not None:
+        producer_key = _public(producer_key)
+    if producer_key is not None and producer_key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ) == key.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ):
+        raise ValueError("signed assignment assigner and producer keys must differ")
     for name, expected in {
         "task_id": task_id, "assignment_id": assignment_id, "producer_id": producer_id,
         "artifact_id": artifact_id, "content_hash": content_hash,
@@ -751,7 +793,7 @@ def verify_vote_envelope(
         if isinstance(envelope, Mapping)
         else _validate(envelope)
     )
-    key = registry.authorize(item.voter_id, item.key_id, role=required_role)
+    key = _public(registry.authorize(item.voter_id, item.key_id, role=required_role))
     for name, expected in {
         "task_id": task_id,
         "assignment_id": assignment_id,

@@ -103,7 +103,20 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   and call `.frozen_copy()` to establish an immutable trust root. Assignment
   validation rejects the assigner identity in `assigned_peers` and rejects an
   assigner public key equal to any electorate key, including when a caller has
-  hand-built inconsistent registry state around the normal mutation checks.
+  hand-built inconsistent registry state around the normal mutation checks. It
+  also rejects an assigner whose normalized identity equals the producer or
+  whose key equals the producer's registered key under another identity. The
+  producer need not be registered; an unknown producer key remains valid.
+  Structural `VoteSignerRegistryView` implementations must provide the
+  role-independent `public_key_for_identity` lookup. Frozen grant roles must be
+  the exact built-in `frozenset` type, preventing subclasses from overriding
+  membership or set operations. Trust-root validation also requires the exact
+  internal `_Grant` type and exact built-in `str` values for the identity and
+  every role. Registry, frozen-snapshot, and mesh ingestion serialize
+  caller-supplied Ed25519 public-key objects to raw bytes and reconstruct
+  concrete keys with `Ed25519PublicKey.from_public_bytes`, so trust checks never
+  retain caller-defined verification or comparison methods. These checks do not
+  change assignment canonical bytes, digests, signatures, or protocol fixtures.
 - **Supporting types:** `mesh/voting.py` (`ValidationVote.vote_hash`,
   `RemoteVoteRequest`), `mesh/peers.py` (`PeerAssignment`), `mesh/settlement.py`
   (`MeshProof.verify`, `MeshResult`, `ReconciliationReport`), `mesh/exceptions.py`.
@@ -267,10 +280,11 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   - The `tool_call` gate is **default-DENY allowlist**
     (`DEFAULT_COMMAND_ALLOWLIST = true, echo`); the constitution may
     extend but never weaken it.
-  - Code-owned protected paths include root and nested dotenv files (`.env`,
-    `.env.*`, `**/.env`, `**/.env.*`) under normalized, case-insensitive matching.
-    Writes to those paths require human review even when local configuration
-    supplies an empty protected-path list.
+  - Code-owned protected paths include root and nested dotenv and direnv files,
+    including dotted suffixes and backup names (`.env.*`, `.env~`, `.envrc.*`,
+    `.envrc~`, and their `**/` variants), under normalized, case-insensitive
+    matching. Writes to those paths require human review even when local
+    configuration supplies an empty protected-path list.
   - `_intake` **fails closed** if the constitution declares a
     `constitutional_version`/`hash` ≠ the pinned `608508a9bd224290`.
 - **⚠** Schema v1 and unanchored bundles remain readable for diagnostics, but
@@ -310,11 +324,16 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   v1, and decoders require its exact field set and scalar types.
 - **⚠** `LocalRemotePeer` requires an explicit canonical-hex request-signer
   allowlist and a separately provisioned immutable `trusted_assigners`
-  registry. It verifies the assigner signature and bindings, exact roster and
-  quorum, and its own assignment membership before signing; request-signer trust
-  does not imply assigner trust. It checks request authorization and signature
+  registry. `trusted_assigners` must be an exact
+  `FrozenVoteSignerRegistry`, not a subclass with overridable trust methods. The
+  peer verifies the assigner signature and bindings, exact roster and quorum,
+  and its own assignment membership before signing; request-signer trust does
+  not imply assigner trust. It checks request authorization and signature
   validity before allocating replay state, then maintains a locked, bounded
   nonce cache per authorized signer (`RemoteVoteReplayError`).
+  Request-signer keys cross the same raw-byte reconstruction boundary and the
+  allowlist stores only canonical lowercase raw-key hex strings; caller-defined
+  key behavior and string-subclass behavior are not retained.
   `allow_untrusted_request_signers=True` is rejected.
 
 The checked-in Rust protocol fixture corpus is intentionally historical.
@@ -639,7 +658,7 @@ philosophy; see `TOOLS.md`). Highlights:
 | `generate_security_report.py` | Build `security-audit-report.md` from security tests. |
 | `generate_rust_protocol_fixtures.py` | Emit the frozen detached-vote v1, remote-request v0, and proof v1 Rust compatibility corpus; build v-next assignment-v1/request-v3 examples separately. |
 | `check_typecheck_coverage.py` | Assert every optional extra is type-checked or excepted. |
-| `testnet_deploy.py` | Bittensor testnet deploy (`register`/`miner`/`validator`); validator mode requires `--authorized-voters FILE` and `--authority-keys FILE`. |
+| `testnet_deploy.py` | Bittensor testnet deploy (`register`/`miner`/`validator`); validator mode requires public `--authorized-voters FILE` data and a private `--authority-keys FILE` whose opened descriptor is an owner-only regular file owned by the effective user. |
 | `finetune_extended_refusal.py`, `convert_swarm_output_to_swebench_predictions.py` | Recipe/finetuning + format conversion. |
 
 Continue to [06 Runtime Flows →](06-runtime-flows.md).
@@ -677,5 +696,13 @@ Testnet validator startup requires `--authority-keys FILE`, containing exactly
 `assigner_id`, `assigner_private_key_hex`, and
 `request_signing_private_key_hex`, in addition to the public voter file. Remote
 peers must independently provision the matching assigner public grant and
-request-signer public key. Existing evidence without a signed assignment cannot
-be promoted to proof-grade history by synthesizing one after the fact.
+request-signer public key. The authority file is opened without following a
+symlink in the final path component and must be a regular file whose mode grants
+no group or other permissions (`st_mode & 0o077 == 0`); `0600` is accepted while
+`0640` and `0644` are rejected. Its descriptor owner must also equal the
+process's effective user (`st_uid == os.geteuid()`). `O_NOFOLLOW` covers only
+the final path component; it does not prohibit symlinks in parent components,
+so operators must control every parent directory in the authority-file path.
+This private-file rule does not apply to the existing public-only
+`--authorized-voters` document. Existing evidence without a signed assignment
+cannot be promoted to proof-grade history by synthesizing one after the fact.

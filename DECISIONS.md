@@ -483,3 +483,40 @@ paths are allowed. Unlisted directories and filesystem entries that are neither
 regular files nor directories, including FIFOs, sockets, and devices, fail
 closed with `unlisted_packet_entry`; the existing symlink-specific rejection is
 retained.
+
+### 2026-10-09 — C17 Phase A: close remaining trust and secret-file edges
+
+Signed-assignment verification now separates the assigner from the producer as
+well as from the electorate. Equal normalized identities fail closed, and a
+role-independent registry lookup rejects a producer identity whose registered
+Ed25519 key equals the authorized assigner key. An unknown producer key remains
+valid because the assignment schema does not require producer registration.
+Custom structural registry views must implement `public_key_for_identity`.
+Remote peers require the exact `FrozenVoteSignerRegistry`, and frozen grant
+roles require the exact built-in `frozenset`, so subclasses cannot override
+authorization operations at those two trust boundaries.
+
+Governed handoff extends its normalized, case-insensitive code-owned path set to
+`.envrc~`, `.envrc.*`, and their nested variants. Testnet validator startup now
+opens the private authority-key document without following a symlink in the
+final path component and accepts only a regular file with no group or other
+permission bits. The public
+`--authorized-voters` file remains public-only provisioning data and keeps its
+existing policy.
+
+These checks change only fail-closed admission and startup behavior. The
+signed-assignment schema, canonical bytes, digest, signatures, and frozen Rust
+compatibility fixtures are unchanged.
+
+Rework 1 closes nested trust-object gaps as well. Registry validation requires
+the exact internal grant type and exact built-in `str` values for identities and
+every role. Trust-root ingestion serializes caller-supplied Ed25519 public-key
+objects to raw bytes and reconstructs concrete keys with
+`Ed25519PublicKey.from_public_bytes`; caller-defined verification or comparison
+methods are never retained. Remote request-signer allowlists use the same
+reconstruction boundary and store canonical lowercase raw-key hex strings.
+
+The authority-key loader also requires the opened descriptor's `st_uid` to
+equal `os.geteuid()`. `O_NOFOLLOW` protects only the final path component; it
+does not establish a recursive no-symlink policy for parent components, so
+operators must control every parent directory in the authority-file path.
