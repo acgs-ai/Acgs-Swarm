@@ -26,28 +26,38 @@ the standalone context — ignore the submodule rules.
 ## Testing
 
 ```bash
-# Standalone (this repo) — from the repo root
-python -m pytest tests/ --import-mode=importlib
-
-# Inside the ACGS monorepo checkout — from the monorepo root
-python -m pytest packages/constitutional_swarm/tests/ --import-mode=importlib
+# Standalone (this repo) — from the repo root. Setup installs the locked tools.
+make setup
+make test
 ```
 
 ## Commands
 
 ```bash
-# Lint (clean — CI matrix uses pure ruff defaults via isolated checkout)
-python -m ruff check src/
+# Lint with the pinned Ruff policy
+make lint
 
-# Format
-python -m ruff format src/
+# Static type checking
+make typecheck
 
-# Test (CI: 1503 passed [dev], 1652 passed + 2 xfailed [research] — Birkhoff collapse, expected)
-python -m pytest tests/ --import-mode=importlib -q
+# Full local gate
+make verify
 
-# Test WebSocket transport (requires extra)
-pip install -e ".[transport]" && python -m pytest tests/test_gossip_protocol.py -v
+# Include the WebSocket transport extra in the locked environment
+make setup EXTRAS="dev transport"
+make test
 ```
+
+`make setup` records the normalized extras in `.venv/.make-extras`. Later Make
+gates reuse that exact set when `EXTRAS` is omitted; if you request a different
+set explicitly, rerun `make setup EXTRAS="..."` first. `SYNC_FLAGS` now covers
+base sync options only; Make always appends the normalized `EXTRAS` arguments.
+
+`ruff format --check` is not yet a blocking CI gate because the repository has
+pre-existing format debt. The formatting baseline is `line-length = 100`.
+Establish a clean baseline in a dedicated formatting follow-up, then add the
+blocking check without mixing mechanical changes into a behavioral patch. Use
+`make format` only for a deliberate formatting change.
 
 ## Module map (MCFS research stack)
 
@@ -72,7 +82,8 @@ Feature branches live in `.worktrees/` (gitignored). Create with:
 ```bash
 git worktree add .worktrees/<branch-name> -b <branch-name>
 cd .worktrees/<branch-name>
-# pytest needs pythonpath = ["src"] in pyproject.toml (already present in worktree copy)
+make setup
+make test
 ```
 
 ## Key invariants
