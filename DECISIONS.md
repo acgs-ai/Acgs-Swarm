@@ -50,7 +50,8 @@ signature inputs also joined free-text fields with colons, so different field
 partitions could produce the same pre-image. The protocol now treats one
 versioned `VoteEnvelope` as the indivisible unit of vote evidence.
 
-- **Canonical envelope:** `mesh/vote_envelope.py` defines protocol version 1,
+- **Historical C14 v1 envelope (superseded):** `mesh/vote_envelope.py` defined
+  protocol version 1,
   domain-separated sorted-key JSON encoding, strict codecs, Ed25519 signing and
   verification, and a deterministic envelope root. Each envelope binds voter
   and key identity, task, assignment, producer, artifact, content hash,
@@ -158,8 +159,10 @@ an outer receipt signature over supplied aggregates. These approaches either
 leave multiple encoders, let evidence self-authorize, change 3-of-5 into
 unanimity, or preserve the original provenance gap.
 
-Migration is explicit: provision voter and receipt trust registries out of band,
-emit protocol-v1 envelopes, and write new mesh settlements as schema v2. There
+This historical migration required provisioning voter and receipt trust
+registries out of band, emitting the then-current protocol-v1 envelopes, and
+writing new mesh settlements as schema v2. The later C14 final-review decision
+below supersedes live envelope emission with protocol v2. There
 is no implicit unsigned or aggregate admission fallback. Historical schema v1
 settlements and v0.1 aggregate receipts may still be parsed as records, but they
 are not proof-grade evidence. Fixture consumers must accept structured grants
@@ -201,9 +204,9 @@ provisioned (six with the default five-peer configuration).
 - Command lines, attestor names, and unsigned provenance are diagnostic
   metadata. Until an authenticated provenance channel exists,
   `authenticated_provenance`, `external_success`, `independence_verified`, and
-  `success_evidence` remain false. Exact or greater-than-95-percent reviewer
-  answer agreement is also diagnostic; it is not proof of copying or
-  independence.
+  `success_evidence` remain false. The original exact or greater-than-95-percent
+  reviewer-agreement heuristic was diagnostic only; the C16 decision below
+  supersedes it with a calibrated shared-wrong-answer diagnostic.
 - Coordinator manifests do not publish plain hashes of unblinded source
   artifacts. The kit verifier and coordinator-pack packet generator instead
   check source-artifact integrity by regenerating the complete canonical pack
@@ -324,3 +327,159 @@ V2 settlement never freezes a partial electorate. The historical
 no longer permits early settlement. Persistent mesh configurations require
 quorum at least three at construction, so the mesh cannot declare an outcome
 persistable when the receipt layer would reject its quorum.
+
+This entry records the C14 transition to roster-bound envelope v2. The C16
+completion decision below supersedes its live envelope and remote-request
+versions and moves electorate authority out of voter-signed evidence. The outer
+`MeshProof` and settlement schema remain independently versioned at v2.
+
+### 2026-10-09 — C16 follow-up: closed benchmark and handoff detection gaps
+
+Reviewer packet integrity is now an exact inventory contract: every regular file
+under a distributed packet must have one canonical relative POSIX path in its
+manifest, with `reviewer_manifest.json` as the sole manifest-external file.
+Unlisted, renamed, traversal-aliased, and symlinked packet members fail closed;
+the verifier rejects a symlink in any path component before reading a leaf.
+
+Reviewer-copying diagnostics no longer treat high overall agreement as evidence.
+They test identical shared wrong answers using a hypergeometric upper tail
+conditional on both reviewers' observed error counts, then apply a Bonferroni
+correction across every comparable pair in that answer matrix. All-correct and
+low-noise honest reviewers are therefore not flagged solely for agreement.
+This remains a diagnostic under independence and exchangeability assumptions;
+common difficult questions, an incorrect ground-truth key, few observed errors,
+or deliberate removal of shared errors can reduce calibration or power.
+
+Governed handoff treats `.env.*`, nested `**/.env`, and nested `**/.env.*`
+paths as code-owned protected paths after normalization and case folding.
+
+Receipt verification now requires independent vote evidence by default.
+`verify_bundle(..., require_independent_votes=True)` labels successful output
+`evidence_policy="proof_grade"`; callers must explicitly opt into development
+evidence, and the CLI exposes that exception as `--allow-dev-evidence` with
+`evidence_policy="development"` in its output. The exception is rejected for
+settlement-store verification, where proof-grade evidence remains mandatory.
+
+`VoteSignerRegistry.frozen_copy()` now returns a separate
+`FrozenVoteSignerRegistry` whose key maps are `MappingProxyType` values and
+whose grants are tuples. The snapshot exposes lookup/export operations but no
+mutation methods, so a caller cannot re-enable mutation by changing a flag.
+The former registry-constructor `frozen=` switch is removed; provision a mutable
+registry, then call `.frozen_copy()` when establishing a trust root.
+
+Cascade admission now enforces an electorate at least as large as
+`min_consensus_miners` and a quorum at least both a strict majority and the
+configured `consensus_threshold` floor. `run_full_cascade_remote(...)` provides
+the working independent-voter path through remote signed-envelope collection;
+the accepted result is reverified before it can produce a delta. The configured
+floor is checked directly as `quorum / electorate_size` against
+`consensus_threshold`.
+
+Independent mesh recovery now quarantines historical development-mode records.
+Recovering them requires a mesh explicitly configured with
+`evidence_mode="single_operator_dev"`; the mode remains labelled development
+evidence and does not establish independent custody or an authenticated
+electorate.
+
+The authenticated-assigner design proposed by C16 N1 is **not delivered** in
+this change. Protocol v2 still binds a voter-carried assigned roster, so the
+electorate remains self-attested. A complete fix requires coordinated changes to
+the remote vote wire protocol, remote signer path, and cross-language fixtures,
+which were outside this worktree's owned files. No signed-assignment fixture,
+testnet, deployment, receipt, cascade, or recovery migration is claimed.
+
+**Supersession:** the statement above records the original C16 ownership
+boundary. The completion decision below delivers that coordinated migration and
+is authoritative for current proof-grade behavior.
+
+### 2026-10-09 — C16 completion: authenticated assignment authority
+
+Voters no longer define who may vote. Before releasing vote requests, the mesh
+creates an immutable signed-assignment v1 object. Its domain-separated,
+sorted-key canonical JSON binds the task, assignment, assigner and key,
+producer, artifact and content hash, constitutional hash, sorted normalized
+peer roster, strict-majority quorum, selection seed, and issue time. An Ed25519
+key carrying the explicit `assigner` role signs this object. Vote-envelope v3
+binds the digest of the complete signed assignment, including its signature, so
+an envelope cannot be moved to a different assignment or paired with a forged
+roster.
+
+Proof-grade consumers authenticate the assignment before the votes. Precedent
+admission, validator finalization, subnet-owner admission, cascade validation,
+governance receipt construction and verification, and settlement recovery all
+derive the expected peers and quorum from that authenticated object, then
+verify complete, distinct vote-envelope v3 evidence. Missing assignments,
+untrusted or unauthorized assigners, subject-binding mismatches, assignment
+digest mismatches, and legacy envelope versions fail closed. Development mode
+may relax the independent-custody requirement only; it cannot waive assignment
+authority.
+
+Assignment trust is an immutable public-key value. A mesh using its internally
+owned registry creates a dedicated local assigner key and freezes its trust
+snapshot. A mesh using an externally supplied registry requires an explicitly
+provisioned assigner identity, private key, and matching `assigner` grant before
+the snapshot is established. The normalized assigner identity is reserved from
+voter registration, remote-agent registration, and voter unregistration, so
+those lifecycle operations cannot overwrite or remove assignment authority.
+Public trust export remains bootstrap data rather than verifier authority.
+Recovery therefore requires the original assigner and voter public trust roots;
+persisted evidence cannot authorize keys carried inside itself.
+
+Remote vote request v3 carries the signed assignment and signs the exact request
+schema. A remote peer independently verifies both its request-signer allowlist
+and an immutable assigner registry, then checks the assignment bindings, exact
+roster and quorum, and its own membership before signing a vote. Request-signing
+authority, assignment authority, and voter authority are separate roles even if
+an operator deliberately provisions the same key material for more than one.
+
+Testnet validator startup now requires `--authority-keys` in addition to
+`--authorized-voters`. The authority-key file supplies `assigner_id`,
+`assigner_private_key_hex`, and `request_signing_private_key_hex`; each remote
+peer must receive the matching assigner public grant and request-signer public
+key through an independent provisioning channel. Fixtures, precedents,
+synapses, and receipts carry the signed assignment. Historical records without
+one remain readable only as unverified history and cannot be upgraded by
+inventing assignment authority.
+
+The checked-in Rust compatibility fixture bytes remain unchanged. Their
+explicit historical detached-vote v1, remote-request v0, and `MeshProof` v1
+encoders are retained, while the separate v-next helper emits signed-assignment
+v1 and remote-request v3 examples. Current outer `MeshProof` and settlement
+objects remain v2; these versions describe different protocol layers.
+
+Rejected alternatives were deriving the expected roster from the submitted
+envelopes, trusting an unsigned outer roster, or treating the request signer as
+the assigner. Each makes the electorate self-attested or collapses independent
+authority boundaries. The assignment signature proves which authorized key
+selected the electorate; it does not prove unbiased selection or independent
+host custody. The recorded selection seed supports the built-in selection path,
+but a custom selection policy is not necessarily replayable from that seed.
+Trust registration, key custody, and production provisioning remain deployment
+responsibilities and are not established by local tests.
+
+### 2026-10-09 — C16 rework: exclusive assigner custody
+
+This entry supersedes the C16-completion statement that assignment and voter
+authority may deliberately reuse an identity or key. An assigner is now
+cryptographically disjoint from the electorate: `assigner` and
+`voter`/`validator` roles are mutually exclusive both per normalized identity
+and per Ed25519 public key. Mutable registration and replacement, immutable
+snapshot construction, and governance-receipt grant loading all reject a
+dual-role identity or key. Assignment validation also rejects an assigner in
+the assigned roster and rejects an assigner key equal to any voter key. These
+checks apply even to hand-built registry state, so bypassing a convenience
+registration helper cannot make a self-assigned coalition proof-grade.
+
+Settlement recovery is pinned to the recovering mesh's configured assigner,
+not merely any key carrying an `assigner` grant in its frozen registry. The
+persisted signed assignment must name that exact normalized assigner identity
+and its exact public-key fingerprint before its signature or votes can activate
+state. A broader registry therefore cannot redirect recovery to another trusted
+assigner.
+
+This entry also completes the earlier reviewer-packet inventory statement.
+Manifested regular files and only the directories required by their canonical
+paths are allowed. Unlisted directories and filesystem entries that are neither
+regular files nor directories, including FIFOs, sockets, and devices, fail
+closed with `unlisted_packet_entry`; the existing symlink-specific rejection is
+retained.
