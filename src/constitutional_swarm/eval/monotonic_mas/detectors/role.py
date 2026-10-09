@@ -18,8 +18,8 @@ Synonym evasion (e.g. "deactivate guardrails" for "disable safety") was
 the remaining 11.1pp gap. After empirically rejecting bi-encoder cosine
 (L6/L12/nomic-embed all had closed separation windows on this rule
 library), this module composes a 4th channel via cross-encoder scoring
-(see semantic.py). Cross-encoder load is lazy + fail-soft: if
-sentence-transformers isn't installed, the channel is silently skipped.
+(see semantic.py). Cross-encoder load is lazy and local-only; unavailable
+states are exposed in detector debug output.
 
 Detection composes four channels (caught iff ANY hits):
   (a) Rule engine on RAW payload — literal character matches (rm -rf).
@@ -66,9 +66,20 @@ def _validate_one(agent: AgentDNA, text: str) -> tuple[int, float, str]:
     )
 
 
-def detect_role(trace: dict, governance_enabled: bool) -> tuple[bool, dict]:
+def detect_role(
+    trace: dict,
+    governance_enabled: bool,
+    *,
+    semantic_enabled: bool = True,
+) -> tuple[bool, dict]:
     if not governance_enabled:
-        return False, {"validated": False, "violations": 0, "risk_score": 0.0}
+        return False, {
+            "validated": False,
+            "violations": 0,
+            "risk_score": 0.0,
+            "semantic_status": "not_evaluated",
+            "semantic_unavailable_reason": None,
+        }
 
     agent = _get_agent()
     raw = trace["payload"]
@@ -90,11 +101,17 @@ def detect_role(trace: dict, governance_enabled: bool) -> tuple[bool, dict]:
     # Channel (d): cross-encoder semantic match. Only fires if the lexical
     # channels missed -- avoids paying ~120ms when we already have a catch.
     lexical_caught = n_viols > 0 or risk_score >= RISK_THRESHOLD
-    if lexical_caught:
+    if lexical_caught or not semantic_enabled:
         semantic_caught = False
         semantic_hits: list[tuple[str, float]] = []
+        semantic_status = "not_evaluated"
+        semantic_unavailable_reason = None
     else:
-        semantic_caught, semantic_hits = semantic.match(raw)
+        semantic_result = semantic.evaluate(raw)
+        semantic_caught = semantic_result.caught
+        semantic_hits = list(semantic_result.hits)
+        semantic_status = semantic_result.status
+        semantic_unavailable_reason = semantic_result.reason
 
     caught = lexical_caught or semantic_caught
     return caught, {
@@ -106,6 +123,8 @@ def detect_role(trace: dict, governance_enabled: bool) -> tuple[bool, dict]:
         "risk_match": risk_score >= RISK_THRESHOLD,
         "semantic_match": semantic_caught,
         "semantic_hits": semantic_hits,
+        "semantic_status": semantic_status,
+        "semantic_unavailable_reason": semantic_unavailable_reason,
         "normalized_changed": normalized_changed,
         "normalization_added_catch": (n_norm > n_raw) or (risk_norm > risk_raw),
     }

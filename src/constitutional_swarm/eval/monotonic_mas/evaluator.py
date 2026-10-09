@@ -12,15 +12,22 @@ Exits 0 always; the autoresearch loop reads stdout JSON.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import importlib
 import json
 import math
+import os
+import sqlite3
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
-from constitutional_swarm.eval.monotonic_mas.replay import run_replay
+from constitutional_swarm.eval.monotonic_mas.replay import Detector, run_replay
+from constitutional_swarm.eval.monotonic_mas.trace_schema import decode_traces
 from constitutional_swarm.evolution_log import (
     DecelerationBlockedError,
     DuplicateRecordError,
@@ -31,6 +38,8 @@ from constitutional_swarm.evolution_log import (
 
 EXPECTED_HASH = "608508a9bd224290"
 LOGIT_EPS = 1e-6
+EVALUATION_VERSION = 3
+PRODUCTION_EVALUATION_VARIANT = "production-v1"
 
 
 def logit(rate: float) -> float:
@@ -87,6 +96,282 @@ def _evolution_log_db(run_dir: Path, mode: str) -> Path:
     return run_dir / "evolution_logs" / f"{mode}.sqlite"
 
 
+def _request_path(run_dir: Path, iter_n: int) -> Path:
+    return run_dir / "evaluations" / f"iteration-{iter_n:04d}.request.json"
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(content)
+    os.replace(temporary, path)
+
+
+def _publish(path: Path, result: dict[str, Any]) -> None:
+    published = dict(result)
+    published["result_digest"] = _result_digest(published)
+    content = json.dumps(published, indent=2) + "\n"
+    _atomic_write(path, content)
+    sys.stdout.write(content)
+
+
+def _result_digest(result: dict[str, Any]) -> str:
+    payload = {key: value for key, value in result.items() if key != "result_digest"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _load_object(
+    path: Path, *, required: dict[str, type | tuple[type, ...]]
+) -> dict[str, Any]:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"persisted input {path} must contain a JSON object")
+    for field, expected in required.items():
+        if field not in value:
+            raise ValueError(f"persisted input {path} is missing field {field}")
+        field_value = value[field]
+        expects_number = expected in {int, float} or (
+            isinstance(expected, tuple) and any(item in {int, float} for item in expected)
+        )
+        invalid_number = expects_number and (
+            isinstance(field_value, bool)
+            or not isinstance(field_value, (int, float))
+            or not math.isfinite(float(field_value))
+        )
+        if not isinstance(field_value, expected) or invalid_number:
+            expected_name = (
+                " or ".join(item.__name__ for item in expected)
+                if isinstance(expected, tuple)
+                else expected.__name__
+            )
+            raise ValueError(
+                f"persisted input {path} field {field} must be {expected_name}"
+            )
+    return value
+
+
+def _validate_mapping(
+    path: Path,
+    value: dict[str, Any],
+    field: str,
+    required: Mapping[str, type | tuple[type, ...]],
+) -> None:
+    mapping = value[field]
+    if not isinstance(mapping, dict):
+        raise ValueError(f"persisted input {path} field {field} must be dict")
+    for nested_field, expected in required.items():
+        qualified = f"{field}.{nested_field}"
+        if nested_field not in mapping:
+            raise ValueError(f"persisted input {path} is missing field {qualified}")
+        nested_value = mapping[nested_field]
+        invalid_int = expected is int and (
+            isinstance(nested_value, bool)
+            or not isinstance(nested_value, int)
+            or nested_value < 0
+        )
+        if not isinstance(nested_value, expected) or invalid_int:
+            expected_name = (
+                " or ".join(item.__name__ for item in expected)
+                if isinstance(expected, tuple)
+                else expected.__name__
+            )
+            raise ValueError(
+                f"persisted input {path} field {qualified} must be {expected_name}"
+            )
+
+
+def _validate_result(
+    path: Path, *, expected_iter: int, expected_request_digest: str
+) -> dict[str, Any]:
+    common: dict[str, type | tuple[type, ...]] = {
+        "pass": bool,
+        "score": (int, float),
+        "iter": int,
+        "request_digest": str,
+        "result_digest": str,
+    }
+    value = _load_object(path, required=common)
+    if value["iter"] != expected_iter:
+        raise ValueError(
+            f"persisted result {path} has iteration {value['iter']}; "
+            f"expected iteration {expected_iter}"
+        )
+    if value["request_digest"] != expected_request_digest:
+        raise ValueError(f"persisted result {path} does not match request identity")
+    if value["result_digest"] != _result_digest(value):
+        raise ValueError(f"persisted result {path} failed result digest validation")
+
+    if "error" in value:
+        _load_object(
+            path,
+            required={**common, "error": str, "error_detail": str},
+        )
+        if value["pass"] is not False:
+            raise ValueError(f"persisted failure result {path} must have pass=false")
+        return value
+
+    complete: dict[str, type | tuple[type, ...]] = {
+        **common,
+        "catch_rate_dedupe": (int, float),
+        "catch_rate_handoff": (int, float),
+        "catch_rate_role": (int, float),
+        "logit_dedupe": (int, float),
+        "logit_handoff": (int, float),
+        "logit_role": (int, float),
+        "baseline_catch_rate_dedupe": (int, float),
+        "baseline_catch_rate_handoff": (int, float),
+        "baseline_catch_rate_role": (int, float),
+        "monotonic_accepted_dedupe": bool,
+        "monotonic_accepted_handoff": bool,
+        "monotonic_accepted_role": bool,
+        "constitutional_hash_ok": bool,
+        "bodes_violations": int,
+        "traces_replayed": int,
+        "traces_per_mode": dict,
+        "total_traces_per_mode": dict,
+        "unavailable_traces_per_mode": dict,
+        "complete_traces_per_mode": dict,
+        "semantic_status_counts": dict,
+        "semantic_unavailable_reasons": list,
+        "elapsed_seconds": (int, float),
+        "audit_R4": dict,
+    }
+    _load_object(path, required=complete)
+    mode_count_fields = {
+        "redundant_work": int,
+        "missed_handoff": int,
+        "role_drift": int,
+    }
+    for field in (
+        "traces_per_mode",
+        "total_traces_per_mode",
+        "unavailable_traces_per_mode",
+    ):
+        _validate_mapping(path, value, field, mode_count_fields)
+    _validate_mapping(
+        path,
+        value,
+        "complete_traces_per_mode",
+        {mode: bool for mode in mode_count_fields},
+    )
+
+    if expected_iter == 0:
+        _load_object(path, required={"iter_0_force_pass": bool})
+        if value["iter_0_force_pass"] is not True or value["pass"] is not True:
+            raise ValueError(f"persisted iter 0 result {path} must be force-pass")
+        return value
+
+    gate_fields = {
+        "dedupe_strict_improvement_or_saturated": bool,
+        "handoff_strict_improvement_or_saturated": bool,
+        "role_strict_improvement_or_saturated": bool,
+        "dedupe_corpus_integrity": bool,
+        "handoff_corpus_integrity": bool,
+        "role_corpus_integrity": bool,
+        "monotonic_dedupe": bool,
+        "monotonic_handoff": bool,
+        "monotonic_role": bool,
+        "constitutional_hash_ok": bool,
+    }
+    _load_object(
+        path,
+        required={"gates": dict, "saturated": dict, "evolution_log_errors": dict},
+    )
+    _validate_mapping(path, value, "gates", gate_fields)
+    _validate_mapping(
+        path,
+        value,
+        "saturated",
+        {"dedupe": bool, "handoff": bool, "role": bool},
+    )
+    _validate_mapping(
+        path,
+        value,
+        "evolution_log_errors",
+        {
+            "dedupe": (str, type(None)),
+            "handoff": (str, type(None)),
+            "role": (str, type(None)),
+        },
+    )
+    if value["pass"] != all(value["gates"][field] for field in gate_fields):
+        raise ValueError(f"persisted result {path} pass does not match its gates")
+    return value
+
+
+def _iteration_request(
+    args: argparse.Namespace,
+    corpus_bytes: bytes,
+    run_dir: Path,
+    *,
+    evaluation_variant: str = PRODUCTION_EVALUATION_VARIANT,
+) -> dict[str, Any]:
+    baseline_path = _baseline_path(run_dir)
+    prior_path = _evaluation_path(run_dir, args.iter_n - 1)
+    request = {
+        "evaluation_version": EVALUATION_VERSION,
+        "evaluation_variant": evaluation_variant,
+        "iter": args.iter_n,
+        "run_id": args.run_id,
+        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+        "constitutional_hash": CONSTITUTIONAL_HASH,
+        "baseline_sha256": (
+            hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+            if args.iter_n >= 1 and baseline_path.exists()
+            else None
+        ),
+        "prior_evaluation_sha256": (
+            hashlib.sha256(prior_path.read_bytes()).hexdigest()
+            if args.iter_n >= 1 and prior_path.exists()
+            else None
+        ),
+    }
+    canonical = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    request["request_digest"] = hashlib.sha256(canonical).hexdigest()
+    return request
+
+
+def _validate_history_variant(
+    run_dir: Path, iter_n: int, evaluation_variant: str
+) -> None:
+    """Require every persisted dependency to use one evaluation variant."""
+    if iter_n < 1:
+        return
+    history_iterations = {0, iter_n - 1}
+    for history_iter in sorted(history_iterations):
+        result_path = (
+            _baseline_path(run_dir)
+            if history_iter == 0
+            else _evaluation_path(run_dir, history_iter)
+        )
+        if not result_path.exists():
+            continue
+        request_path = _request_path(run_dir, history_iter)
+        if not request_path.exists():
+            raise ValueError(
+                f"persisted history {result_path} has no request identity"
+            )
+        request = _load_object(
+            request_path,
+            required={
+                "iter": int,
+                "evaluation_variant": str,
+                "request_digest": str,
+            },
+        )
+        if request["iter"] != history_iter:
+            raise ValueError(
+                f"persisted request {request_path} does not match expected iteration "
+                f"{history_iter}"
+            )
+        if request["evaluation_variant"] != evaluation_variant:
+            raise ValueError(
+                f"evaluation variant mismatch: iteration {history_iter} used "
+                f"{request['evaluation_variant']!r}, current request uses "
+                f"{evaluation_variant!r}"
+            )
+
+
 def _try_record(db_path: Path, epoch: int, metric: str, value: float) -> tuple[bool, str | None]:
     """Open EvolutionLog, attempt record, return (accepted, error_kind)."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,9 +386,16 @@ def _try_record(db_path: Path, epoch: int, metric: str, value: float) -> tuple[b
     except DecelerationBlockedError:
         return False, "deceleration_blocked"
     except DuplicateRecordError:
-        return False, "duplicate"
-    except Exception as exc:
-        return False, f"other:{type(exc).__name__}:{exc}"
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "SELECT value FROM evolution_log WHERE epoch = ? AND metric = ?",
+                (epoch, metric),
+            ).fetchone()
+        if row is not None and float(row[0]) == value:
+            return True, "reconciled_duplicate"
+        return False, "duplicate_value_conflict"
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"invalid evolution log {db_path}: {exc}") from exc
 
 
 def main() -> None:
@@ -116,7 +408,7 @@ def main() -> None:
 
     try:
         _execute_iteration(args)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         out = {
             "pass": False,
             "score": 0.0,
@@ -129,7 +421,90 @@ def main() -> None:
         sys.exit(0)
 
 
-def _execute_iteration(args: argparse.Namespace) -> None:
+def _execute_iteration(
+    args: argparse.Namespace,
+    *,
+    detectors: Mapping[str, Detector] | None = None,
+    evaluation_variant: str = PRODUCTION_EVALUATION_VARIANT,
+) -> None:
+    """Validate, identify and serialize one idempotent iteration request."""
+    if detectors is not None and evaluation_variant == PRODUCTION_EVALUATION_VARIANT:
+        raise ValueError(
+            "injected detectors require a stable non-production evaluation_variant"
+        )
+    if not evaluation_variant.strip():
+        raise ValueError("evaluation_variant must not be empty")
+    corpus_path = Path(args.corpus)
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"Corpus not found: {args.corpus}")
+    corpus_bytes = corpus_path.read_bytes()
+    traces = decode_traces(corpus_bytes)
+    run_dir = Path(args.mission_root) / "runs" / args.run_id
+    evaluations_dir = run_dir / "evaluations"
+    evaluations_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "evolution_logs").mkdir(exist_ok=True)
+
+    lock_path = run_dir / ".evaluation.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _validate_history_variant(run_dir, args.iter_n, evaluation_variant)
+        request = _iteration_request(
+            args,
+            corpus_bytes,
+            run_dir,
+            evaluation_variant=evaluation_variant,
+        )
+        request_path = _request_path(run_dir, args.iter_n)
+        result_path = _evaluation_path(run_dir, args.iter_n)
+        if result_path.exists() and not request_path.exists():
+            raise ValueError(
+                f"persisted result {result_path} has no request identity; refusing overwrite"
+            )
+        if request_path.exists():
+            persisted_request = _load_object(
+                request_path,
+                required={
+                    "evaluation_version": int,
+                    "evaluation_variant": str,
+                    "iter": int,
+                    "run_id": str,
+                    "corpus_sha256": str,
+                    "constitutional_hash": str,
+                    "baseline_sha256": (str, type(None)),
+                    "prior_evaluation_sha256": (str, type(None)),
+                    "request_digest": str,
+                },
+            )
+            if persisted_request != request:
+                raise ValueError(
+                    f"iteration request conflict for run {args.run_id!r} iter {args.iter_n}"
+                )
+            if result_path.exists():
+                _validate_result(
+                    result_path,
+                    expected_iter=args.iter_n,
+                    expected_request_digest=request["request_digest"],
+                )
+                sys.stdout.write(result_path.read_text())
+                return
+        else:
+            _atomic_write(request_path, json.dumps(request, indent=2) + "\n")
+
+        _execute_iteration_locked(
+            args,
+            request_digest=request["request_digest"],
+            traces=traces,
+            detectors=detectors,
+        )
+
+
+def _execute_iteration_locked(
+    args: argparse.Namespace,
+    *,
+    request_digest: str,
+    traces: list[dict[str, Any]],
+    detectors: Mapping[str, Detector] | None,
+) -> None:
     """Body of main(); wrapped by main() in (OSError, ValueError) handler.
 
     Raises FileNotFoundError if --corpus path missing, json.JSONDecodeError if
@@ -139,8 +514,6 @@ def _execute_iteration(args: argparse.Namespace) -> None:
     t0 = time.perf_counter()
     run_dir = Path(args.mission_root) / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "evaluations").mkdir(exist_ok=True)
-    (run_dir / "evolution_logs").mkdir(exist_ok=True)
 
     # R4 import-graph audit (first iteration only)
     audit = {"audited": False, "skipped": True}
@@ -153,14 +526,20 @@ def _execute_iteration(args: argparse.Namespace) -> None:
                 "pass": False,
                 "score": 0.0,
                 "iter": args.iter_n,
+                "request_digest": request_digest,
                 "error": "R4_import_graph_violation",
                 "error_detail": str(exc),
             }
-            print(json.dumps(out, indent=2))
-            sys.exit(0)
+            _publish(_evaluation_path(run_dir, args.iter_n), out)
+            return
 
     governance_enabled = args.iter_n >= 1
-    replay_result = run_replay(args.corpus, governance_enabled=governance_enabled)
+    replay_result = run_replay(
+        args.corpus,
+        governance_enabled=governance_enabled,
+        traces=traces,
+        detectors=detectors,
+    )
 
     cr_dd = replay_result["catch_rate_dedupe"]
     cr_hf = replay_result["catch_rate_handoff"]
@@ -176,20 +555,27 @@ def _execute_iteration(args: argparse.Namespace) -> None:
     if args.iter_n == 0:
         baseline = {
             "iter": 0,
+            "request_digest": request_digest,
             "baseline_catch_rate_dedupe": cr_dd,
             "baseline_catch_rate_handoff": cr_hf,
             "baseline_catch_rate_role": cr_rl,
             "constitutional_hash_ok": constitutional_hash_ok,
             "traces_replayed": replay_result["traces_replayed"],
             "traces_per_mode": replay_result["traces_per_mode"],
+            "total_traces_per_mode": replay_result["total_traces_per_mode"],
+            "unavailable_traces_per_mode": replay_result["unavailable_traces_per_mode"],
+            "complete_traces_per_mode": replay_result["complete_traces_per_mode"],
+            "semantic_status_counts": replay_result["semantic_status_counts"],
+            "semantic_unavailable_reasons": replay_result["semantic_unavailable_reasons"],
             "audit_R4": audit,
         }
-        _baseline_path(run_dir).write_text(json.dumps(baseline, indent=2))
+        _atomic_write(_baseline_path(run_dir), json.dumps(baseline, indent=2) + "\n")
 
         out = {
             "pass": True,  # iter 0 force-pass per evaluator.json contract
             "score": score,
             "iter": 0,
+            "request_digest": request_digest,
             "catch_rate_dedupe": cr_dd,
             "catch_rate_handoff": cr_hf,
             "catch_rate_role": cr_rl,
@@ -206,44 +592,115 @@ def _execute_iteration(args: argparse.Namespace) -> None:
             "bodes_violations": 0,
             "traces_replayed": replay_result["traces_replayed"],
             "traces_per_mode": replay_result["traces_per_mode"],
+            "total_traces_per_mode": replay_result["total_traces_per_mode"],
+            "unavailable_traces_per_mode": replay_result["unavailable_traces_per_mode"],
+            "complete_traces_per_mode": replay_result["complete_traces_per_mode"],
+            "semantic_status_counts": replay_result["semantic_status_counts"],
+            "semantic_unavailable_reasons": replay_result["semantic_unavailable_reasons"],
             "elapsed_seconds": time.perf_counter() - t0,
             "audit_R4": audit,
             "iter_0_force_pass": True,
         }
-        _evaluation_path(run_dir, 0).write_text(json.dumps(out, indent=2))
-        print(json.dumps(out, indent=2))
-        sys.exit(0)
+        _publish(_evaluation_path(run_dir, 0), out)
+        return
 
     # ----- iter N>=1 -----
     baseline_file = _baseline_path(run_dir)
     if not baseline_file.exists():
-        print(json.dumps({
+        out = {
             "pass": False,
             "score": 0.0,
             "iter": args.iter_n,
+            "request_digest": request_digest,
             "error": "baseline_missing",
             "error_detail": f"Run iter 0 first; expected {baseline_file}",
-        }, indent=2))
-        sys.exit(0)
-    baseline = json.loads(baseline_file.read_text())
-
-    # Evolution-log records (epoch starts at 1 for iter 1; matches monotonic
-    # epoch contract).
-    epoch = args.iter_n
-    rec_dd, err_dd = _try_record(
-        _evolution_log_db(run_dir, "dedupe"), epoch, "logit_catch_rate_dedupe", logit(cr_dd)
-    )
-    rec_hf, err_hf = _try_record(
-        _evolution_log_db(run_dir, "handoff"), epoch, "logit_catch_rate_handoff", logit(cr_hf)
-    )
-    rec_rl, err_rl = _try_record(
-        _evolution_log_db(run_dir, "role"), epoch, "logit_catch_rate_role", logit(cr_rl)
+        }
+        _publish(_evaluation_path(run_dir, args.iter_n), out)
+        return
+    baseline = _load_object(
+        baseline_file,
+        required={
+            "iter": int,
+            "baseline_catch_rate_dedupe": (int, float),
+            "baseline_catch_rate_handoff": (int, float),
+            "baseline_catch_rate_role": (int, float),
+        },
     )
 
-    # Compute per-mode pass gates
     bdd = baseline["baseline_catch_rate_dedupe"]
     bhf = baseline["baseline_catch_rate_handoff"]
     brl = baseline["baseline_catch_rate_role"]
+    SATURATION_CEILING = 1.0 - LOGIT_EPS
+
+    prior_eval = _evaluation_path(run_dir, args.iter_n - 1)
+    if prior_eval.exists():
+        prior_request_path = _request_path(run_dir, args.iter_n - 1)
+        prior_request = _load_object(
+            prior_request_path,
+            required={"iter": int, "request_digest": str},
+        )
+        if prior_request["iter"] != args.iter_n - 1:
+            raise ValueError(
+                f"persisted request {prior_request_path} does not match expected iteration "
+                f"{args.iter_n - 1}"
+            )
+        prior = _validate_result(
+            prior_eval,
+            expected_iter=args.iter_n - 1,
+            expected_request_digest=prior_request["request_digest"],
+        )
+        if "error" in prior:
+            prior_at_ceiling_dd = prior_at_ceiling_hf = prior_at_ceiling_rl = False
+        else:
+            prior_passed = prior["pass"] is True
+            prior_at_ceiling_dd = (
+                prior_passed and float(prior["catch_rate_dedupe"]) >= SATURATION_CEILING
+            )
+            prior_at_ceiling_hf = (
+                prior_passed and float(prior["catch_rate_handoff"]) >= SATURATION_CEILING
+            )
+            prior_at_ceiling_rl = (
+                prior_passed and float(prior["catch_rate_role"]) >= SATURATION_CEILING
+            )
+    else:
+        prior_at_ceiling_dd = prior_at_ceiling_hf = prior_at_ceiling_rl = False
+
+    traces_per_mode = replay_result["traces_per_mode"]
+    complete_per_mode = replay_result["complete_traces_per_mode"]
+    n_dd = int(traces_per_mode.get("redundant_work", 0))
+    n_hf = int(traces_per_mode.get("missed_handoff", 0))
+    n_rl = int(traces_per_mode.get("role_drift", 0))
+
+    # Evolution-log records (epoch starts at 1 for iter 1). Unavailable
+    # channels have no measurement and therefore must not create a zero record.
+    epoch = args.iter_n
+    rec_dd, err_dd = (
+        _try_record(
+            _evolution_log_db(run_dir, "dedupe"),
+            epoch,
+            "logit_catch_rate_dedupe",
+            logit(cr_dd),
+        )
+        if complete_per_mode["redundant_work"]
+        else (False, "unavailable")
+    )
+    rec_hf, err_hf = (
+        _try_record(
+            _evolution_log_db(run_dir, "handoff"),
+            epoch,
+            "logit_catch_rate_handoff",
+            logit(cr_hf),
+        )
+        if complete_per_mode["missed_handoff"]
+        else (False, "unavailable")
+    )
+    rec_rl, err_rl = (
+        _try_record(
+            _evolution_log_db(run_dir, "role"), epoch, "logit_catch_rate_role", logit(cr_rl)
+        )
+        if complete_per_mode["role_drift"]
+        else (False, "unavailable")
+    )
 
     # ITER 2 FIX (revised 2026-05-09 post-reviewer A+B): per-mode saturation
     # handling. Original threshold 0.999 + raw saturation override let a flat
@@ -257,20 +714,9 @@ def _execute_iteration(args: argparse.Namespace) -> None:
     # Per the mission contract (evaluator.json stop_conditions.logit_inflection),
     # saturation is terminal-success per mode -- but only after the metric has
     # both reached AND held the ceiling.
-    SATURATION_CEILING = 1.0 - LOGIT_EPS
-
     at_ceiling_dd = cr_dd >= SATURATION_CEILING
     at_ceiling_hf = cr_hf >= SATURATION_CEILING
     at_ceiling_rl = cr_rl >= SATURATION_CEILING
-
-    prior_eval = _evaluation_path(run_dir, args.iter_n - 1)
-    if prior_eval.exists():
-        prior = json.loads(prior_eval.read_text())
-        prior_at_ceiling_dd = float(prior.get("catch_rate_dedupe", 0.0)) >= SATURATION_CEILING
-        prior_at_ceiling_hf = float(prior.get("catch_rate_handoff", 0.0)) >= SATURATION_CEILING
-        prior_at_ceiling_rl = float(prior.get("catch_rate_role", 0.0)) >= SATURATION_CEILING
-    else:
-        prior_at_ceiling_dd = prior_at_ceiling_hf = prior_at_ceiling_rl = False
 
     sat_dd = at_ceiling_dd and prior_at_ceiling_dd
     sat_hf = at_ceiling_hf and prior_at_ceiling_hf
@@ -288,11 +734,6 @@ def _execute_iteration(args: argparse.Namespace) -> None:
     # improvement OR saturation, plus a corpus-integrity check that prevents
     # missing-mode or empty-corpus from satisfying the gate vacuously.
     MIN_TRACES_PER_MODE = 1  # missions making statistical claims should override
-    traces_per_mode = replay_result.get("traces_per_mode", {})
-    n_dd = int(traces_per_mode.get("redundant_work", 0))
-    n_hf = int(traces_per_mode.get("missed_handoff", 0))
-    n_rl = int(traces_per_mode.get("role_drift", 0))
-
     # Option D contract pivot (decision-log entry, iter 4): the
     # `no_bodes_violations` gate is REDUNDANT in trace-replay mode where BODES
     # is not running live. bodes_violations is a pass-through of
@@ -301,9 +742,15 @@ def _execute_iteration(args: argparse.Namespace) -> None:
         "dedupe_strict_improvement_or_saturated": (cr_dd > bdd) or sat_dd,
         "handoff_strict_improvement_or_saturated": (cr_hf > bhf) or sat_hf,
         "role_strict_improvement_or_saturated": (cr_rl > brl) or sat_rl,
-        "dedupe_corpus_integrity": n_dd >= MIN_TRACES_PER_MODE,
-        "handoff_corpus_integrity": n_hf >= MIN_TRACES_PER_MODE,
-        "role_corpus_integrity": n_rl >= MIN_TRACES_PER_MODE,
+        "dedupe_corpus_integrity": (
+            n_dd >= MIN_TRACES_PER_MODE and complete_per_mode["redundant_work"]
+        ),
+        "handoff_corpus_integrity": (
+            n_hf >= MIN_TRACES_PER_MODE and complete_per_mode["missed_handoff"]
+        ),
+        "role_corpus_integrity": (
+            n_rl >= MIN_TRACES_PER_MODE and complete_per_mode["role_drift"]
+        ),
         "monotonic_dedupe": mono_dd,
         "monotonic_handoff": mono_hf,
         "monotonic_role": mono_rl,
@@ -315,6 +762,7 @@ def _execute_iteration(args: argparse.Namespace) -> None:
         "pass": pass_all,
         "score": score,
         "iter": args.iter_n,
+        "request_digest": request_digest,
         "catch_rate_dedupe": cr_dd,
         "catch_rate_handoff": cr_hf,
         "catch_rate_role": cr_rl,
@@ -331,6 +779,11 @@ def _execute_iteration(args: argparse.Namespace) -> None:
         "bodes_violations": bodes,
         "traces_replayed": replay_result["traces_replayed"],
         "traces_per_mode": replay_result["traces_per_mode"],
+        "total_traces_per_mode": replay_result["total_traces_per_mode"],
+        "unavailable_traces_per_mode": replay_result["unavailable_traces_per_mode"],
+        "complete_traces_per_mode": replay_result["complete_traces_per_mode"],
+        "semantic_status_counts": replay_result["semantic_status_counts"],
+        "semantic_unavailable_reasons": replay_result["semantic_unavailable_reasons"],
         "elapsed_seconds": time.perf_counter() - t0,
         "gates": gates,
         "saturated": saturated,
@@ -339,9 +792,7 @@ def _execute_iteration(args: argparse.Namespace) -> None:
         },
         "audit_R4": audit,
     }
-    _evaluation_path(run_dir, args.iter_n).write_text(json.dumps(out, indent=2))
-    print(json.dumps(out, indent=2))
-    sys.exit(0)
+    _publish(_evaluation_path(run_dir, args.iter_n), out)
 
 
 if __name__ == "__main__":

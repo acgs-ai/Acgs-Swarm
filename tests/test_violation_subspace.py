@@ -205,7 +205,7 @@ class TestFitLeace:
         safe_coords = sub.coordinates(safe)
         unsafe_coords = sub.coordinates(unsafe)
         # Before erasure (raw coords) the class means differ
-        assert abs(float(unsafe_coords.mean() - safe_coords.mean())) > 0.5
+        assert float(unsafe_coords.mean() - safe_coords.mean()) > 0.5
         # After one-sided steering (gamma=1, tau=0): positive violation
         # coordinates collapse to 0; negative coords pass through.
         steered = np.asarray([sub.steer(u, gamma=1.0, tau=0.0) for u in unsafe])
