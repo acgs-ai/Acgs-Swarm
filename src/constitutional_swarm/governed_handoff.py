@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import inspect
 import json
@@ -16,9 +17,12 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
-from dataclasses import dataclass
+import sys
+import threading
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from time import time
@@ -90,6 +94,20 @@ except (TypeError, ValueError):
 # gate is default-DENY against this set. Keep this to inert commands; interpreter
 # and test-runner commands remain denied even if a local policy allowlists them.
 DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("true", "echo")
+DEFAULT_SECRET_COMMAND_PATTERNS: tuple[str, ...] = (
+    r"\b(cat|less|more|head|tail|sed|awk|grep|rg)\b.*"
+    r"(\.env|secret|credential|id_rsa|token)",
+    r"\b(printenv|env)\b",
+    r"\b(git\s+config\s+--get|gh\s+auth\s+token)\b",
+)
+
+# Child processes see a code-owned search path and a small set of benign locale
+# and home-directory values. In particular, no ACGS signing value or ambient
+# credential is inherited across the process boundary.
+FIXED_SUBPROCESS_PATH = "/usr/local/bin:/usr/bin:/bin"
+_SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {"HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"}
+)
 
 # Executables that can execute arbitrary code from their arguments — interpreters,
 # test runners, generic launchers, and shells. The ``tool_call`` gate denies these
@@ -100,18 +118,122 @@ DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("true", "echo")
 # version-suffixed names (``python3.11``) the literal set would otherwise miss.
 DENIED_INTERPRETER_COMMANDS: frozenset[str] = frozenset(
     {
-        "python", "python2", "python3", "pypy", "pypy3",
-        "pytest", "py.test", "tox", "nox",
-        "ipython", "bpython",
-        "node", "nodejs", "npx", "deno", "bun",
-        "ruby", "perl", "php", "lua", "rscript",
-        "sh", "bash", "zsh", "fish", "dash", "ksh",
-        "env", "uv", "uvx", "poetry", "pipenv", "hatch", "pdm",
+        "ant",
+        "awk",
+        "bash",
+        "bpython",
+        "busybox",
+        "bun",
+        "cc",
+        "chroot",
+        "chrt",
+        "clang",
+        "cmake",
+        "ctest",
+        "dash",
+        "deno",
+        "doas",
+        "docker",
+        "ed",
+        "env",
+        "ex",
+        "find",
+        "fish",
+        "flock",
+        "g++",
+        "gawk",
+        "gcc",
+        "gdb",
+        "git",
+        "gmake",
+        "go",
+        "gradle",
+        "gradlew",
+        "hatch",
+        "ionice",
+        "ipython",
+        "java",
+        "javac",
+        "ksh",
+        "less",
+        "ltrace",
+        "lua",
+        "make",
+        "man",
+        "mawk",
+        "meson",
+        "more",
+        "mvn",
+        "nawk",
+        "nice",
+        "ninja",
+        "nix",
+        "node",
+        "nodejs",
+        "nohup",
+        "nox",
+        "npm",
+        "npx",
+        "nsenter",
+        "nvim",
+        "pdm",
+        "perl",
+        "php",
+        "pip",
+        "pip2",
+        "pip3",
+        "pipenv",
+        "pipx",
+        "pkexec",
+        "pnpm",
+        "podman",
+        "poetry",
+        "py.test",
+        "pypy",
+        "pypy3",
+        "pytest",
+        "python",
+        "python2",
+        "python3",
+        "rscript",
+        "rsync",
+        "ruby",
+        "runuser",
+        "scp",
+        "sed",
+        "setsid",
+        "sh",
+        "sqlite3",
+        "ssh",
+        "stdbuf",
+        "strace",
+        "su",
+        "sudo",
+        "systemd-run",
+        "tar",
+        "taskset",
+        "tclsh",
+        "timeout",
+        "toolbox",
+        "tox",
+        "unshare",
+        "unzip",
+        "uv",
+        "uvx",
+        "vi",
+        "vim",
+        "watch",
+        "xargs",
+        "yarn",
+        "zip",
+        "zsh",
     }
 )
 
 # Version-suffixed interpreter basenames (python3.11, python3.12, pypy3.10, ...).
-_DENIED_INTERPRETER_PATTERN = re.compile(r"^(python|pypy)\d+(\.\d+)*$", re.IGNORECASE)
+_DENIED_INTERPRETER_PATTERN = re.compile(
+    r"^(python|pypy|pip)\d+(\.\d+)*$", re.IGNORECASE
+)
 
 
 def _is_denied_interpreter(executable: str) -> bool:
@@ -121,6 +243,91 @@ def _is_denied_interpreter(executable: str) -> bool:
     return name in DENIED_INTERPRETER_COMMANDS or bool(
         _DENIED_INTERPRETER_PATTERN.match(name)
     )
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Harden configured signing state, then return a minimal child environment."""
+
+    # Public subprocess boundaries can be called without ``run_task``. Loading
+    # here makes process hardening an invariant of every governed child launch.
+    _load_bundle_signer()
+
+    child_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _SUBPROCESS_ENV_ALLOWLIST and not name.startswith("ACGS_SIGNING_")
+    }
+    child_env["PATH"] = FIXED_SUBPROCESS_PATH
+    return child_env
+
+
+def _resolve_command(
+    command: str, *, command_allowlist: set[str] | frozenset[str]
+) -> list[str]:
+    """Parse, authorize, and resolve a command against the fixed executable path."""
+
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError("unparseable command; fail closed") from exc
+    if not argv:
+        raise ValueError("empty tool command")
+    executable = argv[0]
+    denied_argument = next(
+        (
+            argument.replace("\\", "/").rsplit("/", 1)[-1]
+            for argument in argv
+            if _is_denied_interpreter(
+                argument.replace("\\", "/").rsplit("/", 1)[-1]
+            )
+        ),
+        None,
+    )
+    if denied_argument is not None:
+        raise ValueError(
+            f"interpreter or launcher {denied_argument!r} is not allowed for task directives"
+        )
+    if Path(executable).name != executable or "/" in executable or "\\" in executable:
+        raise ValueError("path-qualified executable is not allowed")
+    if executable not in command_allowlist:
+        raise ValueError(f"command {executable!r} not in allowlist; fail closed")
+    resolved = shutil.which(executable, path=FIXED_SUBPROCESS_PATH)
+    if resolved is None or not Path(resolved).is_absolute():
+        raise ValueError(f"command {executable!r} cannot be resolved on the fixed path")
+    return [resolved, *argv[1:]]
+
+
+def _claim_exclusive_file(path: Path, *, readable: bool = False) -> int:
+    """Create and retain a private, non-following evidence file descriptor."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (os.O_RDWR if readable else os.O_WRONLY) | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise OSError(f"evidence path is not a private regular file: {path}")
+    return descriptor
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while persisting evidence")
+        view = view[written:]
+
+
+def _read_all(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while chunk := os.pread(descriptor, 1024 * 1024, offset):
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
 
 
 @dataclass(frozen=True)
@@ -136,9 +343,21 @@ class AuditLogger:
     task_id: str
     previous_hash: str = ZERO_HASH
     event_index: int = 0
+    _descriptor: int | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._descriptor is None:
+            self._descriptor = _claim_exclusive_file(self.path, readable=True)
+
+    def close(self) -> None:
+        if self._descriptor is not None:
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def read_events(self) -> list[dict[str, Any]]:
+        if self._descriptor is None:
+            raise ValueError("audit logger is closed")
+        return _parse_audit_bytes(_read_all(self._descriptor))
 
     def emit(
         self, role: str, event_type: str, payload: dict[str, Any]
@@ -154,8 +373,10 @@ class AuditLogger:
         }
         event_hash = sha256_text(canonical_json(base))
         event = {**base, "event_hash": event_hash}
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(canonical_json(event) + "\n")
+        if self._descriptor is None:
+            raise ValueError("audit logger is closed")
+        _write_all(self._descriptor, (canonical_json(event) + "\n").encode("utf-8"))
+        os.fsync(self._descriptor)
         self.previous_hash = event_hash
         self.event_index += 1
         return event
@@ -185,6 +406,15 @@ class PolicyDecision:
 
 
 class PolicyEngine:
+    """Apply the code-owned governed handoff policy.
+
+    Command allowlists are safe only for commands whose complete argument
+    language cannot launch another command. Allowlisting a command-capable tool
+    is equivalent to granting arbitrary code execution, so known interpreters,
+    launchers, wrappers, and shell-escape-capable tools remain unconditionally
+    denied.
+    """
+
     def __init__(
         self, constitution: dict[str, Any], swarm: dict[str, Any], repo_root: Path
     ) -> None:
@@ -210,27 +440,28 @@ class PolicyEngine:
                 )
             )
         )
-        self.secret_patterns = [
-            re.compile(str(pattern), re.IGNORECASE)
-            for pattern in policy.get(
-                "secret_command_patterns",
-                [
-                    r"\b(cat|less|more|head|tail|sed|awk|grep|rg)\b.*"
-                    r"(\.env|secret|credential|id_rsa|token)",
-                    r"\b(printenv|env)\b",
-                    r"\b(git\s+config\s+--get|gh\s+auth\s+token)\b",
-                ],
+        configured_secret_patterns = policy.get("secret_command_patterns")
+        if not isinstance(configured_secret_patterns, list):
+            configured_secret_patterns = []
+        secret_patterns = dict.fromkeys(
+            (
+                *DEFAULT_SECRET_COMMAND_PATTERNS,
+                *(str(pattern) for pattern in configured_secret_patterns),
             )
+        )
+        self.secret_patterns = [
+            re.compile(pattern, re.IGNORECASE) for pattern in secret_patterns
         ]
         # Default-DENY allowlist: only executables named here may run. A
         # constitution may EXTEND but the code-owned default always applies when
         # the constitution provides no (non-empty) list.
         allowlist = policy.get("command_allowlist")
-        self.command_allowlist: set[str] = (
-            {str(name) for name in allowlist}
-            if isinstance(allowlist, list) and allowlist
-            else set(DEFAULT_COMMAND_ALLOWLIST)
+        configured_allowlist = (
+            {str(name) for name in allowlist} if isinstance(allowlist, list) else set()
         )
+        self.command_allowlist = (
+            set(DEFAULT_COMMAND_ALLOWLIST) | configured_allowlist
+        ) - set(DENIED_INTERPRETER_COMMANDS)
 
     def decide(self, gate: str, subject: str, **context: Any) -> PolicyDecision:
         if gate == "intake":
@@ -284,28 +515,9 @@ class PolicyEngine:
                 "tool_call", command, DENY, "shell metacharacters are not allowed"
             )
         try:
-            argv = shlex.split(command)
-        except ValueError:
-            return PolicyDecision(
-                "tool_call", command, DENY, "unparseable command; fail closed"
-            )
-        if not argv:
-            return PolicyDecision("tool_call", command, DENY, "empty tool command")
-        executable = Path(argv[0]).name
-        if _is_denied_interpreter(executable):
-            return PolicyDecision(
-                "tool_call",
-                command,
-                DENY,
-                f"interpreter/test runner {executable!r} is not allowed for task directives",
-            )
-        if executable not in self.command_allowlist:
-            return PolicyDecision(
-                "tool_call",
-                command,
-                DENY,
-                f"command {executable!r} not in allowlist; fail closed",
-            )
+            _resolve_command(command, command_allowlist=self.command_allowlist)
+        except ValueError as exc:
+            return PolicyDecision("tool_call", command, DENY, str(exc))
         return PolicyDecision("tool_call", command, ALLOW, "tool command allowed")
 
     def _file_write(self, raw_path: str) -> PolicyDecision:
@@ -409,6 +621,7 @@ class RunResult:
     audit_path: Path
     bundle_path: Path
     chain_hash: str
+    signed: bool = False
 
 
 @dataclass(frozen=True)
@@ -471,7 +684,12 @@ class ExternalAgentAdapter:
             raise RuntimeError(f"{self.name} adapter is not configured")
         argv = [*shlex.split(self._command), str(task.path)]
         completed = subprocess.run(
-            argv, check=False, capture_output=True, text=True, timeout=120
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_scrubbed_env(),
         )
         if completed.returncode != 0:
             raise RuntimeError(
@@ -499,31 +717,139 @@ def build_adapter(name: str, config: dict[str, Any] | None = None) -> ExecutorAd
 class BundleSigner:
     """Ed25519 signer the supervisor uses to make an evidence bundle unforgeable.
 
-    The private key lives only in the supervisor process; the sandboxed agent
-    never has it, so a self-consistent chain fabricated from scratch cannot carry
-    a valid signature.
+    Governed child environments omit all ``ACGS_SIGNING_*`` values. On Linux,
+    signer loading also marks the supervisor non-dumpable before any child is
+    started, blocking same-user reads of the supervisor environment through
+    procfs. A parent shell that exported an inline key still retains it, and a
+    same-user agent is not fully contained on any platform. Non-Linux platforms
+    additionally lack this procfs/ptrace mitigation. Prefer
+    ``ACGS_SIGNING_KEY_FILE`` plus a separate operating-system user.
     """
 
     key_id: str
     private_key: Ed25519PrivateKey
 
 
-def _load_bundle_signer() -> BundleSigner | None:
-    """Load the supervisor signer from ``ACGS_SIGNING_KEY`` (hex Ed25519 seed).
+_SIGNER_CACHE_LOCK = threading.Lock()
+_SIGNER_CACHE_IDENTITY: tuple[int, str, str, str] | None = None
+_SIGNER_CACHE_VALUE: BundleSigner | None = None
 
-    Absent or malformed -> ``None``: the run is UNSIGNED and the bundle says so.
-    An unsigned bundle can never satisfy a trust-anchored verification.
+
+def _mark_process_non_dumpable() -> None:
+    """Block Linux ptrace/procfs inspection before a signed child launch."""
+
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        error_number = ctypes.get_errno()
+        if error_number:
+            raise OSError(error_number, os.strerror(error_number))
+        raise OSError("prctl(PR_SET_DUMPABLE, 0) failed")
+
+
+def _read_signing_key_file(path: str) -> str:
+    """Read exactly one hex seed, permitting one trailing newline."""
+
+    if not path:
+        raise ValueError("ACGS_SIGNING_KEY_FILE must name a private key file")
+    from constitutional_swarm.secure_files import PrivateFileError, private_file
+
+    try:
+        with private_file(path) as stream:
+            payload = stream.read(66)
+    except PrivateFileError as exc:
+        raise ValueError(f"ACGS_SIGNING_KEY_FILE is not private: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"ACGS_SIGNING_KEY_FILE cannot be read securely: {exc}") from exc
+    if payload.endswith(b"\n"):
+        payload = payload[:-1]
+    if len(payload) != 64:
+        raise ValueError(
+            "ACGS_SIGNING_KEY_FILE must contain exactly 64 hexadecimal characters "
+            "and may end with one newline"
+        )
+    try:
+        return payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "ACGS_SIGNING_KEY_FILE must contain exactly 64 hexadecimal characters"
+        ) from exc
+
+
+def _secure_signer_process() -> None:
+    """Fail closed when the platform signer-isolation control cannot be applied."""
+
+    try:
+        _mark_process_non_dumpable()
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError(
+            f"cannot secure supervisor process for signed operation: {exc}"
+        ) from exc
+
+
+def _load_bundle_signer() -> BundleSigner | None:
+    """Load and cache the configured supervisor Ed25519 signer.
+
+    ``ACGS_SIGNING_KEY_FILE`` is preferred and is revalidated on every load as
+    an effective-user-owned, owner-only, regular, single-link file; mode 0600 is
+    recommended. It contains exactly 64 hexadecimal seed characters, with one
+    optional trailing newline. ``ACGS_SIGNING_KEY`` remains supported for
+    compatibility but is deprecated because the exporting parent shell retains
+    it. An absent key produces an unsigned bundle; malformed or insecure
+    configured material fails closed.
+
+    Child environments omit signing values. Linux additionally requires a
+    successful ``PR_SET_DUMPABLE=0`` call on every configured load, including a
+    cache hit. A same-user agent is not fully contained on any platform, and
+    other platforms additionally lack that procfs/ptrace mitigation. Use a
+    private key file and a separate user for stronger isolation.
     """
 
-    raw = os.environ.get("ACGS_SIGNING_KEY", "").strip()
-    if not raw:
-        return None
-    key_id = os.environ.get("ACGS_SIGNING_KEY_ID", "").strip() or "acgs-supervisor"
-    try:
-        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(raw))
-    except ValueError:
-        return None
-    return BundleSigner(key_id=key_id, private_key=private_key)
+    global _SIGNER_CACHE_IDENTITY, _SIGNER_CACHE_VALUE
+
+    with _SIGNER_CACHE_LOCK:
+        key_file = os.environ.get("ACGS_SIGNING_KEY_FILE")
+        if key_file is not None:
+            raw = _read_signing_key_file(key_file)
+            source = f"file:{key_file}"
+            setting_name = "ACGS_SIGNING_KEY_FILE"
+        else:
+            configured = os.environ.get("ACGS_SIGNING_KEY")
+            if configured is None:
+                if _SIGNER_CACHE_VALUE is not None:
+                    _secure_signer_process()
+                return None
+            raw = configured
+            source = "environment"
+            setting_name = "ACGS_SIGNING_KEY"
+        key_id = os.environ.get("ACGS_SIGNING_KEY_ID", "").strip() or "acgs-supervisor"
+        if len(raw) != 64 or re.fullmatch(r"[0-9a-fA-F]{64}", raw) is None:
+            raise ValueError(
+                f"{setting_name} must provide exactly 64 hexadecimal characters"
+            )
+        seed = bytes.fromhex(raw)
+        _secure_signer_process()
+        identity = (os.getpid(), source, key_id, hashlib.sha256(seed).hexdigest())
+        if identity == _SIGNER_CACHE_IDENTITY and _SIGNER_CACHE_VALUE is not None:
+            return _SIGNER_CACHE_VALUE
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(seed)
+        except ValueError as exc:
+            raise ValueError(f"{setting_name} is not a valid Ed25519 seed") from exc
+        signer = BundleSigner(key_id=key_id, private_key=private_key)
+        _SIGNER_CACHE_IDENTITY = identity
+        _SIGNER_CACHE_VALUE = signer
+        return signer
 
 
 def _bundle_attestation_preimage(bundle: dict[str, Any]) -> bytes:
@@ -653,7 +979,28 @@ def build_bundle(
     constitutional_version: str = CONSTITUTIONAL_HASH,
     signer: BundleSigner | None = None,
 ) -> dict[str, Any]:
-    events = read_audit(audit_path)
+    return _build_bundle_from_snapshot(
+        audit_path=audit_path,
+        bundle_path=bundle_path,
+        constitution_hash=constitution_hash,
+        workflow_hash=workflow_hash,
+        constitutional_version=constitutional_version,
+        signer=signer,
+        events=read_audit(audit_path),
+    )
+
+
+def _build_bundle_from_snapshot(
+    *,
+    audit_path: Path,
+    bundle_path: Path,
+    constitution_hash: str,
+    workflow_hash: str,
+    constitutional_version: str = CONSTITUTIONAL_HASH,
+    signer: BundleSigner | None = None,
+    events: list[dict[str, Any]],
+    bundle_descriptor: int | None = None,
+) -> dict[str, Any]:
     chain_hash = replay_hashes(events)
     summary = _derived_bundle_summary(events)
     expected_metadata = {
@@ -661,10 +1008,10 @@ def build_bundle(
         "constitutional_version": constitutional_version,
         "workflow_hash": workflow_hash,
     }
-    for field, expected in expected_metadata.items():
-        if summary[field] != expected:
+    for metadata_field, expected in expected_metadata.items():
+        if summary[metadata_field] != expected:
             raise ValueError(
-                f"{field} does not match signed run_metadata audit evidence"
+                f"{metadata_field} does not match signed run_metadata audit evidence"
             )
     bundle = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
@@ -684,10 +1031,21 @@ def build_bundle(
             "public_key": signer.private_key.public_key().public_bytes_raw().hex(),
             "sig": base64.b64encode(signature).decode("ascii"),
         }
-    bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    bundle_path.write_text(
-        json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    owns_descriptor = bundle_descriptor is None
+    descriptor = (
+        _claim_exclusive_file(bundle_path)
+        if bundle_descriptor is None
+        else bundle_descriptor
     )
+    try:
+        _write_all(
+            descriptor,
+            (json.dumps(bundle, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        os.fsync(descriptor)
+    finally:
+        if owns_descriptor:
+            os.close(descriptor)
     return bundle
 
 
@@ -757,7 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
                     "audit_path": str(result.audit_path),
                     "bundle_path": str(result.bundle_path),
                     "chain_hash": result.chain_hash,
-                    "signed": _load_bundle_signer() is not None,
+                    "signed": result.signed,
                 },
                 sort_keys=True,
             )
@@ -779,6 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "bundle_path": f".acgs/evidence/{args.task}.bundle.json",
                     "chain_hash": bundle["chain_hash"],
+                    "signed": isinstance(bundle.get("signature"), dict),
                 },
                 sort_keys=True,
             )
@@ -788,27 +1147,50 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def pack_task(task_id: str, *, acgs_dir: Path = Path(".acgs")) -> dict[str, Any]:
+    task_id = _validate_task_id(task_id)
     evidence_dir = acgs_dir / "evidence"
     audit_path = evidence_dir / f"{task_id}.audit.jsonl"
     if not audit_path.exists():
         raise FileNotFoundError(audit_path)
-    run_metadata = _latest_payload(read_audit(audit_path), "run_metadata")
-    return build_bundle(
+    events = read_audit(audit_path)
+    run_metadata = _validate_pack_snapshot(events, task_id=task_id)
+    signer = _load_bundle_signer()
+    return _build_bundle_from_snapshot(
         audit_path=audit_path,
         bundle_path=evidence_dir / f"{task_id}.bundle.json",
         constitution_hash=run_metadata["constitution_hash"],
         workflow_hash=run_metadata["workflow_hash"],
+        signer=signer,
+        events=events,
     )
 
 
+def _validate_pack_snapshot(
+    events: list[dict[str, Any]], *, task_id: str
+) -> dict[str, Any]:
+    """Validate a frozen audit snapshot against the caller-pinned task identity."""
+
+    replay_hashes(events)
+    for index, event in enumerate(events):
+        if event.get("task_id") != task_id:
+            raise ValueError(f"audit event {index} task id does not match requested task id")
+    task_metadata = _required_latest_payload(events, "task_metadata")
+    if task_metadata.get("task_id") != task_id:
+        raise ValueError("audit task metadata task id does not match requested task id")
+    return _required_latest_payload(events, "run_metadata")
+
+
 def read_audit(path: Path) -> list[dict[str, Any]]:
+    return _parse_audit_bytes(path.read_bytes())
+
+
+def _parse_audit_bytes(payload: bytes) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            if line.strip():
-                event = json.loads(line)
-                event["_line"] = line_no
-                events.append(event)
+    for line_no, line in enumerate(payload.decode("utf-8").splitlines(), start=1):
+        if line.strip():
+            event = json.loads(line)
+            event["_line"] = line_no
+            events.append(event)
     return events
 
 
@@ -830,10 +1212,26 @@ def replay_hashes(events: list[dict[str, Any]]) -> str:
     return previous
 
 
-def run_local_command(command: str, *, cwd: Path) -> dict[str, Any]:
-    argv = shlex.split(command)
+def run_local_command(
+    command: str,
+    *,
+    cwd: Path,
+    command_allowlist: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    effective_allowlist = (
+        set(DEFAULT_COMMAND_ALLOWLIST)
+        if command_allowlist is None
+        else set(command_allowlist)
+    ) - set(DENIED_INTERPRETER_COMMANDS)
+    argv = _resolve_command(command, command_allowlist=effective_allowlist)
     completed = subprocess.run(
-        argv, cwd=cwd, check=False, capture_output=True, text=True, timeout=120
+        argv,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_scrubbed_env(),
     )
     return {
         "command": command,
@@ -856,14 +1254,51 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
     evidence_dir = acgs_dir / "evidence"
     audit_path = evidence_dir / f"{task.task_id}.audit.jsonl"
     bundle_path = evidence_dir / f"{task.task_id}.bundle.json"
-    if audit_path.exists():
-        audit_path.unlink()
+    signer = _load_bundle_signer()
+    for evidence_path in (audit_path, bundle_path):
+        if evidence_path.exists():
+            raise FileExistsError(evidence_path)
+    audit_descriptor = _claim_exclusive_file(audit_path, readable=True)
+    try:
+        bundle_descriptor = _claim_exclusive_file(bundle_path)
+    except Exception:
+        os.close(audit_descriptor)
+        raise
+    logger = AuditLogger(audit_path, task.task_id, _descriptor=audit_descriptor)
+    try:
+        return _run_claimed_task(
+            repo_root=repo_root,
+            constitution_path=constitution_path,
+            swarm_path=swarm_path,
+            constitution=constitution,
+            swarm=swarm,
+            task=task,
+            logger=logger,
+            bundle_path=bundle_path,
+            bundle_descriptor=bundle_descriptor,
+            signer=signer,
+        )
+    finally:
+        logger.close()
+        os.close(bundle_descriptor)
 
+
+def _run_claimed_task(
+    *,
+    repo_root: Path,
+    constitution_path: Path,
+    swarm_path: Path,
+    constitution: dict[str, Any],
+    swarm: dict[str, Any],
+    task: TaskSpec,
+    logger: AuditLogger,
+    bundle_path: Path,
+    bundle_descriptor: int,
+    signer: BundleSigner | None,
+) -> RunResult:
     constitution_hash = hash_yaml_payload(constitution)
     workflow_hash = hash_yaml_payload(swarm)
-    logger = AuditLogger(audit_path, task.task_id)
     policy = PolicyEngine(constitution, swarm, repo_root)
-    signer = _load_bundle_signer()
 
     logger.emit(
         "observer",
@@ -888,7 +1323,13 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
     _record_decision(logger, intake)
     if intake.outcome != ALLOW:
         return _finish(
-            logger, bundle_path, constitution_hash, workflow_hash, "blocked", signer=signer
+            logger,
+            bundle_path,
+            constitution_hash,
+            workflow_hash,
+            "blocked",
+            signer=signer,
+            bundle_descriptor=bundle_descriptor,
         )
 
     _transition(policy, logger, "intake_pending->planned")
@@ -952,7 +1393,13 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
         final_state = "handoff_ready"
     _transition(policy, logger, f"validating->{final_state}")
     return _finish(
-        logger, bundle_path, constitution_hash, workflow_hash, final_state, signer=signer
+        logger,
+        bundle_path,
+        constitution_hash,
+        workflow_hash,
+        final_state,
+        signer=signer,
+        bundle_descriptor=bundle_descriptor,
     )
 
 
@@ -1062,14 +1509,17 @@ def _finish(
     final_state: str,
     *,
     signer: BundleSigner | None = None,
+    bundle_descriptor: int | None = None,
 ) -> RunResult:
     logger.emit("observer", "final_state", {"state": final_state})
-    bundle = build_bundle(
+    bundle = _build_bundle_from_snapshot(
         audit_path=logger.path,
         bundle_path=bundle_path,
         constitution_hash=constitution_hash,
         workflow_hash=workflow_hash,
         signer=signer,
+        events=logger.read_events(),
+        bundle_descriptor=bundle_descriptor,
     )
     return RunResult(
         task_id=logger.task_id,
@@ -1077,6 +1527,7 @@ def _finish(
         audit_path=logger.path,
         bundle_path=bundle_path,
         chain_hash=bundle["chain_hash"],
+        signed=signer is not None,
     )
 
 
@@ -1091,7 +1542,9 @@ def _handle_test_action(
     _record_decision(logger, decision)
     if decision.outcome != ALLOW:
         return True
-    event = run_local_command(action.value, cwd=repo_root)
+    event = run_local_command(
+        action.value, cwd=repo_root, command_allowlist=policy.command_allowlist
+    )
     tests_run.append(event)
     logger.emit("validator", "test_run", event)
     return not event["passed"]
@@ -1104,7 +1557,9 @@ def _handle_tool_action(
     _record_decision(logger, decision)
     if decision.outcome != ALLOW:
         return True
-    event = run_local_command(action.value, cwd=repo_root)
+    event = run_local_command(
+        action.value, cwd=repo_root, command_allowlist=policy.command_allowlist
+    )
     logger.emit("executor", "tool_event", event)
     return event["returncode"] != 0
 
@@ -1251,12 +1706,21 @@ def _record_decision(logger: AuditLogger, decision: PolicyDecision) -> None:
     logger.emit("validator", "policy_decision", decision.as_dict())
 
 
+def _validate_task_id(task_id: str) -> str:
+    if (
+        task_id in {"", ".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", task_id) is None
+    ):
+        raise ValueError("task id must be a safe filename component")
+    return task_id
+
+
 def _task_id(path: Path, content: str) -> str:
-    match = re.search(r"(?m)^task_id:\s*([A-Za-z0-9_.-]+)\s*$", content)
+    match = re.search(r"(?m)^task_id:\s*(.*?)\s*$", content)
     if match:
-        return match.group(1)
+        return _validate_task_id(match.group(1))
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.stem).strip("-") or "task"
-    return f"{safe_stem}-{sha256_text(content)[:10]}"
+    return _validate_task_id(f"{safe_stem}-{sha256_text(content)[:10]}")
 
 
 def _transition(policy: PolicyEngine, logger: AuditLogger, transition: str) -> None:
