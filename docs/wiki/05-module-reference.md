@@ -66,20 +66,54 @@ The per-module map of *what the code does and how*. Organized by maturity tier
 - **Purpose:** Byzantine-tolerant peer validation with cryptographic proof.
 - **Surface (`mesh/core.py`):** `ConstitutionalMesh` —
   `register_local_signer` / `register_remote_agent` / `sign_vote`,
+  `sign_vote_envelope` / `submit_vote_envelope`,
   `request_validation` (→ `PeerAssignment`), `submit_vote`, `get_result`
   (→ `MeshResult` + `MeshProof`), `halt`/`resume`/`is_halted`,
-  `rotate_constitution`, `get_reputation`, `_select_peers` (trust-weighted
-  sampling + one exploration slot).
+  `rotate_constitution`, `get_reputation`, read-only `vote_registry`,
+  `receipt_trust_registry()`, `_select_peers` (trust-weighted sampling + one
+  exploration slot). Pass an out-of-band `VoteSignerRegistry` with the
+  `vote_registry=` constructor argument when recovery or external consumers
+  must share voter authority.
+- **Vote evidence (`mesh/vote_envelope.py`):** `VoteEnvelope`,
+  `VoteSignerRegistry`, `sign_vote_envelope`, `verify_vote_envelope` /
+  `verify_vote_envelopes`, strict dict codecs, canonical bytes and envelope-root
+  helpers. Import these from `constitutional_swarm.mesh.vote_envelope`.
+  Envelope v2 additionally signs `assigned_peers_hash`, `assigned_peer_count`,
+  `quorum`, and `evidence_mode`. `sign_vote_envelope` requires `assigned_peers`
+  and `quorum`; `canonical_assigned_peers_hash` hashes the sorted canonical
+  roster. `verify_vote_envelopes` requires the entire signed electorate and can
+  cross-check `expected_assigned_peers`, `expected_quorum`, and independent
+  custody mode. V1 evidence is rejected on live admission paths.
+  `VoteSignerRegistry.frozen_copy()` captures a public-key-only trust snapshot;
+  all registry mutation methods reject changes on a frozen snapshot.
 - **Supporting types:** `mesh/voting.py` (`ValidationVote.vote_hash`,
   `RemoteVoteRequest`), `mesh/peers.py` (`PeerAssignment`), `mesh/settlement.py`
   (`MeshProof.verify`, `MeshResult`, `ReconciliationReport`), `mesh/exceptions.py`.
 - **Logic:** a producer requests validation; the mesh assigns peers; each peer
-  signs and submits a vote; on quorum the result is settled, frozen, and (if a
-  store is attached) persisted, with a `MeshProof` for later verification.
-- **⚠** Signed votes are **mandatory** — missing/bad signature →
-  `InvalidVoteSignatureError`. Settled = frozen (`AssignmentSettledError`);
-  durable replay blocked (`RecoveredAssignmentError`); halted mesh blocks all ops
-  (`MeshHaltedError`); persistence failure after freeze → `SettlementPersistenceError`.
+  signs a protocol-v2 envelope; consumers preserve and reverify that envelope.
+  `request_validation(..., task_id=...)` binds the task explicitly and defaults
+  it to the artifact ID. V2 settlement waits for every assigned peer, including
+  when the compatibility `complete_evidence` option is false. Persistent
+  settlements additionally require quorum at least three. Multi-identity local signing requires the explicit mesh
+  `evidence_mode="single_operator_dev"`; those envelopes cannot become
+  independent precedent evidence.
+  Before an assignment is recorded, the final peer selection must contain
+  exactly the risk-expanded number requested, use canonical distinct identities,
+  exclude the producer, and contain only currently available candidates.
+- **⚠** Configured quorum must be a strict majority of
+  `peers_per_validation`; tie-capable configurations reject at construction.
+  Settlement requires the configured quorum and a strict majority of the
+  actual assigned peers, including peers added by risk expansion. Signed
+  envelopes are mandatory for proof-grade settlement — missing/bad signatures
+  or bindings fail closed.
+  Settled = frozen (`AssignmentSettledError`); durable replay blocked
+  (`RecoveredAssignmentError`); halted mesh blocks all ops (`MeshHaltedError`);
+  persistence failure after freeze → `SettlementPersistenceError`. Recovered
+  schema-v2 records are reverified against the externally provisioned voter
+  registry and require an explicitly serialized protocol-v2 `MeshProof`.
+  `MeshProof` defaults to v2; a missing proof version or a v1 proof cannot
+  authenticate schema-v2 recovery. Unauthenticated or inconsistent records are
+  quarantined.
 
 ### `settlement_store.py` — durable settlement
 - **Purpose:** persist settled results as replayable evidence.
@@ -89,25 +123,67 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `SettlementRecord`, `DuplicateSettlementError`.
 - **⚠** Append-only; duplicate key → `DuplicateSettlementError`. The
   pending/clear pair is the crash-safe two-phase write — mark pending before the
-  freeze, clear only after durable success.
+  freeze, clear only after durable success. New mesh evidence uses settlement
+  schema v2, whose canonical digest includes the exact ordered vote-envelope
+  dictionaries. Schema v1 remains readable history but is not proof-grade mesh
+  evidence.
 
 ### `governance_receipts.py` (+ `_cli.py`, `_dsse.py`) — verifier-first receipts
 - **Purpose:** canonicalized, independently verifiable governance evidence.
 - **Surface:** Pydantic models `GovernanceReceipt`, `GovernanceReceiptBundle`,
   `ReceiptPayload`, `RoleIdentity`, `ValidatorVote`, `SignatureRecord`,
-  `VerificationVerdict`; functions `canonical_json_bytes`, `payload_digest`,
-  `build_receipt`, `verify_bundle`, `bundle_from/to_json`, `reconstructability_score`.
+  `SignerTrustGrant`, `VerificationVerdict`; functions `canonical_json_bytes`,
+  `payload_digest`, `receipt_from_mesh_settlement`, `build_receipt`,
+  `verify_bundle`, `bundle_from/to_json`, `reconstructability_score`.
   CLI: `governance_receipts_cli.main` → `acgs-verify-receipts`.
   DSSE: `governance_receipts_dsse.py` — `to_in_toto_statement`,
   `to_dsse_envelope`/`verify_dsse_envelope`, `DsseSigner`, `pae`.
 - **Logic:** receipts hash-link a payload + detached signatures; `verify_bundle`
-  re-derives digests and checks signatures against caller-supplied trusted keys
-  with **no trust in the producer** (verifier-first profile, ADR
-  `acgs_v0_1_verifier_first_scope.md`). Report mode preserves diagnostics but is
-  still fail-closed: unsigned, untrusted, or otherwise unverifiable bundles have
-  `valid: false`. Validator IDs are stripped and case-folded before blank and
-  duplicate checks, so spelling or whitespace variants cannot count as distinct
-  validators.
+  re-derives digests and checks signatures against caller-supplied structured
+  trust grants with **no trust in the producer** (verifier-first profile, ADR
+  `acgs_v0_1_verifier_first_scope.md`). Each grant binds a canonical identity,
+  public key, and authorized `validator`, `coordinator`, or `settlement` roles.
+  Settlement-shaped evidence always requires the settlement role, regardless of
+  signed metadata. Report mode preserves diagnostics but is still fail-closed:
+  unsigned, untrusted, role-unauthorized, aggregate-only, or otherwise
+  unverifiable bundles have `valid: false`.
+- **Vote provenance:** proof-grade mesh receipts require settlement schema v2
+  plus the original signed `VoteEnvelope` list. The verifier independently
+  authorizes each voter, checks all subject bindings, rejects duplicate voters
+  or keys, requires every voter to belong to the signed canonical
+  `assigned_peers` roster, recomputes the tally and decision, and requires a
+  unique strict majority using that roster's length as the denominator.
+  `assigned_peer_count` is retained only as a compatibility projection and must
+  equal the roster length. `ValidatorVote` is only a human-readable projection:
+  an empty original signed reason remains unchanged in the envelope while the
+  projection displays `No rationale provided`.
+  Validator and signer identities use NFKC +
+  Unicode-`Cf` removal + trim + case-fold normalization; Ed25519 public keys and
+  envelope key fingerprints use canonical lowercase hex.
+- **⚠ Migration:** `trusted_signers` keeps its keyword name, but flat
+  `{key_id: public_key_hex}` values no longer authorize receipts. Supply
+  `{identity_id, public_key_hex, roles}` grants. Aggregate-only historical
+  receipts remain parseable but cannot verify as proof-grade evidence.
+
+  `governance_fixtures.py` provides deterministic proof-grade benchmark data:
+  seeded voter keys sign the original envelopes, seeded coordinator keys sign
+  the receipts, and `fixture_trusted_signers()` returns the matching structured
+  role grants. Fixture content hashes cover canonical action/evidence JSON.
+  Escalation narratives that lack a resolved binary vote fail closed as denied
+  receipts while retaining the escalation rationale in signed evidence, so
+  canonical fixture payload digests differ from the aggregate-only fixtures.
+
+  `VoteSignerRegistry.trust_grants(role=...)` exports only identities already
+  authorized for that role and records exactly the requested role; it never
+  promotes voter-only identities to validators.
+  `ConstitutionalMesh.receipt_trust_registry()` is a pure export of signer
+  configuration. It does not establish verifier trust: provision the expected
+  voter keys and settlement-role grant independently, before receiving evidence.
+  Receipt verification requires the complete electorate bound into every vote,
+  checks signed metadata quorum against the envelopes, and requires quorum at
+  least three. Vote envelopes or assignment metadata always require an outer
+  settlement-role signer. `acgs-verify-receipts --expected-signer-role` lets the
+  verifier choose an additional expected role for other receipt shapes.
 
 ### `quorum_certificate.py` — accountable-safety quorum
 - **Surface:** `QuorumCertificate` (`.to_dict`/`.from_dict`, `.qc_id`),
@@ -158,8 +234,14 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `canonical_content_hash` (+ `legacy_*` compat fixtures), `encode_vote_payload_v1`,
   `encode_remote_vote_request_*_v1`, `encode_mesh_proof_v1`,
   `encode_settlement_record_v1`, `encode_spectral_sphere_snapshot_v1`.
-- **⚠** `legacy_*` functions reproduce the *current* Python wire format and must
-  stay byte-stable; the `*_v1` encoders are the versioned Rust-core target.
+- **⚠** `legacy_*` functions preserve historical Python formats, including the
+  colon-joined vote and remote-request vectors, and must stay byte-stable; they
+  are not the current signing default. Current detached vote payloads use
+  domain-separated canonical v2, while current
+  remote request signatures use domain-separated canonical v1. Historical
+  detached vote v1 and remote request v0 require explicit version selection.
+  The `*_v1` functions in this module remain the canonical Rust-core fixture
+  target rather than an implicit compatibility fallback.
   ADR: `docs/internal/rust_core_protocol_adr.md`.
 
 ### `constants.py` / `contract.py`
@@ -175,8 +257,21 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   (`.start`/`.stop`/`.actual_port`), `LocalRemotePeer.handle_vote_request`,
   `RemoteVoteResponse`, encode/decode helpers.
 - **Logic:** one-shot request-response over WebSocket; a public-key-only peer
-  validates and signs the request. Replay protection via nonce window
-  (`RemoteVoteReplayError`).
+  validates a versioned, domain-separated canonical request and returns the
+  original `VoteEnvelope` unchanged. Decoders require the exact protocol-v2
+  field set and scalar types.
+- **⚠** `LocalRemotePeer` requires an explicit canonical-hex request-signer
+  allowlist. It checks authorization and signature validity before allocating
+  replay state, then maintains a locked, bounded nonce cache per authorized
+  signer (`RemoteVoteReplayError`). `allow_untrusted_request_signers=True` is
+  rejected.
+
+The checked-in Rust protocol fixture corpus is intentionally historical.
+`scripts/generate_rust_protocol_fixtures.py` explicitly requests detached-vote
+v1, remote-request v0, and `MeshProof` v1, then serializes only their frozen
+historical fields. The checked-in fixture files remain byte-identical; current
+secure protocol defaults produce new evidence instead of redefining this
+compatibility corpus.
 
 ### `gossip_protocol.py` — gossip transport (`[transport]`)
 - **Surface:** `SwarmNode` (CRDT replica + transport; `.gossip_round`,
@@ -265,8 +360,55 @@ The largest subpackage; a full incentive subnet. By role:
 
 - **⚠** `arweave_audit_log.py` uses a **two-phase commit**: cache Phase 1 in
   `_retry_state`, clear only on Phase 2 success (crash-safe). `TierManager` and
-  `PrecedentStore` are thread-safe via `threading.Lock`. Precedent quorum is
-  **3/5** (`min_total_validators=5, min_votes_for_precedent=3`).
+  `PrecedentStore` are thread-safe via `threading.Lock`.
+- **Precedent evidence:** `ValidatorConfig` defaults to five peers, quorum
+  three, and `complete_evidence=True`. `ValidationSynapse.vote_envelopes`
+  carries all five original envelopes. `SubnetOwner` and `PrecedentStore`
+  require independently provisioned immutable voter trust snapshots, reverify
+  task/assignment/producer/artifact/content/constitution bindings, recompute
+  counts and the envelope root, and require at least five distinct authorized
+  voters, at least three approvals, the signed quorum, and a strict majority
+  of the entire signed electorate. Aggregate-only records and
+  incomplete evidence fail closed; `ValidationSynapse.is_verified` reports only
+  structural presence and is not an authorization verdict.
+- **Validator provisioning:** default precedent production uses public-only
+  remote voter registration and remote signature collection. Owner admission
+  receives a separately provisioned frozen public-key registry; validator
+  registry mutation cannot rotate owner authority. `--authorized-voters FILE`
+  must supply public grants for remote voters, not voter private keys:
+  `{"authorized_voters": [{"identity_id": "voter-id", "public_key_hex": "...",
+  "vote_host": "voter.example", "vote_port": 9443}]}`.
+  `register_miner(..., vote_public_key=...)` registers remote voters;
+  `await validate_remote(judgment, peer_routes=..., client=...)` collects their
+  signatures using the existing remote vote transport. Default mode refuses
+  `vote_private_key`; synchronous local simulation requires explicit dev mode.
+  The explicit `single_operator_dev` mode supports local multi-identity
+  simulation and signs that mode into the envelope. Default precedent admission
+  rejects those envelopes; the mode label alone is not proof of custody.
+  Provision all owner grants before constructing its frozen trust snapshot.
+  Public keys establish which identities are authorized; operators remain
+  responsible for establishing independent control of those identities.
+- **Response authentication:** `GovernanceDeliberation` exposes
+  `response_protocol_version`, `response_signer_hotkey`, and
+  `response_signature`. Miners sign canonical response bytes that bind the
+  request content hash, requester hotkey, selected axon identity, and judgment
+  body. The testnet validator verifies both the SDK axon routing tuple and the
+  request-bound body signature before converting or admitting a judgment;
+  unsigned or mismatched miner responses fail closed.
+- **Codifier trust boundary:** `RuleCodifier(precedent_store=...)` and
+  `PrecedentBackedCodifier(precedent_store=...)` accept only exact canonical
+  records already admitted by that explicitly provisioned store. There is no
+  registry-less fallback store. Empty read-only cluster/proposal queries may
+  return `[]` without a store, but observing records or any populated
+  codification path fails before evidence use when the trusted store is absent.
+- **Autonomous research example:**
+  `examples/mac_acgs_autonomous_research.py` exposes
+  `run_with_precedents(precedents, vote_registry)`. Callers must supply at
+  least 16 complete v2 records signed by independently controlled voters plus
+  the public-key trust registry used to verify them. The standalone entry point
+  exits with status 2 because no authenticated external evidence source is
+  configured. The former synthetic private-key helpers were removed.
+
   Guide: [`bittensor/AGENTS.md`](../../src/constitutional_swarm/bittensor/AGENTS.md).
 
 ---
@@ -395,9 +537,20 @@ philosophy; see `TOOLS.md`). Highlights:
 | `eval_trust_convergence.py`, `eval_swe_bench_synthetic.py`, `benchmark_coverage.py` | Eval/measurement scripts. |
 | `verify_citations.py`, `verify_governance_receipts.py` | Citation + receipt verification. |
 | `generate_security_report.py` | Build `security-audit-report.md` from security tests. |
-| `generate_rust_protocol_fixtures.py` | Emit canonical fixtures for the Rust core. |
+| `generate_rust_protocol_fixtures.py` | Emit the frozen detached-vote v1, remote-request v0, and proof v1 Rust compatibility corpus. |
 | `check_typecheck_coverage.py` | Assert every optional extra is type-checked or excepted. |
-| `testnet_deploy.py` | Bittensor testnet deploy (`register`/`miner`/`validator`). |
+| `testnet_deploy.py` | Bittensor testnet deploy (`register`/`miner`/`validator`); validator mode requires `--authorized-voters FILE`. |
 | `finetune_extended_refusal.py`, `convert_swarm_output_to_swebench_predictions.py` | Recipe/finetuning + format conversion. |
 
 Continue to [06 Runtime Flows →](06-runtime-flows.md).
+
+### C14 migration boundary
+
+`bittensor/cascade.py` must authenticate protocol-v2 envelopes before treating a
+mesh result as consensus; structural `MeshProof.verify()` is insufficient. Live
+remote request and detached signature verifiers reject legacy formats. Historical
+encoders exist only for explicitly selected frozen compatibility vectors.
+
+The previous benchmark fixture description above describes the inherited fixture
+producer. That producer needs a coordinated electorate/role migration before its
+receipts can satisfy the current v2 admission contract; see the C14 fix report.

@@ -9,8 +9,9 @@ Index of architecture & product decisions. Detailed ADRs live in
 | Decision | Value / rule | Rationale |
 |---|---|---|
 | Constitutional hash | `608508a9bd224290` | Stable identity of the canonical constitution. |
-| Precedent quorum | 3/5 super-majority (`min_total_validators=5, min_votes_for_precedent=3`) | Byzantine-tolerant precedent setting. |
-| Signed votes mandatory | `ConstitutionalMesh.submit_vote` requires Ed25519 signatures | No unauthenticated trust updates. |
+| Precedent quorum | 3/5 super-majority over at least five distinct, authorized `VoteEnvelope` signers (`min_total_validators=5, min_votes_for_precedent=3`) | Counts and roots are derived consistency data; only verified voter evidence can create precedent. |
+| Signed votes mandatory | Versioned, canonical Ed25519 `VoteEnvelope` evidence is carried unchanged from voter to every consumer | No unauthenticated trust updates or aggregate-only proof. |
+| Signer authority is external | Voter keys use `VoteSignerRegistry`; receipt keys use structured `SignerTrustGrant` roles | Evidence cannot authorize its own signer or self-declare a privileged role. |
 | `manifold.py` is frozen | Birkhoff/Sinkhorn baseline is **not** fixed | Its uniformity collapse is the kept empirical control; `spectral_sphere.py` is the production direction. |
 | `EvolutionLog` write rules | Strict monotonicity + acceleration enforced at write time | Append-only, SQLite-backed governance metrics. |
 | Two-phase audit commit | Cache Phase 1 in `_retry_state`, clear only on Phase 2 success | Crash-safe Arweave audit logging. |
@@ -40,6 +41,137 @@ Index of architecture & product decisions. Detailed ADRs live in
 | Single source of truth for commands | `tools/registry.yaml` | Validated by `make agent-check`; `TOOLS.md` is the human view. |
 
 ## Decisions log
+
+### 2026-10-09 — Canonical vote evidence and role-scoped trust
+
+Aggregate vote counts and root hashes do not prove which validators voted, what
+they signed, or whether they were authorized. The former mesh and remote-vote
+signature inputs also joined free-text fields with colons, so different field
+partitions could produce the same pre-image. The protocol now treats one
+versioned `VoteEnvelope` as the indivisible unit of vote evidence.
+
+- **Canonical envelope:** `mesh/vote_envelope.py` defines protocol version 1,
+  domain-separated sorted-key JSON encoding, strict codecs, Ed25519 signing and
+  verification, and a deterministic envelope root. Each envelope binds voter
+  and key identity, task, assignment, producer, artifact, content hash,
+  constitutional hash, decision, reason, nonce, and issue time. Request
+  signatures use a separate versioned canonical domain.
+- **External authorization:** `VoteSignerRegistry` binds a canonical voter ID to
+  one Ed25519 key fingerprint and explicit roles. IDs are NFKC-normalized,
+  Unicode format characters are removed, then values are trimmed and
+  case-folded. Vote key IDs and compared public-key fingerprints are lowercase
+  hexadecimal. Canonical identity collisions and cross-identity key reuse fail.
+  `ConstitutionalMesh(vote_registry=...)` accepts the out-of-band registry;
+  `mesh.vote_registry` exposes it read-only. `VoteSignerRegistry.trust_grants`
+  exports only identities already authorized for the requested role and assigns
+  exactly that role, so exporting validator grants cannot promote voter-only
+  identities. `mesh.receipt_trust_registry()` combines those exact-role voter
+  grants with the mesh's separately authorized settlement receipt signer.
+- **End-to-end evidence:** mesh results, remote responses, Bittensor validation
+  synapses, precedent records, settlement schema v2 records, and governance
+  receipts preserve the original envelope list. Every state-changing consumer
+  re-verifies signer authority, signatures, subject bindings, distinct voters,
+  and derived counts. A supplied root or tally never authenticates a result.
+- **Collection and decision are separate:** precedent-producing
+  `ValidatorConfig` defaults to five peers, quorum three, and
+  `complete_evidence=True`. The validator collects all five distinct envelopes
+  while retaining the 3-of-5 decision rule; early-settling mesh operation must
+  be selected explicitly and cannot create precedent from incomplete evidence.
+- **Unique mesh outcome:** the constructor requires configured quorum to be a
+  strict majority of configured `peers_per_validation`. Settlement and
+  pending-record recovery then require an approving or denying strict majority
+  of the actual assigned peer set, including any peers added by risk expansion.
+  A tie or a schema v1/otherwise unauthenticated stored result is quarantined
+  instead of becoming active state.
+- **Assignment-bound selection and receipts:** the mesh validates the final
+  peer selection before recording an assignment: it must contain exactly the
+  risk-expanded number requested, use canonical distinct identities, exclude
+  the producer, and contain only available candidates. Proof-grade governance
+  receipts sign the canonical `assigned_peers` roster, require every verified
+  envelope voter to be a member, and derive the strict-majority denominator
+  from that roster. `assigned_peer_count` remains a compatibility projection
+  and must equal the signed roster length; it is never trusted as the quorum
+  source.
+- **Explicit compatibility versions:** current detached vote payloads use
+  domain-separated canonical protocol v2 and current remote request signatures
+  use domain-separated canonical protocol v1. The historical colon-joined
+  encodings are available only through explicit detached-vote v1 and
+  remote-request v0 selection. Remote wire decode accepts only the exact
+  protocol-v1 request schema. `MeshProof` defaults to v2;
+  schema-v2 settlement recovery requires an explicitly serialized v2 proof, so
+  a missing proof version or a v1 proof cannot authenticate current settlement
+  evidence.
+- **Role-scoped receipts:** the v0.1 governance-receipt wrapper remains stable,
+  but proof-grade settlement receipts require schema v2 envelope evidence.
+  `trusted_signers` values are structured `SignerTrustGrant` records containing
+  `identity_id`, `public_key_hex`, and one or more of `validator`,
+  `coordinator`, or `settlement`. The verifier derives the required outer role
+  from the evidence shape; signed metadata cannot lower it. Flat trust maps,
+  unsigned or aggregate-only vote history, missing roles, and unauthorized
+  signer keys fail closed.
+- **Proof-grade deterministic fixtures:** `governance_fixtures.py` now derives
+  reproducible Ed25519 voter and coordinator keys from fixed seeds, includes the
+  original signed envelopes in every valid benchmark receipt, and returns
+  explicit identity/key/role grants from `fixture_trusted_signers()`. Fixture
+  content hashes cover canonical JSON containing the action and evidence-hash
+  map. An escalation that has no signable approve/deny outcome is represented
+  as a fail-closed denial while its escalation rationale remains in the signed
+  vote evidence. This changes deterministic payload digests but preserves the
+  benchmark narratives and verifier path.
+- **Trusted precedent source for codification:** `RuleCodifier` no longer
+  creates a registry-less fallback store. Non-empty clustering, proposal,
+  approval, and activation require an injected `PrecedentStore`; supplied
+  records must be exact canonical records already admitted by that store.
+  Empty read-only clustering/proposal calls may still return an empty list
+  without a store. `PrecedentBackedCodifier` follows the same rule: an empty
+  observed stream is readable, while observation or populated codification
+  requires the explicitly supplied trusted store.
+- **Explicit validator provisioning:** `ConstitutionalValidator` accepts a
+  caller-supplied `VoteSignerRegistry`, and `register_miner(...,
+  vote_private_key=...)` registers the exact local Ed25519 signer material and
+  preserves it across constitution rotation. The testnet validator command
+  requires `--authorized-voters FILE`; that JSON file must contain at least
+  `peers_per_validation + 1` distinct normalized identities (six with the
+  default five-peer configuration) with distinct 32-byte private keys encoded
+  as 64 lowercase hexadecimal characters. The extra identity is required
+  because the judgment producer is excluded from its own assignment. The
+  validator and `SubnetOwner` share the resulting registry. Invalid or missing
+  grants fail before the Bittensor SDK, wallet, or subtensor is accessed, and
+  metagraph hotkeys are never implicitly authorized.
+- **Authenticated miner responses:** `GovernanceDeliberation` carries
+  `response_protocol_version`, `response_signer_hotkey`, and
+  `response_signature`. The response body signature binds the original request
+  hash and requester hotkey, the selected axon identity, and the complete
+  judgment body. The testnet validator verifies both the Bittensor SDK axon
+  routing signature and this request-bound body signature before conversion,
+  validation, or precedent admission; unsigned or mismatched responses fail
+  closed.
+- **Frozen historical vectors:** `scripts/generate_rust_protocol_fixtures.py`
+  explicitly selects detached vote v1, remote request v0, and `MeshProof` v1,
+  then serializes only each version's frozen historical fields. The checked-in
+  Rust fixture corpus remains byte-identical; secure current defaults do not
+  silently redefine those compatibility vectors.
+
+Rejected alternatives were delimiter escaping at individual call sites,
+trust-on-first-use for keys carried beside an envelope, quorum five, and trusting
+an outer receipt signature over supplied aggregates. These approaches either
+leave multiple encoders, let evidence self-authorize, change 3-of-5 into
+unanimity, or preserve the original provenance gap.
+
+Migration is explicit: provision voter and receipt trust registries out of band,
+emit protocol-v1 envelopes, and write new mesh settlements as schema v2. There
+is no implicit unsigned or aggregate admission fallback. Historical schema v1
+settlements and v0.1 aggregate receipts may still be parsed as records, but they
+are not proof-grade evidence. Fixture consumers must accept structured grants
+instead of flat key maps, and any code that submits precedents for codification
+must share the same explicitly provisioned admission store. Historical Rust
+vectors stay on their frozen explicit versions; new protocol evidence uses the
+current secure defaults instead of modifying the checked-in compatibility
+corpus. Testnet operators must provide an `authorized_voters` JSON document to
+the validator command; existing deployments that relied on metagraph discovery
+as voter authorization now fail closed until at least
+`peers_per_validation + 1` independent local signing authorities are
+provisioned (six with the default five-peer configuration).
 
 ### 2026-08-15 — Public façade and receipt identity
 
@@ -103,3 +235,43 @@ optional extra). Deferred: REVIEW-halts-loop and full executor loop-ification
 **Why:** the productized signed-evidence-bundle space is commoditized (Microsoft
 AGT, nono, Pipelock, Fuzentry), so the durable, identity-aligned move is making
 the deterministic kernel actually forgery-resistant as research.
+
+
+### 2026-10-09 — C14 final review: signed electorate and separate voter custody
+
+This decision supersedes the C14 v1 envelope and shared testnet trust provisions
+above. Authentic signatures alone do not prevent an aggregator omitting dissent
+or an operator signing for every identity. Current vote envelopes therefore bind
+the canonical sorted assigned roster hash, assigned count, quorum, and evidence
+mode in protocol v2. Admission verifies the complete roster, recomputes every
+tally, and enforces both the signed quorum and a strict majority of all assigned
+voters. Precedents additionally require at least five distinct authorized voters
+and at least three approvals. Historical v1 and aggregate evidence fails closed.
+
+Owner authority is a frozen public-key snapshot provisioned outside the validator.
+Mutating or re-keying the validator registry cannot change owner authority. Default
+validator provisioning accepts remote voters' public keys and collects their
+signatures remotely. Local multi-identity signing requires explicit development
+mode; its signed evidence is labelled non-independent and default precedent
+admission rejects it. A mode label is not proof of independent custody; the
+external trust registry and custody policy remain deployment responsibilities.
+
+Receipts bind the exact envelope electorate and quorum, require complete votes,
+and enforce a quorum floor of three. The outer role is settlement whenever the
+receipt carries vote envelopes or an assignment ID, regardless of removable
+evidence hash entries. The CLI supports verifier-selected expected signer roles.
+The mesh receipt trust getter is a pure public-data export, never an independent
+verifier trust anchor. Cascade consensus must authenticate v2 evidence and
+recompute outcomes, rather than trust a structural proof or supplied counts.
+
+Rejected alternatives: unsigned roster metadata preserves omission attacks;
+sharing or copying a mutable registry exposes the admission trust root to
+re-keying; marking local votes independent without changing key custody merely
+renames the original defect. Legacy fixture encoders may remain explicit, but
+live request and signature verification cannot select legacy encodings.
+
+V2 settlement never freezes a partial electorate. The historical
+`complete_evidence=False` parameter remains accepted for call compatibility but
+no longer permits early settlement. Persistent mesh configurations require
+quorum at least three at construction, so the mesh cannot declare an outcome
+persistable when the receipt layer would reject its quorum.
