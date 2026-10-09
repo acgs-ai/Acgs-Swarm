@@ -32,20 +32,17 @@ from constitutional_swarm.mesh import ConstitutionalMesh, MeshProof, MeshResult,
 from constitutional_swarm.mesh.vote_envelope import (
     VoteSignerRegistry,
     compute_vote_envelope_root,
+    key_id_for_public_key,
     sign_assignment,
     sign_vote_envelope,
     signed_assignment_digest,
+    verify_assignment_vote_envelopes,
     vote_envelope_hash,
 )
 from constitutional_swarm.remote_vote_transport import LocalRemotePeer, RemoteVoteResponse
 from constitutional_swarm.settlement_store import JSONLSettlementStore
 
 def test_c16_registry_frozen_snapshot_has_no_mutation_capability() -> None:
-    import pytest
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
-
     registry = VoteSignerRegistry()
     registry.register(
         "registry-voter",
@@ -72,14 +69,6 @@ def test_c16_registry_frozen_snapshot_has_no_mutation_capability() -> None:
 
 
 def test_c16_registry_frozen_snapshot_is_detached_from_source_and_exports() -> None:
-    import pytest
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    from constitutional_swarm.mesh.vote_envelope import (
-        VoteSignerRegistry,
-        key_id_for_public_key,
-    )
-
     original_key = Ed25519PrivateKey.generate().public_key()
     replacement_key = Ed25519PrivateKey.generate().public_key()
     registry = VoteSignerRegistry()
@@ -1007,6 +996,23 @@ def _c16_signed_assignment_fixture(*, assigner_roles=("assigner",)):
     return assignment, registry, voter_key, bindings
 
 
+def _c16_signed_vote_for_assignment(
+    assignment, voter_key, bindings, *, voter_id, reason, nonce
+):
+    return sign_vote_envelope(
+        voter_key,
+        voter_id=voter_id,
+        decision="approved",
+        reason=reason,
+        nonce=nonce,
+        issued_at=1_800_000_001.0,
+        assigned_peers=assignment.assigned_peers,
+        quorum=assignment.quorum,
+        assignment_digest=signed_assignment_digest(assignment),
+        **bindings,
+    )
+
+
 def test_c16_signed_assignment_requires_assigner_role() -> None:
     from constitutional_swarm.mesh.vote_envelope import verify_signed_assignment
 
@@ -1786,23 +1792,16 @@ def test_c16_frozen_registry_rejects_mutable_grant_roles() -> None:
 
 
 def test_c16_proof_verifier_rejects_assigner_key_aliased_to_voter() -> None:
-    from constitutional_swarm.mesh.vote_envelope import (
-        _Grant,
-        verify_assignment_vote_envelopes,
-    )
+    from constitutional_swarm.mesh.vote_envelope import _Grant
 
     assignment, registry, voter_key, bindings = _c16_signed_assignment_fixture()
-    envelope = sign_vote_envelope(
+    envelope = _c16_signed_vote_for_assignment(
+        assignment,
         voter_key,
+        bindings,
         voter_id="assigned-voter",
-        decision="approved",
         reason="approval",
         nonce="aliased-key-proof",
-        issued_at=1_800_000_001.0,
-        assigned_peers=assignment.assigned_peers,
-        quorum=assignment.quorum,
-        assignment_digest=signed_assignment_digest(assignment),
-        **bindings,
     )
     assigner = registry._identities[assignment.assigner_id]
     registry._identities["aliased-voter"] = _Grant(
@@ -1822,11 +1821,6 @@ def test_c16_proof_verifier_rejects_assigner_key_aliased_to_voter() -> None:
 
 
 def test_c16_proof_verifier_compares_actual_assigner_and_voter_keys() -> None:
-    from constitutional_swarm.mesh.vote_envelope import (
-        key_id_for_public_key,
-        verify_assignment_vote_envelopes,
-    )
-
     shared_key = Ed25519PrivateKey.generate()
     key_id = key_id_for_public_key(shared_key.public_key())
     bindings = {
@@ -1846,17 +1840,13 @@ def test_c16_proof_verifier_compares_actual_assigner_and_voter_keys() -> None:
         issued_at=1_800_000_000.0,
         **bindings,
     )
-    envelope = sign_vote_envelope(
+    envelope = _c16_signed_vote_for_assignment(
+        assignment,
         shared_key,
+        bindings,
         voter_id="shared-key-voter",
-        decision="approved",
         reason="same physical key",
         nonce="shared-key-nonce",
-        issued_at=1_800_000_001.0,
-        assigned_peers=assignment.assigned_peers,
-        quorum=assignment.quorum,
-        assignment_digest=signed_assignment_digest(assignment),
-        **bindings,
     )
 
     class HandBuiltRegistry:
@@ -1894,20 +1884,14 @@ def test_c16_proof_verifier_compares_actual_assigner_and_voter_keys() -> None:
 def test_c16_proof_verifier_rejects_desynchronized_frozen_registry_indexes() -> None:
     from types import MappingProxyType
 
-    from constitutional_swarm.mesh.vote_envelope import verify_assignment_vote_envelopes
-
     assignment, registry, voter_key, bindings = _c16_signed_assignment_fixture()
-    envelope = sign_vote_envelope(
+    envelope = _c16_signed_vote_for_assignment(
+        assignment,
         voter_key,
+        bindings,
         voter_id="assigned-voter",
-        decision="approved",
         reason="approval",
         nonce="desynchronized-index-proof",
-        issued_at=1_800_000_001.0,
-        assigned_peers=assignment.assigned_peers,
-        quorum=assignment.quorum,
-        assignment_digest=signed_assignment_digest(assignment),
-        **bindings,
     )
     frozen = registry.frozen_copy()
     identities = dict(frozen._identities)
@@ -1927,20 +1911,14 @@ def test_c16_proof_verifier_rejects_desynchronized_frozen_registry_indexes() -> 
 
 
 def test_c16_proof_verifier_rejects_desynchronized_mutable_key_index() -> None:
-    from constitutional_swarm.mesh.vote_envelope import verify_assignment_vote_envelopes
-
     assignment, registry, voter_key, bindings = _c16_signed_assignment_fixture()
-    envelope = sign_vote_envelope(
+    envelope = _c16_signed_vote_for_assignment(
+        assignment,
         voter_key,
+        bindings,
         voter_id="assigned-voter",
-        decision="approved",
         reason="approval",
         nonce="desynchronized-key-proof",
-        issued_at=1_800_000_001.0,
-        assigned_peers=assignment.assigned_peers,
-        quorum=assignment.quorum,
-        assignment_digest=signed_assignment_digest(assignment),
-        **bindings,
     )
     registry._keys[assignment.key_id] = "assigned-voter"
 
@@ -1989,20 +1967,14 @@ def test_c16_signed_assignment_rejects_assigner_in_electorate() -> None:
 
 
 def test_c16_proof_verifier_rejects_hand_built_dual_role_registry() -> None:
-    from constitutional_swarm.mesh.vote_envelope import verify_assignment_vote_envelopes
-
     assignment, registry, voter_key, bindings = _c16_signed_assignment_fixture()
-    envelope = sign_vote_envelope(
+    envelope = _c16_signed_vote_for_assignment(
+        assignment,
         voter_key,
+        bindings,
         voter_id="assigned-voter",
-        decision="approved",
         reason="approval",
         nonce="dual-role-proof",
-        issued_at=1_800_000_001.0,
-        assigned_peers=assignment.assigned_peers,
-        quorum=assignment.quorum,
-        assignment_digest=signed_assignment_digest(assignment),
-        **bindings,
     )
     _c16_corrupt_registry_with_dual_role(registry)
 

@@ -484,6 +484,13 @@ regular files nor directories, including FIFOs, sockets, and devices, fail
 closed with `unlisted_packet_entry`; the existing symlink-specific rejection is
 retained.
 
+C17 Phase B consolidates candidate trust-root validation for mutable register
+and replace operations without changing validation order, lock scope, errors,
+or mutations. All proof-grade consumers continue through the shared signed-
+assignment verifier. Settlement recovery intentionally checks its pinned
+authority root before checking assignment-bound votes against the current voter
+registry; the checks protect distinct trust roots.
+
 ### 2026-10-09 — C17 Phase A: close remaining trust and secret-file edges
 
 Signed-assignment verification now separates the assigner from the producer as

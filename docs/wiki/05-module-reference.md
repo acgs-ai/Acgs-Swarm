@@ -117,6 +117,8 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   concrete keys with `Ed25519PublicKey.from_public_bytes`, so trust checks never
   retain caller-defined verification or comparison methods. These checks do not
   change assignment canonical bytes, digests, signatures, or protocol fixtures.
+  Mutable register and replace operations build and validate candidate grants
+  through the same private path before changing either registry index.
 - **Supporting types:** `mesh/voting.py` (`ValidationVote.vote_hash`,
   `RemoteVoteRequest`), `mesh/peers.py` (`PeerAssignment`), `mesh/settlement.py`
   (`MeshProof.verify`, `MeshResult`, `ReconciliationReport`), `mesh/exceptions.py`.
@@ -691,6 +693,11 @@ validator finalization, subnet-owner admission, cascade validation, receipts,
 and recovery reject missing or mismatched assignments and legacy vote envelopes.
 Explicit development mode relaxes independent custody only; it never waives
 assignment verification.
+
+All proof-grade consumers call the shared signed-assignment verifier directly or
+through the assignment-bound envelope verifier. Recovery deliberately performs
+both checks in order: the pinned authority root authenticates the assignment,
+then the current voter registry authenticates its assignment-bound envelopes.
 
 Testnet validator startup requires `--authority-keys FILE`, containing exactly
 `assigner_id`, `assigner_private_key_hex`, and

@@ -251,6 +251,18 @@ def _validate_registry_grants(grants: Sequence[_Grant]) -> tuple[_Grant, ...]:
     return tuple(canonical)
 
 
+def _validate_candidate_grants(
+    grants: Collection[_Grant],
+    candidate: _Grant,
+    identity: str,
+    old: _Grant | None,
+) -> None:
+    _validate_registry_grants(
+        tuple(candidate if grant.identity == identity else grant for grant in grants)
+        + (() if old is not None else (candidate,))
+    )
+
+
 def _validate_registry_indexes(
     grants: Sequence[_Grant],
     identities: Mapping[str, _Grant],
@@ -370,12 +382,8 @@ class VoteSignerRegistry:
                     "public key is already registered to another voter identity"
                 )
             candidate = _Grant(identity, key_id, key, role_set)
-            _validate_registry_grants(
-                tuple(
-                    candidate if grant.identity == identity else grant
-                    for grant in self._identities.values()
-                )
-                + (() if old is not None else (candidate,))
+            _validate_candidate_grants(
+                self._identities.values(), candidate, identity, old
             )
             self._identities[identity] = candidate
             self._keys[key_id] = identity
@@ -434,12 +442,8 @@ class VoteSignerRegistry:
                 )
             old = self._identities.get(identity)
             candidate = _Grant(identity, key_id, key, role_set)
-            _validate_registry_grants(
-                tuple(
-                    candidate if grant.identity == identity else grant
-                    for grant in self._identities.values()
-                )
-                + (() if old is not None else (candidate,))
+            _validate_candidate_grants(
+                self._identities.values(), candidate, identity, old
             )
             if old is not None and old.key_id != key_id:
                 self._keys.pop(old.key_id, None)
