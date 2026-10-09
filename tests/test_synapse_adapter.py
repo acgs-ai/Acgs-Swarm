@@ -598,11 +598,16 @@ rules:
             client.register_local_miner(MinerAxonServer(miner))
 
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=5,
+                quorum=5,
+            ),
         )
         for i in range(3):
             validator.register_miner(f"e2e-miner-{i}", domain="privacy")
-        validator.register_miner("extra-peer")
+        for i in range(3):
+            validator.register_miner(f"extra-peer-{i}")
 
         # Step 1: Package case
         case = owner.package_case(
@@ -618,6 +623,7 @@ rules:
         # Step 3: Validate first judgment
         validation = validator.validate(judgments[0])
         assert validation.accepted is True
+        assert validation.votes_for + validation.votes_against == 5
 
         # Step 4: Record result
         precedent = owner.record_result(case, judgments[0], validation)

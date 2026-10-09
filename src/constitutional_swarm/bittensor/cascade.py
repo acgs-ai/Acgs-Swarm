@@ -15,16 +15,26 @@ Only precedents surviving all four stages amend the living constitution.
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from acgs_lite import Constitution, ConstitutionalViolationError
+from acgs_lite import Constitution
 
 from constitutional_swarm.dna import AgentDNA
-from constitutional_swarm.mesh import ConstitutionalMesh
+from constitutional_swarm.mesh import (
+    ConstitutionalMesh,
+    InsufficientPeersError,
+    InvalidVoteSignatureError,
+    MeshHaltedError,
+    MeshResult,
+    MeshSnapshotStaleError,
+    SettlementPersistenceError,
+    UnauthorizedVoterError,
+)
 
 
 class CascadeStage(Enum):
@@ -162,14 +172,30 @@ class PrecedentCascade:
         mesh: ConstitutionalMesh | None = None,
         *,
         consensus_threshold: float = 0.8,
+        min_consensus_miners: int = 3,
         seed: int | None = None,
     ) -> None:
+        if (
+            isinstance(consensus_threshold, bool)
+            or not isinstance(consensus_threshold, (int, float))
+            or not 0.0 < consensus_threshold <= 1.0
+        ):
+            raise ValueError("consensus_threshold must be in the interval (0, 1]")
+        if (
+            isinstance(min_consensus_miners, bool)
+            or not isinstance(min_consensus_miners, int)
+            or min_consensus_miners < 1
+        ):
+            raise ValueError("min_consensus_miners must be a positive integer")
         self._constitution = constitution
         self._dna = AgentDNA(constitution=constitution, agent_id="cascade-validator", strict=False)
         self._mesh = mesh
         self._consensus_threshold = consensus_threshold
+        self._min_consensus_miners = min_consensus_miners
         self._metrics = CascadeMetrics()
         self._accepted: list[ConstitutionDelta] = []
+        self._issued: dict[str, PrecedentCandidate] = {}
+        self._mesh_results: dict[str, MeshResult] = {}
         self._seed = seed
 
     @property
@@ -189,7 +215,7 @@ class PrecedentCascade:
     ) -> PrecedentCandidate:
         """Create a new candidate at Stage 1."""
         self._metrics.submitted += 1
-        return PrecedentCandidate(
+        candidate = PrecedentCandidate(
             candidate_id=uuid.uuid4().hex[:12],
             judgment_text=judgment,
             reasoning_text=reasoning,
@@ -200,9 +226,13 @@ class PrecedentCascade:
             current_stage=CascadeStage.DNA_PRECHECK,
             alive=True,
         )
+        self._issued[candidate.candidate_id] = candidate
+        return candidate
 
     def advance(self, candidate: PrecedentCandidate) -> PrecedentCandidate:
         """Advance a candidate through its current stage."""
+        if self._issued.get(candidate.candidate_id) is not candidate:
+            raise ValueError("candidate is not the current instance issued by this cascade")
         if not candidate.alive:
             return candidate
 
@@ -219,6 +249,11 @@ class PrecedentCascade:
             return candidate
 
         updated = candidate.with_result(result)
+        if updated.alive:
+            self._issued[candidate.candidate_id] = updated
+        else:
+            self._issued.pop(candidate.candidate_id, None)
+            self._mesh_results.pop(candidate.candidate_id, None)
 
         # Track funnel
         if result.passed:
@@ -253,20 +288,37 @@ class PrecedentCascade:
 
         Returns None if the candidate didn't pass all stages.
         """
-        if not candidate.alive or candidate.stages_passed < len(STAGE_ORDER):
+        current = self._issued.get(candidate.candidate_id)
+        stage_sequence = tuple(result.stage for result in candidate.stage_results)
+        mesh_result = self._mesh_results.get(candidate.candidate_id)
+        if (
+            current is not candidate
+            or not candidate.alive
+            or candidate.current_stage is not STAGE_ORDER[-1]
+            or stage_sequence != tuple(STAGE_ORDER)
+            or not all(result.passed for result in candidate.stage_results)
+            or candidate.constitutional_hash != self._constitution.hash
+            or mesh_result is None
+            or not self._valid_mesh_result(candidate, mesh_result)
+        ):
             return None
+
+        total_votes = mesh_result.votes_for + mesh_result.votes_against
+        consensus_strength = mesh_result.votes_for / total_votes
 
         delta = ConstitutionDelta(
             candidate_id=candidate.candidate_id,
             rule_text=candidate.judgment_text,
             domain=candidate.domain,
             source_miner=candidate.miner_uid,
-            consensus_strength=self._consensus_threshold,
+            consensus_strength=consensus_strength,
             compatibility_verified=True,
             constitutional_hash=candidate.constitutional_hash,
         )
         self._accepted.append(delta)
         self._metrics.record_improvement(1.0)
+        self._issued.pop(candidate.candidate_id, None)
+        self._mesh_results.pop(candidate.candidate_id, None)
         return delta
 
     def ceiling_detected(self) -> bool:
@@ -291,13 +343,12 @@ class PrecedentCascade:
         """Stage 2: Mesh validation (3-peer quorum)."""
         start = time.perf_counter_ns()
         if self._mesh is None:
-            # No mesh available — pass through
             elapsed = time.perf_counter_ns() - start
             return CascadeResult(
                 stage=CascadeStage.MESH_VALIDATION,
-                passed=True,
+                passed=False,
                 latency_ns=elapsed,
-                detail="no mesh configured — pass through",
+                detail="no mesh configured",
             )
 
         try:
@@ -306,14 +357,29 @@ class PrecedentCascade:
                 content=candidate.judgment_text,
                 artifact_id=candidate.candidate_id,
             )
+            self._mesh_results[candidate.candidate_id] = result
             elapsed = time.perf_counter_ns() - start
+            passed = self._valid_mesh_result(candidate, result)
             return CascadeResult(
                 stage=CascadeStage.MESH_VALIDATION,
-                passed=result.accepted,
+                passed=passed,
                 latency_ns=elapsed,
-                detail=f"votes: {result.votes_for}/{result.votes_for + result.votes_against}",
+                detail=(
+                    f"votes: {result.votes_for}/{result.votes_for + result.votes_against}"
+                    if passed
+                    else "invalid or unbound mesh settlement"
+                ),
             )
-        except (KeyError, ValueError) as exc:
+        except (
+            InsufficientPeersError,
+            InvalidVoteSignatureError,
+            KeyError,
+            MeshHaltedError,
+            MeshSnapshotStaleError,
+            SettlementPersistenceError,
+            UnauthorizedVoterError,
+            ValueError,
+        ) as exc:
             elapsed = time.perf_counter_ns() - start
             return CascadeResult(
                 stage=CascadeStage.MESH_VALIDATION,
@@ -323,40 +389,61 @@ class PrecedentCascade:
             )
 
     def _stage_consensus(self, candidate: PrecedentCandidate) -> CascadeResult:
-        """Stage 3: Multi-miner consensus.
-
-        In production, this would re-broadcast the case to N miners and
-        check for semantic agreement. For now, we check if the judgment
-        passes DNA validation from multiple perspectives (strict + non-strict).
-        """
+        """Stage 3: enforce miner count and approval ratio on the mesh result."""
         start = time.perf_counter_ns()
-        # Simulate multi-perspective validation
-        strict_dna = AgentDNA(
-            constitution=self._constitution,
-            agent_id="consensus-strict",
-            strict=True,
-        )
-        nonstrict_dna = AgentDNA(
-            constitution=self._constitution,
-            agent_id="consensus-nonstrict",
-            strict=False,
-        )
-
-        try:
-            strict_dna.validate(candidate.judgment_text)
-            strict_pass = True
-        except ConstitutionalViolationError:
-            strict_pass = False
-
-        nonstrict_result = nonstrict_dna.validate(candidate.judgment_text)
+        result = self._mesh_results.get(candidate.candidate_id)
         elapsed = time.perf_counter_ns() - start
+        if result is None or not self._valid_mesh_result(candidate, result):
+            return CascadeResult(
+                stage=CascadeStage.MULTI_MINER_CONSENSUS,
+                passed=False,
+                latency_ns=elapsed,
+                detail="no valid mesh settlement",
+            )
 
-        passed = strict_pass and nonstrict_result.valid
+        total_votes = result.votes_for + result.votes_against
+        approval_ratio = result.votes_for / total_votes if total_votes else 0.0
+        passed = (
+            total_votes >= self._min_consensus_miners
+            and approval_ratio >= self._consensus_threshold
+        )
         return CascadeResult(
             stage=CascadeStage.MULTI_MINER_CONSENSUS,
             passed=passed,
             latency_ns=elapsed,
-            detail=f"strict={strict_pass}, nonstrict={nonstrict_result.valid}",
+            detail=(
+                f"votes={total_votes}/{self._min_consensus_miners}, "
+                f"approval={approval_ratio:.3f}/{self._consensus_threshold:.3f}"
+            ),
+        )
+
+    def _valid_mesh_result(
+        self,
+        candidate: PrecedentCandidate,
+        result: MeshResult,
+    ) -> bool:
+        """Check settled proof coherence for content and constitution.
+
+        Candidate association is cascade-local state; these checks do not
+        establish signed task or candidate provenance.
+        """
+        proof = result.proof
+        expected_content_hash = hashlib.sha256(
+            candidate.judgment_text.encode("utf-8")
+        ).hexdigest()[:32]
+        total_votes = result.votes_for + result.votes_against
+        return (
+            result.accepted
+            and result.quorum_met
+            and result.settled
+            and proof is not None
+            and proof.verify()
+            and proof.assignment_id == result.assignment_id
+            and proof.content_hash == expected_content_hash
+            and proof.constitutional_hash == self._constitution.hash
+            and result.constitutional_hash == self._constitution.hash
+            and proof.accepted == result.accepted
+            and len(proof.vote_hashes) == total_votes
         )
 
     def _stage_compatibility(self, candidate: PrecedentCandidate) -> CascadeResult:

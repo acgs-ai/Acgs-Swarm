@@ -131,19 +131,14 @@ class MinerAxonServer:
 
     @staticmethod
     def _caller_hotkey(synapse: Any) -> str:
-        """Best-effort Bittensor caller hotkey extraction.
+        """Extract the authenticated Bittensor caller hotkey.
 
-        Real bt.Synapse objects carry caller identity under ``dendrite``; local
-        tests may provide a flat validator_hotkey/request_hotkey field.
+        Only ``dendrite.hotkey`` is populated by the transport authentication
+        path. Request-body and axon fields are attacker-controlled and are not
+        accepted as caller identity.
         """
-
-        for container_name in ("dendrite", "axon"):
-            container = getattr(synapse, container_name, None)
-            hotkey = getattr(container, "hotkey", "")
-            if hotkey:
-                return str(hotkey)
-        for field_name in ("validator_hotkey", "request_hotkey", "hotkey"):
-            hotkey = getattr(synapse, field_name, "")
-            if hotkey:
-                return str(hotkey)
-        return ""
+        dendrite = getattr(synapse, "dendrite", None)
+        hotkey = getattr(dendrite, "hotkey", None)
+        if not isinstance(hotkey, str):
+            return ""
+        return hotkey.strip()

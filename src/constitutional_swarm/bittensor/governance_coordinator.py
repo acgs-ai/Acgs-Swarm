@@ -47,15 +47,15 @@ Example::
     coordinator.finalize_case(case_id, accepted=True, votes={"val-1": "approve", ...})
 
     # Periodic audit cycle
-    audit = coordinator.run_audit_cycle()
+    audit = coordinator.run_audit_cycle(check_fn=revalidate_case)
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from acgs_lite import (
     AuditPolicy,
@@ -96,6 +96,9 @@ class CoordinatorConfig:
         trust_config: Default trust config for new validators.
         default_risk_tier: Risk tier when not specified.
         auto_audit: Run audit cycle automatically after each finalization.
+        audit_check_fn: Higher-fidelity callback used by automatic audits.
+        registered_miners: Explicit emission eligibility allowlist. ``None``
+            means emissions are not configured and computation fails loudly.
     """
 
     case_config: CaseConfig = field(default_factory=CaseConfig)
@@ -109,8 +112,10 @@ class CoordinatorConfig:
     )
     default_risk_tier: str = "medium"
     auto_audit: bool = False
+    audit_check_fn: Callable[[str, str], str] | None = None
     emission_weights: EmissionWeights | None = None
     authenticity_threshold: float = 0.55
+    registered_miners: set[str] | None = None
 
 
 # ── Audit results ────────────────────────────────────────────────────────────
@@ -147,7 +152,24 @@ class GovernanceCoordinator:
 
     def __init__(self, config: CoordinatorConfig | None = None) -> None:
         cfg = config or CoordinatorConfig()
+        if cfg.audit_check_fn is not None and not callable(cfg.audit_check_fn):
+            raise TypeError("audit_check_fn must be callable")
+        if cfg.auto_audit and cfg.audit_check_fn is None:
+            raise ValueError("audit_check_fn is required when auto_audit is enabled")
+        if cfg.registered_miners is not None:
+            if not isinstance(cfg.registered_miners, set):
+                raise TypeError("registered_miners must be a set of miner identifiers or None")
+            if any(
+                not isinstance(miner_id, str) or not miner_id
+                for miner_id in cfg.registered_miners
+            ):
+                raise ValueError("registered_miners must contain non-empty string identifiers")
+            registered_miners: set[str] | None = set(cfg.registered_miners)
+        else:
+            registered_miners = None
         self._config = cfg
+        self._audit_check_fn = cfg.audit_check_fn
+        self._registered_miners = registered_miners
 
         self._case_mgr = CaseManager(cfg.case_config)
         self._pool = ValidatorPool()
@@ -163,6 +185,7 @@ class GovernanceCoordinator:
 
         self._emission_calc = EmissionCalculator(
             weights=cfg.emission_weights or EmissionWeights(),
+            registered_miners=registered_miners,
         )
         self._manifold: GovernanceManifold | None = None
         self._miner_authenticity: dict[str, list[float]] = {}  # rolling window
@@ -439,23 +462,37 @@ class GovernanceCoordinator:
         Returns:
             EmissionCycle with normalized emission weights.
         """
-        if self._manifold is not None:
-            col_sums = self._manifold.column_sums()
-            uid_to_col = {inp.miner_uid: i for i, inp in enumerate(miner_inputs)}
-            updated: list[MinerEmissionInput] = []
-            for inp in miner_inputs:
+        if self._registered_miners is None:
+            raise ValueError(
+                "registered_miners must be configured before computing emissions"
+            )
+
+        seen_uids: set[str] = set()
+        duplicate_uids: set[str] = set()
+        for inp in miner_inputs:
+            if inp.miner_uid in seen_uids:
+                duplicate_uids.add(inp.miner_uid)
+            else:
+                seen_uids.add(inp.miner_uid)
+        if duplicate_uids:
+            duplicates = ", ".join(sorted(duplicate_uids))
+            raise ValueError(f"duplicate miner_uid entries: {duplicates}")
+
+        col_sums = self._manifold.column_sums() if self._manifold is not None else []
+        uid_to_col = {inp.miner_uid: i for i, inp in enumerate(miner_inputs)}
+        updated: list[MinerEmissionInput] = []
+        for inp in miner_inputs:
+            trust = inp.manifold_trust
+            if self._manifold is not None:
                 idx = uid_to_col.get(inp.miner_uid)
                 trust = (
                     col_sums[idx] if idx is not None and idx < len(col_sums) else inp.manifold_trust
                 )
-                window = self._miner_authenticity.get(inp.miner_uid, [])
-                avg_auth = sum(window) / len(window) if window else inp.avg_authenticity
-                from dataclasses import replace as _dc_replace
+            window = self._miner_authenticity.get(inp.miner_uid, [])
+            avg_auth = sum(window) / len(window) if window else inp.avg_authenticity
+            updated.append(replace(inp, manifold_trust=trust, avg_authenticity=avg_auth))
 
-                updated.append(_dc_replace(inp, manifold_trust=trust, avg_authenticity=avg_auth))
-            miner_inputs = updated
-
-        return self._emission_calc.compute(miner_inputs)
+        return self._emission_calc.compute(updated)
 
     def screen_miner_authenticity(
         self,
@@ -483,28 +520,26 @@ class GovernanceCoordinator:
 
     def run_audit_cycle(
         self,
-        check_fn: Any | None = None,
+        check_fn: Callable[[str, str], str] | None = None,
         *,
         _now: datetime | None = None,
     ) -> AuditCycleResult:
         """Run a spot-check audit cycle and apply trust adjustments.
 
-        If no check_fn is provided, uses the default oracle that
-        agrees with the original outcome (no-op audit). In production,
-        this would be a higher-fidelity re-validation function.
+        The per-call callback takes precedence over the callback configured on
+        :class:`CoordinatorConfig`.  Auditing fails closed if neither exists.
 
         Returns:
             AuditCycleResult with all audit data.
         """
-        if check_fn is None:
-            # Default: agree with original (no spot-check disagreements)
-            def _default_oracle(case_id: str, sub_hash: str) -> str:
-                return "approve"
-
-            check_fn = _default_oracle
+        resolved_check_fn = check_fn if check_fn is not None else self._audit_check_fn
+        if resolved_check_fn is None:
+            raise ValueError("check_fn is required to run an audit cycle")
+        if not callable(resolved_check_fn):
+            raise TypeError("check_fn must be callable")
 
         # Run spot-checks
-        results = self._auditor.run_spot_check(check_fn, _now=_now)
+        results = self._auditor.run_spot_check(resolved_check_fn, _now=_now)
 
         # Compute trust adjustments
         adjustments = self._auditor.compute_adjustments(results)

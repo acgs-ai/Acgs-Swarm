@@ -15,9 +15,15 @@ Zero-retraining architecture (as specified in §5 of the Q&A doc):
   • Bayesian weight updates are separate from the retrieval index
 
 Key invariants:
-  • PrecedentRecord is only stored after validator acceptance (quorum met)
-  • A single miner's judgment never becomes precedent alone
+  • PrecedentRecord is stored only when its reported aggregate tally has at
+    least 3 approvals and at least 5 total votes
+  • A miner judgment cannot become precedent unless its caller reports that
+    aggregate 3-of-5 acceptance and the constitutional hash matches
   • Rollback: any precedent can be revoked by marking it inactive
+
+Trust boundary: admission validates caller-supplied counts, acceptance state,
+and constitutional hash. The store does not authenticate voter identities,
+validator signatures, or task origin; those remain producer responsibilities.
 
 Roadmap reference: 08-subnet-implementation-roadmap.md § Phase 3
 Q&A reference:    07-subnet-concept-qa-responses.md § 5
@@ -25,10 +31,13 @@ Q&A reference:    07-subnet-concept-qa-responses.md § 5
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
 import time
 import uuid
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,6 +224,10 @@ class PrecedentStore:
     arrives, call retrieve() to find similar past cases and optionally
     get an auto-resolution if confidence is high enough.
 
+    Admission enforces aggregate count, acceptance-state, and constitutional-
+    hash consistency on caller-supplied records. It does not authenticate voter
+    identities, validator signatures, or task origin.
+
     Usage::
 
         store = PrecedentStore(
@@ -227,7 +240,7 @@ class PrecedentStore:
             case_id="...", task_id="...", miner_uid="miner-01",
             judgment="Privacy takes precedence",
             reasoning="ECHR Article 8 applies",
-            votes_for=2, votes_against=0,
+            votes_for=3, votes_against=2,
             proof_root_hash="abc123",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector={"privacy": 0.9, "transparency": 0.6, ...},
@@ -252,16 +265,34 @@ class PrecedentStore:
         self,
         constitutional_hash: str,
         auto_resolve_threshold: float = 0.85,
-        min_votes_for_precedent: int = 2,
-        min_total_validators: int = 0,
+        min_votes_for_precedent: int = 3,
+        min_total_validators: int = 5,
     ) -> None:
+        if (
+            isinstance(min_votes_for_precedent, bool)
+            or not isinstance(min_votes_for_precedent, int)
+            or min_votes_for_precedent < 3
+        ):
+            raise ValueError("min_votes_for_precedent cannot be lower than 3")
+        if (
+            isinstance(min_total_validators, bool)
+            or not isinstance(min_total_validators, int)
+            or min_total_validators < 5
+        ):
+            raise ValueError("min_total_validators cannot be lower than 5")
+        if min_votes_for_precedent > min_total_validators:
+            raise ValueError("min_votes_for_precedent cannot exceed min_total_validators")
+        if min_votes_for_precedent * 5 < 3 * min_total_validators:
+            raise ValueError(
+                "Configured precedent quorum cannot weaken the 3/5 super-majority ratio"
+            )
         self._constitutional_hash = constitutional_hash
         self._auto_resolve_threshold = auto_resolve_threshold
         self._min_votes = min_votes_for_precedent
         self._min_total_validators = min_total_validators
         self._records: dict[str, PrecedentRecord] = {}
         self._revocation_log: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Core operations
@@ -274,12 +305,14 @@ class PrecedentStore:
     @property
     def size(self) -> int:
         """Number of active precedents."""
-        return sum(1 for r in self._records.values() if r.is_active)
+        with self._lock:
+            return sum(1 for r in self._records.values() if r.is_active)
 
     @property
     def total_stored(self) -> int:
         """Total records including revoked."""
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def add(self, record: PrecedentRecord) -> None:
         """Add a validated precedent record.
@@ -292,6 +325,18 @@ class PrecedentStore:
           • Minimum validator votes
           • Not already present (idempotent add raises ValueError)
         """
+        self._admit(record, exact_repeat_ok=False)
+
+    def admit(self, record: PrecedentRecord) -> PrecedentRecord:
+        """Admit *record*, treating an exact repeated observation as idempotent."""
+        return self._admit(record, exact_repeat_ok=True)
+
+    def _admit(
+        self,
+        record: PrecedentRecord,
+        *,
+        exact_repeat_ok: bool,
+    ) -> PrecedentRecord:
         if record.constitutional_hash != self._constitutional_hash:
             raise ValueError(
                 f"Constitutional hash mismatch: "
@@ -303,20 +348,100 @@ class PrecedentStore:
                 f"Precedent {record.precedent_id} was not accepted by validators. "
                 "Only accepted judgments may be stored."
             )
+        if not record.is_active:
+            raise ValueError(f"Precedent {record.precedent_id} is inactive or revoked")
+        for name, value in (
+            ("votes_for", record.votes_for),
+            ("votes_against", record.votes_against),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} vote count must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} vote count cannot be negative")
+
         total_votes = record.votes_for + record.votes_against
+        if record.votes_for < self._min_votes:
+            raise ValueError(
+                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
+            )
         if total_votes < self._min_total_validators:
             raise ValueError(
                 f"Insufficient total validators: got={total_votes} "
                 f"required={self._min_total_validators}"
             )
-        if record.votes_for < self._min_votes:
+        if record.votes_for <= record.votes_against:
             raise ValueError(
-                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
+                "Precedent admission requires a strict majority: more validator votes "
+                "for than against"
             )
+        if record.votes_for * self._min_total_validators < self._min_votes * total_votes:
+            raise ValueError(
+                "Insufficient validator super-majority: "
+                f"got={record.votes_for}/{total_votes} "
+                f"required={self._min_votes}/{self._min_total_validators}"
+            )
+        canonical = dataclasses.replace(
+            record,
+            validator_grade=record.votes_for / total_votes,
+            impact_vector=dict(record.impact_vector),
+            ambiguous_dimensions=tuple(record.ambiguous_dimensions),
+        )
         with self._lock:
-            if record.precedent_id in self._records:
+            existing = self._records.get(record.precedent_id)
+            if existing is not None:
+                if exact_repeat_ok and existing == canonical:
+                    return self._copy_record(existing)
                 raise ValueError(f"Precedent {record.precedent_id} already stored.")
-            self._records[record.precedent_id] = record
+            if any(stored.case_id == canonical.case_id for stored in self._records.values()):
+                raise ValueError(
+                    f"Precedent source case already stored: case_id={canonical.case_id!r}"
+                )
+            if any(stored.task_id == canonical.task_id for stored in self._records.values()):
+                raise ValueError(
+                    f"Precedent source task already stored: task_id={canonical.task_id!r}"
+                )
+            self._records[canonical.precedent_id] = canonical
+            return self._copy_record(canonical)
+
+    def active_records(self) -> tuple[PrecedentRecord, ...]:
+        """Return defensive snapshots of all currently active precedents."""
+        with self._lock:
+            return tuple(self._copy_record(r) for r in self._records.values() if r.is_active)
+
+    def active_records_by_id(self, precedent_ids: list[str]) -> tuple[PrecedentRecord, ...]:
+        """Resolve source IDs to active snapshots, failing closed on stale sources."""
+        with self._lock:
+            return self._active_records_by_id_locked(precedent_ids)
+
+    def require_canonical_records(
+        self,
+        records: Sequence[PrecedentRecord],
+    ) -> tuple[PrecedentRecord, ...]:
+        """Resolve records already admitted to this store and reject altered copies."""
+        precedent_ids = [record.precedent_id for record in records]
+        if len(set(precedent_ids)) != len(precedent_ids):
+            raise ValueError("Duplicate precedent source IDs are not canonical input")
+        with self._lock:
+            canonical = self._active_records_by_id_locked(precedent_ids)
+            for supplied, admitted in zip(records, canonical, strict=True):
+                if supplied != admitted:
+                    raise ValueError(
+                        f"Precedent source {supplied.precedent_id!r} does not match its "
+                        "canonical admitted record"
+                    )
+            return canonical
+
+    @contextmanager
+    def guard_active_sources(
+        self,
+        precedent_ids: Sequence[str],
+    ) -> Iterator[tuple[PrecedentRecord, ...]]:
+        """Hold the store lock while a consumer validates and uses active sources."""
+        self._lock.acquire()
+        try:
+            yield self._active_records_by_id_locked(precedent_ids)
+        finally:
+            self._lock.release()
 
     def retrieve(
         self,
@@ -344,11 +469,13 @@ class PrecedentStore:
         Returns:
             RetrievalResult with ranked matches and optional auto-resolution
         """
-        candidates = [
-            r
-            for r in self._records.values()
-            if r.is_active and (escalation_type is None or r.escalation_type == escalation_type)
-        ]
+        with self._lock:
+            candidates = [
+                self._copy_record(r)
+                for r in self._records.values()
+                if r.is_active
+                and (escalation_type is None or r.escalation_type == escalation_type)
+            ]
 
         # Score all candidates
         scored = [(r, _cosine_similarity(impact_vector, r.impact_vector)) for r in candidates]
@@ -396,8 +523,6 @@ class PrecedentStore:
 
             record = self._records[precedent_id]
             # Replace with an inactive copy (PrecedentRecord is frozen)
-            import dataclasses
-
             inactive = dataclasses.replace(record, is_active=False)
             self._records[precedent_id] = inactive
 
@@ -416,18 +541,20 @@ class PrecedentStore:
     def escalation_distribution(self) -> dict[str, int]:
         """Count active precedents by escalation type."""
         counts: dict[str, int] = {}
-        for r in self._records.values():
-            if r.is_active:
-                key = r.escalation_type.value
-                counts[key] = counts.get(key, 0) + 1
+        with self._lock:
+            for r in self._records.values():
+                if r.is_active:
+                    key = r.escalation_type.value
+                    counts[key] = counts.get(key, 0) + 1
         return counts
 
     def miner_contribution_counts(self) -> dict[str, int]:
         """Count active precedents contributed by each miner."""
         counts: dict[str, int] = {}
-        for r in self._records.values():
-            if r.is_active:
-                counts[r.miner_uid] = counts.get(r.miner_uid, 0) + 1
+        with self._lock:
+            for r in self._records.values():
+                if r.is_active:
+                    counts[r.miner_uid] = counts.get(r.miner_uid, 0) + 1
         return counts
 
     def escalation_rate_projection(
@@ -449,8 +576,17 @@ class PrecedentStore:
         return max(0.005, projected)  # floor at 0.5% — some cases always novel
 
     def summary(self) -> dict[str, Any]:
-        active = self.size
-        total = self.total_stored
+        with self._lock:
+            records = tuple(self._records.values())
+            active = sum(1 for record in records if record.is_active)
+            total = len(records)
+            distribution: dict[str, int] = {}
+            for record in records:
+                if record.is_active:
+                    key = record.escalation_type.value
+                    distribution[key] = distribution.get(key, 0) + 1
+            revocation_entries = len(self._revocation_log)
+        projected = max(0.005, 0.03 - ((active / 1000.0) * 0.005))
         return {
             "constitutional_hash": self._constitutional_hash,
             "active_precedents": active,
@@ -458,7 +594,25 @@ class PrecedentStore:
             "revoked": total - active,
             "auto_resolve_threshold": self._auto_resolve_threshold,
             "min_votes_required": self._min_votes,
-            "escalation_distribution": self.escalation_distribution(),
-            "revocation_log_entries": len(self._revocation_log),
-            "projected_escalation_rate": self.escalation_rate_projection(),
+            "escalation_distribution": distribution,
+            "revocation_log_entries": revocation_entries,
+            "projected_escalation_rate": projected,
         }
+
+    @staticmethod
+    def _copy_record(record: PrecedentRecord) -> PrecedentRecord:
+        return dataclasses.replace(record, impact_vector=dict(record.impact_vector))
+
+    def _active_records_by_id_locked(
+        self,
+        precedent_ids: Sequence[str],
+    ) -> tuple[PrecedentRecord, ...]:
+        records: list[PrecedentRecord] = []
+        for precedent_id in precedent_ids:
+            record = self._records.get(precedent_id)
+            if record is None or not record.is_active:
+                raise ValueError(
+                    f"Precedent source {precedent_id!r} is not active or was revoked"
+                )
+            records.append(self._copy_record(record))
+        return tuple(records)

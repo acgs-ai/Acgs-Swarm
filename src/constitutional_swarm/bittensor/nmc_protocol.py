@@ -21,7 +21,7 @@ pattern solves this via a commit-reveal scheme:
 Anti-Sybil Guarantees:
   • Commitment phase: miners can't see others' work → can't copy
   • Sybil detection: identical judgment texts → SybilFlag (automatic)
-  • Consensus excludes flagged miners (configurable)
+  • Consensus tallies each committed identity once; flags remain telemetry
   • The chain of commitments + reveals is a tamper-evident audit log
 
 Pluggability:
@@ -36,12 +36,49 @@ Q&A §3:  docs/strategy/07-subnet-concept-qa-responses.md
 from __future__ import annotations
 
 import hashlib
+import hmac
 import time
 import uuid
+import warnings
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+
+_COMMITMENT_DOMAIN = b"constitutional-swarm:nmc-commitment:v1\x00"
+
+
+def compute_commitment_hash(judgment_text: str, nonce: str) -> str:
+    """Return the canonical domain-separated commitment for an NMC reveal.
+
+    Both UTF-8 fields are length-prefixed so distinct ``(judgment, nonce)``
+    pairs cannot serialize to the same byte sequence through delimiter
+    ambiguity.
+    """
+    payload = bytearray(_COMMITMENT_DOMAIN)
+    for value in (judgment_text, nonce):
+        encoded = value.encode("utf-8")
+        payload.extend(len(encoded).to_bytes(8, "big"))
+        payload.extend(encoded)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _deterministic_winner(scores: Mapping[str, int | float]) -> str:
+    """Return the lexically first judgment among those with the top score."""
+    top_score = max(scores.values())
+    return min(judgment for judgment, score in scores.items() if score == top_score)
+
+
+def _warn_deprecated_exclude_sybils(exclude_sybils: bool | None) -> None:
+    if exclude_sybils is not None:
+        warnings.warn(
+            "exclude_sybils is deprecated; duplicate-content flags are "
+            "telemetry and never remove independently identified miners",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -71,12 +108,12 @@ class SynthesisMethod(Enum):
 class NMCCommitment:
     """A miner's blind commitment to a judgment.
 
-    commitment_hash = SHA-256(judgment_text + ":" + nonce)
+    Use :func:`compute_commitment_hash` to construct ``commitment_hash``.
     """
 
     commitment_id: str
     miner_uid: str
-    commitment_hash: str  # SHA-256(judgment + ":" + nonce)
+    commitment_hash: str
     submitted_at: float
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,7 +129,7 @@ class NMCCommitment:
 class NMCReveal:
     """A miner's reveal of their committed judgment.
 
-    The coordinator verifies: SHA-256(judgment_text + ":" + nonce) == commitment_hash
+    The coordinator verifies the canonical commitment encoding.
     """
 
     reveal_id: str
@@ -104,9 +141,8 @@ class NMCReveal:
 
     def verify_commitment(self, commitment_hash: str) -> bool:
         """Verify this reveal matches the original commitment."""
-        payload = f"{self.judgment_text}:{self.nonce}"
-        expected = hashlib.sha256(payload.encode()).hexdigest()
-        return expected == commitment_hash
+        expected = compute_commitment_hash(self.judgment_text, self.nonce)
+        return hmac.compare_digest(expected, commitment_hash)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,7 +193,8 @@ class ConsensusJudgment:
 
     confidence: ratio of miners that agreed with the winning judgment.
     sybil_flags: miners suspected of Sybil behavior in this session.
-    excluded_miners: miners excluded from consensus (Sybil flagged).
+    excluded_miners: retained for wire compatibility; duplicate-content flags
+        are telemetry and do not remove independently identified miners.
     """
 
     session_id: str
@@ -167,7 +204,7 @@ class ConsensusJudgment:
     method: SynthesisMethod
     committed_count: int  # how many miners committed
     reveal_count: int  # how many miners revealed
-    valid_reveal_count: int  # after excluding Sybils
+    valid_reveal_count: int  # unique committed identities included in tally
     sybil_flags: tuple[SybilFlag, ...]
     excluded_miners: tuple[str, ...]
     synthesized_at: float
@@ -216,7 +253,7 @@ class NMCSession:
 
         # Phase 1: commit (miners do this independently)
         nonce = uuid.uuid4().hex
-        commitment_hash = hashlib.sha256(f"{judgment}:{nonce}".encode()).hexdigest()
+        commitment_hash = compute_commitment_hash(judgment, nonce)
         session.accept_commitment("miner-01", commitment_hash)
 
         # Phase 2: reveal (after all commit or deadline)
@@ -226,6 +263,9 @@ class NMCSession:
         # Phase 3: synthesize
         consensus = session.synthesize()
         print(consensus.judgment_text, consensus.confidence)
+
+    ``exclude_sybils`` is deprecated. Duplicate-content detection is telemetry;
+    every independently committed miner identity remains in the tally.
     """
 
     def __init__(
@@ -234,7 +274,7 @@ class NMCSession:
         required_miners: set[str] | None = None,
         min_reveals: int = 2,
         deadline_seconds: float = 300.0,
-        exclude_sybils: bool = True,
+        exclude_sybils: bool | None = None,
         miner_weights: dict[str, float] | None = None,
         trust_supplied_weights: bool = False,
     ) -> None:
@@ -243,7 +283,7 @@ class NMCSession:
         self._required = set(required_miners or [])
         self._min_reveals = min_reveals
         self._deadline_at = time.time() + deadline_seconds
-        self._exclude_sybils = exclude_sybils
+        _warn_deprecated_exclude_sybils(exclude_sybils)
         self._miner_weights = dict(miner_weights or {})
         self._trust_supplied_weights = trust_supplied_weights
 
@@ -397,10 +437,13 @@ class NMCSession:
     ) -> ConsensusJudgment:
         """Synthesize a consensus judgment from all reveals.
 
+        Raises TypeError if ``method`` is not a :class:`SynthesisMethod`.
         Raises ValueError if:
           - session not in REVEALING state
           - fewer than min_reveals valid reveals
         """
+        if not isinstance(method, SynthesisMethod):
+            raise TypeError("method must be a SynthesisMethod")
         if self._state not in (NMCSessionState.REVEALING, NMCSessionState.SYNTHESIZED):
             raise ValueError(f"Cannot synthesize: session is {self._state.value}")
         if require_min_reveals and len(self._reveals) < self._min_reveals:
@@ -409,17 +452,13 @@ class NMCSession:
 
         reveals = list(self._reveals.values())
         sybil_flags = self._detect_sybils(reveals)
-        sybil_uids = {f.flagged_miner for f in sybil_flags}
-
-        if self._exclude_sybils:
-            valid_reveals = [r for r in reveals if r.miner_uid not in sybil_uids]
-        else:
-            valid_reveals = reveals
-
-        if not valid_reveals:
-            # All miners flagged — use all reveals and note low confidence
-            valid_reveals = reveals
-            sybil_uids = set()
+        # Each entry in ``_reveals`` already represents one unique committed
+        # miner identity. Duplicate content is useful collusion telemetry, but
+        # removing agreeing identities here makes the result order-dependent
+        # and can invert an honest majority. Keep ``exclude_sybils`` as an API
+        # deprecated compatibility argument while treating flags as flag-only
+        # evidence.
+        valid_reveals = reveals
 
         # Apply synthesis strategy
         judgment_text, confidence = self._synthesize(valid_reveals, method)
@@ -434,7 +473,7 @@ class NMCSession:
             reveal_count=len(reveals),
             valid_reveal_count=len(valid_reveals),
             sybil_flags=tuple(sybil_flags),
-            excluded_miners=tuple(sorted(sybil_uids)),
+            excluded_miners=(),
             synthesized_at=time.time(),
         )
         self._state = NMCSessionState.SYNTHESIZED
@@ -457,16 +496,16 @@ class NMCSession:
         """
         if method == SynthesisMethod.MAJORITY_VOTE:
             counts = Counter(r.judgment_text for r in reveals)
-            winner, vote_count = counts.most_common(1)[0]
-            return winner, vote_count / len(reveals)
+            winner = _deterministic_winner(counts)
+            return winner, counts[winner] / len(reveals)
 
         if method == SynthesisMethod.WEIGHTED_VOTE:
             weighted: dict[str, float] = {}
             total_weight = 0.0
-            for r in reveals:
+            for r in sorted(reveals, key=lambda reveal: (reveal.judgment_text, reveal.miner_uid)):
                 weighted[r.judgment_text] = weighted.get(r.judgment_text, 0.0) + r.weight
                 total_weight += r.weight
-            winner = max(weighted, key=lambda k: weighted[k])
+            winner = _deterministic_winner(weighted)
             if total_weight == 0:
                 return winner, 0.0
             return winner, weighted[winner] / total_weight
@@ -477,13 +516,10 @@ class NMCSession:
                 return texts.pop(), 1.0
             # No consensus — return most common with low confidence
             counts = Counter(r.judgment_text for r in reveals)
-            winner, _ = counts.most_common(1)[0]
+            winner = _deterministic_winner(counts)
             return winner, 0.0
 
-        # Fallback: majority
-        counts = Counter(r.judgment_text for r in reveals)
-        winner, vote_count = counts.most_common(1)[0]
-        return winner, vote_count / len(reveals)
+        raise AssertionError(f"Unhandled synthesis method: {method!r}")
 
     def _detect_sybils(self, reveals: list[NMCReveal]) -> list[SybilFlag]:
         """Flag miners with exactly duplicate judgment texts.
@@ -570,17 +606,19 @@ class NMCCoordinator:
 
         # Log outcome
         outcome = coordinator.get_session_outcome("ESC-2026-042")
+
+    ``exclude_sybils`` is deprecated and has no effect on created sessions.
     """
 
     def __init__(
         self,
         default_min_reveals: int = 2,
         default_deadline_seconds: float = 300.0,
-        exclude_sybils: bool = True,
+        exclude_sybils: bool | None = None,
     ) -> None:
+        _warn_deprecated_exclude_sybils(exclude_sybils)
         self._default_min = default_min_reveals
         self._default_deadline = default_deadline_seconds
-        self._exclude_sybils = exclude_sybils
         self._sessions: dict[str, NMCSession] = {}  # case_id → session
 
     def create_session(
@@ -601,7 +639,6 @@ class NMCCoordinator:
             required_miners=required_miners,
             min_reveals=min_reveals or self._default_min,
             deadline_seconds=deadline_seconds or self._default_deadline,
-            exclude_sybils=self._exclude_sybils,
         )
         self._sessions[case_id] = session
         return session
