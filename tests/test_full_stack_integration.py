@@ -159,8 +159,8 @@ class TestFullStackIntegration:
         validator = ConstitutionalValidator(
             config=ValidatorConfig(
                 constitution_path=constitution_path,
-                peers_per_validation=3,
-                quorum=2,
+                peers_per_validation=5,
+                quorum=5,
                 use_manifold=True,
             ),
         )
@@ -231,6 +231,7 @@ class TestFullStackIntegration:
         validation = validator.validate(judgment)
         assert validation.accepted is True
         assert validation.quorum_met is True
+        assert validation.votes_for + validation.votes_against == 5
         assert validation.proof_root_hash  # Merkle proof exists
 
         # ── 8. SN Owner records precedent ──

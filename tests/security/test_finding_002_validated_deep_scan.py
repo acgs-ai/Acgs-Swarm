@@ -28,7 +28,11 @@ from constitutional_swarm.bittensor.constitution_sync import (
     ConstitutionReceiver,
     ConstitutionSyncMessage,
 )
-from constitutional_swarm.bittensor.nmc_protocol import NMCSession, SynthesisMethod
+from constitutional_swarm.bittensor.nmc_protocol import (
+    NMCSession,
+    SynthesisMethod,
+    compute_commitment_hash,
+)
 from constitutional_swarm.gossip_protocol import GossipServer
 from constitutional_swarm.governed_handoff import DENY, PolicyEngine
 from constitutional_swarm.merkle_crdt import MerkleCRDT
@@ -177,7 +181,7 @@ def test_governed_handoff_denies_interpreter_aliases_even_if_allowlisted(
 
 
 def _commitment(judgment: str, nonce: str) -> str:
-    return hashlib.sha256(f"{judgment}:{nonce}".encode()).hexdigest()
+    return compute_commitment_hash(judgment, nonce)
 
 
 def test_nmc_rejects_commitments_from_miners_outside_required_set() -> None:

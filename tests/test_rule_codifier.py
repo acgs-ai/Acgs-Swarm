@@ -49,12 +49,12 @@ def _make_rec(
 ) -> PrecedentRecord:
     return PrecedentRecord.create(
         case_id=case_id,
-        task_id="t1",
+        task_id=f"task-{case_id}",
         miner_uid="miner-01",
         judgment=judgment,
         reasoning="rationale",
-        votes_for=3,
-        votes_against=0,
+        votes_for=9,
+        votes_against=1,
         proof_root_hash="abc",
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=vector or _PRIVACY_VEC,
@@ -77,6 +77,32 @@ def _make_cluster(
         validator_agreement=agreement,
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT.value,
     )
+
+
+def _admit_records(
+    codifier: RuleCodifier,
+    records: list[PrecedentRecord],
+) -> list[PrecedentRecord]:
+    for record in records:
+        codifier.precedent_store.add(record)
+    return list(
+        codifier.precedent_store.active_records_by_id(
+            [record.precedent_id for record in records]
+        )
+    )
+
+
+def _canonical_cluster(
+    codifier: RuleCodifier,
+    *,
+    size: int = 5,
+    vector: dict | None = None,
+    prefix: str = "source",
+) -> PrecedentCluster:
+    records = [_make_rec(f"{prefix}-{i}", vector=vector) for i in range(size)]
+    source_ids = {record.precedent_id for record in records}
+    clusters = codifier.find_clusters(_admit_records(codifier, records))
+    return next(cluster for cluster in clusters if source_ids.intersection(cluster.precedent_ids))
 
 
 SIMPLE_CONSTITUTION = """\
@@ -154,7 +180,7 @@ class TestClustering:
 
     def test_find_clusters_single(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.8)
-        recs = [_make_rec(f"c{i}") for i in range(3)]
+        recs = _admit_records(codifier, [_make_rec(f"c{i}") for i in range(3)])
         clusters = codifier.find_clusters(recs)
         assert len(clusters) >= 1
 
@@ -163,24 +189,22 @@ class TestClustering:
         # 5 privacy-heavy, 5 security-heavy
         priv_recs = [_make_rec(f"priv{i}", vector=_PRIVACY_VEC) for i in range(5)]
         sec_recs = [_make_rec(f"sec{i}", vector=_SECURITY_VEC) for i in range(5)]
-        clusters = codifier.find_clusters(priv_recs + sec_recs)
+        clusters = codifier.find_clusters(_admit_records(codifier, priv_recs + sec_recs))
         # Should form 2 clusters (privacy group + security group)
         assert len(clusters) >= 1
 
-    def test_revoked_excluded_from_clustering(self):
+    def test_revoked_raw_input_rejected(self):
         codifier = RuleCodifier(CONST_HASH)
         import dataclasses
 
         r = _make_rec("c1")
         revoked = dataclasses.replace(r, is_active=False)
-        clusters = codifier.find_clusters([revoked])
-        # Revoked precedent not included in any cluster
-        for cl in clusters:
-            assert "c1" not in [pid for pid in cl.precedent_ids]
+        with pytest.raises(ValueError, match="inactive|revoked"):
+            codifier.find_clusters([revoked])
 
     def test_cluster_has_dominant_dimensions(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.7)
-        recs = [_make_rec(f"c{i}") for i in range(5)]
+        recs = _admit_records(codifier, [_make_rec(f"c{i}") for i in range(5)])
         clusters = codifier.find_clusters(recs)
         for cl in clusters:
             # dominant_dimensions should reflect high-score dims
@@ -188,7 +212,9 @@ class TestClustering:
 
     def test_cluster_validator_agreement(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.7)
-        recs = [_make_rec(f"c{i}", grade=0.90) for i in range(5)]
+        recs = _admit_records(
+            codifier, [_make_rec(f"c{i}", grade=0.90) for i in range(5)]
+        )
         clusters = codifier.find_clusters(recs)
         for cl in clusters:
             assert 0.0 <= cl.validator_agreement <= 1.0
@@ -202,37 +228,37 @@ class TestClustering:
 class TestProposeRules:
     def test_below_min_size_not_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=10, min_validator_agreement=0.5)
-        small = _make_cluster(size=5)
+        small = _canonical_cluster(codifier, size=5)
         candidates = codifier.propose_rules([small])
         assert candidates == []
 
     def test_below_min_agreement_not_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.95)
-        low_agreement = _make_cluster(size=10, agreement=0.80)
+        low_agreement = _canonical_cluster(codifier, size=10)
         candidates = codifier.propose_rules([low_agreement])
         assert candidates == []
 
     def test_qualifying_cluster_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.90)
-        good = _make_cluster(size=10, agreement=0.93)
+        good = _canonical_cluster(codifier, size=10)
         candidates = codifier.propose_rules([good])
         assert len(candidates) == 1
 
     def test_candidate_is_pending(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.9)
-        candidates = codifier.propose_rules([_make_cluster(size=10, agreement=0.93)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier, size=10)])
         assert candidates[0].status == RuleCandidateStatus.PENDING
 
     def test_rule_id_has_prefix(self):
         codifier = RuleCodifier(
             CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5, rule_id_prefix="TEST"
         )
-        candidates = codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier)])
         assert candidates[0].rule_id.startswith("TEST-")
 
     def test_to_yaml_block_format(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        candidates = codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier)])
         block = candidates[0].to_yaml_block()
         assert "id:" in block
         assert "text:" in block
@@ -250,7 +276,7 @@ class TestProposeRules:
 class TestApprovalWorkflow:
     def _setup(self) -> tuple[RuleCodifier, RuleCandidate]:
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        cluster = _make_cluster(size=5, agreement=0.91)
+        cluster = _canonical_cluster(codifier)
         [candidate] = codifier.propose_rules([cluster])
         return codifier, candidate
 
@@ -306,18 +332,22 @@ class TestApprovalWorkflow:
 
     def test_multiple_rules_sequential_hashes(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        c1 = codifier.propose_rules([_make_cluster(size=5, agreement=0.91, dims=["privacy"])])[0]
-        c2 = codifier.propose_rules([_make_cluster(size=5, agreement=0.93, dims=["security"])])[0]
+        privacy = _canonical_cluster(codifier, prefix="privacy")
+        security = _canonical_cluster(
+            codifier, vector=_SECURITY_VEC, prefix="security"
+        )
+        c1 = codifier.propose_rules([privacy])[0]
+        c2 = codifier.propose_rules([security])[0]
 
         codifier.approve(c1.candidate_id)
         _, yaml1 = codifier.activate(c1.candidate_id, SIMPLE_CONSTITUTION)
         hash_after_1 = codifier.constitutional_hash
 
         codifier.approve(c2.candidate_id)
-        _, _yaml2 = codifier.activate(c2.candidate_id, yaml1)
+        codifier.activate(c2.candidate_id, yaml1)
         hash_after_2 = codifier.constitutional_hash
 
-        assert hash_after_1 != hash_after_2  # each activation produces new hash
+        assert hash_after_1 != hash_after_2
 
     def test_nonexistent_candidate_raises(self):
         codifier = RuleCodifier(CONST_HASH)
@@ -335,8 +365,10 @@ class TestApprovalWorkflow:
 
     def test_pending_candidates_property(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
-        codifier.propose_rules([_make_cluster(size=5, agreement=0.92)])
+        first = _canonical_cluster(codifier, prefix="first")
+        second = _canonical_cluster(codifier, vector=_SECURITY_VEC, prefix="second")
+        codifier.propose_rules([first])
+        codifier.propose_rules([second])
         assert len(codifier.pending_candidates) == 2
 
 
@@ -387,12 +419,12 @@ class TestRuleCodificationE2E:
     ) -> PrecedentRecord:
         return PrecedentRecord.create(
             case_id=case_id,
-            task_id="t-e2e",
+            task_id=f"task-{case_id}",
             miner_uid="miner-e2e",
             judgment=judgment,
             reasoning="e2e rationale",
-            votes_for=3,
-            votes_against=0,
+            votes_for=9,
+            votes_against=1,
             proof_root_hash="e2ehash",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=vector,
@@ -422,6 +454,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
 
         # Step 1: Find clusters
         clusters = codifier.find_clusters(precedents, domain="e2e-test")
@@ -479,6 +512,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
 
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
@@ -510,6 +544,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) >= 1
@@ -527,6 +562,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) >= 1

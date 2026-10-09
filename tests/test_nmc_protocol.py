@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import uuid
 
 import pytest
@@ -12,6 +11,7 @@ from constitutional_swarm.bittensor.nmc_protocol import (
     NMCSession,
     NMCSessionState,
     SynthesisMethod,
+    compute_commitment_hash,
 )
 
 # ---------------------------------------------------------------------------
@@ -20,7 +20,7 @@ from constitutional_swarm.bittensor.nmc_protocol import (
 
 
 def _commitment(judgment: str, nonce: str) -> str:
-    return hashlib.sha256(f"{judgment}:{nonce}".encode()).hexdigest()
+    return compute_commitment_hash(judgment, nonce)
 
 
 def _make_session(
@@ -279,8 +279,7 @@ class TestSybilDetection:
         assert flag.is_exact_duplicate
         assert flag.confidence == pytest.approx(1.0)
 
-    def test_sybil_excluded_from_consensus(self):
-        # m2 copies m1's judgment → only m1 + m3 contribute
+    def test_duplicate_content_is_flagged_without_excluding_identity(self):
         session, _ = _three_miner_session(
             j1="allow",
             j2="allow",
@@ -288,11 +287,11 @@ class TestSybilDetection:
             exclude_sybils=True,
         )
         consensus = session.synthesize()
-        # One pair is duplicate: either m1 or m2 is excluded
-        # After exclusion: remaining miners vote allow + deny
-        assert consensus.valid_reveal_count == 2  # one excluded
+        assert consensus.judgment_text == "allow"
+        assert consensus.confidence == pytest.approx(2 / 3)
+        assert consensus.valid_reveal_count == 3
 
-    def test_excluded_miners_recorded(self):
+    def test_duplicate_content_does_not_record_excluded_miners(self):
         session, _ = _three_miner_session(
             j1="allow",
             j2="allow",
@@ -300,7 +299,7 @@ class TestSybilDetection:
             exclude_sybils=True,
         )
         consensus = session.synthesize()
-        assert len(consensus.excluded_miners) == 1
+        assert consensus.excluded_miners == ()
 
     def test_all_miners_identical_no_exclusion(self):
         """If all miners submit the same judgment, none are excluded."""
@@ -311,8 +310,8 @@ class TestSybilDetection:
             exclude_sybils=True,
         )
         consensus = session.synthesize()
-        # All duplicates → NMC falls back to including all (no valid subset)
         assert consensus.judgment_text == "allow"
+        assert consensus.valid_reveal_count == 3
 
     def test_sybil_flag_immutable(self):
         session, _ = _three_miner_session(j1="X", j2="X", j3="Y", exclude_sybils=False)

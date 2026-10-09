@@ -10,9 +10,11 @@ Demonstrates the full auto-constitution pipeline with real components only:
 Why the precedent-backed codifier exists: post-#118 ``CAMECoordinator`` is
 deliberately precedent-agnostic — at ceiling it passes the codifier an empty
 ``live_approaches`` list (feeding raw grid approaches into rule proposal would
-bypass validator consensus), so a plain ``RuleCodifier`` receives nothing and
-can never propose a rule. ``PrecedentBackedCodifier`` closes the loop by owning
-its own explicit precedent stream — escalated, validator-approved cases. Run:
+bypass precedent admission), so a plain ``RuleCodifier`` receives nothing and
+can never propose a rule. ``PrecedentBackedCodifier`` closes the loop by
+observing an explicit store-backed stream of escalated cases. The synthetic
+records carry aggregate 3-of-5 admission evidence; they do not model signed
+validator identities or cryptographic task provenance. Run:
 
     python examples/mac_acgs_autonomous_research.py
 """
@@ -30,7 +32,7 @@ from constitutional_swarm.bittensor.map_elites import (
     MinerApproach,
 )
 from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
-from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
+from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
 from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
 
@@ -57,7 +59,7 @@ def synth_approaches(rng: random.Random, cycle: int, n: int = 24) -> list[MinerA
 
 
 def synth_precedent(rng: random.Random, idx: int) -> PrecedentRecord:
-    """An escalated safety/security case with high validator consensus."""
+    """An escalated safety/security case with synthetic aggregate acceptance."""
     return PrecedentRecord.create(
         case_id=f"case-{idx}",
         task_id=f"task-{idx}",
@@ -84,13 +86,16 @@ def synth_precedent(rng: random.Random, idx: int) -> PrecedentRecord:
 
 def main() -> int:
     rng = random.Random(42)
-    codifier = PrecedentBackedCodifier()
+    store = PrecedentStore(CONSTITUTIONAL_HASH)
+    codifier = PrecedentBackedCodifier(precedent_store=store)
     loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
     loop.add_external_challenger("human-reviewer-1")
 
     for cycle in range(1, 9):
-        codifier.observe(synth_precedent(rng, 2 * cycle))
-        codifier.observe(synth_precedent(rng, 2 * cycle + 1))
+        first_record = synth_precedent(rng, 2 * cycle)
+        second_record = synth_precedent(rng, 2 * cycle + 1)
+        codifier.observe(store.admit(first_record))
+        codifier.observe(store.admit(second_record))
         result = loop.run_cycle(synth_approaches(rng, cycle))
         print(
             json.dumps(

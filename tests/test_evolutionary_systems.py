@@ -11,6 +11,7 @@ import random
 import tempfile
 
 import pytest
+from constitutional_swarm import ConstitutionalMesh
 from constitutional_swarm.bittensor.cascade import (
     CascadeStage,
     ConstitutionDelta,
@@ -224,6 +225,24 @@ class TestMinerQualityGrid:
 # ===========================================================================
 
 
+def _cascade_with_signed_mesh(constitution):
+    mesh = ConstitutionalMesh(
+        constitution,
+        peers_per_validation=3,
+        quorum=3,
+        seed=42,
+    )
+    mesh.register_local_signer("miner-01")
+    for index in range(3):
+        mesh.register_local_signer(f"validator-{index}")
+    return PrecedentCascade(
+        constitution,
+        mesh,
+        min_consensus_miners=3,
+        consensus_threshold=2 / 3,
+    )
+
+
 class TestPrecedentCascade:
     """Four-stage cascade for constitution evolution."""
 
@@ -231,7 +250,7 @@ class TestPrecedentCascade:
         from acgs_lite import Constitution
 
         constitution = Constitution.from_yaml(constitution_path)
-        cascade = PrecedentCascade(constitution)
+        cascade = _cascade_with_signed_mesh(constitution)
 
         candidate = cascade.run_full_cascade(
             judgment="Privacy should be balanced with transparency in governance reporting",
@@ -261,7 +280,7 @@ class TestPrecedentCascade:
         from acgs_lite import Constitution
 
         constitution = Constitution.from_yaml(constitution_path)
-        cascade = PrecedentCascade(constitution)
+        cascade = _cascade_with_signed_mesh(constitution)
 
         candidate = cascade.run_full_cascade(
             judgment="Fairness requires considering all stakeholder perspectives",
@@ -274,7 +293,6 @@ class TestPrecedentCascade:
         assert isinstance(delta, ConstitutionDelta)
         assert delta.domain == "fairness"
         assert len(cascade.accepted_deltas) == 1
-
     def test_reject_does_not_create_delta(self, constitution_path):
         from acgs_lite import Constitution
 

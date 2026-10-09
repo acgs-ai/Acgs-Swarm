@@ -88,8 +88,8 @@ def validator(constitution_path):
     v = ConstitutionalValidator(
         config=ValidatorConfig(
             constitution_path=constitution_path,
-            peers_per_validation=3,
-            quorum=2,
+            peers_per_validation=5,
+            quorum=3,
             use_manifold=True,
         ),
     )
@@ -97,6 +97,8 @@ def validator(constitution_path):
     v.register_miner("validator-peer-1")
     v.register_miner("validator-peer-2")
     v.register_miner("validator-peer-3")
+    v.register_miner("validator-peer-4")
+    v.register_miner("validator-peer-5")
     return v
 
 
@@ -344,8 +346,8 @@ class TestEndToEnd:
         validator = ConstitutionalValidator(
             config=ValidatorConfig(
                 constitution_path=constitution_path,
-                peers_per_validation=3,
-                quorum=2,
+                peers_per_validation=5,
+                quorum=5,
                 use_manifold=True,
             ),
         )
@@ -354,6 +356,8 @@ class TestEndToEnd:
         validator.register_miner("peer-1", domain="finance")
         validator.register_miner("peer-2", domain="finance")
         validator.register_miner("peer-3", domain="finance")
+        validator.register_miner("peer-4", domain="finance")
+        validator.register_miner("peer-5", domain="finance")
 
         # Step 1: SN Owner packages case
         case = owner.package_case(
@@ -376,6 +380,7 @@ class TestEndToEnd:
         validation = validator.validate(judgment)
         assert validation.accepted is True
         assert validation.quorum_met is True
+        assert validation.votes_for + validation.votes_against == 5
         assert validation.proof_root_hash  # Merkle proof exists
 
         # Step 4: SN Owner records the result
@@ -407,12 +412,18 @@ class TestEndToEnd:
             deliberation_handler=_simple_handler,
         )
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=5,
+                quorum=5,
+            ),
         )
         validator.register_miner("miner-multi")
         validator.register_miner("peer-a")
         validator.register_miner("peer-b")
         validator.register_miner("peer-c")
+        validator.register_miner("peer-d")
+        validator.register_miner("peer-e")
 
         escalation_types = [
             EscalationType.CONSTITUTIONAL_CONFLICT,
@@ -430,6 +441,7 @@ class TestEndToEnd:
             )
             judgment = await miner.process(case.synapse)
             validation = validator.validate(judgment)
+            assert validation.votes_for + validation.votes_against == 5
             owner.record_result(case, judgment, validation)
 
         # Verify empirical distribution
@@ -536,8 +548,8 @@ class TestQuorumFailure:
         with pytest.raises(UnknownMinerError):
             validator.validate(judgment)
 
-    def test_rejected_result_creates_no_precedent(self, constitution_path):
-        """A rejected validation should not create a precedent."""
+    def test_low_vote_result_creates_no_precedent(self, constitution_path):
+        """An accepted result below the precedent vote floor fails closed."""
         owner = SubnetOwner(constitution_path)
         validator = ConstitutionalValidator(
             config=ValidatorConfig(constitution_path=constitution_path),
@@ -550,7 +562,7 @@ class TestQuorumFailure:
         judgment = __import__(
             "constitutional_swarm.bittensor.synapses", fromlist=["JudgmentSynapse"]
         ).JudgmentSynapse(
-            task_id="t",
+            task_id=case.synapse.task_id,
             miner_uid="miner-rej",
             judgment="Valid governance decision",
             reasoning="Sound reasoning",
@@ -558,10 +570,10 @@ class TestQuorumFailure:
             constitutional_hash=validator.constitution_hash,
         )
         validation = validator.validate(judgment)
-        # Even if accepted, test record_result handles the flow
-        precedent = owner.record_result(case, judgment, validation)
-        if not validation.accepted:
-            assert precedent is None or precedent.validation_accepted is False
+        assert validation.accepted is True
+        with pytest.raises(ValueError, match="validator"):
+            owner.record_result(case, judgment, validation)
+        assert owner.precedents == []
 
 
 class TestConstitutionGraceWindow:

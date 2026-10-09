@@ -25,6 +25,7 @@ from constitutional_swarm.bittensor.emission_calculator import (
     MinerTier,
 )
 from constitutional_swarm.bittensor.governance_coordinator import (
+    CoordinatorConfig,
     GovernanceCoordinator,
 )
 from constitutional_swarm.debate_resolver import (
@@ -463,7 +464,9 @@ class TestGovernanceCoordinatorNewMethods:
     def test_compute_emissions_without_manifold_returns_emission_cycle(self) -> None:
         from constitutional_swarm.bittensor.emission_calculator import EmissionCycle
 
-        coord = self._make_coordinator()
+        coord = GovernanceCoordinator(
+            CoordinatorConfig(registered_miners={"miner-a", "miner-b"})
+        )
         inputs = [
             MinerEmissionInput("miner-a", tier=MinerTier.APPRENTICE),
             MinerEmissionInput("miner-b", tier=MinerTier.JOURNEYMAN),
@@ -475,7 +478,9 @@ class TestGovernanceCoordinatorNewMethods:
         from constitutional_swarm.bittensor.emission_calculator import EmissionCycle
         from constitutional_swarm.manifold import GovernanceManifold
 
-        coord = self._make_coordinator()
+        coord = GovernanceCoordinator(
+            CoordinatorConfig(registered_miners={"miner-x", "miner-y"})
+        )
         manifold = GovernanceManifold(num_agents=2)
         manifold.update_trust(0, 1, 1.0)
         manifold.update_trust(1, 0, 0.5)

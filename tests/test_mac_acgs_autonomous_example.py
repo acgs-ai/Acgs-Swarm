@@ -28,12 +28,15 @@ sys.modules["mac_acgs_autonomous_research"] = example
 _spec.loader.exec_module(example)
 
 
-def _run_cycles(loop: MacAcgsLoop, codifier=None, cycles: int = 8) -> None:
+def _run_cycles(loop: MacAcgsLoop, codifier=None, store=None, cycles: int = 8) -> None:
     rng = random.Random(42)
     for cycle in range(1, cycles + 1):
         if codifier is not None:
-            codifier.observe(example.synth_precedent(rng, 2 * cycle))
-            codifier.observe(example.synth_precedent(rng, 2 * cycle + 1))
+            assert store is not None
+            first_record = example.synth_precedent(rng, 2 * cycle)
+            second_record = example.synth_precedent(rng, 2 * cycle + 1)
+            codifier.observe(store.admit(first_record))
+            codifier.observe(store.admit(second_record))
         loop.run_cycle(example.synth_approaches(rng, cycle))
 
 
@@ -67,13 +70,18 @@ def test_default_codifier_evolve_cycle_never_proposes_rules() -> None:
 
 
 def test_precedent_backed_codifier_commits_constitutional_update() -> None:
-    codifier = example.PrecedentBackedCodifier()
+    store = example.PrecedentStore(example.CONSTITUTIONAL_HASH)
+    codifier = example.PrecedentBackedCodifier(precedent_store=store)
     loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
     loop.add_external_challenger("human-reviewer-1")
-    _run_cycles(loop, codifier=codifier)
+    _run_cycles(loop, codifier=codifier, store=store)
 
     updates = loop.constitution_updates()
     assert len(updates) >= 1
     first = updates[0] if isinstance(updates[0], dict) else updates[0].__dict__
     assert first["verdict_outcome"] == "approved"
     assert first["constitutional_hash"] == example.CONSTITUTIONAL_HASH
+    assert store.size == 16
+    assert {record.precedent_id for record in store.active_records()} == {
+        record.precedent_id for record in codifier.precedents
+    }

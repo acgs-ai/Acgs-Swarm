@@ -33,16 +33,16 @@ Q&A:     07-subnet-concept-qa-responses.md § 5 Mechanism 3
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import math
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
+from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 
 _DIMENSIONS = (
     "safety",
@@ -201,8 +201,12 @@ class RuleCodifier:
         min_validator_agreement: float = 0.90,
         similarity_threshold: float = 0.80,
         rule_id_prefix: str = "PREC",
+        precedent_store: PrecedentStore | None = None,
     ) -> None:
+        if precedent_store is not None and precedent_store.constitutional_hash != constitutional_hash:
+            raise ValueError("PrecedentStore constitutional hash does not match RuleCodifier")
         self._constitutional_hash = constitutional_hash
+        self._precedent_constitutional_hash = constitutional_hash
         self._min_size = min_cluster_size
         self._min_agreement = min_validator_agreement
         self._sim_threshold = similarity_threshold
@@ -210,18 +214,28 @@ class RuleCodifier:
         self._candidates: dict[str, RuleCandidate] = {}
         self._rule_counter: int = 0
         self._activated_rules: list[RuleCandidate] = []
+        self._precedent_store = precedent_store or PrecedentStore(constitutional_hash)
+        self._cluster_fingerprints: dict[str, tuple[Any, ...]] = {}
 
     @property
     def constitutional_hash(self) -> str:
         return self._constitutional_hash
 
     @property
+    def precedent_store(self) -> PrecedentStore:
+        return self._precedent_store
+
+    @property
     def pending_candidates(self) -> list[RuleCandidate]:
-        return [c for c in self._candidates.values() if c.status == RuleCandidateStatus.PENDING]
+        return [
+            self._copy_candidate(c)
+            for c in self._candidates.values()
+            if c.status == RuleCandidateStatus.PENDING
+        ]
 
     @property
     def active_rules(self) -> list[RuleCandidate]:
-        return list(self._activated_rules)
+        return [self._copy_candidate(c) for c in self._activated_rules]
 
     # ------------------------------------------------------------------
     # Step 1: Cluster precedents
@@ -245,7 +259,8 @@ class RuleCodifier:
         Returns:
             list of PrecedentCluster (all sizes, pre-filtered)
         """
-        active = [p for p in precedents if p.is_active]
+        self._ensure_store_current()
+        active = list(self._precedent_store.require_canonical_records(precedents))
         if not active:
             return []
 
@@ -286,29 +301,26 @@ class RuleCodifier:
             dominant = [d for d in _DIMENSIONS if centroid.get(d, 0.0) >= 0.5]
             avg_grade = sum(m.validator_grade for m in members) / len(members)
             esc_types = [m.escalation_type.value for m in members]
-            majority_etype = max(set(esc_types), key=esc_types.count)
+            majority_etype = _deterministic_mode(esc_types)
 
             # Majority judgment: most common judgment text (first 100 chars as key)
             judgment_keys = [m.judgment[:100] for m in members]
-            majority_j = max(set(judgment_keys), key=judgment_keys.count)
-            # Recover full text
-            for m in members:
-                if m.judgment[:100] == majority_j:
-                    majority_j = m.judgment
-                    break
+            majority_key = _deterministic_mode(judgment_keys)
+            # Recover a deterministic full-text representative for the key.
+            majority_j = min(m.judgment for m in members if m.judgment[:100] == majority_key)
 
-            result.append(
-                PrecedentCluster(
-                    cluster_id=uuid.uuid4().hex[:8],
-                    precedent_ids=[m.precedent_id for m in members],
-                    centroid_vector=centroid,
-                    dominant_dimensions=dominant,
-                    majority_judgment=majority_j,
-                    validator_agreement=avg_grade,
-                    escalation_type=majority_etype,
-                    domain_hint=domain,
-                )
+            cluster = PrecedentCluster(
+                cluster_id=uuid.uuid4().hex[:8],
+                precedent_ids=[m.precedent_id for m in members],
+                centroid_vector=centroid,
+                dominant_dimensions=dominant,
+                majority_judgment=majority_j,
+                validator_agreement=avg_grade,
+                escalation_type=majority_etype,
+                domain_hint=domain,
             )
+            self._cluster_fingerprints[cluster.cluster_id] = self._cluster_fingerprint(cluster)
+            result.append(self._copy_cluster(cluster))
 
         return result
 
@@ -331,14 +343,18 @@ class RuleCodifier:
         proposed: list[RuleCandidate] = []
 
         for cluster in clusters:
-            if cluster.size < self._min_size:
-                continue
-            if cluster.validator_agreement < self._min_agreement:
-                continue
+            snapshot = self._copy_cluster(cluster)
+            self._ensure_store_current()
+            self._validate_cluster(snapshot)
+            with self._precedent_store.guard_active_sources(snapshot.precedent_ids):
+                if snapshot.size < self._min_size:
+                    continue
+                if snapshot.validator_agreement < self._min_agreement:
+                    continue
 
-            candidate = self._generate_candidate(cluster)
-            self._candidates[candidate.candidate_id] = candidate
-            proposed.append(candidate)
+                candidate = self._generate_candidate(snapshot)
+                self._candidates[candidate.candidate_id] = candidate
+                proposed.append(self._copy_candidate(candidate))
 
         return proposed
 
@@ -351,29 +367,27 @@ class RuleCodifier:
 
         Raises KeyError if not found, ValueError if not in PENDING state.
         """
+        self._ensure_store_current()
         c = self._get_candidate(candidate_id, RuleCandidateStatus.PENDING)
-        import dataclasses
-
-        updated = dataclasses.replace(
-            c,
-            status=RuleCandidateStatus.APPROVED,
-            approved_at=time.time(),
-        )
-        self._candidates[candidate_id] = updated
-        return updated
+        with self._precedent_store.guard_active_sources(c.source_precedent_ids):
+            updated = dataclasses.replace(
+                c,
+                status=RuleCandidateStatus.APPROVED,
+                approved_at=time.time(),
+            )
+            self._candidates[candidate_id] = updated
+            return self._copy_candidate(updated)
 
     def reject(self, candidate_id: str, reason: str = "") -> RuleCandidate:
         """Governor rejects a pending rule candidate."""
         c = self._get_candidate(candidate_id, RuleCandidateStatus.PENDING)
-        import dataclasses
-
         updated = dataclasses.replace(
             c,
             status=RuleCandidateStatus.REJECTED,
             rejection_reason=reason,
         )
         self._candidates[candidate_id] = updated
-        return updated
+        return self._copy_candidate(updated)
 
     def activate(
         self,
@@ -388,23 +402,23 @@ class RuleCodifier:
 
         Raises ValueError if candidate is not in APPROVED state.
         """
+        self._ensure_store_current()
         c = self._get_candidate(candidate_id, RuleCandidateStatus.APPROVED)
-        new_yaml = _append_rule_to_yaml(constitution_yaml, c.to_yaml_block())
-        new_hash = hashlib.sha256(new_yaml.encode()).hexdigest()[:16]
+        with self._precedent_store.guard_active_sources(c.source_precedent_ids):
+            new_yaml = _append_rule_to_yaml(constitution_yaml, c.to_yaml_block())
+            new_hash = hashlib.sha256(new_yaml.encode()).hexdigest()[:16]
 
-        import dataclasses
-
-        activated = dataclasses.replace(
-            c,
-            status=RuleCandidateStatus.ACTIVE,
-            activated_at=time.time(),
-            constitutional_hash_before=self._constitutional_hash,
-            constitutional_hash_after=new_hash,
-        )
-        self._candidates[candidate_id] = activated
-        self._activated_rules.append(activated)
-        self._constitutional_hash = new_hash
-        return activated, new_yaml
+            activated = dataclasses.replace(
+                c,
+                status=RuleCandidateStatus.ACTIVE,
+                activated_at=time.time(),
+                constitutional_hash_before=self._constitutional_hash,
+                constitutional_hash_after=new_hash,
+            )
+            self._candidates[candidate_id] = activated
+            self._activated_rules.append(activated)
+            self._constitutional_hash = new_hash
+            return self._copy_candidate(activated), new_yaml
 
     def revoke(
         self,
@@ -417,8 +431,6 @@ class RuleCodifier:
         constitution YAML must be provided and re-activated to remove the rule.
         """
         c = self._get_candidate(candidate_id, RuleCandidateStatus.ACTIVE)
-        import dataclasses
-
         revoked = dataclasses.replace(
             c,
             status=RuleCandidateStatus.REVOKED,
@@ -426,14 +438,14 @@ class RuleCodifier:
         )
         self._candidates[candidate_id] = revoked
         self._activated_rules = [r for r in self._activated_rules if r.candidate_id != candidate_id]
-        return revoked
+        return self._copy_candidate(revoked)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def all_candidates(self) -> list[RuleCandidate]:
-        return list(self._candidates.values())
+        return [self._copy_candidate(c) for c in self._candidates.values()]
 
     def summary(self) -> dict[str, Any]:
         counts = {s.value: 0 for s in RuleCandidateStatus}
@@ -469,7 +481,7 @@ class RuleCodifier:
             keywords=keywords,
             source_precedent_ids=list(cluster.precedent_ids),
             validator_agreement=cluster.validator_agreement,
-            dominant_dimensions=cluster.dominant_dimensions,
+            dominant_dimensions=list(cluster.dominant_dimensions),
             escalation_type=cluster.escalation_type,
             status=RuleCandidateStatus.PENDING,
             proposed_at=time.time(),
@@ -489,6 +501,48 @@ class RuleCodifier:
                 f"Candidate {candidate_id} is {c.status.value}, expected {expected_status.value}."
             )
         return c
+
+    def _validate_cluster(self, cluster: PrecedentCluster) -> None:
+        expected = self._cluster_fingerprints.get(cluster.cluster_id)
+        if expected is None or expected != self._cluster_fingerprint(cluster):
+            raise ValueError(f"Cluster {cluster.cluster_id!r} is not a canonical cluster source")
+
+    def _ensure_store_current(self) -> None:
+        if self._precedent_store.constitutional_hash != self._precedent_constitutional_hash:
+            raise ValueError(
+                "PrecedentStore constitutional hash does not match the codifier's "
+                "precedent-admission epoch"
+            )
+
+    @staticmethod
+    def _cluster_fingerprint(cluster: PrecedentCluster) -> tuple[Any, ...]:
+        return (
+            tuple(cluster.precedent_ids),
+            tuple(sorted(cluster.centroid_vector.items())),
+            tuple(cluster.dominant_dimensions),
+            cluster.majority_judgment,
+            cluster.validator_agreement,
+            cluster.escalation_type,
+            cluster.domain_hint,
+        )
+
+    @staticmethod
+    def _copy_cluster(cluster: PrecedentCluster) -> PrecedentCluster:
+        return dataclasses.replace(
+            cluster,
+            precedent_ids=list(cluster.precedent_ids),
+            centroid_vector=dict(cluster.centroid_vector),
+            dominant_dimensions=list(cluster.dominant_dimensions),
+        )
+
+    @staticmethod
+    def _copy_candidate(candidate: RuleCandidate) -> RuleCandidate:
+        return dataclasses.replace(
+            candidate,
+            keywords=list(candidate.keywords),
+            source_precedent_ids=list(candidate.source_precedent_ids),
+            dominant_dimensions=list(candidate.dominant_dimensions),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +565,15 @@ def _infer_severity(dominant_dimensions: list[str]) -> str:
     if "privacy" in dominant_dimensions or "fairness" in dominant_dimensions:
         return "high"
     return "medium"
+
+
+def _deterministic_mode(values: list[str]) -> str:
+    """Return the lexical first value among those tied for highest frequency."""
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    top_count = max(counts.values())
+    return min(value for value, count in counts.items() if count == top_count)
 
 
 def _generate_rule_text(cluster: PrecedentCluster) -> str:

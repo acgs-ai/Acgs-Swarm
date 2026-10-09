@@ -57,6 +57,7 @@ def _make_coordinator(
             time_decay_rate=0.001,
         ),
         auto_audit=auto_audit,
+        audit_check_fn=_oracle_agrees if auto_audit else None,
     )
     gc = GovernanceCoordinator(config)
 
