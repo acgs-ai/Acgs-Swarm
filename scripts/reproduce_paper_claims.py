@@ -90,10 +90,12 @@ def _make_spectral(n: int, seed: int, *, r: float = RADIUS) -> Any:
 
     rng = random.Random(seed)
     manifold = SpectralSphereManifold(num_agents=n, r=r)
+    updates = []
     for i in range(n):
         for j in range(n):
             if i != j:
-                manifold.update_trust(i, j, rng.uniform(0.0, 1.0))
+                updates.append((i, j, rng.uniform(0.0, 1.0)))
+    manifold.update_trust_batch(updates)
     return manifold
 
 

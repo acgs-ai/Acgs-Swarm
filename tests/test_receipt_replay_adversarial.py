@@ -303,7 +303,9 @@ def test_orphan_without_committed_settlement_fails(tmp_path) -> None:
 
 def test_vote_signature_is_not_a_receipt_signature(tmp_path) -> None:
     mesh, store, assignment = _settle(tmp_path)
-    vote = mesh._votes[assignment.assignment_id][0]
+    record = store.get(assignment.assignment_id)
+    assert record is not None
+    vote = record.votes[0]
     bundle = bundle_from_json(receipt_path_for(store, assignment.assignment_id).read_text())
     receipt = bundle.receipts[0]
     stolen = build_receipt(
@@ -313,7 +315,7 @@ def test_vote_signature_is_not_a_receipt_signature(tmp_path) -> None:
                 key_id=RECEIPT_SIGNER_KEY_ID,
                 algorithm="ed25519",
                 public_key_hex=_trusted(mesh)[RECEIPT_SIGNER_KEY_ID],
-                signature_hex=vote.signature,
+                signature_hex=vote["signature"],
             )
         ],
     )

@@ -211,6 +211,7 @@ class SpectralSphereManifold:
         self._raw_trust: list[list[float]] = [[0.0] * num_agents for _ in range(num_agents)]
         self._projected: SpectralProjectionResult | None = None
         self._smoothed: SpectralProjectionResult | None = None
+        self._commit_generation = 0
 
     @property
     def num_agents(self) -> int:
@@ -222,60 +223,85 @@ class SpectralSphereManifold:
         return self._r
 
     def update_trust(self, from_agent: int, to_agent: int, delta: float) -> None:
-        """Update the raw trust weight from from_agent toward to_agent."""
-        if not math.isfinite(delta):
-            raise ValueError(f"delta must be a finite number, got {delta!r}")
-        if not (0 <= from_agent < self._n and 0 <= to_agent < self._n):
-            raise IndexError(
-                f"agent index out of range [0, {self._n}): "
-                f"from_agent={from_agent}, to_agent={to_agent}"
-            )
-        self._raw_trust[from_agent][to_agent] += delta
-        self._projected = None  # Invalidate cache
+        """Apply one trust update and commit one projected EMA generation."""
+        self.update_trust_batch([(from_agent, to_agent, delta)])
 
-    def project(self) -> SpectralProjectionResult:
-        """Project current raw trust matrix onto the spectral sphere.
+    @property
+    def commit_generation(self) -> int:
+        """Number of committed update batches; observation never changes it."""
+        return self._commit_generation
 
-        Applies EMA smoothing across sequential projections (hysteresis) to
-        stabilize trust-matrix dynamics under noisy incremental updates. The
-        smoothing is skipped on the first projection (so a single update is
-        visible immediately) and whenever ``smoothing == 0.0`` (back-compat).
-        """
-        if self._projected is not None:
-            return self._projected
+    def update_trust_batch(self, updates: list[tuple[int, int, float]]) -> None:
+        """Apply a settlement-sized update batch and advance EMA exactly once."""
+        for from_agent, to_agent, delta in updates:
+            if not math.isfinite(delta):
+                raise ValueError(f"delta must be a finite number, got {delta!r}")
+            if not (0 <= from_agent < self._n and 0 <= to_agent < self._n):
+                raise IndexError(
+                    f"agent index out of range [0, {self._n}): "
+                    f"from_agent={from_agent}, to_agent={to_agent}"
+                )
+        if not updates:
+            return
+        for from_agent, to_agent, delta in updates:
+            self._raw_trust[from_agent][to_agent] += delta
+        self._commit_projection()
 
+    def replace_raw_trust(self, matrix: list[list[float]], *, commit: bool = True) -> None:
+        """Replace raw state during an ID-stable rebuild."""
+        if len(matrix) != self._n or any(len(row) != self._n for row in matrix):
+            raise ValueError("replacement trust matrix dimensions do not match manifold")
+        self._raw_trust = [list(row) for row in matrix]
+        self._projected = None
+        self._smoothed = None
+        if commit:
+            self._commit_projection()
+
+    def _commit_projection(self) -> SpectralProjectionResult:
+        """Commit one projection/EMA step after mutation."""
         new_proj = spectral_sphere_project(
             self._raw_trust,
             r=self._r,
             max_power_iter=self._max_power_iter,
         )
-
         if self._smoothing > 0.0 and self._smoothed is not None:
             alpha = self._smoothing
-            n = self._n
-            prev_mat = self._smoothed.matrix
-            new_mat = new_proj.matrix
+            previous = self._smoothed
             blended = tuple(
-                tuple(alpha * prev_mat[i][j] + (1.0 - alpha) * new_mat[i][j] for j in range(n))
-                for i in range(n)
-            )
-            # Convex blend of two in-sphere matrices is in-sphere by norm sub-additivity:
-            #   ‖αA + (1-α)B‖₂ ≤ α‖A‖₂ + (1-α)‖B‖₂ ≤ r.
-            # We reuse the tighter of the two parent sigma estimates as an upper bound
-            # instead of re-running power iteration (O(n²·k) saved per project() call).
-            sigma_bound = (
-                alpha * self._smoothed.spectral_norm + (1.0 - alpha) * new_proj.spectral_norm
+                tuple(
+                    alpha * previous.matrix[i][j]
+                    + (1.0 - alpha) * new_proj.matrix[i][j]
+                    for j in range(self._n)
+                )
+                for i in range(self._n)
             )
             new_proj = SpectralProjectionResult(
                 matrix=blended,
-                spectral_norm=sigma_bound,
+                spectral_norm=(
+                    alpha * previous.spectral_norm
+                    + (1.0 - alpha) * new_proj.spectral_norm
+                ),
                 clipped=new_proj.clipped,
                 power_iterations=0,
             )
-
         self._smoothed = new_proj
         self._projected = new_proj
-        return self._projected
+        self._commit_generation += 1
+        return new_proj
+
+    def project(self) -> SpectralProjectionResult:
+        """Project current raw trust matrix onto the spectral sphere.
+
+        This is an observation-only API. Projection and EMA state are committed
+        by update methods so repeated reads cannot advance trust dynamics.
+        """
+        if self._projected is not None:
+            return self._projected
+        return spectral_sphere_project(
+            self._raw_trust,
+            r=self._r,
+            max_power_iter=self._max_power_iter,
+        )
 
     @property
     def trust_matrix(self) -> tuple[tuple[float, ...], ...]:
@@ -352,12 +378,13 @@ class SpectralSphereManifold:
                 for i in range(n)
             ]
 
-        result = SpectralSphereManifold(n, r=self._r, max_power_iter=self._max_power_iter)
-        result._raw_trust = product
-        # Project immediately so trust_matrix is always valid
-        result._projected = spectral_sphere_project(
-            product, r=self._r, max_power_iter=self._max_power_iter
+        result = SpectralSphereManifold(
+            n,
+            r=self._r,
+            max_power_iter=self._max_power_iter,
+            smoothing=self._smoothing,
         )
+        result.replace_raw_trust(product)
         return result
 
     def influence_vector(self, agent_idx: int) -> tuple[float, ...]:

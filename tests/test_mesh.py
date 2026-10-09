@@ -816,7 +816,7 @@ class TestCryptographicProof:
         assert restored.proof.root_hash == result.proof.root_hash
         assert restored.proof.verify() is True
 
-    def test_restart_rejects_mismatched_constitution_hash(self, tmp_path) -> None:
+    def test_restart_filters_historical_constitution_hash(self, tmp_path) -> None:
         store_path = tmp_path / "mesh-settlements.jsonl"
         writer = ConstitutionalMesh(
             Constitution.default(), seed=42, settlement_store_path=store_path
@@ -836,8 +836,11 @@ class TestCryptographicProof:
             ],
             name="other-constitution",
         )
-        with pytest.raises(ValueError, match="constitutional hash does not match"):
-            ConstitutionalMesh(other_constitution, seed=7, settlement_store_path=store_path)
+        reader = ConstitutionalMesh(
+            other_constitution, seed=7, settlement_store_path=store_path
+        )
+        with pytest.raises(KeyError):
+            reader.get_result(next(iter(writer._final_results)))
 
     def test_settled_result_survives_restart_with_sqlite_store(self, tmp_path) -> None:
         store = SQLiteSettlementStore(tmp_path / "mesh-settlements.db")
@@ -1435,20 +1438,17 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_startup_reconciles_pending_jsonl_settlement(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=41)
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = ConstitutionalMesh(
+            constitution, seed=41, settlement_store=source_store
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-jsonl")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-jsonl")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = JSONLSettlementStore(tmp_path / "mesh.jsonl")
         store.mark_pending(record)
@@ -1466,20 +1466,17 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_startup_reconciles_pending_sqlite_settlement(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=43)
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = ConstitutionalMesh(
+            constitution, seed=43, settlement_store=source_store
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-sqlite")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-sqlite")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = SQLiteSettlementStore(tmp_path / "mesh.db")
         store.mark_pending(record)
@@ -1497,20 +1494,17 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_retry_pending_settlements_reconciles_journaled_record(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=47)
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = ConstitutionalMesh(
+            constitution, seed=47, settlement_store=source_store
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-retry")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-retry")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = JSONLSettlementStore(tmp_path / "mesh-retry.jsonl")
         reader = ConstitutionalMesh(constitution, seed=103, settlement_store=store)

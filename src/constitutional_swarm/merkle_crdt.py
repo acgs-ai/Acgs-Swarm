@@ -25,13 +25,121 @@ No external dependencies — pure Python with hashlib and asyncio.
 
 from __future__ import annotations
 
-import bisect
 import hashlib
+import heapq
 import json
+import math
 import threading
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
+
+
+MAX_METADATA_DEPTH = 32
+MAX_METADATA_ITEMS = 10_000
+
+
+class AncestryScanLimitExceeded(ValueError):
+    """A bounded ancestry query stopped before it could prove closure."""
+
+    def __init__(self, checkpoints: tuple[str, ...]) -> None:
+        super().__init__("ancestry scan limit reached before closure")
+        self.checkpoints = checkpoints
+
+
+class FrozenJSONList(tuple[Any, ...]):
+    """Tuple-backed JSON array that compares equal to ordinary sequences."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class FrozenJSONDict(Mapping[str, Any]):
+    """Recursively immutable JSON object with mapping-compatible equality."""
+
+    __slots__ = ("_data",)
+    _data: Mapping[str, Any]
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        object.__setattr__(self, "_data", MappingProxyType(data))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise TypeError("frozen JSON objects cannot be modified")
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(self._data)
+
+
+def normalize_json_value(
+    value: Any,
+    *,
+    max_depth: int = MAX_METADATA_DEPTH,
+    max_items: int = MAX_METADATA_ITEMS,
+) -> Any:
+    """Validate, detach, and recursively freeze a JSON-compatible value."""
+    remaining = [max_items]
+
+    def freeze(item: Any, depth: int) -> Any:
+        if depth > max_depth:
+            raise ValueError(f"JSON value exceeds maximum depth {max_depth}")
+        if item is None or isinstance(item, (str, bool, int)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("JSON numbers must be finite")
+            return item
+        if isinstance(item, Mapping):
+            remaining[0] -= len(item)
+            if remaining[0] < 0:
+                raise ValueError(f"JSON value exceeds maximum item count {max_items}")
+            frozen: dict[str, Any] = {}
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON object keys must be strings")
+                frozen[key] = freeze(nested, depth + 1)
+            return FrozenJSONDict(frozen)
+        if isinstance(item, (list, tuple)):
+            remaining[0] -= len(item)
+            if remaining[0] < 0:
+                raise ValueError(f"JSON value exceeds maximum item count {max_items}")
+            return FrozenJSONList(freeze(nested, depth + 1) for nested in item)
+        raise TypeError(f"unsupported JSON value type: {type(item).__name__}")
+
+    return freeze(value, 0)
+
+
+def thaw_json_value(value: Any) -> Any:
+    """Return a detached, JSON-serializable copy of a normalized value."""
+    if isinstance(value, Mapping):
+        return {key: thaw_json_value(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [thaw_json_value(nested) for nested in value]
+    return value
+
+
+def _normalize_metadata(metadata: Any) -> FrozenJSONDict:
+    normalized = normalize_json_value(metadata)
+    if not isinstance(normalized, FrozenJSONDict):
+        raise TypeError("metadata must be a JSON object")
+    return normalized
 
 
 def _canonical_bytes(data: dict[str, Any]) -> bytes:
@@ -72,7 +180,30 @@ class DAGNode:
     timestamp: float = field(default_factory=time.time)
     bodes_passed: bool = False
     constitutional_hash: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "cid",
+            "agent_id",
+            "payload",
+            "payload_type",
+            "constitutional_hash",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise TypeError(f"{field_name} must be a string")
+        if not isinstance(self.parent_cids, (list, tuple)) or any(
+            not isinstance(parent, str) for parent in self.parent_cids
+        ):
+            raise TypeError("parent_cids must be a sequence of strings")
+        parents = tuple(self.parent_cids)
+        if len(set(parents)) != len(parents):
+            raise ValueError("parent_cids must not contain duplicates")
+        if type(self.bodes_passed) is not bool:
+            raise TypeError("bodes_passed must be a boolean")
+        normalized = _normalize_metadata(self.metadata)
+        object.__setattr__(self, "parent_cids", parents)
+        object.__setattr__(self, "metadata", normalized)
 
     def to_canonical_dict(self) -> dict[str, Any]:
         """The fields that define the CID (everything except cid itself)."""
@@ -83,7 +214,7 @@ class DAGNode:
             "parent_cids": list(self.parent_cids),
             "bodes_passed": self.bodes_passed,
             "constitutional_hash": self.constitutional_hash,
-            "metadata": self.metadata,
+            "metadata": thaw_json_value(self.metadata),
         }
 
     def verify_cid(self) -> bool:
@@ -103,6 +234,7 @@ def compute_cid(
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Compute the CID for a node before constructing it."""
+    normalized_metadata = _normalize_metadata(metadata or {})
     data = {
         "agent_id": agent_id,
         "payload": payload,
@@ -110,7 +242,7 @@ def compute_cid(
         "parent_cids": list(parent_cids),
         "bodes_passed": bodes_passed,
         "constitutional_hash": constitutional_hash,
-        "metadata": metadata or {},
+        "metadata": thaw_json_value(normalized_metadata),
     }
     return _sha256_hex(_canonical_bytes(data))
 
@@ -142,6 +274,9 @@ class MerkleCRDT:
         self._reject_unverified = reject_unverified
         self._nodes: dict[str, DAGNode] = {}  # cid → node
         self._children: dict[str, set[str]] = {}  # cid → set of child cids
+        self._heads: set[str] = set()
+        self._causally_closed: set[str] = set()
+        self._missing_parent_count: dict[str, int] = {}
         self._lock = threading.Lock()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -252,16 +387,95 @@ class MerkleCRDT:
 
     def _heads_unlocked(self) -> frozenset[str]:
         """Heads computation without lock (caller must hold lock)."""
-        all_cids = set(self._nodes.keys())
-        non_heads: set[str] = set()
-        for node in self._nodes.values():
-            non_heads.update(node.parent_cids)
-        return frozenset(all_cids - non_heads)
+        return frozenset(self._heads)
 
     def get(self, cid: str) -> DAGNode | None:
         """Retrieve a node by CID."""
         with self._lock:
             return self._nodes.get(cid)
+
+    def frontier_snapshot(self) -> tuple[str, ...]:
+        """Return a deterministic immutable snapshot of the current frontier."""
+        with self._lock:
+            return tuple(sorted(self._heads_unlocked()))
+
+    def get_many(
+        self, cids: list[str] | tuple[str, ...], *, limit: int
+    ) -> list[DAGNode]:
+        """Return up to ``limit`` requested nodes in deterministic CID order."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._lock:
+            return [
+                self._nodes[cid]
+                for cid in sorted(set(cids))[:limit]
+                if cid in self._nodes
+            ]
+
+    def missing_ancestry(
+        self,
+        frontier: list[str] | tuple[str, ...],
+        *,
+        limit: int,
+        scan_limit: int | None = None,
+    ) -> tuple[str, ...]:
+        """Find missing CIDs needed to causally close an advertised frontier."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        max_scan = scan_limit if scan_limit is not None else max(limit * 16, limit)
+        if max_scan <= 0:
+            raise ValueError("scan_limit must be positive")
+        with self._lock:
+            pending = list(reversed(sorted(set(frontier))))
+            seen: set[str] = set()
+            missing: list[str] = []
+            scanned = 0
+            while pending and len(missing) < limit and scanned < max_scan:
+                cid = pending.pop()
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                scanned += 1
+                if cid in self._causally_closed:
+                    continue
+                node = self._nodes.get(cid)
+                if node is None:
+                    missing.append(cid)
+                    continue
+                pending.extend(reversed(sorted(node.parent_cids)))
+            checkpoints: list[str] = []
+            while pending and len(checkpoints) < limit:
+                cid = pending.pop()
+                if cid not in seen and cid not in self._causally_closed:
+                    checkpoints.append(cid)
+        if checkpoints and not missing:
+            raise AncestryScanLimitExceeded(tuple(sorted(checkpoints)))
+        return tuple(sorted(missing))
+
+    def ancestry_nodes(
+        self,
+        roots: list[str] | tuple[str, ...],
+        *,
+        limit: int,
+    ) -> list[DAGNode]:
+        """Return a bounded, head-first ancestry closure for requested roots."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._lock:
+            pending = list(reversed(sorted(set(roots))))
+            seen: set[str] = set()
+            result: list[DAGNode] = []
+            while pending and len(result) < limit:
+                cid = pending.pop()
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                node = self._nodes.get(cid)
+                if node is None:
+                    continue
+                result.append(node)
+                pending.extend(reversed(sorted(node.parent_cids)))
+            return result
 
     @property
     def size(self) -> int:
@@ -282,30 +496,33 @@ class MerkleCRDT:
         """
         with self._lock:
             nodes = dict(self._nodes)
+            children = {
+                cid: tuple(sorted(child for child in child_cids if child in nodes))
+                for cid, child_cids in self._children.items()
+                if cid in nodes
+            }
 
         # Kahn's algorithm
         in_degree: dict[str, int] = {cid: 0 for cid in nodes}
         for node in nodes.values():
-            for parent_cid in node.parent_cids:
-                if parent_cid in nodes:
-                    # parent_cid has a child (this node), not relevant for in_degree
-                    pass
-            # Count how many of this node's parents exist in our DAG
-            in_degree[node.cid] = sum(1 for p in node.parent_cids if p in nodes)
+            in_degree[node.cid] = len(
+                {parent for parent in node.parent_cids if parent in nodes}
+            )
 
-        queue = sorted([cid for cid, deg in in_degree.items() if deg == 0])
+        queue = [cid for cid, degree in in_degree.items() if degree == 0]
+        heapq.heapify(queue)
         result: list[DAGNode] = []
 
         while queue:
-            cid = queue.pop(0)
+            cid = heapq.heappop(queue)
             result.append(nodes[cid])
-            # Find all nodes that have `cid` as a parent
-            for node in nodes.values():
-                if cid in node.parent_cids:
-                    in_degree[node.cid] -= 1
-                    if in_degree[node.cid] == 0:
-                        # Insert in sorted order for determinism — O(log n) vs O(n log n)
-                        bisect.insort(queue, node.cid)
+            for child_cid in children.get(cid, ()):
+                in_degree[child_cid] -= 1
+                if in_degree[child_cid] == 0:
+                    heapq.heappush(queue, child_cid)
+
+        if len(result) != len(nodes):
+            raise ValueError("Merkle DAG contains a cycle or inconsistent child index")
 
         return result
 
@@ -333,9 +550,40 @@ class MerkleCRDT:
 
     def _store_unlocked(self, node: DAGNode) -> None:
         """Store a node and update the child index. Caller must hold lock."""
+        if node.cid in self._nodes:
+            return
         self._nodes[node.cid] = node
+        self._heads.add(node.cid)
         for parent_cid in node.parent_cids:
             self._children.setdefault(parent_cid, set()).add(node.cid)
+            if parent_cid in self._nodes:
+                self._heads.discard(parent_cid)
+        if any(
+            child_cid in self._nodes for child_cid in self._children.get(node.cid, ())
+        ):
+            self._heads.discard(node.cid)
+        self._missing_parent_count[node.cid] = sum(
+            parent_cid not in self._causally_closed for parent_cid in node.parent_cids
+        )
+        if self._missing_parent_count[node.cid] == 0:
+            self._close_causality_unlocked(node.cid)
+
+    def _close_causality_unlocked(self, cid: str) -> None:
+        """Mark a node and newly satisfied descendants causally closed."""
+        pending = [cid]
+        while pending:
+            closed_cid = pending.pop()
+            if closed_cid in self._causally_closed:
+                continue
+            self._causally_closed.add(closed_cid)
+            self._missing_parent_count[closed_cid] = 0
+            for child_cid in self._children.get(closed_cid, ()):
+                if child_cid not in self._nodes or child_cid in self._causally_closed:
+                    continue
+                remaining = self._missing_parent_count[child_cid] - 1
+                self._missing_parent_count[child_cid] = remaining
+                if remaining == 0:
+                    pending.append(child_cid)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ from constitutional_swarm import (
     ConstitutionalMesh,
     JSONLSettlementStore,
     ReconciliationReport,
+    SettlementPersistenceError,
     SettlementRecord,
 )
 
@@ -26,7 +27,10 @@ class _SelectiveFailingSettlementStore:
 
     def append(self, record: SettlementRecord) -> None:
         assignment_id = str(record.assignment["assignment_id"])
-        if assignment_id in self._failing_assignment_ids:
+        if (
+            "*" in self._failing_assignment_ids
+            or assignment_id in self._failing_assignment_ids
+        ):
             raise OSError(f"phase 2 commit failed for {assignment_id}")
         self._settled[assignment_id] = record
 
@@ -56,26 +60,23 @@ def _build_pending_record(
     is_recovered: bool = False,
 ) -> tuple[Constitution, SettlementRecord]:
     constitution = Constitution.default()
-    source_mesh = ConstitutionalMesh(constitution, seed=seed)
+    source_store = _SelectiveFailingSettlementStore(failing_assignment_ids={"*"})
+    source_mesh = ConstitutionalMesh(
+        constitution,
+        seed=seed,
+        settlement_store=source_store,
+    )
     for i in range(5):
         source_mesh.register_local_signer(f"agent-{i:02d}")
 
-    result = source_mesh.full_validation("agent-00", "safe output", artifact_id)
-    assignment = source_mesh._assignments[result.assignment_id]
-    record = SettlementRecord(
-        assignment=source_mesh._serialize_assignment(assignment),
-        result=source_mesh._serialize_result(result),
-        constitutional_hash=result.constitutional_hash,
+    with pytest.raises(SettlementPersistenceError):
+        source_mesh.full_validation("agent-00", "safe output", artifact_id)
+    pending = source_store.load_pending()[0]
+    record = replace(
+        pending,
         is_recovered=is_recovered,
-        votes=source_mesh._vote_dicts(
-            source_mesh._votes.get(assignment.assignment_id, [])
-        ),
+        assignment={**pending.assignment, "is_recovered": is_recovered},
     )
-    if not is_recovered:
-        record = replace(
-            record,
-            assignment={**record.assignment, "is_recovered": False},
-        )
     return constitution, record
 
 

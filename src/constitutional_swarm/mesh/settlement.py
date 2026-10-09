@@ -78,6 +78,7 @@ class ReconciliationReport:
     skipped_recovered: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
+    skipped_constitution: int = 0
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return a structured log payload for this reconciliation pass."""
@@ -85,6 +86,7 @@ class ReconciliationReport:
             "attempted": self.attempted,
             "settled": self.settled,
             "skipped_recovered": self.skipped_recovered,
+            "skipped_constitution": self.skipped_constitution,
             "failed": self.failed,
             "errors": list(self.errors),
         }

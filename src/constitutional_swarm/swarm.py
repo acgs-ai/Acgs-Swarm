@@ -11,7 +11,7 @@ import hashlib
 import json
 import threading
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any
 
 from constitutional_swarm.artifact import Artifact, ArtifactStore
@@ -36,6 +36,7 @@ NodeStatus = ExecutionStatus
 _UNSET = object()
 _AUTHORITY_TRANSPORT_ERRORS = (ConnectionError, EOFError, OSError, TimeoutError)
 _MAX_WORKFLOW_NODES = 1000
+_METADATA_ATOM_TYPES = (type(None), bool, int, float, complex, str, bytes)
 
 
 def _neg_priority(node: TaskNode) -> int:
@@ -50,19 +51,87 @@ def _with_status(
     artifact_id: str | object | None = _UNSET,
 ) -> TaskNode:
     """Clone a TaskNode while updating lifecycle fields."""
-    updates: dict[str, Any] = {
-        "status": status,
-        "metadata": dict(node.metadata),
-    }
+    owned = _node_snapshot(node)
+    owned.status = status
     if claimed_by is not _UNSET:
-        updates["claimed_by"] = claimed_by
+        owned.claimed_by = claimed_by  # type: ignore[assignment]
     if artifact_id is not _UNSET:
-        updates["artifact_id"] = artifact_id
-    return replace(node, **updates)
+        owned.artifact_id = artifact_id  # type: ignore[assignment]
+    return owned
 
 
 def _node_snapshot(node: TaskNode) -> TaskNode:
-    return replace(node, metadata=dict(node.metadata))
+    """Transfer task ownership without retaining nested caller-owned state."""
+    return TaskNode(
+        node_id=node.node_id,
+        title=node.title,
+        description=node.description,
+        domain=node.domain,
+        required_capabilities=tuple(node.required_capabilities),
+        depends_on=tuple(node.depends_on),
+        priority=node.priority,
+        max_budget_tokens=node.max_budget_tokens,
+        status=node.status,
+        claimed_by=node.claimed_by,
+        artifact_id=node.artifact_id,
+        metadata=_copy_task_metadata(node.metadata),
+    )
+
+
+def _copy_task_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Copy the supported metadata model without invoking user copy hooks."""
+    copied = _copy_metadata_value(metadata, set())
+    if not isinstance(copied, dict):
+        raise TypeError("task metadata must be a dict")
+    return copied
+
+
+def _copy_metadata_value(value: Any, active: set[int]) -> Any:
+    value_type = type(value)
+    if value_type in _METADATA_ATOM_TYPES:
+        return value
+
+    identity = id(value)
+    if identity in active:
+        raise TypeError("cyclic task metadata is unsupported")
+    active.add(identity)
+    try:
+        if value_type is dict:
+            return {
+                _copy_metadata_value(key, active): _copy_metadata_value(item, active)
+                for key, item in value.items()
+            }
+        if value_type is list:
+            return [_copy_metadata_value(item, active) for item in value]
+        if value_type is tuple:
+            return tuple(_copy_metadata_value(item, active) for item in value)
+        if value_type is set:
+            return {_copy_metadata_value(item, active) for item in value}
+        if value_type is frozenset:
+            return frozenset(_copy_metadata_value(item, active) for item in value)
+        if value_type is bytearray:
+            return bytearray(value)
+        if is_dataclass(value) and not isinstance(value, type):
+            parameters = getattr(value_type, "__dataclass_params__", None)
+            if parameters is not None and parameters.frozen:
+                try:
+                    copied_record = object.__new__(value_type)
+                except TypeError as exc:
+                    raise TypeError(
+                        f"unsupported task metadata type: {value_type.__name__}"
+                    ) from exc
+                for item in fields(value):
+                    object.__setattr__(
+                        copied_record,
+                        item.name,
+                        _copy_metadata_value(
+                            object.__getattribute__(value, item.name), active
+                        ),
+                    )
+                return copied_record
+        raise TypeError(f"unsupported task metadata type: {value_type.__name__}")
+    finally:
+        active.remove(identity)
 
 
 @dataclass
@@ -454,6 +523,8 @@ class SwarmExecutor:
                         if rc.lower() in cap_names:
                             available.append(node)
                             break
+            # Detach while lifecycle fields and nested metadata are protected.
+            available = [_node_snapshot(node) for node in available]
 
         if len(available) > 1:
             first_priority = available[0].priority
@@ -461,7 +532,7 @@ class SwarmExecutor:
                 if node.priority != first_priority:
                     available.sort(key=_neg_priority)
                     break
-        return [_node_snapshot(node) for node in available]
+        return available
 
     def prepare_claim(self, node_id: str, agent_id: str) -> AttemptAuthorizationPayload:
         """Create a fresh, context-bound claim payload for the agent to sign."""

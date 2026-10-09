@@ -23,21 +23,21 @@ def _mesh_with_manifold(n: int) -> ConstitutionalMesh:
 
 
 def _inject_trust(mesh: ConstitutionalMesh) -> None:
-    """Directly inject trust values into the mesh manifold."""
-    assert mesh._manifold is not None
-    for i in range(len(mesh._agent_indices)):
-        for j in range(len(mesh._agent_indices)):
-            if i != j:
-                mesh._manifold._raw_trust[i][j] = 0.5 + (i * 0.1)
-    mesh._manifold.project()
+    """Inject trust through the ID-stable owner API."""
+    agent_ids = tuple(mesh._agent_indices)
+    mesh.update_trust(
+        [
+            (from_agent, to_agent, 0.5 + (from_index * 0.1))
+            for from_index, from_agent in enumerate(agent_ids)
+            for to_agent in agent_ids
+            if from_agent != to_agent
+        ]
+    )
 
 
 def _trust_sum(mesh: ConstitutionalMesh) -> float:
     """Sum of all raw trust values — proxy for 'non-zero trust exists'."""
-    if mesh._manifold is None:
-        return 0.0
-    raw = mesh._manifold._raw_trust
-    return sum(raw[i][j] for i in range(len(raw)) for j in range(len(raw[i])))
+    return sum(sum(row) for row in mesh.raw_trust_snapshot().matrix)
 
 
 class TestAgentChurn:
@@ -78,20 +78,14 @@ class TestAgentChurn:
         _inject_trust(mesh)
 
         # Record agent-0's trust relationships
-        idx_0 = mesh._agent_indices.get("agent-0")
-        assert idx_0 is not None
-
         # Unregister agent-0 — trust should be archived
         mesh.unregister_agent("agent-0")
         assert "agent-0" in mesh._trust_archive, "Trust archive should contain departed agent"
 
         # Re-register agent-0 — archive should be restored with decay
         mesh.register_local_signer("agent-0", domain="test")
-        idx_after = mesh._agent_indices.get("agent-0")
-        assert idx_after is not None
-
-        raw_after = mesh._manifold._raw_trust[idx_after]  # type: ignore[index]
-        restored = sum(raw_after)
+        snapshot = mesh.raw_trust_snapshot()
+        restored = sum(snapshot.matrix[snapshot.agent_ids.index("agent-0")])
         assert restored > 0.0, "Returning agent should have non-zero trust restored from archive"
         assert "agent-0" not in mesh._trust_archive, "Archive should be cleared after restore"
 

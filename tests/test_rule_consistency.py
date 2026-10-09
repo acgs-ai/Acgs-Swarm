@@ -411,29 +411,32 @@ class TestGossipSecurityFixes:
         """_wire_to_node must reject metadata exceeding MAX_METADATA_BYTES."""
 
         from constitutional_swarm.gossip_protocol import MAX_METADATA_BYTES, _wire_to_node
+        from constitutional_swarm.merkle_crdt import compute_cid
 
         oversized = {"data": "x" * (MAX_METADATA_BYTES + 1024)}
         data = {
-            "cid": "abc123",
+            "cid": compute_cid("test-agent", "hello", (), metadata=oversized),
             "agent_id": "test-agent",
             "payload": "hello",
             "metadata": oversized,
         }
-        with pytest.raises(ValueError, match="metadata exceeds"):
+        with pytest.raises(ValueError, match="metadata exceeds 65536 bytes"):
             _wire_to_node(data)
 
     def test_normal_metadata_is_accepted(self) -> None:
         """Small metadata must pass through without error."""
         from constitutional_swarm.gossip_protocol import _wire_to_node
+        from constitutional_swarm.merkle_crdt import compute_cid
 
         data = {
-            "cid": "abc123",
+            "cid": compute_cid("test-agent", "hello", (), metadata={"key": "small value"}),
             "agent_id": "test-agent",
             "payload": "hello",
             "metadata": {"key": "small value"},
         }
         node = _wire_to_node(data)
         assert node.metadata == {"key": "small value"}
+        assert node.verify_cid()
 
     def test_topological_order_is_deterministic(self) -> None:
         """topological_order must return the same order on repeated calls."""

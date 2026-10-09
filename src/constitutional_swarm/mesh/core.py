@@ -29,7 +29,7 @@ import random
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -48,6 +48,7 @@ from constitutional_swarm.mesh.exceptions import (
     DuplicateVoteError,
     InsufficientPeersError,
     InvalidVoteSignatureError,
+    MeshCapacityError,
     MeshHaltedError,
     MeshSnapshotStaleError,
     RecoveredAssignmentError,
@@ -69,7 +70,9 @@ from constitutional_swarm.mesh.settlement import (
     _compute_merkle_root,
 )
 from constitutional_swarm.mesh.voting import RemoteVoteRequest, ValidationVote
+from constitutional_swarm.mesh.trust import TrustSnapshot, _TrustState
 from constitutional_swarm.settlement_store import (
+    DuplicateSettlementError,
     JSONLSettlementStore,
     SettlementRecord,
     SettlementStore,
@@ -126,11 +129,24 @@ class ConstitutionalMesh:
         auto_reconcile: bool = True,
         request_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
         receipt_signing_private_key: Ed25519PrivateKey | bytes | str | None = None,
+        max_pending_assignments: int = 10_000,
+        max_settled_results: int = 10_000,
+        max_shadow_metrics: int = 1_000,
     ) -> None:
-        if quorum > peers_per_validation:
+        if peers_per_validation < 1:
+            raise ValueError("peers_per_validation must be at least 1")
+        if quorum < 1 or quorum > peers_per_validation:
             raise ValueError(
-                f"Quorum ({quorum}) cannot exceed peers_per_validation ({peers_per_validation})"
+                f"Quorum ({quorum}) must be between 1 and peers_per_validation "
+                f"({peers_per_validation})"
             )
+        for name, value in (
+            ("max_pending_assignments", max_pending_assignments),
+            ("max_settled_results", max_settled_results),
+            ("max_shadow_metrics", max_shadow_metrics),
+        ):
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1")
         if manifold_type not in {"birkhoff", "spectral"}:
             raise ValueError(
                 f"manifold_type must be 'birkhoff' or 'spectral', got {manifold_type!r}"
@@ -192,7 +208,12 @@ class ConstitutionalMesh:
         )
         self._assignments: dict[str, PeerAssignment] = {}
         self._votes: dict[str, list[ValidationVote]] = {}
-        self._final_results: dict[str, MeshResult] = {}
+        self._final_results: OrderedDict[str, MeshResult] = OrderedDict()
+        self._max_pending_assignments = max_pending_assignments
+        self._max_settled_results = max_settled_results
+        self._total_validations = 0
+        self._total_votes = 0
+        self._total_settled = 0
         self._use_manifold = use_manifold
         self._manifold_type = manifold_type
         self._trust_policy = resolved_policy
@@ -210,14 +231,14 @@ class ConstitutionalMesh:
             self._shadow_manifold: spectral_sphere_mod.SpectralSphereManifold | None = (
                 None
             )
-            self._shadow_metrics: list[dict[str, float | str]] = []
-        self._agent_indices: dict[str, int] = {}
-        # Trust persistence: keyed by (from_agent_id, to_agent_id)
-        # Survives agent churn and constitution rotation when preserve_trust=True.
-        self._trust_store: dict[tuple[str, str], float] = {}
-        # Archive for departed agents: agent_id → {partner_id: (trust_value, timestamp)}
-        # Capped at _TRUST_ARCHIVE_MAX entries; LRU eviction by timestamp.
-        self._trust_archive: dict[str, dict[str, tuple[float, float]]] = {}
+            self._shadow_metrics: deque[dict[str, float | str]] = deque(
+                maxlen=max_shadow_metrics
+            )
+        self._trust_state = _TrustState(
+            decay_rate=self._TRUST_DECAY_RATE,
+            archive_limit=self._TRUST_ARCHIVE_MAX,
+        )
+        self._sync_trust_aliases()
         self._settled_assignments: set[str] = set()
         self._settled_voters: dict[str, set[str]] = {}
         self._lock = threading.RLock()
@@ -304,9 +325,9 @@ class ConstitutionalMesh:
             )
             self._agent_vote_private_keys.pop(agent_id, None)
             if self._use_manifold and agent_id not in self._agent_indices:
-                self._agent_indices[agent_id] = len(self._agent_indices)
+                self._trust_state.register(agent_id)
+                self._sync_trust_aliases()
                 self._rebuild_manifold()
-                self._restore_archive_for_agent(agent_id)
             self._state_generation += 1
 
     def register_local_signer(
@@ -327,9 +348,9 @@ class ConstitutionalMesh:
             self._agent_vote_private_keys[agent_id] = private_key
             self._agent_vote_public_keys[agent_id] = private_key.public_key()
             if self._use_manifold and agent_id not in self._agent_indices:
-                self._agent_indices[agent_id] = len(self._agent_indices)
+                self._trust_state.register(agent_id)
+                self._sync_trust_aliases()
                 self._rebuild_manifold()
-                self._restore_archive_for_agent(agent_id)
             self._state_generation += 1
 
     def register_agent(self, *args: Any, **kwargs: Any) -> None:
@@ -348,25 +369,8 @@ class ConstitutionalMesh:
             self._agent_vote_public_keys.pop(agent_id, None)
             self._agent_vote_private_keys.pop(agent_id, None)
             if self._use_manifold and agent_id in self._agent_indices:
-                self._archive_trust_for_agent(agent_id)
-                # Remove departing agent from trust_store entries
-                self._trust_store = {
-                    (a, b): v
-                    for (a, b), v in self._trust_store.items()
-                    if a != agent_id and b != agent_id
-                }
-                remaining_ids = [
-                    existing_agent_id
-                    for existing_agent_id, _ in sorted(
-                        self._agent_indices.items(), key=lambda item: item[1]
-                    )
-                    if existing_agent_id != agent_id
-                    and existing_agent_id in self._agents
-                ]
-                self._agent_indices = {
-                    existing_agent_id: idx
-                    for idx, existing_agent_id in enumerate(remaining_ids)
-                }
+                self._trust_state.unregister(agent_id)
+                self._sync_trust_aliases()
                 self._rebuild_manifold()
             self._voter_dna.pop(agent_id, None)
             self._state_generation += 1
@@ -389,8 +393,6 @@ class ConstitutionalMesh:
                 security-motivated rotation.
         """
         with self._lock:
-            if preserve_trust and self._use_manifold:
-                self._save_trust_to_store()
             self._constitution = new_constitution
             self._dna = AgentDNA(
                 constitution=new_constitution,
@@ -401,15 +403,14 @@ class ConstitutionalMesh:
             self._state_generation += 1
             self._voter_dna.clear()
             if self._use_manifold:
-                if preserve_trust:
-                    self._rebuild_manifold()
-                else:
+                if not preserve_trust:
                     # Hard reset — null manifold first so _save_trust_to_store is a no-op
                     self._manifold = None
                     if self._shadow_spectral:
                         self._shadow_manifold = None
-                        self._shadow_metrics = []
-                    self._trust_store = {}
+                        self._shadow_metrics.clear()
+                    self._trust_state.reset()
+                    self._sync_trust_aliases()
                     self._rebuild_manifold()
 
     def _voter_dna_locked(self, voter_id: str) -> AgentDNA:
@@ -490,6 +491,11 @@ class ConstitutionalMesh:
     ) -> PeerAssignment:
         with self._lock:
             self._check_halted()
+            self._discard_stale_assignments_locked()
+            if self._pending_assignment_count_locked() >= self._max_pending_assignments:
+                raise MeshCapacityError(
+                    f"mesh pending assignment capacity {self._max_pending_assignments} reached"
+                )
             if producer_id not in self._agents:
                 raise KeyError(f"Producer {producer_id} not registered")
             dna = self._dna
@@ -553,18 +559,20 @@ class ConstitutionalMesh:
                 raise MeshSnapshotStaleError(
                     "constitution hash changed during validation"
                 )
+            if self._pending_assignment_count_locked() >= self._max_pending_assignments:
+                raise MeshCapacityError(
+                    f"mesh pending assignment capacity {self._max_pending_assignments} reached"
+                )
             self._assignments[assignment.assignment_id] = assignment
             self._votes[assignment.assignment_id] = []
+            self._total_validations += 1
             self._agents[producer_id].validations_received += 1
             return assignment
 
     def _copy_raw_trust_locked(self) -> list[list[float]] | None:
         if not self._use_manifold or self._manifold is None:
             return None
-        raw = getattr(self._manifold, "_raw_trust", None)
-        if raw is None:
-            return None
-        return [list(row) for row in raw]
+        return [list(row) for row in self._manifold.trust_matrix]
 
     def _routing_snapshot_locked(self) -> dict[str, Any]:
         """Capture every input that can invalidate snapshot-compute-commit."""
@@ -606,15 +614,8 @@ class ConstitutionalMesh:
             return list(selected)[:needed]
         if not self._use_manifold or trust_raw is None or producer_id not in indices:
             return list(self._rng.sample(available, k=needed))
-        detached = self._build_manifold(len(trust_raw), self._manifold_type)
-        detached._raw_trust = trust_raw  # type: ignore[attr-defined]
-        if hasattr(detached, "_projected"):
-            detached._projected = None  # type: ignore[attr-defined]
-        proj = detached.project()
-        if not getattr(proj, "converged", True):
-            return list(self._rng.sample(available, k=needed))
         producer_idx = indices[producer_id]
-        trust_row = proj.matrix[producer_idx]
+        trust_row = trust_raw[producer_idx]
         weight_map: dict[str, float] = {}
         for aid in available:
             idx = indices.get(aid)
@@ -644,16 +645,17 @@ class ConstitutionalMesh:
         """
         with self._lock:
             self._check_halted()
-            assignment = self._assignments.get(assignment_id)
-            if assignment is None:
-                raise KeyError(f"Assignment {assignment_id} not found")
-            if assignment.is_recovered:
-                raise RecoveredAssignmentError(
-                    f"Assignment {assignment_id} is already durably settled"
-                )
             if assignment_id in self._final_results:
                 raise AssignmentSettledError(
                     f"Assignment {assignment_id} is already settled"
+                )
+            assignment = self._assignments.get(assignment_id)
+            if assignment is None:
+                raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
+            if assignment.is_recovered:
+                raise RecoveredAssignmentError(
+                    f"Assignment {assignment_id} is already durably settled"
                 )
             if voter_id not in assignment.peers:
                 raise UnauthorizedVoterError(
@@ -676,7 +678,7 @@ class ConstitutionalMesh:
                         voter_id=voter_id,
                         approved=approved,
                         reason=reason,
-                        constitutional_hash=self.constitutional_hash,
+                        constitutional_hash=assignment.constitutional_hash,
                         content_hash=assignment.content_hash,
                     ),
                 )
@@ -695,11 +697,12 @@ class ConstitutionalMesh:
                 approved=approved,
                 reason=reason,
                 signature=signature,
-                constitutional_hash=self.constitutional_hash,
+                constitutional_hash=assignment.constitutional_hash,
                 content_hash=assignment.content_hash,
                 timestamp=time.time(),
             )
             self._votes[assignment_id] = [*existing, vote]
+            self._total_votes += 1
 
             if voter_id in self._agents:
                 self._agents[voter_id].validations_performed += 1
@@ -733,22 +736,27 @@ class ConstitutionalMesh:
 
         The settlement snapshot is written to the backing store *outside* the
         mesh lock so that slow or remote I/O in the store does not block
-        concurrent callers.  The in-memory ``_final_results`` entry is written
-        first so that concurrent readers see the settled result immediately
-        (read-your-writes), then the lock is released before persisting.
+        concurrent callers. A durable pending marker is written before the
+        in-memory result is installed, and the completed durable record is then
+        appended before the pending marker is cleared.
         """
         with self._lock:
+            final = self._final_results.get(assignment_id)
+            if final is not None:
+                recovered = self._assignments.get(assignment_id)
+                if recovered is not None and recovered.is_recovered:
+                    raise RecoveredAssignmentError(
+                        f"Assignment {assignment_id} is already durably settled"
+                    )
+                return final
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
             if assignment.is_recovered:
                 raise RecoveredAssignmentError(
                     f"Assignment {assignment_id} is already durably settled"
                 )
-
-            final = self._final_results.get(assignment_id)
-            if final is not None:
-                return final
 
             preview = self._preview_result(assignment)
             if not preview.quorum_met:
@@ -773,13 +781,14 @@ class ConstitutionalMesh:
                 settled=True,
                 settled_at=settled_at,
             )
-            pending_record = replace(
+            settled_votes = list(self._votes.get(assignment_id, []))
+            pending_record = self._record_with_serialized_votes(
                 self._build_settlement_record(assignment, final),
-                votes=self._vote_dicts(list(self._votes.get(assignment_id, []))),
+                settled_votes,
             )
             recovered_assignment = replace(assignment, is_recovered=True)
             settled_record = self._build_settlement_record(recovered_assignment, final)
-            settled_votes = list(self._votes.get(assignment_id, []))
+            settlement_fence = self._constitution_fence_locked()
         # Persist outside the lock — store I/O must not block mesh operations.
         # A durable pending marker is written first so startup reconciliation can
         # recover frozen-but-not-yet-durable settlements after a crash.
@@ -791,13 +800,29 @@ class ConstitutionalMesh:
                 existing = self._final_results.get(assignment_id)
                 if existing is not None:
                     return existing
-                self._final_results[assignment_id] = final
+                if not self._constitution_fence_matches_locked(settlement_fence):
+                    raise MeshSnapshotStaleError(
+                        f"Assignment {assignment_id} crossed a constitution rotation "
+                        "during settlement"
+                    )
+                # This install is the settlement linearization point. A later
+                # rotation may make the result historical while Phase 2 persists.
+                self._remember_final_result_locked(assignment_id, final)
             self._persist_settlement_record(settled_record, votes=settled_votes)
             self._maybe_crash("after-append")
             if self._settlement_store is not None:
                 self._settlement_store.clear_pending(assignment_id)
             with self._lock:
-                self._assignments[assignment_id] = recovered_assignment
+                self._assignments[assignment_id] = replace(
+                    recovered_assignment,
+                    content="",
+                )
+                self._votes.pop(assignment_id, None)
+                self._settled_assignments.discard(assignment_id)
+                self._settled_voters.pop(assignment_id, None)
+                self._total_settled += 1
+        except MeshSnapshotStaleError:
+            raise
         except Exception as exc:
             raise SettlementPersistenceError(
                 f"Settlement {assignment_id} was frozen in memory but could not be persisted"
@@ -820,6 +845,7 @@ class ConstitutionalMesh:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
             self._assert_assignment_payload_complete(assignment)
             if voter_id not in self._agent_vote_private_keys:
                 raise UnauthorizedVoterError(
@@ -978,6 +1004,7 @@ class ConstitutionalMesh:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
             self._assert_assignment_payload_complete(assignment)
             if voter_id not in assignment.peers:
                 raise UnauthorizedVoterError(
@@ -1039,6 +1066,15 @@ class ConstitutionalMesh:
             raise ValueError(
                 f"Remote vote response voter mismatch: {response.voter_id} != {voter_id}"
             )
+        with self._lock:
+            assignment = self._assignments.get(assignment_id)
+            if assignment is None:
+                raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
+            if response.constitutional_hash != assignment.constitutional_hash:
+                raise ValueError("Remote vote response constitution mismatch")
+            if response.content_hash != assignment.content_hash:
+                raise ValueError("Remote vote response content hash mismatch")
         return self.submit_vote(
             assignment_id,
             voter_id,
@@ -1150,14 +1186,68 @@ class ConstitutionalMesh:
                 " or does not match its content hash"
             )
 
+    def _require_current_assignment_constitution(
+        self, assignment: PeerAssignment
+    ) -> None:
+        if assignment.constitutional_hash != self.constitutional_hash:
+            raise MeshSnapshotStaleError(
+                f"Assignment {assignment.assignment_id} belongs to a stale constitution"
+            )
+
+    def _constitution_fence_locked(self) -> tuple[int, str]:
+        """Capture the active constitution generation and content hash."""
+        return self._constitution_generation, self.constitutional_hash
+
+    def _constitution_fence_matches_locked(self, fence: tuple[int, str]) -> bool:
+        """Return whether no constitution rotation crossed an external I/O phase."""
+        generation, constitutional_hash = fence
+        return (
+            self._constitution_generation == generation
+            and self.constitutional_hash == constitutional_hash
+        )
+
     # -- Stats -------------------------------------------------------------
+
+    def _pending_assignment_count_locked(self) -> int:
+        return sum(
+            1 for assignment in self._assignments.values() if not assignment.is_recovered
+        )
+
+    def _discard_stale_assignments_locked(self) -> None:
+        """Reclaim bounded pending capacity from invalidated constitutions."""
+        stale_ids = [
+            assignment_id
+            for assignment_id, assignment in self._assignments.items()
+            if not assignment.is_recovered
+            and assignment.constitutional_hash != self.constitutional_hash
+        ]
+        for assignment_id in stale_ids:
+            self._assignments.pop(assignment_id, None)
+            self._votes.pop(assignment_id, None)
+            self._settled_assignments.discard(assignment_id)
+            self._settled_voters.pop(assignment_id, None)
+        if stale_ids:
+            self._state_generation += 1
+
+    def _remember_final_result_locked(
+        self, assignment_id: str, result: MeshResult
+    ) -> None:
+        self._final_results[assignment_id] = result
+        self._final_results.move_to_end(assignment_id)
+        while len(self._final_results) > self._max_settled_results:
+            evicted_id, _ = self._final_results.popitem(last=False)
+            self._assignments.pop(evicted_id, None)
+            self._votes.pop(evicted_id, None)
+            self._settled_assignments.discard(evicted_id)
+            self._settled_voters.pop(evicted_id, None)
 
     def summary(self) -> dict[str, Any]:
         """Mesh statistics."""
         with self._lock:
-            total_validations = len(self._assignments)
-            total_votes = sum(len(v) for v in self._votes.values())
-            settled = len(self._final_results)
+            total_validations = self._total_validations
+            total_votes = self._total_votes
+            settled = self._total_settled
+            pending = self._pending_assignment_count_locked()
         pending_settlements = (
             0
             if self._settlement_store is None
@@ -1178,7 +1268,7 @@ class ConstitutionalMesh:
                 "constitutional_hash": self.constitutional_hash,
                 "total_validations": total_validations,
                 "settled": settled,
-                "pending": total_validations - settled,
+                "pending": pending,
                 "pending_settlements": pending_settlements,
                 "total_votes": total_votes,
                 "settlement_storage": settlement_storage,
@@ -1321,92 +1411,68 @@ class ConstitutionalMesh:
     _TRUST_ARCHIVE_MAX: int = 1000
     _TRUST_DECAY_RATE: float = 0.05  # fraction lost per re-join round
 
-    def _save_trust_to_store(self) -> None:
-        """Snapshot current manifold raw trust into _trust_store (by agent_id pair)."""
-        if self._manifold is None:
-            return
-        raw = self._manifold._raw_trust  # direct access — same package
-        n = len(raw)
-        for aid, i in self._agent_indices.items():
-            if i >= n:
-                continue  # new agent not yet in old manifold
-            for bid, j in self._agent_indices.items():
-                if j >= n:
-                    continue
-                val = raw[i][j]
-                if val != 0.0:
-                    self._trust_store[(aid, bid)] = val
+    def _sync_trust_aliases(self) -> None:
+        """Expose read-compatible aliases while `_TrustState` remains authoritative."""
+        self._agent_indices = self._trust_state.indices
+        self._trust_store = self._trust_state.values
+        self._trust_archive = self._trust_state.archive
 
-    def _restore_trust_from_store(
+    def raw_trust_snapshot(self) -> TrustSnapshot:
+        """Return a detached ID-addressable snapshot of canonical raw trust."""
+        with self._lock:
+            return self._trust_state.raw_snapshot()
+
+    def update_trust(self, updates: list[tuple[str, str, float]]) -> None:
+        """Apply one ID-keyed trust batch and advance one logical trust round."""
+        with self._lock:
+            shadow = self._synchronized_shadow_manifold_locked()
+            self._trust_state.apply_updates(updates)
+            self._sync_trust_aliases()
+            indices = self._agent_indices
+            indexed = [(indices[a], indices[b], delta) for a, b, delta in updates]
+            if self._manifold is not None:
+                batch = getattr(self._manifold, "update_trust_batch", None)
+                if batch is not None:
+                    batch(indexed)
+                else:
+                    for from_index, to_index, delta in indexed:
+                        self._manifold.update_trust(from_index, to_index, delta)
+                    self._manifold.project()
+            if shadow is not None:
+                shadow.update_trust_batch(indexed)
+            if updates:
+                self._state_generation += 1
+
+    def _synchronized_shadow_manifold_locked(
         self,
-        manifold: GovernanceManifold
-        | spectral_sphere_mod.SpectralSphereManifold
-        | None = None,
-    ) -> None:
-        """Replay _trust_store into a freshly built manifold instance."""
-        target = self._manifold if manifold is None else manifold
-        if target is None:
-            return
-        for (aid, bid), val in self._trust_store.items():
-            i = self._agent_indices.get(aid)
-            j = self._agent_indices.get(bid)
-            if i is not None and j is not None:
-                target._raw_trust[i][j] = val
+    ) -> spectral_sphere_mod.SpectralSphereManifold | None:
+        """Repair a stale shadow dimension before applying the next trust batch."""
+        shadow = getattr(self, "_shadow_manifold", None)
+        expected_size = len(self._agent_indices)
+        if shadow is None or shadow.num_agents == expected_size:
+            return shadow
+        logger.error(
+            "Shadow manifold dimension mismatch; rebuilding from canonical trust",
+            extra={
+                "shadow_agents": shadow.num_agents,
+                "expected_agents": expected_size,
+            },
+        )
+        rebuilt = cast(
+            "spectral_sphere_mod.SpectralSphereManifold",
+            self._build_manifold(expected_size, "spectral"),
+        )
+        self._restore_manifold_snapshot(rebuilt)
+        self._shadow_manifold = rebuilt
+        return rebuilt
 
-    def _restore_archive_for_agent(self, agent_id: str) -> None:
-        """Restore archived trust for a returning agent with exponential decay."""
-        archived = self._trust_archive.pop(agent_id, None)
-        if archived is None or self._manifold is None:
-            return
-        now = time.monotonic()
-        i = self._agent_indices.get(agent_id)
-        if i is None:
-            return
-        for partner_id, (val, ts) in archived.items():
-            j = self._agent_indices.get(partner_id)
-            if j is None:
-                continue
-            elapsed_rounds = max(0.0, now - ts)
-            decayed = val * max(0.0, 1.0 - self._TRUST_DECAY_RATE * elapsed_rounds)
-            if decayed > 0.0:
-                self._manifold._raw_trust[i][j] = decayed
-                self._manifold._raw_trust[j][i] = decayed
-                shadow = getattr(self, "_shadow_manifold", None)
-                if shadow is not None:
-                    shadow._raw_trust[i][j] = decayed
-                    shadow._raw_trust[j][i] = decayed
-
-    def _archive_trust_for_agent(self, agent_id: str) -> None:
-        """Save departing agent's trust to archive (capped at _TRUST_ARCHIVE_MAX)."""
-        if self._manifold is None:
-            return
-        i = self._agent_indices.get(agent_id)
-        if i is None:
-            return
-        raw = self._manifold._raw_trust
-        now = time.monotonic()
-        entries: dict[str, tuple[float, float]] = {}
-        for partner_id, j in self._agent_indices.items():
-            if partner_id == agent_id:
-                continue
-            val = raw[i][j]
-            if val != 0.0:
-                entries[partner_id] = (val, now)
-        if entries:
-            # Evict oldest archive entries if at cap
-            while len(self._trust_archive) >= self._TRUST_ARCHIVE_MAX:
-                oldest = min(
-                    self._trust_archive,
-                    key=lambda aid: min(
-                        ts for _, ts in self._trust_archive[aid].values()
-                    ),
-                )
-                del self._trust_archive[oldest]
-            self._trust_archive[agent_id] = entries
+    def advance_trust_rounds(self, count: int) -> None:
+        """Advance logical trust rounds without using wall-clock time."""
+        with self._lock:
+            self._trust_state.advance_rounds(count)
 
     def _rebuild_manifold(self) -> None:
         """Rebuild the manifold with the current number of agents, preserving trust state."""
-        self._save_trust_to_store()
         n = len(self._agent_indices)
         if n == 0:
             self._manifold = None
@@ -1414,14 +1480,26 @@ class ConstitutionalMesh:
                 self._shadow_manifold = None
             return
         self._manifold = self._build_manifold(n, self._manifold_type)
-        self._restore_trust_from_store()
+        self._restore_manifold_snapshot(self._manifold)
         if self._shadow_spectral:
             # "spectral" always yields a SpectralSphereManifold (the shadow's type).
             self._shadow_manifold = cast(
                 "spectral_sphere_mod.SpectralSphereManifold",
                 self._build_manifold(n, "spectral"),
             )
-            self._restore_trust_from_store(self._shadow_manifold)
+            self._restore_manifold_snapshot(self._shadow_manifold)
+
+    def _restore_manifold_snapshot(
+        self,
+        manifold: GovernanceManifold | spectral_sphere_mod.SpectralSphereManifold,
+    ) -> None:
+        matrix = [list(row) for row in self._trust_state.raw_snapshot().matrix]
+        replace_raw = getattr(manifold, "replace_raw_trust", None)
+        if replace_raw is not None:
+            replace_raw(matrix)
+        else:
+            manifold._raw_trust = matrix
+            manifold.project()
 
     def _build_manifold(
         self,
@@ -1474,50 +1552,36 @@ class ConstitutionalMesh:
             self._settled_assignments.add(assignment_id)
             if self._manifold is not None:
                 assignment = self._assignments[assignment_id]
-                producer_idx = self._agent_indices.get(assignment.producer_id)
-                if producer_idx is not None:
-                    for vote in votes:
-                        voter_idx = self._agent_indices.get(vote.voter_id)
-                        if voter_idx is None:
-                            continue
-                        if vote.approved == majority_approved:
-                            self._manifold.update_trust(producer_idx, voter_idx, 0.1)
-                        else:
-                            self._manifold.update_trust(producer_idx, voter_idx, -0.5)
-                    self._manifold.project()
-                    self._state_generation += 1
+                updates = [
+                    (
+                        assignment.producer_id,
+                        vote.voter_id,
+                        0.1 if vote.approved == majority_approved else -0.5,
+                    )
+                    for vote in votes
+                    if vote.voter_id in self._agent_indices
+                ]
+                if assignment.producer_id in self._agent_indices and updates:
+                    self.update_trust(updates)
                     shadow = getattr(self, "_shadow_manifold", None)
                     if shadow is not None:
-                        try:
-                            for vote in votes:
-                                voter_idx = self._agent_indices.get(vote.voter_id)
-                                if voter_idx is None:
-                                    continue
-                                if vote.approved == majority_approved:
-                                    shadow.update_trust(producer_idx, voter_idx, 0.1)
-                                else:
-                                    shadow.update_trust(producer_idx, voter_idx, -0.5)
-                            shadow.project()
-                            self._shadow_metrics.append(
-                                {
-                                    "assignment_id": assignment_id,
-                                    "birkhoff_variance": _trust_variance(
-                                        self._manifold.trust_matrix
-                                    ),
-                                    "spectral_variance": _trust_variance(
-                                        shadow.trust_matrix
-                                    ),
-                                    "birkhoff_spectral_norm": _matrix_spectral_norm(
-                                        self._manifold.trust_matrix
-                                    ),
-                                    "spectral_spectral_norm": _matrix_spectral_norm(
-                                        shadow.trust_matrix
-                                    ),
-                                }
-                            )
-                        except IndexError:
-                            # Shadow mode must never interfere with the live routing path.
-                            pass
+                        self._shadow_metrics.append(
+                            {
+                                "assignment_id": assignment_id,
+                                "birkhoff_variance": _trust_variance(
+                                    self._manifold.trust_matrix
+                                ),
+                                "spectral_variance": _trust_variance(
+                                    shadow.trust_matrix
+                                ),
+                                "birkhoff_spectral_norm": _matrix_spectral_norm(
+                                    self._manifold.trust_matrix
+                                ),
+                                "spectral_spectral_norm": _matrix_spectral_norm(
+                                    shadow.trust_matrix
+                                ),
+                            }
+                        )
 
     def _maybe_finalize_result(self, assignment_id: str) -> bool:
         """Return whether the first quorum-reaching result should be frozen."""
@@ -1531,6 +1595,7 @@ class ConstitutionalMesh:
 
     def _preview_result(self, assignment: PeerAssignment) -> MeshResult:
         """Compute the current non-final view of an assignment."""
+        self._require_current_assignment_constitution(assignment)
         votes = self._votes.get(assignment.assignment_id, [])
         votes_for = sum(1 for v in votes if v.approved)
         votes_against = sum(1 for v in votes if not v.approved)
@@ -1595,7 +1660,7 @@ class ConstitutionalMesh:
         self,
         record: SettlementRecord,
         *,
-        votes: list[Any] | None = None,
+        votes: list[Any],
     ) -> None:
         """Append a pre-built settlement record when configured.
 
@@ -1625,7 +1690,11 @@ class ConstitutionalMesh:
 
         assignment_id = str(record.assignment["assignment_id"])
         try:
-            unsigned = receipt_from_mesh_settlement(record, votes or [])
+            completed_record = self._record_with_serialized_votes(record, votes)
+            unsigned = receipt_from_mesh_settlement(
+                completed_record,
+                list(completed_record.votes),
+            )
             payload_bytes = payload_canonical_bytes(unsigned.payload)
             signing_key = self._receipt_signing_private_key
             signing_public = self._receipt_signing_public_key
@@ -1649,7 +1718,7 @@ class ConstitutionalMesh:
             raise SettlementPersistenceError(
                 f"Settlement {assignment_id} receipt could not be built"
             ) from exc
-        bound = replace(record, receipt_digest=receipt.payload_digest)
+        bound = replace(completed_record, receipt_digest=receipt.payload_digest)
         if store_filesystem_path(self._settlement_store) is None:
             # In-memory adapters have no receipt file; still persist the pointer.
             self._settlement_store.append(bound)
@@ -1695,13 +1764,31 @@ class ConstitutionalMesh:
             assignment = self._deserialize_assignment(record.assignment)
             assignment = replace(assignment, is_recovered=True)
             result = self._deserialize_result(record.result)
-            if assignment.constitutional_hash != self.constitutional_hash:
-                raise ValueError(
-                    "Persisted settlement constitutional hash does not match current mesh"
-                )
+            if not self._stored_record_is_current(record, assignment, result):
+                continue
             self._assignments[assignment.assignment_id] = assignment
             self._votes.setdefault(assignment.assignment_id, [])
-            self._final_results[assignment.assignment_id] = result
+            self._remember_final_result_locked(assignment.assignment_id, result)
+            self._total_validations += 1
+            self._total_settled += 1
+
+    def _stored_record_is_current(
+        self,
+        record: SettlementRecord,
+        assignment: PeerAssignment,
+        result: MeshResult,
+    ) -> bool:
+        """Validate stored hash tags and classify active versus historical records."""
+        tags = {
+            record.constitutional_hash,
+            assignment.constitutional_hash,
+            result.constitutional_hash,
+        }
+        if "" in tags or len(tags) != 1:
+            raise ValueError("Persisted settlement constitutional hash tags disagree")
+        if result.proof is not None and result.proof.constitutional_hash not in tags:
+            raise ValueError("Persisted settlement proof constitutional hash disagrees")
+        return assignment.constitutional_hash == self.constitutional_hash
 
     def reconcile_pending_settlements(self) -> ReconciliationReport:
         """Replay durable pending settlements into the primary store once."""
@@ -1735,13 +1822,14 @@ class ConstitutionalMesh:
                 assignment = self._deserialize_assignment(record.assignment)
                 assignment = replace(assignment, is_recovered=record.is_recovered)
                 result = self._deserialize_result(record.result)
-                if assignment.constitutional_hash != self.constitutional_hash:
-                    raise ValueError(
-                        "Persisted settlement constitutional hash does not match current mesh"
-                    )
-
-                installed = False
                 with self._lock:
+                    if not self._stored_record_is_current(record, assignment, result):
+                        report = replace(
+                            report,
+                            skipped_constitution=report.skipped_constitution + 1,
+                        )
+                        continue
+                    reconciliation_fence = self._constitution_fence_locked()
                     existing_assignment = self._assignments.get(
                         assignment.assignment_id
                     )
@@ -1750,70 +1838,86 @@ class ConstitutionalMesh:
                         and existing_assignment.is_recovered
                     ):
                         self._settlement_store.clear_pending(assignment.assignment_id)
-                        report = ReconciliationReport(
-                            attempted=report.attempted,
-                            settled=report.settled,
+                        report = replace(
+                            report,
                             skipped_recovered=report.skipped_recovered + 1,
-                            failed=report.failed,
                             errors=errors,
                         )
                         continue
                 if not record.votes:
                     raise ValueError("pending settlement has no authentic votes")
                 recovered_votes = self._authenticated_vote_dicts(list(record.votes))
-                with self._lock:
-                    self._assignments.setdefault(assignment.assignment_id, assignment)
-                    self._votes.setdefault(assignment.assignment_id, [])
-                    self._final_results.setdefault(assignment.assignment_id, result)
-                    installed = True
 
-                report = ReconciliationReport(
+                report = replace(
+                    report,
                     attempted=report.attempted + 1,
-                    settled=report.settled,
-                    skipped_recovered=report.skipped_recovered,
-                    failed=report.failed,
                     errors=errors,
                 )
-                try:
-                    self._persist_settlement_record(
-                        self._build_settlement_record(
-                            replace(assignment, is_recovered=True),
-                            result,
-                        ),
-                        votes=recovered_votes,
+                durable_record = self._build_settlement_record(
+                    replace(assignment, is_recovered=True),
+                    result,
+                )
+                expected_durable = self._expected_durable_record(
+                    durable_record,
+                    votes=recovered_votes,
+                )
+                existing_durable = self._durable_settlement(assignment.assignment_id)
+                if existing_durable is None:
+                    try:
+                        self._persist_settlement_record(
+                            durable_record,
+                            votes=recovered_votes,
+                        )
+                    except DuplicateSettlementError:
+                        pass
+                    existing_durable = self._durable_settlement(
+                        assignment.assignment_id
                     )
-                except Exception:
-                    if installed:
-                        with self._lock:
-                            self._final_results.pop(assignment.assignment_id, None)
-                            current = self._assignments.get(assignment.assignment_id)
-                            if current is assignment:
-                                self._assignments.pop(assignment.assignment_id, None)
-                    raise
+                self._require_matching_durable_settlement(
+                    expected_durable,
+                    existing_durable,
+                )
                 with self._lock:
+                    if not self._constitution_fence_matches_locked(reconciliation_fence):
+                        # Phase 2 is durable history, but it must not become active
+                        # state after crossing a constitution rotation. Keep the
+                        # now-foreign pending marker for the stale-record policy.
+                        report = replace(
+                            report,
+                            skipped_constitution=report.skipped_constitution + 1,
+                            errors=errors,
+                        )
+                        continue
                     current_assignment = self._assignments.get(assignment.assignment_id)
-                    if (
-                        current_assignment is not None
-                        and not current_assignment.is_recovered
-                    ):
+                    if current_assignment is None:
+                        self._assignments[assignment.assignment_id] = replace(
+                            assignment,
+                            is_recovered=True,
+                            content="",
+                        )
+                        self._total_validations += 1
+                    elif not current_assignment.is_recovered:
                         self._assignments[assignment.assignment_id] = replace(
                             current_assignment,
                             is_recovered=True,
+                            content="",
                         )
+                    if assignment.assignment_id not in self._final_results:
+                        self._remember_final_result_locked(assignment.assignment_id, result)
+                    self._votes.pop(assignment.assignment_id, None)
+                    self._settled_assignments.discard(assignment.assignment_id)
+                    self._settled_voters.pop(assignment.assignment_id, None)
+                    self._total_settled += 1
                 self._settlement_store.clear_pending(assignment.assignment_id)
-                report = ReconciliationReport(
-                    attempted=report.attempted,
+                report = replace(
+                    report,
                     settled=report.settled + 1,
-                    skipped_recovered=report.skipped_recovered,
-                    failed=report.failed,
                     errors=errors,
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 errors.append(f"{assignment_id}: {exc}")
-                report = ReconciliationReport(
-                    attempted=report.attempted,
-                    settled=report.settled,
-                    skipped_recovered=report.skipped_recovered,
+                report = replace(
+                    report,
                     failed=report.failed + 1,
                     errors=errors,
                 )
@@ -1823,6 +1927,63 @@ class ConstitutionalMesh:
             extra={"settlement_backend": backend, **report.as_log_fields()},
         )
         return report
+
+    def _expected_durable_record(
+        self,
+        record: SettlementRecord,
+        *,
+        votes: list[Any],
+    ) -> SettlementRecord:
+        """Return the exact immutable record produced by successful Phase 2."""
+        from constitutional_swarm.governance_receipts import (
+            receipt_from_mesh_settlement,
+        )
+
+        completed_record = self._record_with_serialized_votes(record, votes)
+        receipt = receipt_from_mesh_settlement(
+            completed_record,
+            list(completed_record.votes),
+        )
+        return replace(completed_record, receipt_digest=receipt.payload_digest)
+
+    def _record_with_serialized_votes(
+        self,
+        record: SettlementRecord,
+        votes: list[Any],
+    ) -> SettlementRecord:
+        """Install the exact authenticated vote evidence used by receipts."""
+        return replace(record, votes=self._vote_dicts(votes))
+
+    def _durable_settlement(self, assignment_id: str) -> SettlementRecord | None:
+        """Load one durable settlement by identity and reject duplicate history."""
+        if self._settlement_store is None:
+            return None
+        matches = [
+            record
+            for record in self._settlement_store.load_all()
+            if str(record.assignment.get("assignment_id", "")) == assignment_id
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Durable settlement {assignment_id} appears more than once"
+            )
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _require_matching_durable_settlement(
+        expected: SettlementRecord,
+        existing: SettlementRecord | None,
+    ) -> None:
+        """Fail closed unless an existing Phase-2 record is byte-semantically equal."""
+        assignment_id = str(expected.assignment.get("assignment_id", "<unknown>"))
+        if existing is None:
+            raise ValueError(
+                f"Durable settlement {assignment_id} disappeared after duplicate append"
+            )
+        if existing != expected:
+            raise ValueError(
+                f"Durable settlement {assignment_id} conflicts with pending snapshot"
+            )
 
     def retry_pending_settlements(self) -> ReconciliationReport:
         """Backward-compatible alias for pending settlement reconciliation."""
@@ -2013,6 +2174,7 @@ class ConstitutionalMesh:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
+            self._require_current_assignment_constitution(assignment)
             signing_key = self._agent_vote_private_keys.get(voter_id)
             if signing_key is None:
                 raise UnauthorizedVoterError(
@@ -2024,7 +2186,7 @@ class ConstitutionalMesh:
                     voter_id=voter_id,
                     approved=approved,
                     reason=reason,
-                    constitutional_hash=self.constitutional_hash,
+                    constitutional_hash=assignment.constitutional_hash,
                     content_hash=assignment.content_hash,
                 )
             ).hex()
@@ -2089,7 +2251,7 @@ class ConstitutionalMesh:
         constitutional_hash: str,
         content_hash: str,
     ) -> bytes:
-        """Build the canonical byte payload that remote peers must sign."""
+        """Build the legacy colon-joined byte payload that remote peers currently sign."""
         return cls._vote_payload_bytes(
             assignment_id=assignment_id,
             voter_id=voter_id,

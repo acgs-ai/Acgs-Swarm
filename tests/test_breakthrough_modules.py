@@ -1041,22 +1041,16 @@ class TestGossipBatchLimits:
             decode_batch(json.dumps(nodes))
 
     def test_valid_batch_accepted(self) -> None:
-        import json
+        from constitutional_swarm.gossip_protocol import decode_batch, encode_batch
+        from constitutional_swarm.merkle_crdt import MerkleCRDT
 
-        from constitutional_swarm.gossip_protocol import decode_batch
+        expected = MerkleCRDT("a").append("p")
+        result = decode_batch(encode_batch([expected]))
 
-        nodes = [
-            {
-                "cid": "c1",
-                "agent_id": "a",
-                "payload": "p",
-                "parent_cids": [],
-                "bodes_passed": False,
-                "constitutional_hash": "",
-            }
-        ]
-        result = decode_batch(json.dumps(nodes))
         assert len(result) == 1
+        assert result[0].cid == expected.cid
+        assert result[0].to_canonical_dict() == expected.to_canonical_dict()
+        assert result[0].verify_cid()
 
 
 class TestResolverHashValidation:
