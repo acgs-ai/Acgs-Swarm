@@ -22,6 +22,7 @@ from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 from constitutional_swarm.langgraph_runtime.guards import (
     constitutional_hash_guard,
     fail_closed_guard,
+    has_pinned_constitutional_hash,
 )
 from constitutional_swarm.langgraph_runtime.nodes import (
     append_crdt_node,
@@ -57,7 +58,9 @@ def build_swarm_graph(
     generator:
         Callable invoked by ``generate_node``. Returns ``(patch, stats)``.
     dna:
-        Required DNA validator instance with a ``validate(patch)`` method.
+        Required DNA validator instance with a ``validate(patch)`` method and
+        an exact ``hash`` equal to ``CONSTITUTIONAL_HASH``. The hash is checked
+        at construction and again at graph entry and after generation.
     crdt:
         Optional MerkleCRDT instance with an ``append(payload, bodes_passed)`` method.
     checkpointer:
@@ -72,23 +75,31 @@ def build_swarm_graph(
         Ready-to-invoke LangGraph runnable.
     """
     actual = constitution.get("hash", "")
-    if actual != CONSTITUTIONAL_HASH:
+    if not has_pinned_constitutional_hash(actual):
         raise ConstitutionalHashError(
-            f"constitution hash mismatch: expected {CONSTITUTIONAL_HASH!r}, "
-            f"got {actual!r}"
+            f"constitution hash mismatch: expected {CONSTITUTIONAL_HASH!r}, got {actual!r}"
         )
     if dna is None:
         raise ValueError("dna is required for constitutional graph validation")
+    dna_hash = getattr(dna, "hash", None)
+    if not has_pinned_constitutional_hash(dna_hash):
+        raise ConstitutionalHashError(
+            f"DNA hash mismatch: expected {CONSTITUTIONAL_HASH!r}, got {dna_hash!r}"
+        )
 
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
+
+    def _runtime_hash_guard(state: dict[str, object]) -> str:
+        if not has_pinned_constitutional_hash(getattr(dna, "hash", None)):
+            return "halt"
+        return constitutional_hash_guard(state)
 
     g = StateGraph(SwarmGraphState)
     g.add_node("generate", lambda s: generate_node(s, generator=generator))
     g.add_node("validate", lambda s: validate_node(s, dna=dna))
     g.add_node("append_crdt", lambda s: append_crdt_node(s, crdt=crdt))
     g.add_node("settle", lambda s: settle_node(s))
-    g.add_node("accept", lambda _state: {"governance_status": "accepted"})
     g.add_node(
         "reject",
         lambda _state: {
@@ -110,16 +121,11 @@ def build_swarm_graph(
         },
     )
 
+    g.add_conditional_edges(START, _runtime_hash_guard, {"ok": "generate", "halt": "halt"})
+    g.add_conditional_edges("generate", _runtime_hash_guard, {"ok": "validate", "halt": "halt"})
     g.add_conditional_edges(
-        START, constitutional_hash_guard, {"ok": "generate", "halt": "halt"}
+        "validate", fail_closed_guard, {"accept": "append_crdt", "reject": "reject"}
     )
-    g.add_conditional_edges(
-        "generate", constitutional_hash_guard, {"ok": "validate", "halt": "halt"}
-    )
-    g.add_conditional_edges(
-        "validate", fail_closed_guard, {"accept": "accept", "reject": "reject"}
-    )
-    g.add_edge("accept", "append_crdt")
     g.add_edge("append_crdt", "settle")
     g.add_edge("settle", END)
     g.add_edge("halt", END)

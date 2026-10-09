@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from constitutional_swarm.langgraph_runtime.guards import has_completed_acceptance
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 if TYPE_CHECKING:
@@ -29,8 +30,13 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
     graph_factory:
         Callable returning a CompiledStateGraph for this agent. Called once
         per task (so the graph can be parameterised by task metadata). The
-        graph's ``invoke(state)`` must return a state dict with keys
-        ``patch``, ``intervention_rate``, and optionally ``violations``.
+        graph's ``invoke(state)`` must return a state dict with ``patch``,
+        ``intervention_rate``, ``governed=True``, a finite ``risk_score`` below
+        the runtime threshold, an empty concrete ``violations`` sequence, the
+        exact pinned ``constitutional_hash``, and
+        ``governance_status="accepted"`` emitted only after completion.
+        ``settled`` is optional peer-quorum evidence and does not authorize
+        patch release.
     llm:
         Optional ``langchain_core.language_models.BaseChatModel`` used by the
         graph's internal nodes. The ``graph_factory`` is responsible for
@@ -79,8 +85,9 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         -------
         (patch_str, stats_dict)
             ``stats_dict`` always contains ``intervention_rate`` (float),
-            ``violations`` (list), ``constitutional_hash`` (str), and
-            ``settled`` (bool). Additional graph-emitted keys are merged in.
+            validation evidence, ``constitutional_hash`` (str), and
+            ``settled`` (bool). A patch is returned only for explicit completed
+            acceptance; additional graph-emitted keys are merged in.
         """
         from constitutional_swarm.langgraph_runtime.state import init_state
 
@@ -92,16 +99,22 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
 
         stats: dict[str, Any] = {
             "intervention_rate": float(result.get("intervention_rate", 0.0)),
-            "violations": list(result.get("violations") or []),
+            "violations": result.get("violations"),
+            "risk_score": result.get("risk_score"),
+            "governed": result.get("governed"),
             "constitutional_hash": result.get("constitutional_hash", "") or "",
             "settled": bool(result.get("settled", False)),
         }
         governance_status = result.get("governance_status")
         if governance_status is not None:
             stats["governance_status"] = governance_status
-            if governance_status != "accepted":
+        if not has_completed_acceptance(result):
+            if type(governance_status) is str:
                 stats["error"] = f"governance_{governance_status}"
-                return "", stats
+            else:
+                stats["error"] = "governance_incomplete"
+            return "", stats
+        stats["violations"] = list(result["violations"])
         return result.get("patch", "") or "", stats
 
 

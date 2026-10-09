@@ -39,8 +39,10 @@ from constitutional_swarm.swe_bench.swarm_coordinator import SwarmCoordinator
 
 
 class _C9RuntimeCleanDNA:
+    hash = CONSTITUTIONAL_HASH
+
     def validate(self, _patch: str) -> SimpleNamespace:
-        return SimpleNamespace(violations=(), risk_score=0.0)
+        return SimpleNamespace(valid=True, violations=(), risk_score=0.0)
 
 
 class _C9RuntimeCRDT:
@@ -1251,8 +1253,14 @@ def test_c9_runtime_agent_does_not_return_governance_rejected_patch() -> None:
     from constitutional_swarm.langgraph_runtime.agent import LangGraphSWEBenchAgent
 
     class _C9RuntimeRiskyDNA:
+        hash = CONSTITUTIONAL_HASH
+
         def validate(self, _patch: str) -> SimpleNamespace:
-            return SimpleNamespace(violations=("unsafe patch",), risk_score=1.0)
+            return SimpleNamespace(
+                valid=False,
+                violations=("unsafe patch",),
+                risk_score=1.0,
+            )
 
     crdt = _C9RuntimeCRDT()
 
@@ -1291,6 +1299,8 @@ def test_c9_runtime_append_node_binds_exact_constitutional_hash() -> None:
         {
             "patch": "patch",
             "governed": True,
+            "risk_score": 0.0,
+            "violations": [],
             "constitutional_hash": CONSTITUTIONAL_HASH,
         },
         crdt=crdt,
@@ -1372,13 +1382,12 @@ async def test_c9_runtime_streaming_appends_accumulated_accepted_state() -> None
             {"generate": {"patch": "accepted patch", "intervention_rate": 0.25}},
             {
                 "validate": {
-                    "governance_status": "accepted",
                     "governed": True,
                     "risk_score": 0.0,
                     "violations": [],
                 }
             },
-            {"settle": {"settled": True}},
+            {"settle": {"governance_status": "accepted", "settled": True}},
         ]
     )
     crdt = _C9RuntimeCRDT()
@@ -1443,7 +1452,10 @@ def test_c9_runtime_adapter_binds_governed_result_hash(
     )
 
     assert created[0].calls[0]["bodes_passed"] is True
-    assert created[0].calls[0]["constitutional_hash"] == CONSTITUTIONAL_HASH
+    expected_artifact_hash = (
+        CONSTITUTIONAL_HASH if hash_source == "metadata" else ""
+    )
+    assert created[0].calls[0]["constitutional_hash"] == expected_artifact_hash
 
 
 def test_c9_runtime_adapter_stamps_default_hash_on_governed_result(monkeypatch) -> None:
@@ -1473,9 +1485,9 @@ def test_c9_runtime_adapter_stamps_default_hash_on_governed_result(monkeypatch) 
         _c9_runtime_make_tasks(1),
     )
 
-    assert outcome["patches"][0].metadata["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in outcome["patches"][0].metadata
     assert created[0].calls[0]["bodes_passed"] is True
-    assert created[0].calls[0]["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert created[0].calls[0]["constitutional_hash"] == ""
 
 
 def test_c9_runtime_adapter_marks_generation_only_log_ungoverned(monkeypatch) -> None:
@@ -2040,7 +2052,7 @@ def test_c9_runtime_coordinator_default_hash_stamps_direct_governed_result() -> 
     patch_result = result["patches"][0]
     assert patch_result.success is True
     assert patch_result.governed is True
-    assert patch_result.metadata["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in patch_result.metadata
 
 
 def test_c9_runtime_coordinator_hash_mismatch_rejects_one_result_and_preserves_batch(
@@ -2550,12 +2562,12 @@ async def test_c9_runtime_streaming_excludes_private_accumulated_state() -> None
             },
             {
                 "validate": {
-                    "governance_status": "accepted",
                     "governed": True,
                     "risk_score": 0.0,
+                    "violations": [],
                 }
             },
-            {"settle": {"settled": True}},
+            {"settle": {"governance_status": "accepted", "settled": True}},
         ]
     )
     crdt = _C9RuntimeCRDT()

@@ -36,6 +36,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
+from constitutional_swarm.langgraph_runtime.guards import (
+    has_pinned_constitutional_hash,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from langchain.agents.middleware import AgentMiddleware
@@ -55,8 +58,7 @@ def _import_create_swarm() -> Any:
         from langgraph_swarm import create_swarm
     except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
         raise LangGraphSwarmUnavailable(
-            "langgraph_swarm not installed; "
-            "pip install constitutional-swarm[langgraph-swarm]"
+            "langgraph_swarm not installed; pip install constitutional-swarm[langgraph-swarm]"
         ) from exc
     return create_swarm
 
@@ -67,8 +69,7 @@ def _import_memory_saver() -> Any:
         from langgraph.checkpoint.memory import MemorySaver
     except ImportError as exc:  # pragma: no cover - langgraph is a hard peer dep
         raise LangGraphSwarmUnavailable(
-            "langgraph not installed; "
-            "pip install constitutional-swarm[langgraph-swarm]"
+            "langgraph not installed; pip install constitutional-swarm[langgraph-swarm]"
         ) from exc
     return MemorySaver
 
@@ -79,6 +80,9 @@ def constitutional_guard_middleware(
     name: str = "constitutional_hash_guard",
 ) -> AgentMiddleware:
     """Return a ``before_agent`` middleware that fails closed on hash mismatch.
+
+    ``expected_hash`` is retained for compatibility but must equal the package
+    pin exactly; callers cannot select an alternate trust root.
 
     Wire this into every peer agent so direct A->B handoffs cannot bypass
     validation::
@@ -97,13 +101,17 @@ def constitutional_guard_middleware(
     is responsible for plumbing ``constitutional_hash`` into the swarm's
     ``state_schema`` (extend ``langgraph_swarm.SwarmState``).
     """
+    if not has_pinned_constitutional_hash(expected_hash):
+        raise ValueError(
+            f"expected_hash must be the package constitutional hash {CONSTITUTIONAL_HASH!r}"
+        )
+
     try:
         from langchain.agents import AgentState
         from langchain.agents.middleware import before_agent
     except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
         raise LangGraphSwarmUnavailable(
-            "langchain not installed; "
-            "pip install constitutional-swarm[langgraph-swarm]"
+            "langchain not installed; pip install constitutional-swarm[langgraph-swarm]"
         ) from exc
 
     # Declare the middleware's state-schema contribution. langchain merges
@@ -119,7 +127,7 @@ def constitutional_guard_middleware(
             actual = state.get("constitutional_hash", "")
         else:  # AgentState dataclass / pydantic-style
             actual = getattr(state, "constitutional_hash", "")
-        if actual != expected_hash:
+        if not has_pinned_constitutional_hash(actual):
             return {"jump_to": "end"}
         return None
 
@@ -131,6 +139,7 @@ def build_handoff_swarm(
     *,
     agent_names: Sequence[str],
     constitution: dict[str, Any],
+    dna: Any = None,
     default_agent: str | None = None,
     checkpointer: Any = None,
 ) -> Any:
@@ -151,6 +160,10 @@ def build_handoff_swarm(
     constitution:
         Must have ``constitution["hash"] == CONSTITUTIONAL_HASH`` or this
         raises a fail-closed RuntimeError.
+    dna:
+        Trusted in-process DNA authority whose exact ``hash`` must equal the
+        package pin. This cross-check does not prove that peer middleware is
+        attached; callers remain responsible for that wiring.
     default_agent:
         Name of the agent to receive the first message. Defaults to
         ``agent_names[0]``.
@@ -172,21 +185,20 @@ def build_handoff_swarm(
         If ``langgraph_swarm`` is not installed.
     """
     actual_hash = constitution.get("hash", "")
-    if actual_hash != CONSTITUTIONAL_HASH:
+    if not has_pinned_constitutional_hash(actual_hash):
         raise RuntimeError(
-            f"constitution hash mismatch: expected {CONSTITUTIONAL_HASH!r}, "
-            f"got {actual_hash!r}"
+            f"constitution hash mismatch: expected {CONSTITUTIONAL_HASH!r}, got {actual_hash!r}"
         )
+    if dna is None:
+        raise ValueError("dna is required for constitutional handoff construction")
+    dna_hash = getattr(dna, "hash", None)
+    if not has_pinned_constitutional_hash(dna_hash):
+        raise RuntimeError(f"DNA hash mismatch: expected {CONSTITUTIONAL_HASH!r}, got {dna_hash!r}")
 
     if len(agents) != len(agent_names):
-        raise ValueError(
-            f"agents/agent_names length mismatch: "
-            f"{len(agents)}/{len(agent_names)}"
-        )
+        raise ValueError(f"agents/agent_names length mismatch: {len(agents)}/{len(agent_names)}")
 
-    for idx, (agent, declared_name) in enumerate(
-        zip(agents, agent_names, strict=True)
-    ):
+    for idx, (agent, declared_name) in enumerate(zip(agents, agent_names, strict=True)):
         runtime_name = getattr(agent, "name", None)
         if runtime_name != declared_name:
             raise ValueError(
@@ -196,9 +208,7 @@ def build_handoff_swarm(
 
     chosen_default = default_agent or agent_names[0]
     if chosen_default not in agent_names:
-        raise ValueError(
-            f"default_agent {chosen_default!r} not in agent_names {list(agent_names)}"
-        )
+        raise ValueError(f"default_agent {chosen_default!r} not in agent_names {list(agent_names)}")
 
     create_swarm = _import_create_swarm()
     memory_saver_cls = _import_memory_saver()

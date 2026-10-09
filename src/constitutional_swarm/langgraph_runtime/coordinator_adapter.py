@@ -7,7 +7,6 @@ compiled LangGraph (via LangGraphSWEBenchAgent).
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, replace
@@ -15,7 +14,13 @@ from functools import partial
 from typing import Any
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
+from constitutional_swarm.langgraph_runtime.guards import (
+    has_clean_validation_evidence,
+    has_completed_acceptance,
+    has_pinned_constitutional_hash,
+)
 from constitutional_swarm.merkle_crdt import MerkleCRDT
+from constitutional_swarm.strict_json import StrictJSONError, canonical_dumps
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, SWEPatch
 from constitutional_swarm.swe_bench.harness import _patch_generation_metrics
 
@@ -60,10 +65,8 @@ def run_langgraph(
     """
     if not agents:
         raise ValueError("run_langgraph requires at least one agent.")
-    configured_hash = (
-        CONSTITUTIONAL_HASH if constitutional_hash is None else constitutional_hash
-    )
-    if configured_hash != CONSTITUTIONAL_HASH:
+    configured_hash = CONSTITUTIONAL_HASH if constitutional_hash is None else constitutional_hash
+    if not has_pinned_constitutional_hash(configured_hash):
         raise ValueError(
             "configured constitutional hash mismatch: "
             f"expected {CONSTITUTIONAL_HASH!r}, got {configured_hash!r}"
@@ -107,9 +110,7 @@ def run_langgraph(
                     best_i = i
             assignments.append((effective_agents[best_i], task))
     else:
-        assignments = [
-            (effective_agents[i % n_agents], task) for i, task in enumerate(subset)
-        ]
+        assignments = [(effective_agents[i % n_agents], task) for i, task in enumerate(subset)]
 
     shared_crdt = MerkleCRDT("coordinator")
     patches: list[SWEPatch] = []
@@ -119,7 +120,18 @@ def run_langgraph(
             configured_hash=configured_hash,
         )
         patches.append(result)
-        payload = json.dumps(asdict(result), allow_nan=False)
+        try:
+            payload = canonical_dumps(asdict(result))
+        except (StrictJSONError, TypeError, ValueError) as exc:
+            result, bodes_passed, artifact_hash = _reject_malformed_result(
+                result,
+                configured_hash=configured_hash,
+                error="invalid_result",
+                diagnostic_key="result_serialization_error",
+                diagnostic_value=exc,
+            )
+            patches[-1] = result
+            payload = canonical_dumps(asdict(result))
         shared_crdt.append(
             payload=payload,
             bodes_passed=bodes_passed,
@@ -135,7 +147,7 @@ def _normalize_result(
     configured_hash: str,
 ) -> tuple[SWEPatch, bool, str]:
     """Bind one result to the configured constitution without aborting a batch."""
-    if not isinstance(result.metadata, Mapping):
+    if type(result.metadata) is not dict:
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,
@@ -143,20 +155,11 @@ def _normalize_result(
             diagnostic_key="reported_metadata_type",
             diagnostic_value=result.metadata,
         )
-    try:
-        metadata = dict(result.metadata)
-    except (TypeError, ValueError) as exc:
-        return _reject_malformed_result(
-            result,
-            configured_hash=configured_hash,
-            error="invalid_metadata",
-            diagnostic_key="metadata_conversion_error",
-            diagnostic_value=exc,
-        )
+    metadata = result.metadata.copy()
     result_hash = metadata.get("constitutional_hash")
     governance_status = metadata.get("governance_status")
 
-    if not isinstance(result_hash, (str, type(None))):
+    if type(result_hash) not in (str, type(None)):
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,
@@ -165,7 +168,7 @@ def _normalize_result(
             diagnostic_value=result_hash,
             extra={"expected_constitutional_hash": configured_hash},
         )
-    if governance_status is not None and not isinstance(governance_status, str):
+    if governance_status is not None and type(governance_status) is not str:
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,
@@ -173,15 +176,13 @@ def _normalize_result(
             diagnostic_key="reported_governance_status",
             diagnostic_value=governance_status,
         )
-    governance_attempted = result.governed or governance_status in {
+    governance_attempted = result.governed is True or governance_status in {
         "accepted",
         "rejected",
         "halted",
     }
 
-    if result_hash in (None, ""):
-        metadata["constitutional_hash"] = configured_hash
-    elif result_hash != configured_hash:
+    if result_hash not in (None, "") and result_hash != configured_hash:
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,
@@ -192,8 +193,8 @@ def _normalize_result(
         )
 
     try:
-        json.dumps(metadata, allow_nan=False)
-    except (TypeError, ValueError) as exc:
+        canonical_dumps(metadata)
+    except (StrictJSONError, TypeError, ValueError) as exc:
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,
@@ -202,8 +203,38 @@ def _normalize_result(
             diagnostic_value=exc,
         )
 
-    if governance_status in {"rejected", "halted"}:
-        metadata.setdefault("error", f"governance_{governance_status}")
+    violations = metadata.get("violations", [])
+    if type(violations) is not list or any(type(item) is not str for item in violations):
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="invalid_violations",
+            diagnostic_key="reported_violations_type",
+            diagnostic_value=violations,
+        )
+
+    validation_evidence_present = any(
+        key in metadata for key in ("governed", "risk_score", "violations")
+    )
+    validation_evidence = {
+        "governed": metadata.get("governed", True),
+        "risk_score": metadata.get("risk_score", 0.0),
+        "violations": violations,
+    }
+    unsafe_validation_evidence = (
+        governance_status is None
+        and validation_evidence_present
+        and not has_clean_validation_evidence(validation_evidence)
+    )
+    invalid_acceptance = governance_status == "accepted" and not has_completed_acceptance(metadata)
+
+    validation_rejected = unsafe_validation_evidence or invalid_acceptance
+    if governance_status in {"rejected", "halted"} or validation_rejected:
+        if validation_rejected:
+            metadata["governance_status"] = "rejected"
+            metadata["error"] = "governance_rejected"
+        else:
+            metadata.setdefault("error", f"governance_{governance_status}")
         normalized = replace(
             result,
             patch="",
@@ -214,10 +245,10 @@ def _normalize_result(
         bodes_passed = False
     elif governance_status == "accepted":
         normalized = replace(result, metadata=metadata)
-        bodes_passed = True
+        bodes_passed = result.governed is True and result.success is True
     elif governance_status is None:
         normalized = replace(result, metadata=metadata)
-        bodes_passed = result.governed
+        bodes_passed = result.governed is True and result.success is True and not violations
     else:
         metadata.update(
             {
@@ -234,7 +265,13 @@ def _normalize_result(
             metadata=metadata,
         )
         bodes_passed = False
-    artifact_hash = configured_hash if governance_attempted else ""
+    normalized_status = metadata.get("governance_status")
+    artifact_hash = (
+        configured_hash
+        if governance_attempted
+        and (result_hash == configured_hash or normalized_status in {"rejected", "halted"})
+        else ""
+    )
     return normalized, bodes_passed, artifact_hash
 
 
@@ -257,11 +294,14 @@ def _reject_malformed_result(
         metadata[diagnostic_key] = _json_safe_diagnostic(diagnostic_value)
     if extra is not None:
         metadata.update(extra)
-    rejected = replace(
-        result,
+    task_id = result.task_id if type(result.task_id) is str else "unknown"
+    rejected = SWEPatch(
+        task_id=task_id,
         patch="",
         success=False,
         governed=False,
+        intervention_rate=0.0,
+        duration_s=0.0,
         metadata=metadata,
     )
     return rejected, False, configured_hash
