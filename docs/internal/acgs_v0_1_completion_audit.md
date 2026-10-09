@@ -5,17 +5,27 @@ repo evidence. It is intentionally conservative: local scaffolding can support a
 public study, but it is not a substitute for collected blind-review results or
 external replication.
 
-## C12 Correction and Current Status
+## C15 Correction and Current Status
 
-The C12 forensic review invalidated the earlier completion interpretation. The
-historical commands and published numbers below remain recorded, but they are
-not current success evidence. The previous statement that the
+The C12 forensic review invalidated the earlier completion interpretation. C15
+introduces controls for the local key-substitution and cross-condition-linkage
+defects in newly generated C15-format packs. The security rework adds
+reviewer-specific pseudonyms, opaque packet ordering, canonical packet checks in
+seal and verify paths, copied-answer diagnostics, and a strict evidence-name
+allowlist. The final rework removes plain unblinded-artifact hashes from
+coordinator manifests, adds a greater-than-95-percent reviewer-answer agreement
+diagnostic, requires a retained nonce source for standalone packet generation,
+and reports specific reviewer-packet leak codes. These changes define local
+integrity controls; they do not supply authenticated external provenance or new
+empirical study evidence. Historical commands and published numbers below remain
+recorded, but they are not current success evidence. The previous
+statement that the
 "public-study tier is verified" applied only to the presence and old-schema
 validation of the owner-published blind-review data and scorecard. It did not
 establish structural blinding, bind result claims to the bytes of referenced
 files, or use the incident as the statistical unit of independence.
 
-Current status is open pending regeneration and reanalysis. The hardening must:
+The C15 local validation contract requires the implementation to:
 
 - reject direct or mechanically normalized answer copies in reviewer artifacts;
 - treat all seven hidden answers as synthetic assessment classifications derived
@@ -23,45 +33,86 @@ Current status is open pending regeneration and reanalysis. The hardening must:
   copy guard proves human reconstructability;
 - disclose that legitimate evidence availability and content can still reveal
   condition identity even when schemas and superficial value domains match;
-- ship and retain `coordinator_pack/condition_key.json` with its randomized
-  `conditions` mapping and secret per-pack `pack_nonce`;
-- compute significance only from the sealed answer matrix with one independent
-  contrast per incident;
+- regenerate the answer key, condition key, templates, manifests, and every
+  manifested reviewer artifact from the secret per-pack `pack_nonce`, requiring
+  byte equality before scoring;
+- separately require `--verify-replication-kit` and reviewer-packet generation
+  from `--coordinator-pack` to regenerate and byte-compare the complete
+  coordinator pack, including unblinded `artifacts/**` sources omitted from
+  plain-hash manifests;
+- require an expected precollection commitment supplied separately from the
+  mutable bundle and bind that digest into the answer seal;
+- use the fixed six-reviewer cohort, with a balanced
+  assignment that exposes each reviewer to one condition per underlying
+  incident and reviewer-specific, condition-specific HMAC-SHA256 incident
+  pseudonyms, with packet rows and paths ordered only by opaque pseudonym;
+- reject answer rows outside the regenerated reviewer assignment;
+- compute significance only from the sealed answer matrix using an exact
+  one-sided sign test over incident-stratified, between-reviewer contrasts;
 - hash actual referenced file bytes during bundle construction and re-hash them
-  during validation; and
-- accept an external attestor only through the explicit normalized identity
-  policy, rather than a substring test or a self-reported command line.
+  during validation, while rejecting logical evidence names outside the fixed
+  required set plus optional scorecard;
+- omit plain hashes of unblinded source artifacts from the coordinator reviewer
+  manifest and kit manifest; `--verify-replication-kit` and reviewer-packet
+  generation from `--coordinator-pack` regenerate those sources from the
+  retained nonce for path and byte verification;
+- keep `coordinator_pack/reviewer_manifest.json` and `kit_manifest.json`
+  coordinator-only until unblinding, distributing only isolated filtered
+  reviewer manifests;
+- derive standalone reviewer packets from a retained coordinator pack or nonce
+  file, reject a missing nonce source, and warn on compatibility-only inline
+  nonce input;
+- treat command lines, attestor names, and unsigned provenance as diagnostics.
+  They cannot set external-success or independence fields true. Exact or
+  greater-than-95-percent reviewer answer agreement is also diagnostic, not
+  authenticated copying or independence evidence; and
+- return explicit `unblinded_artifact_present` and
+  `coordinator_manifest_present` audit issues for those packet leak classes.
 
 Earlier per-answer significance, including `p ≈ 1.9e-211`, is superseded and
 requires incident-level reanalysis. The recorded values below are not edited or
 silently reinterpreted.
 
-Two integrity gaps remain open after C12 and block any tamper-evidence claim
-(see `governance_benchmark_plan.md`, "Open integrity limitations"): the
-coordinator keys (`answer_key.json`, `condition_key.json`) are not bound by the
-seal, so they can be substituted after collection; and a single reviewer packet
-links all conditions by incident ID, so ACGS-derived answers can be joined onto
-baseline rows.
+Current status remains open pending regeneration, recollection, reanalysis, and
+authenticated non-ACGS provenance. The owner-published artifacts use the earlier
+schema and do not acquire C15 validity retroactively. C15 also leaves explicit
+trust boundaries: authenticity of the out-of-band commitment channel, semantic
+condition cues because value signatures differ by condition, reviewers sharing
+packets across cohorts, coordinator disclosure of hidden material, authenticated
+reviewer identity, and authenticated external execution.
+The audit therefore records that no completed external replication bundle exists
+that authenticates the claimed submitter, execution, or independence.
 
 ## Success Criteria Checklist
 
 | Requirement | Current evidence | Status |
 |---|---|---|
 | Fixed forensic questionnaire: who acted, authority, rule, evidence, approval or denial, failure, defensibility | `FORENSIC_QUESTIONNAIRE` in `src/constitutional_swarm/forensic_benchmark.py`; validated by `tests/test_governance_receipts.py` | Satisfied locally |
-| Matched artifact conditions: ungoverned logs, centralized structured logs, ACGS receipts and audit artifacts | `BASELINES` and generated artifact directories use one typed schema. C12 requires integrity fields and strength fingerprints to be condition-neutral where feasible, and raw-log unknowns to remain `unknown`/`unavailable`. Evidence-content differences remain a disclosed unblinding limit. | Open pending regenerated packet audit |
-| Blind reviewers see artifacts but not hidden ground truth or true condition labels | Coordinator-only `answer_key.json` and `condition_key.json` remain outside the reviewer packet. C12 adds normalized structural answer-copy detection. All seven answers are synthetic assessment classifications derived deterministically from exposed technique, timing, and related incident attributes; answer values carry no supporting-reference fields. `what_failed` is an assessment category rather than a typed field copy. The guard detects mechanical transcription but does not prove human reconstructability or prevent semantic inference. | Open pending C12 structural and empirical validation |
+| Matched artifact conditions: ungoverned logs, centralized structured logs, ACGS receipts and audit artifacts | `BASELINES` and generated artifact directories use one typed schema. C15 keeps integrity fields and strength fingerprints condition-neutral where feasible, while value signatures and legitimate evidence content can still differ by condition. Raw-log unknowns remain `unknown`/`unavailable`. | Defined locally; semantic-unblinding assessment remains empirical |
+| Blind reviewers see artifacts but not hidden ground truth or true condition labels | Coordinator-only keys, nonce, coordinator reviewer manifest, and kit manifest remain outside reviewer packets. C15 uses per-reviewer packets, balanced one-condition-per-incident assignments, reviewer-specific condition HMAC pseudonyms, opaque packet ordering, and structural answer-copy diagnostics. The controls do not prove human blinding or prevent reviewers from sharing packets across cohorts. | Local isolation controls present; empirical and collusion limits remain open |
 | Adversarial incident set includes collusion, memory poisoning, rule gaming, fragmented actions, and misleading traces | `ADVERSARIAL_TECHNIQUES` and deterministic `generate_incident_specs()` cover all five techniques across 50 to 200 incidents | Satisfied locally |
-| Scored outputs include accuracy, time, confidence calibration, inter-reviewer agreement, and delta versus strongest baseline | The scoring surface exists, but C12 changes the inference to an incident-level paired sign test computed only from the sealed matrix. Callers cannot supply a p-value override. Existing published statistics require reanalysis. | Requires incident-level reanalysis |
-| Result gate rejects toy, internal-only, or statistically weak success claims | C12 requires a manifest of actual input files and SHA-256 digests, builder hashing of those bytes, validator re-hashing against an evidence root, and failure on missing or changed files. Syntactically valid hashes, metadata, attestor-name substring checks, and self-reported commands do not prove integrity or independence. | Open pending C12 gate verification |
-| Public benchmark with 50 to 200 adversarial incidents has collected blind-review responses | The public release exposes owner-published artifacts under the earlier schema. Their existence is historical evidence; they must be regenerated or revalidated under the C12 blinding, file-integrity, and incident-level inference rules. | Historical evidence; not current success proof |
-| ACGS artifacts beat the strongest baseline significantly on collected public-study data | Earlier per-answer significance is superseded. No C12-compliant incident-level reanalysis or non-ACGS public-study scorecard exists yet. | Open |
+| Scored outputs include accuracy, time, confidence calibration, inter-reviewer agreement, and delta versus strongest baseline | C15 computes the p-value from the sealed matrix with an exact one-sided sign test over incident-stratified, between-reviewer contrasts. Reviewer/question cells do not inflate the binomial sample size. Callers cannot supply a p-value override. Existing published statistics require reanalysis. | Requires C15-format incident-level reanalysis |
+| Result gate rejects substituted keys, changed artifacts, toy data, or statistically weak claims | The result gate regenerates and byte-compares the keys and manifested reviewer artifacts, requires a separately supplied precollection commitment, re-hashes referenced evidence, enforces reviewer assignment, and rejects unknown evidence logical names. Unblinded `artifacts/**` sources are excluded from result-evidence manifests; `--verify-replication-kit` and `--generate-reviewer-packet --coordinator-pack` regenerate and byte-compare the complete coordinator pack to protect them. Syntactically valid hashes, locally stored commitment records, metadata, attestor names, and self-reported commands do not prove independence. | Local integrity checks defined; external provenance remains open |
+| Public benchmark with 50 to 200 adversarial incidents has collected blind-review responses | The public release exposes owner-published artifacts under the earlier schema. Generator v5 changes pseudonyms, manifest membership, packet bytes, and commitments, so the pack must be regenerated and answers recollected under the revised contract. | Historical evidence; not current success proof |
+| ACGS artifacts beat the strongest baseline significantly on collected public-study data | Earlier per-answer significance is superseded. No C15-compliant incident-stratified reanalysis or authenticated non-ACGS public-study scorecard exists yet. | Open |
 | Inter-reviewer agreement is reported from real blind reviewers | Synthetic test answers and the owner-published release evidence report agreement; no independent reviewer cohort has rerun the benchmark | Open |
-| Non-ACGS group reruns the benchmark and reproduces the advantage | `ExternalReplicationRecord` schema and validation exist, but no completed external replication bundle exists | Open |
+| Non-ACGS group reruns the benchmark and reproduces the advantage | `ExternalReplicationRecord` can be checked for local shape and consistency, but the current format authenticates neither the submitter nor execution. `authenticated_provenance`, `external_success`, `independence_verified`, and `success_evidence` remain false. | Open; no authenticated provenance mechanism |
 
 ## Historical Verification Evidence
 
-The following outputs are preserved from earlier work lanes. They have not been
-rerun against the C12 contract and cannot close the current audit.
+The following outputs are preserved from earlier work lanes. They predate the
+C15 commitment, assignment, and provenance contract and cannot close the current
+audit. Literal values such as `reviewer_count=2`, `valid=true`, and
+`success_evidence=true` describe the historical validator only; the current
+contract requires the fixed balanced six-reviewer cohort and cannot authenticate
+external success.
+
+The historical seal commands below are retained verbatim as historical evidence.
+They are not current instructions. Generator v5 changes manifest membership, packet bytes, and
+precollection commitments, so current seal and verify invocations must use a
+newly generated pack and separately pass its coordinator-only `--protocol-json`,
+`--answer-key-json`, and `--condition-key-json` inputs. The nonce remains inside
+the coordinator-only condition key and must not be distributed to reviewers.
 
 ```bash
 python -m pytest tests/test_governance_receipts.py tests/test_v0_1_scope_docs.py -q
@@ -388,8 +439,10 @@ rg -n \
 
 Do not mark the active goal complete from local evidence alone. The
 owner-published public-study artifacts exist, but their scientific claims are
-not currently verified under the C12 contract. Completion requires regenerated
-or revalidated reviewer artifacts, incident-level reanalysis from the sealed
-matrix, successful byte-level verification of referenced files, explicit
-attestor-policy acceptance, and completed non-ACGS replication. Therefore no
-success claim is verified by this audit.
+not currently verified under the C15 contract. Completion requires regenerated
+reviewer artifacts, new answers collected under the isolated assignment,
+incident-stratified between-reviewer reanalysis from the commitment-bound sealed
+matrix, successful canonical byte regeneration and referenced-file re-hashing,
+and authenticated non-ACGS replication provenance. The current format provides
+no provenance mechanism capable of setting external-success or independence
+true. Therefore no success claim is verified by this audit.

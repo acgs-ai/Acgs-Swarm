@@ -6,6 +6,7 @@ import json
 import inspect
 import math
 from collections.abc import Mapping, Sequence
+from io import StringIO
 from typing import Any
 
 import pytest
@@ -352,8 +353,8 @@ def test_condition_key_is_pack_bound_and_reused_for_every_reviewer_output() -> N
     assert exported["pack_nonce"] == pack.pack_nonce
     template = files["reviewer_answer_template.csv"]
     for label in exported_key:
-        assert f"reviewer_artifacts/{label}/" in template
-        assert any(path.startswith(f"reviewer_artifacts/{label}/") for path in files)
+        assert f"/{label}/" in template
+        assert any(f"/{label}/" in path for path in files if path.startswith("reviewer_artifacts/"))
 
 
 def test_reviewer_packet_filter_rejects_arbitrary_json_under_artifact_prefix() -> None:
@@ -362,13 +363,13 @@ def test_reviewer_packet_filter_rejects_arbitrary_json_under_artifact_prefix() -
         {"renamed_container": {"payload": "the hidden answer"}}
     )
 
-    with pytest.raises(ValueError, match="reviewer artifact"):
-        reviewer_packet_files(files)
+    with pytest.raises(ValueError, match="reviewer"):
+        reviewer_packet_files(files, reviewer_id="reviewer-1")
 
     files = artifact_pack_to_files(generate_artifact_pack())
     files["reviewer_artifacts/../../answer_key.json"] = "{}"
-    with pytest.raises(ValueError, match="reviewer artifact path"):
-        reviewer_packet_files(files)
+    with pytest.raises(ValueError, match="reviewer"):
+        reviewer_packet_files(files, reviewer_id="reviewer-1")
 
 
 @pytest.mark.parametrize(
@@ -393,7 +394,7 @@ def test_reviewer_packet_filter_rejects_answer_injection_in_root_files(
         files[root_file] = files[root_file].replace(",,,\n", ",answer prose,0.5,1\n", 1)
 
     with pytest.raises(ValueError, match="reviewer"):
-        reviewer_packet_files(files)
+        reviewer_packet_files(files, reviewer_id="reviewer-1")
 
 
 def test_reviewer_packet_filter_rejects_missing_artifact_file() -> None:
@@ -403,8 +404,8 @@ def test_reviewer_packet_filter_rejects_missing_artifact_file() -> None:
     )
     del files[missing_path]
 
-    with pytest.raises(ValueError, match="do not match"):
-        reviewer_packet_files(files)
+    with pytest.raises(ValueError, match="canonical generator"):
+        reviewer_packet_files(files, reviewer_id="reviewer-1")
 
 
 @pytest.mark.parametrize(
@@ -444,8 +445,8 @@ def test_reviewer_packet_filter_rejects_duplicate_json_keys(
     )
     files[path] = files[path].replace(needle, replacement, 1)
 
-    with pytest.raises(ValueError, match="duplicate JSON key"):
-        reviewer_packet_files(files)
+    with pytest.raises(ValueError, match="canonical generator"):
+        reviewer_packet_files(files, reviewer_id="reviewer-1")
 
 
 def test_sign_test_uses_incidents_as_independent_units() -> None:
@@ -698,6 +699,7 @@ def test_result_bundle_builder_requires_real_evidence_root(tmp_path) -> None:
             ),
             evidence_root=tmp_path,
             evidence_paths={},
+            expected_precollection_commitment="0" * 64,
         )
 
 
@@ -758,28 +760,43 @@ def _write_integrity_evidence(tmp_path):
             ),
         )
         writer.writeheader()
-        for incident_id, answer_key in pack.answer_key.items():
-            for label, condition in condition_key.items():
-                for reviewer_id in ("reviewer-1", "reviewer-2"):
-                    for question_id, ground_truth in answer_key.items():
-                        writer.writerow(
-                            {
-                                "incident_id": incident_id,
-                                "condition_label": label,
-                                "reviewer_id": reviewer_id,
-                                "question_id": question_id,
-                                "answer": (
-                                    ground_truth
-                                    if condition == "acgs_receipts_and_audit_artifacts"
-                                    else "incorrect"
-                                ),
-                                "confidence": "0.9",
-                                "elapsed_seconds": "10",
-                            }
-                        )
+        for row in csv.DictReader(StringIO(pack_files["reviewer_answer_template.csv"])):
+            label = row["condition_label"]
+            condition = condition_key[label]
+            internal_id = next(
+                incident_id
+                for incident_id in pack.answer_key
+                if forensic_benchmark.reviewer_incident_pseudonym(
+                    pack.pack_nonce,
+                    incident_id,
+                    condition,
+                    row["reviewer_id"],
+                )
+                == row["incident_id"]
+            )
+            ground_truth = pack.answer_key[internal_id][row["question_id"]]
+            writer.writerow(
+                {
+                    "incident_id": row["incident_id"],
+                    "condition_label": label,
+                    "reviewer_id": row["reviewer_id"],
+                    "question_id": row["question_id"],
+                    "answer": (
+                        ground_truth
+                        if condition == "acgs_receipts_and_audit_artifacts"
+                        else "incorrect"
+                    ),
+                    "confidence": "0.9",
+                    "elapsed_seconds": "10",
+                }
+            )
     packet_dir = tmp_path / "reviewer_packet"
     packet_dir.mkdir()
-    packet_files = reviewer_packet_files(pack_files)
+    manifest = json.loads(pack_files["reviewer_manifest.json"])
+    packet_files = {
+        path: pack_files[path]
+        for path in manifest["files"]
+    }
     for relative_path, content in packet_files.items():
         output_path = packet_dir / relative_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,10 +821,13 @@ def _write_integrity_evidence(tmp_path):
                 "reviewer_packet": {
                     "reviewer_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()
                 },
+                "precollection_commitment": forensic_benchmark.precollection_commitment_digest(
+                    pack_files
+                ),
                 "validation": {
                     "valid": True,
-                    "row_count": 50 * 3 * 2 * len(FORENSIC_QUESTIONNAIRE),
-                    "reviewer_count": 2,
+                    "row_count": 50 * 6 * len(FORENSIC_QUESTIONNAIRE),
+                    "reviewer_count": 6,
                 },
             },
             sort_keys=True,
@@ -826,6 +846,12 @@ def _write_integrity_evidence(tmp_path):
     return pack, replication, evidence_paths, member_path
 
 
+def _expected_precollection_commitment(tmp_path) -> str:
+    return json.loads((tmp_path / "answer-seal.json").read_text())[
+        "precollection_commitment"
+    ]
+
+
 def test_result_bundle_rehashes_actual_files_and_recomputes_statistics(tmp_path) -> None:
     pack, replication, evidence_paths, _ = _write_integrity_evidence(tmp_path)
     bundle = forensic_benchmark.build_result_bundle(
@@ -833,16 +859,27 @@ def test_result_bundle_rehashes_actual_files_and_recomputes_statistics(tmp_path)
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     verdict = forensic_benchmark.validate_result_bundle(
         bundle,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is True
     assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert verdict.command_metadata == replication.command_line
+    assert {diagnostic.code for diagnostic in verdict.provenance_diagnostics} == {
+        "authenticated_provenance_unavailable",
+        "identical_reviewer_answer_vectors",
+        "unauthenticated_command_metadata",
+    }
     assert bundle.answer_evidence.answers_sha256 == hashlib.sha256(
         (tmp_path / "answers.csv").read_bytes()
     ).hexdigest()
@@ -856,6 +893,7 @@ def test_result_bundle_rejects_tampered_manifest_member(tmp_path) -> None:
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     member_path.write_text('{"evidence":"tampered"}\n')
 
@@ -863,6 +901,7 @@ def test_result_bundle_rejects_tampered_manifest_member(tmp_path) -> None:
         bundle,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is False
@@ -879,6 +918,7 @@ def test_result_bundle_rejects_fabricated_hash_and_p_value(tmp_path) -> None:
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     fake_binding = bundle.evidence_files[0].model_copy(update={"sha256": "a" * 64})
     tampered = bundle.model_copy(
@@ -892,6 +932,7 @@ def test_result_bundle_rejects_fabricated_hash_and_p_value(tmp_path) -> None:
         tampered,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is False
@@ -907,12 +948,14 @@ def test_result_bundle_rejects_untrusted_replication_group(tmp_path) -> None:
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     verdict = forensic_benchmark.validate_result_bundle(
         bundle,
         evidence_root=tmp_path,
         trusted_attestors=(),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is False
@@ -926,12 +969,14 @@ def test_result_bundle_rejects_p_value_not_computed_from_sealed_csv(tmp_path) ->
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     ).model_copy(update={"p_value_vs_strongest_baseline": 0.01})
 
     verdict = forensic_benchmark.validate_result_bundle(
         bundle,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is False
@@ -940,6 +985,7 @@ def test_result_bundle_rejects_p_value_not_computed_from_sealed_csv(tmp_path) ->
 
 def test_result_bundle_builder_rejects_malformed_seal(tmp_path) -> None:
     pack, replication, evidence_paths, _ = _write_integrity_evidence(tmp_path)
+    expected_commitment = _expected_precollection_commitment(tmp_path)
     (tmp_path / "answer-seal.json").write_text('{"schema":"wrong"}')
 
     with pytest.raises(ValueError, match="invalid_answer_seal"):
@@ -948,11 +994,13 @@ def test_result_bundle_builder_rejects_malformed_seal(tmp_path) -> None:
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=expected_commitment,
         )
 
 
 def test_result_bundle_builder_rejects_empty_manifest(tmp_path) -> None:
     pack, replication, evidence_paths, _ = _write_integrity_evidence(tmp_path)
+    expected_commitment = _expected_precollection_commitment(tmp_path)
     manifest_path = tmp_path / "reviewer_packet" / "reviewer_manifest.json"
     manifest_path.write_text('{"files":{}}')
     answer_bytes = (tmp_path / "answers.csv").read_bytes()
@@ -983,6 +1031,7 @@ def test_result_bundle_builder_rejects_empty_manifest(tmp_path) -> None:
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=expected_commitment,
         )
 
 
@@ -993,6 +1042,7 @@ def test_result_bundle_rejects_missing_bound_file(tmp_path) -> None:
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     (tmp_path / "answer_key.json").unlink()
 
@@ -1000,6 +1050,7 @@ def test_result_bundle_rejects_missing_bound_file(tmp_path) -> None:
         bundle,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
 
     assert verdict.valid is False
@@ -1018,6 +1069,7 @@ def test_result_bundle_builder_rejects_hashed_but_malformed_reviewer_packet(
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     malformed = b'{"evidence":"sealed"}\n'
     member_path.write_bytes(malformed)
@@ -1042,6 +1094,7 @@ def test_result_bundle_builder_rejects_hashed_but_malformed_reviewer_packet(
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
         )
 
     rebound = []
@@ -1061,6 +1114,7 @@ def test_result_bundle_builder_rejects_hashed_but_malformed_reviewer_packet(
         forged_bundle,
         evidence_root=tmp_path,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     assert verdict.valid is False
     assert "invalid_reviewer_packet" in {issue.code for issue in verdict.issues}
@@ -1068,21 +1122,24 @@ def test_result_bundle_builder_rejects_hashed_but_malformed_reviewer_packet(
 
 def test_result_bundle_builder_rejects_condition_key_without_pack_nonce(tmp_path) -> None:
     pack, replication, evidence_paths, _ = _write_integrity_evidence(tmp_path)
+    expected_commitment = _expected_precollection_commitment(tmp_path)
     condition_path = tmp_path / "condition_key.json"
     envelope = json.loads(condition_path.read_text())
     condition_path.write_text(json.dumps(envelope["conditions"], sort_keys=True))
 
-    with pytest.raises(ValueError, match="condition_key"):
+    with pytest.raises(ValueError, match="canonical_pack_regeneration_failed"):
         forensic_benchmark.build_result_bundle(
             protocol=pack.protocol,
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=expected_commitment,
         )
 
 
 def test_result_bundle_builder_rejects_duplicate_condition_key_fields(tmp_path) -> None:
     pack, replication, evidence_paths, _ = _write_integrity_evidence(tmp_path)
+    expected_commitment = _expected_precollection_commitment(tmp_path)
     condition_path = tmp_path / "condition_key.json"
     envelope = json.loads(condition_path.read_text())
     condition_path.write_text(
@@ -1093,12 +1150,13 @@ def test_result_bundle_builder_rejects_duplicate_condition_key_fields(tmp_path) 
         "}"
     )
 
-    with pytest.raises(ValueError, match="duplicate JSON key"):
+    with pytest.raises(ValueError, match="canonical_pack_regeneration_failed"):
         forensic_benchmark.build_result_bundle(
             protocol=pack.protocol,
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=expected_commitment,
         )
 
 
@@ -1115,6 +1173,7 @@ def test_result_bundle_optional_answers_crosscheck_is_order_independent(tmp_path
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
         answers=list(reversed(answers)),
     )
 
@@ -1136,6 +1195,7 @@ def test_result_bundle_optional_answers_crosscheck_rejects_changed_value(tmp_pat
             external_replication=replication,
             evidence_root=tmp_path,
             evidence_paths=evidence_paths,
+            expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
             answers=answers,
         )
 
@@ -1220,7 +1280,7 @@ def test_cli_cohort_identity_policy_rejects_acgs_lookalikes(
                 "cohort_id": "cohort-2026-10",
                 "conflict_of_interest_screened": True,
                 "recruiting_organization": organization,
-                "reviewer_count": 2,
+                "reviewer_count": 6,
                 "reviewer_roster_sha256": "a" * 64,
             }
         )
@@ -1237,7 +1297,11 @@ def test_cli_cohort_identity_policy_rejects_acgs_lookalikes(
     payload = json.loads(capsys.readouterr().out)
 
     assert return_code == (0 if expected_valid else 1)
-    assert payload["success_evidence"] is expected_valid
+    assert payload["valid"] is expected_valid
+    assert payload["success_evidence"] is False
+    assert payload["authenticated_provenance"] is False
+    assert payload["independence_verified"] is False
+    assert payload["diagnostics"]
     if not expected_valid:
         assert "reviewer_cohort_not_trusted" in {
             issue["code"] for issue in payload["issues"]
@@ -1302,6 +1366,7 @@ def _cli_bound_bundle_args(tmp_path, mode: str, *, tampered: bool) -> list[str]:
         external_replication=replication,
         evidence_root=tmp_path,
         evidence_paths=evidence_paths,
+        expected_precollection_commitment=_expected_precollection_commitment(tmp_path),
     )
     if tampered:
         bundle = bundle.model_copy(update={"p_value_vs_strongest_baseline": 0.01})
@@ -1310,6 +1375,8 @@ def _cli_bound_bundle_args(tmp_path, mode: str, *, tampered: bool) -> list[str]:
     common = [
         "--evidence-root",
         str(tmp_path),
+        "--expected-precollection-commitment",
+        _expected_precollection_commitment(tmp_path),
         "--trusted-attestor",
         "Independent Systems Lab",
     ]
@@ -1335,7 +1402,7 @@ def _cli_bound_bundle_args(tmp_path, mode: str, *, tampered: bool) -> list[str]:
                     "cohort_id": "cohort-2026-10",
                     "conflict_of_interest_screened": True,
                     "recruiting_organization": "Independent Systems Lab",
-                    "reviewer_count": 2,
+                    "reviewer_count": 6,
                     "reviewer_roster_sha256": "b" * 64,
                 }
             )
@@ -1355,6 +1422,12 @@ def _cli_bound_bundle_args(tmp_path, mode: str, *, tampered: bool) -> list[str]:
             str(tmp_path / "answers.csv"),
             "--reviewer-packet",
             str(tmp_path / "reviewer_packet"),
+            "--protocol-json",
+            str(tmp_path / "protocol.json"),
+            "--answer-key-json",
+            str(tmp_path / "answer_key.json"),
+            "--condition-key-json",
+            str(tmp_path / "condition_key.json"),
             "--answer-seal-result-bundle",
             str(bundle_path),
             *common,

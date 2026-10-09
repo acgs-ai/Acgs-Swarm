@@ -41,6 +41,55 @@ Index of architecture & product decisions. Detailed ADRs live in
 
 ## Decisions log
 
+### 2026-10-09 — Forensic benchmark commitment and reviewer isolation
+
+- A forensic result is locally valid only when public generator code regenerates
+  the answer key, condition key, templates, manifests, and every manifested
+  reviewer artifact from the committed `pack_nonce`, with byte equality for
+  those result-evidence files. Unblinded `artifacts/**` sources are outside that
+  result-evidence manifest; `--verify-replication-kit` and reviewer-packet
+  generation from `--coordinator-pack` regenerate and byte-compare the complete
+  coordinator pack, including those sources.
+- The generator emits a precollection commitment over canonical sorted-key JSON
+  containing the exact answer-key hash, condition-key hash, nonce hash,
+  generator version, and reviewer-manifest hash. The answer seal binds the
+  digest. Validation requires the expected digest through a separate argument;
+  no file in the mutable bundle can supply its own trust anchor.
+- Reviewer assignment uses the fixed balanced cohort `reviewer-1` through
+  `reviewer-6`. Each reviewer receives each underlying
+  incident under exactly one condition. Reviewer-specific, condition-specific
+  HMAC-SHA256 incident pseudonyms and pseudonym-only packet ordering prevent the
+  tested public-order and twin-packet joins, and matrix validation rejects rows
+  outside the assignment. This control does not prevent reviewers from sharing
+  packets across cohorts or inferring a condition from its semantic content.
+- Significance uses the incident as the unit: condition accuracy is aggregated
+  across assigned reviewers and questions, then an exact one-sided sign test is
+  applied to incident-stratified, between-reviewer ACGS-versus-baseline
+  contrasts with ties removed.
+- Command lines, attestor names, and unsigned provenance are diagnostic
+  metadata. Until an authenticated provenance channel exists,
+  `authenticated_provenance`, `external_success`, `independence_verified`, and
+  `success_evidence` remain false. Exact or greater-than-95-percent reviewer
+  answer agreement is also diagnostic; it is not proof of copying or
+  independence.
+- Coordinator manifests do not publish plain hashes of unblinded source
+  artifacts. The kit verifier and coordinator-pack packet generator instead
+  check source-artifact integrity by regenerating the complete canonical pack
+  from the retained nonce and comparing paths and bytes. The
+  `coordinator_pack/reviewer_manifest.json` and root `kit_manifest.json` remain
+  coordinator-only until unblinding; each distributed reviewer packet carries
+  only its isolated filtered manifest.
+- Standalone reviewer packets are derived from a retained coordinator pack or a
+  nonce file. Inline nonce input is compatibility-only and produces an exposure
+  warning; omitting every nonce source is an error.
+- Result evidence uses a strict logical-name allowlist. Required evidence and an
+  optional scorecard are accepted; caller-defined evidence manifests cannot
+  authenticate their own members.
+- Residual trust lies in the out-of-band commitment channel and study operations.
+  Value signatures can differ by condition. Reviewer packet sharing or collusion,
+  coordinator disclosure of the nonce or hidden keys, and authenticated reviewer
+  identity remain outside local validation.
+
 ### 2026-08-15 — Public façade and receipt identity
 
 - `__all__` is the stable eager façade. Star-import no longer dumps research

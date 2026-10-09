@@ -13,6 +13,7 @@ import pytest
 from constitutional_swarm.forensic_benchmark import (
     ADVERSARIAL_TECHNIQUES,
     BASELINES,
+    DEFAULT_REVIEWER_IDS,
     FORENSIC_QUESTIONNAIRE,
     BenchmarkArtifactPack,
     BenchmarkResultBundle,
@@ -26,10 +27,12 @@ from constitutional_swarm.forensic_benchmark import (
     build_result_bundle,
     generate_artifact_pack,
     paired_sign_test_p_value,
+    precollection_commitment_digest,
     replication_metadata_template,
-    reviewer_artifact_manifest,
     reviewer_answer_template_csv,
+    reviewer_assignment,
     reviewer_artifacts_exclude_ground_truth,
+    reviewer_incident_pseudonym,
     reviewer_packet_files,
     score_reviewer_answers,
     validate_answer_matrix,
@@ -611,18 +614,15 @@ def test_generated_artifact_pack_has_50_incidents_and_hidden_answer_key() -> Non
             if path.startswith("artifacts/acgs_receipts_and_audit_artifacts/")
         ]
     ) == 50
-    assert len(
-        [
-            path
-            for path in files
-            if path.startswith("reviewer_artifacts/condition_c/")
-        ]
-    ) == 50
-    blinded_artifact = json.loads(files["reviewer_artifacts/condition_c/incident-001.json"])
+    reviewer_paths = [
+        path for path in files if path.startswith("reviewer_artifacts/reviewer-")
+    ]
+    assert len(reviewer_paths) == 50 * len(DEFAULT_REVIEWER_IDS)
+    blinded_artifact = json.loads(files[reviewer_paths[0]])
     assert "artifact_condition" not in blinded_artifact
     manifest = json.loads(files["reviewer_manifest.json"])
     assert manifest["schema"] == "acgs-v0.1-reviewer-artifact-manifest"
-    assert manifest["file_count"] == 153
+    assert manifest["file_count"] == 303
     assert "answer_key.json" not in manifest["files"]
     assert "condition_key.json" not in manifest["files"]
     assert "protocol.json" not in manifest["files"]
@@ -654,9 +654,13 @@ def test_generated_artifact_pack_has_50_incidents_and_hidden_answer_key() -> Non
 
 def test_reviewer_packet_files_exclude_coordinator_only_material() -> None:
     files = artifact_pack_to_files(generate_artifact_pack())
-    reviewer_files = reviewer_packet_files(files)
+    reviewer_files = reviewer_packet_files(files, reviewer_id="reviewer-1")
 
-    assert set(reviewer_files) == set(json.loads(files["reviewer_manifest.json"])["files"])
+    assert all(
+        not path.startswith("reviewer_artifacts/")
+        or path.startswith("reviewer_artifacts/reviewer-1/")
+        for path in reviewer_files
+    )
     assert "answer_key.json" not in reviewer_files
     assert "condition_key.json" not in reviewer_files
     assert "protocol.json" not in reviewer_files
@@ -679,6 +683,7 @@ def test_replication_template_is_not_success_evidence(tmp_path: Path) -> None:
         fixture.bundle,
         evidence_root=fixture.evidence_root,
         trusted_attestors=("Independent Systems Lab",),
+        expected_precollection_commitment=fixture.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -693,13 +698,13 @@ def test_reviewer_answer_template_is_blind_and_complete() -> None:
     template = reviewer_answer_template_csv(pack)
     rows = list(csv.DictReader(template.splitlines()))
 
-    assert len(rows) == 50 * len(BASELINES) * len(FORENSIC_QUESTIONNAIRE) * 2
+    assert len(rows) == 50 * len(DEFAULT_REVIEWER_IDS) * len(FORENSIC_QUESTIONNAIRE)
     assert "ground_truth" not in rows[0]
     assert "answer_key" not in rows[0]
     assert "correct_answer" not in rows[0]
     assert "artifact_condition" not in rows[0]
     assert rows[0]["condition_label"] in pack.condition_key
-    assert rows[0]["artifact_path"].startswith("reviewer_artifacts/condition_")
+    assert rows[0]["artifact_path"].startswith("reviewer_artifacts/reviewer-")
     assert rows[0]["answer"] == ""
     assert rows[0]["confidence"] == ""
     assert rows[0]["elapsed_seconds"] == ""
@@ -708,11 +713,10 @@ def test_reviewer_answer_template_is_blind_and_complete() -> None:
     } == set(pack.condition_key)
     assert {row["question_id"] for row in rows} == set(FORENSIC_QUESTIONNAIRE)
     assert template == reviewer_answer_template_csv(pack)
-    assert [row["condition_label"] for row in rows[:3]] != [
-        "condition_a",
-        "condition_a",
-        "condition_a",
-    ]
+    assert rows == sorted(
+        rows,
+        key=lambda row: (row["incident_id"], row["question_id"]),
+    )
 
 
 def test_governance_benchmark_runner_generates_incident_pack(tmp_path) -> None:
@@ -757,14 +761,15 @@ def test_governance_benchmark_runner_generates_incident_pack(tmp_path) -> None:
     )
     assert "ground_truth" not in reviewer_artifact
     assert "answer_key" not in reviewer_artifact
-    blinded_artifact = json.loads(
-        (output_dir / "reviewer_artifacts" / "condition_c" / "incident-001.json").read_text()
-    )
+    blinded_path = next((output_dir / "reviewer_artifacts").glob("*/*/*.json"))
+    blinded_artifact = json.loads(blinded_path.read_text())
     assert "artifact_condition" not in blinded_artifact
 
 
 def test_governance_benchmark_runner_generates_reviewer_only_packet(tmp_path) -> None:
     output_dir = tmp_path / "reviewer-packet"
+    nonce_file = tmp_path / "pack-nonce.txt"
+    nonce_file.write_text("15" * 32)
 
     result = subprocess.run(
         [
@@ -772,6 +777,10 @@ def test_governance_benchmark_runner_generates_reviewer_only_packet(tmp_path) ->
             "scripts/run_governance_benchmark.py",
             "--generate-reviewer-packet",
             str(output_dir),
+            "--reviewer-id",
+            "reviewer-1",
+            "--pack-nonce-file",
+            str(nonce_file),
         ],
         check=False,
         capture_output=True,
@@ -781,10 +790,12 @@ def test_governance_benchmark_runner_generates_reviewer_only_packet(tmp_path) ->
     assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload == {
-        "files_written": 154,
+        "files_written": 54,
         "hidden_files_written": False,
         "incident_count": 50,
         "output_dir": str(output_dir),
+        "precollection_commitment": payload["precollection_commitment"],
+        "reviewer_id": "reviewer-1",
     }
     assert (output_dir / "reviewer_manifest.json").exists()
     assert (output_dir / "reviewer_protocol.json").exists()
@@ -826,7 +837,7 @@ def test_governance_benchmark_runner_verifies_reviewer_manifest(tmp_path) -> Non
     assert verify.returncode == 0
     payload = json.loads(verify.stdout)
     assert payload == {
-        "checked_files": 153,
+        "checked_files": 303,
         "issues": [],
         "valid": True,
     }
@@ -834,12 +845,18 @@ def test_governance_benchmark_runner_verifies_reviewer_manifest(tmp_path) -> Non
 
 def test_governance_benchmark_runner_audits_reviewer_only_packet(tmp_path) -> None:
     output_dir = tmp_path / "reviewer-packet"
+    nonce_file = tmp_path / "pack-nonce.txt"
+    nonce_file.write_text("15" * 32)
     generate = subprocess.run(
         [
             sys.executable,
             "scripts/run_governance_benchmark.py",
             "--generate-reviewer-packet",
             str(output_dir),
+            "--reviewer-id",
+            "reviewer-1",
+            "--pack-nonce-file",
+            str(nonce_file),
         ],
         check=False,
         capture_output=True,
@@ -863,7 +880,7 @@ def test_governance_benchmark_runner_audits_reviewer_only_packet(tmp_path) -> No
     payload = json.loads(audit.stdout)
     assert payload["valid"] is True
     assert payload["manifest"] == {
-        "checked_files": 153,
+        "checked_files": 53,
         "issues": [],
         "valid": True,
     }
@@ -928,33 +945,40 @@ def test_governance_benchmark_runner_writes_external_replication_kit(tmp_path) -
     payload = json.loads(result.stdout)
     assert payload == {
         "completed_external_replication": False,
-        "coordinator_files_written": 309,
+        "coordinator_files_written": 460,
         "incident_count": 50,
         "kit_manifest": str(output_dir / "kit_manifest.json"),
         "output_dir": str(output_dir),
         "replication_metadata": str(output_dir / "replication_metadata.json"),
-        "reviewer_files_written": 154,
+        "precollection_commitment": payload["precollection_commitment"],
+        "reviewer_files_written": 324,
         "reviewer_packet_audit_valid": True,
     }
     assert (output_dir / "coordinator_pack" / "answer_key.json").exists()
     assert (output_dir / "coordinator_pack" / "condition_key.json").exists()
-    assert (output_dir / "reviewer_packet" / "reviewer_manifest.json").exists()
+    assert (
+        output_dir / "reviewer_packets" / "reviewer-1" / "reviewer_manifest.json"
+    ).exists()
     assert (output_dir / "reviewer_cohort_manifest.json").exists()
     assert (output_dir / "replication_attestation.json").exists()
     assert (output_dir / "required_public_artifacts.json").exists()
-    assert not (output_dir / "reviewer_packet" / "answer_key.json").exists()
-    assert not (output_dir / "reviewer_packet" / "condition_key.json").exists()
+    assert not (output_dir / "reviewer_packets" / "reviewer-1" / "answer_key.json").exists()
+    assert not (
+        output_dir / "reviewer_packets" / "reviewer-1" / "condition_key.json"
+    ).exists()
 
     kit_manifest = json.loads((output_dir / "kit_manifest.json").read_text())
     assert kit_manifest["schema"] == "acgs-v0.1-external-replication-kit"
     assert kit_manifest["incident_count"] == 50
-    assert kit_manifest["reviewer_packet_audit"]["valid"] is True
+    assert all(
+        audit["valid"] for audit in kit_manifest["reviewer_packet_audits"].values()
+    )
     assert "kit_manifest.json" not in kit_manifest["files"]
     assert "required_public_artifacts.json" in kit_manifest["files"]
-    assert "reviewer_packet/reviewer_manifest.json" in kit_manifest["files"]
+    assert "reviewer_packets/reviewer-1/reviewer_manifest.json" in kit_manifest["files"]
     assert "coordinator_pack/answer_key.json" in kit_manifest["files"]
     assert any(
-        "--audit-reviewer-packet reviewer_packet" in command
+        "--audit-reviewer-packet reviewer_packets/reviewer-1" in command
         for command in kit_manifest["commands"]
     )
     assert any(
@@ -1013,7 +1037,7 @@ def test_governance_benchmark_runner_writes_external_replication_kit(tmp_path) -
     )
     assert replication.completed is False
     assert "TODO" in replication.replicating_group
-    assert "--audit-reviewer-packet reviewer_packet" in replication.command_line
+    assert "--audit-reviewer-packet reviewer_packets/reviewer-1" in replication.command_line
     assert "--verify-replication-kit ." in replication.command_line
     assert (
         "--validate-required-public-artifacts required_public_artifacts.json"
@@ -1143,9 +1167,11 @@ def test_governance_benchmark_runner_verifies_external_replication_kit(tmp_path)
     assert verify.returncode == 0
     payload = json.loads(verify.stdout)
     assert payload["valid"] is True
-    assert payload["checked_files"] == 468
+    assert payload["checked_files"] == 639
     assert payload["issues"] == []
-    assert payload["reviewer_packet_audit"]["valid"] is True
+    assert all(
+        audit["valid"] for audit in payload["reviewer_packet_audits"].values()
+    )
     assert payload["required_public_artifacts"]["valid"] is True
     assert payload["required_public_artifacts"]["artifact_count"] == 5
 
@@ -1168,6 +1194,14 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
             str(output_dir),
             "--submission-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
             "--submission-result-bundle-url",
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/result-bundle.json",
             "--submission-replication-metadata-url",
@@ -1176,6 +1210,8 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/commands-transcript.txt",
             "--evidence-root",
             str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
             "--trusted-attestor",
             "Independent Systems Lab",
         ],
@@ -1257,6 +1293,8 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/commands-transcript.txt",
             "--evidence-root",
             str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
             "--trusted-attestor",
             "Independent Systems Lab",
         ],
@@ -1276,6 +1314,8 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
             str(bundle_path),
             "--evidence-root",
             str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
             "--trusted-attestor",
             "Independent Systems Lab",
         ],
@@ -1320,6 +1360,8 @@ def test_governance_benchmark_runner_rejects_placeholder_submission_urls(
             "https://example.org/commands-transcript.txt",
             "--evidence-root",
             str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
             "--trusted-attestor",
             "Independent Systems Lab",
         ],
@@ -1337,6 +1379,10 @@ def test_governance_benchmark_runner_rejects_placeholder_submission_urls(
             str(output_dir),
             "--submission-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
         ],
         check=False,
         capture_output=True,
@@ -1369,12 +1415,10 @@ def test_governance_benchmark_runner_rejects_tampered_replication_kit(
         text=True,
     )
     assert generate.returncode == 0
-    target = (
-        output_dir
-        / "reviewer_packet"
-        / "reviewer_artifacts"
-        / "condition_a"
-        / "incident-001.json"
+    target = next(
+        (output_dir / "reviewer_packets" / "reviewer-1" / "reviewer_artifacts").glob(
+            "*/*/*.json"
+        )
     )
     target.write_text(
         target.read_text().replace(
@@ -1864,7 +1908,7 @@ def test_governance_benchmark_runner_validates_collected_blind_answers(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
     )
 
     result = subprocess.run(
@@ -1874,7 +1918,12 @@ def test_governance_benchmark_runner_validates_collected_blind_answers(
             "--validate-collected-answers",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -1886,9 +1935,9 @@ def test_governance_benchmark_runner_validates_collected_blind_answers(
     assert payload["valid"] is True
     assert payload["success_evidence"] is False
     assert payload["issues"] == []
-    assert payload["row_count"] == 50 * 3 * 7 * 2
-    assert payload["expected_row_count"] == 50 * 3 * 7 * 2
-    assert payload["reviewer_count"] == 2
+    assert payload["row_count"] == 50 * len(DEFAULT_REVIEWER_IDS) * 7
+    assert payload["expected_row_count"] == 50 * len(DEFAULT_REVIEWER_IDS) * 7
+    assert payload["reviewer_count"] == len(DEFAULT_REVIEWER_IDS)
 
 
 def test_governance_benchmark_runner_rejects_unblinded_collected_answers(
@@ -1910,7 +1959,7 @@ def test_governance_benchmark_runner_rejects_unblinded_collected_answers(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
         extra_fields={"ground_truth": "leaked"},
     )
 
@@ -1921,7 +1970,12 @@ def test_governance_benchmark_runner_rejects_unblinded_collected_answers(
             "--validate-collected-answers",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -1954,7 +2008,7 @@ def test_governance_benchmark_runner_seals_collected_blind_answers(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
     )
 
     result = subprocess.run(
@@ -1966,7 +2020,12 @@ def test_governance_benchmark_runner_seals_collected_blind_answers(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2008,7 +2067,7 @@ def test_governance_benchmark_runner_verifies_collected_answer_seal(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
     )
     seal = subprocess.run(
         [
@@ -2019,7 +2078,12 @@ def test_governance_benchmark_runner_verifies_collected_answer_seal(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2036,7 +2100,12 @@ def test_governance_benchmark_runner_verifies_collected_answer_seal(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2072,7 +2141,7 @@ def test_governance_benchmark_runner_rejects_answer_seal_bundle_hash_mismatch(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
     )
     seal = subprocess.run(
         [
@@ -2083,7 +2152,12 @@ def test_governance_benchmark_runner_rejects_answer_seal_bundle_hash_mismatch(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2103,7 +2177,12 @@ def test_governance_benchmark_runner_rejects_answer_seal_bundle_hash_mismatch(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
             "--answer-seal-result-bundle",
             str(bundle_path),
         ],
@@ -2140,7 +2219,7 @@ def test_governance_benchmark_runner_rejects_tampered_collected_answer_seal(
     assert generate.returncode == 0
     _write_filled_reviewer_template_csv(
         answers_path,
-        output_dir / "reviewer_packet" / "reviewer_answer_template.csv",
+        output_dir / "coordinator_pack" / "reviewer_answer_template.csv",
     )
     seal = subprocess.run(
         [
@@ -2151,7 +2230,12 @@ def test_governance_benchmark_runner_rejects_tampered_collected_answer_seal(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2169,7 +2253,12 @@ def test_governance_benchmark_runner_rejects_tampered_collected_answer_seal(
             "--answers-csv",
             str(answers_path),
             "--reviewer-packet",
-            str(output_dir / "reviewer_packet"),
+            str(output_dir / "coordinator_pack"),
+            *_kit_canonical_input_args(output_dir),
+            "--precollection-commitment",
+            _kit_precollection_commitment(output_dir),
+            "--expected-precollection-commitment",
+            _kit_precollection_commitment(output_dir),
         ],
         check=False,
         capture_output=True,
@@ -2234,7 +2323,7 @@ def test_governance_benchmark_runner_validates_reviewer_cohort_manifest(
                 "cohort_id": "independent-systems-lab-2026-05",
                 "conflict_of_interest_screened": True,
                 "recruiting_organization": "Independent Systems Lab",
-                "reviewer_count": 3,
+                "reviewer_count": len(DEFAULT_REVIEWER_IDS),
                 "reviewer_roster_sha256": "a" * 64,
             }
         )
@@ -2257,8 +2346,11 @@ def test_governance_benchmark_runner_validates_reviewer_cohort_manifest(
     assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
-    assert payload["success_evidence"] is True
-    assert payload["manifest"]["reviewer_count"] == 3
+    assert payload["valid"] is True
+    assert payload["success_evidence"] is False
+    assert payload["authenticated_provenance"] is False
+    assert payload["independence_verified"] is False
+    assert payload["manifest"]["reviewer_count"] == len(DEFAULT_REVIEWER_IDS)
 
 
 def test_governance_benchmark_runner_rejects_reviewer_cohort_count_mismatch(
@@ -2275,7 +2367,7 @@ def test_governance_benchmark_runner_rejects_reviewer_cohort_count_mismatch(
             cohort_id="independent-systems-lab-2026-05",
             conflict_of_interest_screened=True,
             recruiting_organization="Independent Systems Lab",
-            reviewer_count=3,
+            reviewer_count=9,
             reviewer_roster_sha256="a" * 64,
         ).model_dump_json()
     )
@@ -2290,6 +2382,12 @@ def test_governance_benchmark_runner_rejects_reviewer_cohort_count_mismatch(
             str(manifest_path),
             "--cohort-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
+            "--trusted-attestor",
+            fixture.bundle.external_replication.replicating_group,
         ],
         check=False,
         capture_output=True,
@@ -2327,6 +2425,12 @@ def test_governance_benchmark_runner_rejects_scorecard_result_bundle_mismatch(
             str(scorecard_path),
             "--scorecard-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--expected-precollection-commitment",
+            fixture.precollection_commitment,
+            "--trusted-attestor",
+            fixture.bundle.external_replication.replicating_group,
         ],
         check=False,
         capture_output=True,
@@ -2439,6 +2543,8 @@ def test_governance_benchmark_runner_validates_replication_attestation(
             str(metadata_path),
             "--attested-result-bundle",
             str(result_bundle_path),
+            "--expected-precollection-commitment",
+            "a" * 64,
             "--attested-reviewer-cohort-manifest",
             str(cohort_manifest_path),
             "--attested-scorecard",
@@ -2453,6 +2559,8 @@ def test_governance_benchmark_runner_validates_replication_attestation(
             "Independent Systems Lab",
             "--evidence-root",
             str(built.evidence_root),
+            "--expected-precollection-commitment",
+            built.precollection_commitment,
         ],
         check=False,
         capture_output=True,
@@ -2462,11 +2570,15 @@ def test_governance_benchmark_runner_validates_replication_attestation(
     assert result.returncode == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
-    assert payload["success_evidence"] is True
+    assert payload["valid"] is True
+    assert payload["success_evidence"] is False
+    assert payload["authenticated_provenance"] is False
+    assert payload["external_success"] is False
+    assert payload["independence_verified"] is False
     assert payload["attestation"]["declares_independent_rerun"] is True
 
 
-def test_governance_benchmark_runner_rejects_attestation_transcript_missing_command_line(
+def test_governance_benchmark_runner_reports_attestation_command_line_as_diagnostic(
     tmp_path,
 ) -> None:
     attestation_path = tmp_path / "replication_attestation.json"
@@ -2516,13 +2628,23 @@ def test_governance_benchmark_runner_rejects_attestation_transcript_missing_comm
         text=True,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
+    assert payload["valid"] is True
     assert payload["success_evidence"] is False
-    assert "attestation_commands_transcript_missing_command_line" in {
-        issue["code"] for issue in payload["issues"]
-    }
+    assert payload["issues"] == []
+    assert payload["diagnostics"] == [
+        {
+            "authenticated": False,
+            "code": "attestation_commands_transcript_contains_command_line",
+            "message": (
+                "matching caller-supplied command text is metadata only and "
+                "does not prove execution"
+            ),
+            "present": False,
+        }
+    ]
 
 
 def test_governance_benchmark_runner_rejects_attestation_metadata_group_mismatch(
@@ -2612,6 +2734,8 @@ def test_governance_benchmark_runner_rejects_attestation_result_bundle_hash_mism
             str(metadata_path),
             "--attested-result-bundle",
             str(result_bundle_path),
+            "--expected-precollection-commitment",
+            "a" * 64,
         ],
         check=False,
         capture_output=True,
@@ -2973,7 +3097,7 @@ def test_governance_benchmark_runner_rejects_dummy_metadata_public_record_refere
     }
 
 
-def test_governance_benchmark_runner_requires_metadata_completion_audit_command(
+def test_governance_benchmark_runner_reports_completion_audit_command_diagnostic(
     tmp_path,
 ) -> None:
     metadata_path = tmp_path / "replication.json"
@@ -2994,22 +3118,34 @@ def test_governance_benchmark_runner_requires_metadata_completion_audit_command(
             "scripts/run_governance_benchmark.py",
             "--validate-replication-metadata",
             str(metadata_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
+    assert payload["valid"] is True
     assert payload["success_evidence"] is False
-    assert {issue["code"] for issue in payload["issues"]} >= {
-        "external_replication_completion_audit_missing"
+    assert payload["issues"] == []
+    diagnostic = next(
+        item
+        for item in payload["command_metadata_diagnostics"]
+        if item["code"] == "external_replication_completion_audit_missing"
+    )
+    assert diagnostic == {
+        "authenticated": False,
+        "code": "external_replication_completion_audit_missing",
+        "fragment": "--completion-audit-result-bundle",
+        "present": False,
     }
 
 
-def test_governance_benchmark_runner_requires_metadata_public_artifact_validation(
+def test_governance_benchmark_runner_reports_public_artifact_command_diagnostic(
     tmp_path,
 ) -> None:
     metadata_path = tmp_path / "replication.json"
@@ -3030,18 +3166,30 @@ def test_governance_benchmark_runner_requires_metadata_public_artifact_validatio
             "scripts/run_governance_benchmark.py",
             "--validate-replication-metadata",
             str(metadata_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
+    assert payload["valid"] is True
     assert payload["success_evidence"] is False
-    assert {issue["code"] for issue in payload["issues"]} >= {
-        "external_replication_public_artifacts_not_validated"
+    assert payload["issues"] == []
+    diagnostic = next(
+        item
+        for item in payload["command_metadata_diagnostics"]
+        if item["code"] == "external_replication_public_artifacts_not_validated"
+    )
+    assert diagnostic == {
+        "authenticated": False,
+        "code": "external_replication_public_artifacts_not_validated",
+        "fragment": "--validate-required-public-artifacts",
+        "present": False,
     }
 
 
@@ -3060,7 +3208,7 @@ def test_governance_benchmark_runner_rejects_tampered_reviewer_manifest_file(
         capture_output=True,
         text=True,
     )
-    target = output_dir / "reviewer_artifacts" / "condition_a" / "incident-001.json"
+    target = next((output_dir / "reviewer_artifacts").glob("*/*/*.json"))
     target.write_text(
         target.read_text().replace(
             '"principal_role": "executor"',
@@ -3096,18 +3244,19 @@ def test_result_bundle_validates_only_complete_public_study_evidence(tmp_path) -
         bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(bundle.external_replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is True
     assert verdict.issues == []
     assert bundle.incident_count == 50
     assert bundle.question_count == len(FORENSIC_QUESTIONNAIRE)
-    assert bundle.reviewer_count == 2
+    assert bundle.reviewer_count == len(DEFAULT_REVIEWER_IDS)
     assert bundle.scorecard.acgs_wins is True
     assert bundle.p_value_vs_strongest_baseline <= 0.05
 
 
-def test_result_bundle_requires_external_completion_audit_command(tmp_path) -> None:
+def test_result_bundle_reports_external_completion_audit_command_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_completion_audit = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3125,15 +3274,22 @@ def test_result_bundle_requires_external_completion_audit_command(tmp_path) -> N
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_completion_audit_missing"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--completion-audit-result-bundle" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_replication_kit_verification(tmp_path) -> None:
+def test_result_bundle_reports_external_replication_kit_verification_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_kit_verification = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py --verify-replication-kit .",
@@ -3150,15 +3306,22 @@ def test_result_bundle_requires_external_replication_kit_verification(tmp_path) 
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_kit_not_verified"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--verify-replication-kit" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_public_artifact_validation(tmp_path) -> None:
+def test_result_bundle_reports_external_public_artifact_validation_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_public_artifact_validation = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3176,15 +3339,22 @@ def test_result_bundle_requires_external_public_artifact_validation(tmp_path) ->
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_public_artifacts_not_validated"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--validate-required-public-artifacts" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_reviewer_cohort_bundle_binding(tmp_path) -> None:
+def test_result_bundle_reports_external_reviewer_cohort_bundle_binding_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_cohort_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3203,15 +3373,22 @@ def test_result_bundle_requires_external_reviewer_cohort_bundle_binding(tmp_path
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_reviewer_cohort_not_bound"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--cohort-result-bundle" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_answer_matrix_bundle_binding(tmp_path) -> None:
+def test_result_bundle_reports_external_answer_matrix_bundle_binding_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_answer_matrix_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3233,15 +3410,22 @@ def test_result_bundle_requires_external_answer_matrix_bundle_binding(tmp_path) 
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_answer_matrix_not_bound"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--answer-matrix-result-bundle" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_answer_seal_bundle_binding(tmp_path) -> None:
+def test_result_bundle_reports_external_answer_seal_bundle_binding_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_answer_seal_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3261,15 +3445,22 @@ def test_result_bundle_requires_external_answer_seal_bundle_binding(tmp_path) ->
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_answer_seal_not_bound"
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--answer-seal-result-bundle" not in verdict.command_metadata
 
 
-def test_result_bundle_requires_external_scorecard_bundle_binding(tmp_path) -> None:
+def test_result_bundle_reports_external_scorecard_bundle_binding_diagnostic(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_scorecard_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3288,18 +3479,24 @@ def test_result_bundle_requires_external_scorecard_bundle_binding(tmp_path) -> N
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
-    assert verdict.valid is False
-    assert {issue.code for issue in verdict.issues} >= {
-        "external_replication_scorecard_not_validated",
-        "external_replication_scorecard_not_bound",
+    assert verdict.valid is True
+    assert verdict.issues == []
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
+    assert {issue.code for issue in verdict.provenance_diagnostics} >= {
+        "authenticated_provenance_unavailable",
+        "unauthenticated_command_metadata",
     }
+    assert "--scorecard-result-bundle" not in verdict.command_metadata
 
 
 def test_paired_sign_test_p_value_is_computed_from_matched_answers() -> None:
     pack = generate_artifact_pack()
-    answers = _full_blind_review_answers(pack.answer_key)
+    answers = _full_blind_review_answers(pack)
 
     p_value = paired_sign_test_p_value(answers)
 
@@ -3364,37 +3561,21 @@ def test_result_bundle_rejects_toy_or_non_external_success_claim(tmp_path) -> No
         bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
         "not_statistically_significant",
         "external_replication_incomplete",
-        "replicating_group_not_trusted",
         "external_artifact_pack_not_immutable",
         "external_reviewer_cohort_not_immutable",
         "external_scorecard_not_immutable",
         "external_attestation_not_immutable",
-        "external_replication_packet_not_audited",
-        "external_replication_kit_not_verified",
-        "external_replication_public_artifacts_not_validated",
-        "external_replication_reviewer_cohort_not_bound",
-        "external_replication_answer_matrix_not_validated",
-        "external_replication_answer_matrix_not_bound",
-        "external_replication_bundle_not_built",
-        "external_replication_result_bundle_not_validated",
-        "external_replication_scorecard_not_validated",
-        "external_replication_scorecard_not_bound",
-        "external_replication_completion_audit_missing",
-        "external_replication_answer_seal_not_verified",
-        "external_replication_answer_seal_not_bound",
-        "external_replication_attestation_not_validated",
-        "external_replication_attested_bundle_missing",
-        "external_replication_attested_reviewer_cohort_missing",
-        "external_replication_attested_scorecard_missing",
-        "external_replication_attested_artifact_pack_missing",
-        "external_replication_attested_commands_transcript_missing",
     }
+    assert verdict.authenticated_provenance is False
+    assert verdict.external_success is False
+    assert verdict.independence_verified is False
 
 
 def test_result_bundle_rejects_placeholder_external_replication_metadata(tmp_path) -> None:
@@ -3420,30 +3601,14 @@ def test_result_bundle_rejects_placeholder_external_replication_metadata(tmp_pat
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
         "external_replication_placeholder",
-        "external_replication_packet_not_audited",
-        "external_replication_kit_not_verified",
-        "external_replication_public_artifacts_not_validated",
-        "external_replication_reviewer_cohort_not_bound",
-        "external_replication_answer_matrix_not_validated",
-        "external_replication_answer_matrix_not_bound",
-        "external_replication_bundle_not_built",
-        "external_replication_result_bundle_not_validated",
-        "external_replication_scorecard_not_validated",
-        "external_replication_scorecard_not_bound",
-        "external_replication_completion_audit_missing",
-        "external_replication_attestation_not_validated",
-        "external_replication_answer_seal_not_bound",
-        "external_replication_attested_bundle_missing",
-        "external_replication_attested_reviewer_cohort_missing",
-        "external_replication_attested_scorecard_missing",
-        "external_replication_attested_artifact_pack_missing",
-        "external_replication_attested_commands_transcript_missing",
     }
+    assert verdict.authenticated_provenance is False
 
 
 def test_result_bundle_rejects_non_immutable_external_references(tmp_path) -> None:
@@ -3462,6 +3627,7 @@ def test_result_bundle_rejects_non_immutable_external_references(tmp_path) -> No
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3489,6 +3655,7 @@ def test_result_bundle_rejects_placeholder_external_reference_hosts(tmp_path) ->
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3521,6 +3688,7 @@ def test_result_bundle_rejects_dummy_public_record_references(tmp_path) -> None:
         built.bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3555,6 +3723,7 @@ def test_result_bundle_rejects_dummy_answer_evidence_references(tmp_path) -> Non
         bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(bundle.external_replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3585,6 +3754,7 @@ def test_result_bundle_rejects_scorecard_answer_count_mismatch(tmp_path) -> None
         tampered_bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(bundle.external_replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3608,6 +3778,7 @@ def test_result_bundle_rejects_inconsistent_scorecard_claims(tmp_path) -> None:
         tampered_bundle,
         evidence_root=built.evidence_root,
         trusted_attestors=(bundle.external_replication.replicating_group,),
+        expected_precollection_commitment=built.precollection_commitment,
     )
 
     assert verdict.valid is False
@@ -3632,17 +3803,18 @@ def test_condition_score_rejects_impossible_metric_values() -> None:
 
 def test_result_bundle_builder_rejects_incomplete_answer_matrix(tmp_path) -> None:
     pack = generate_artifact_pack()
-    answers = _full_blind_review_answers(pack.answer_key)
+    answers = _full_blind_review_answers(pack)
     built = _build_result_bundle_fixture(tmp_path, pack, answers=answers)
 
     with pytest.raises(ValueError, match="incomplete answer matrix"):
         build_result_bundle(
             protocol=pack.protocol,
             external_replication=built.bundle.external_replication,
-            evidence_root=built.evidence_root,
-            evidence_paths=built.evidence_paths,
-            answers=answers[:-1],
-        )
+                evidence_root=built.evidence_root,
+                evidence_paths=built.evidence_paths,
+                answers=answers[:-1],
+                expected_precollection_commitment=built.precollection_commitment,
+            )
 
 
 def test_answer_matrix_verdict_reports_missing_cells() -> None:
@@ -3650,7 +3822,7 @@ def test_answer_matrix_verdict_reports_missing_cells() -> None:
 
     verdict = validate_answer_matrix(
         pack.protocol,
-        _full_blind_review_answers(pack.answer_key)[:-1],
+        _full_blind_review_answers(pack)[:-1],
     )
 
     assert verdict.valid is False
@@ -3672,6 +3844,8 @@ def test_governance_benchmark_runner_validates_result_bundle_json(tmp_path) -> N
             str(bundle_path),
             "--evidence-root",
             str(built.evidence_root),
+            "--expected-precollection-commitment",
+            built.precollection_commitment,
             "--trusted-attestor",
             bundle.external_replication.replicating_group,
         ],
@@ -3685,7 +3859,11 @@ def test_governance_benchmark_runner_validates_result_bundle_json(tmp_path) -> N
     assert payload["valid"] is True
     assert payload["issues"] == []
     assert payload["summary"]["incident_count"] == 50
-    assert payload["summary"]["reviewer_count"] == 2
+    assert payload["summary"]["reviewer_count"] == len(DEFAULT_REVIEWER_IDS)
+    assert payload["authenticated_provenance"] is False
+    assert payload["external_success"] is False
+    assert payload["independence_verified"] is False
+    assert payload["provenance_diagnostics"]
     assert payload["summary"]["question_count"] == len(FORENSIC_QUESTIONNAIRE)
     assert payload["summary"]["acgs_wins"] is True
     assert payload["summary"]["external_replication_completed"] is True
@@ -3715,6 +3893,8 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
             str(bundle_path),
             "--evidence-root",
             str(built.evidence_root),
+            "--expected-precollection-commitment",
+            built.precollection_commitment,
             "--trusted-attestor",
             bundle.external_replication.replicating_group,
         ],
@@ -3807,7 +3987,7 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
     ]
     assert checklist["public_blind_review_data_verified"]["evidence"] == {
         "incident_count": 50,
-        "reviewer_count": 2,
+            "reviewer_count": len(DEFAULT_REVIEWER_IDS),
         "answer_matrix_uri": bundle.answer_evidence.answer_matrix_uri,
         "answer_seal_uri": bundle.answer_evidence.answer_seal_uri,
         "reviewer_cohort_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-reviewer-cohort.json",
@@ -3967,10 +4147,17 @@ def test_governance_benchmark_runner_validates_answer_matrix_csv(tmp_path) -> No
     protocol_path = tmp_path / "protocol.json"
     answers_path = tmp_path / "answers.csv"
     answer_key_path = tmp_path / "answer-key.json"
+    condition_key_path = tmp_path / "condition-key.json"
+    template_path = tmp_path / "reviewer-answer-template.csv"
 
-    protocol_path.write_text(pack.protocol.model_dump_json())
-    answer_key_path.write_text(json.dumps(pack.answer_key))
-    _write_blind_answers_csv(answers_path, _full_blind_review_answers(pack.answer_key))
+    full_files = artifact_pack_to_files(pack)
+    protocol_path.write_text(full_files["protocol.json"])
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
+    template_path.write_text(full_files["reviewer_answer_template.csv"])
+    _write_collected_answers_from_models(
+        answers_path, template_path, pack, _full_blind_review_answers(pack)
+    )
 
     result = subprocess.run(
         [
@@ -3982,6 +4169,10 @@ def test_governance_benchmark_runner_validates_answer_matrix_csv(tmp_path) -> No
             str(protocol_path),
             "--answer-key-json",
             str(answer_key_path),
+            "--condition-key-json",
+            str(condition_key_path),
+            "--expected-precollection-commitment",
+            precollection_commitment_digest(full_files),
         ],
         check=False,
         capture_output=True,
@@ -3999,10 +4190,17 @@ def test_governance_benchmark_runner_rejects_incomplete_answer_matrix_csv(
     protocol_path = tmp_path / "protocol.json"
     answers_path = tmp_path / "answers.csv"
     answer_key_path = tmp_path / "answer-key.json"
+    condition_key_path = tmp_path / "condition-key.json"
+    template_path = tmp_path / "reviewer-answer-template.csv"
 
-    protocol_path.write_text(pack.protocol.model_dump_json())
-    answer_key_path.write_text(json.dumps(pack.answer_key))
-    _write_blind_answers_csv(answers_path, _full_blind_review_answers(pack.answer_key)[:-1])
+    full_files = artifact_pack_to_files(pack)
+    protocol_path.write_text(full_files["protocol.json"])
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
+    template_path.write_text(full_files["reviewer_answer_template.csv"])
+    _write_collected_answers_from_models(
+        answers_path, template_path, pack, _full_blind_review_answers(pack)[:-1]
+    )
 
     result = subprocess.run(
         [
@@ -4014,6 +4212,10 @@ def test_governance_benchmark_runner_rejects_incomplete_answer_matrix_csv(
             str(protocol_path),
             "--answer-key-json",
             str(answer_key_path),
+            "--condition-key-json",
+            str(condition_key_path),
+            "--expected-precollection-commitment",
+            precollection_commitment_digest(full_files),
         ],
         check=False,
         capture_output=True,
@@ -4033,12 +4235,23 @@ def test_governance_benchmark_runner_rejects_answer_matrix_bundle_hash_mismatch(
     protocol_path = tmp_path / "protocol.json"
     answers_path = tmp_path / "answers.csv"
     answer_key_path = tmp_path / "answer-key.json"
+    condition_key_path = tmp_path / "condition-key.json"
+    template_path = tmp_path / "reviewer-answer-template.csv"
     bundle_path = tmp_path / "result-bundle.json"
-    answers = _full_blind_review_answers(pack.answer_key)
+    answers = _full_blind_review_answers(pack)
 
-    protocol_path.write_text(pack.protocol.model_dump_json())
-    answer_key_path.write_text(json.dumps(pack.answer_key))
-    _write_blind_answers_csv(answers_path, answers)
+    full_files = artifact_pack_to_files(pack)
+    protocol_path.write_text(full_files["protocol.json"])
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
+    template_path.write_text(full_files["reviewer_answer_template.csv"])
+    tampered_answers = [
+        answers[0].model_copy(update={"confidence": 0.8}),
+        *answers[1:],
+    ]
+    _write_collected_answers_from_models(
+        answers_path, template_path, pack, tampered_answers
+    )
     built = _build_result_bundle_fixture(tmp_path, pack, answers=answers)
     bundle_path.write_text(built.bundle.model_dump_json())
 
@@ -4052,8 +4265,16 @@ def test_governance_benchmark_runner_rejects_answer_matrix_bundle_hash_mismatch(
             str(protocol_path),
             "--answer-key-json",
             str(answer_key_path),
+            "--condition-key-json",
+            str(condition_key_path),
+            "--expected-precollection-commitment",
+            built.precollection_commitment,
             "--answer-matrix-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(built.evidence_root),
+            "--trusted-attestor",
+            built.bundle.external_replication.replicating_group,
         ],
         check=False,
         capture_output=True,
@@ -4095,6 +4316,8 @@ def test_governance_benchmark_runner_reports_blank_answer_template_as_invalid(
             str(answer_key_path),
             "--condition-key-json",
             str(condition_key_path),
+            "--expected-precollection-commitment",
+            precollection_commitment_digest(full_files),
         ],
         check=False,
         capture_output=True,
@@ -4126,24 +4349,18 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
     protocol_path.write_text(full_files["protocol.json"])
     answer_key_path.write_text(full_files["answer_key.json"])
     condition_key_path.write_text(full_files["condition_key.json"])
-    reviewer_files = reviewer_packet_files(full_files)
+    manifest_files = json.loads(full_files["reviewer_manifest.json"])["files"]
+    reviewer_files = {
+        relative_path: full_files[relative_path]
+        for relative_path in manifest_files
+    }
     reviewer_files["reviewer_manifest.json"] = full_files["reviewer_manifest.json"]
     _write_text_tree(reviewer_packet_dir, reviewer_files)
-    selected_answers = [
-        answer.model_copy(
-            update={
-                "reviewer_id": {"r1": "reviewer-1", "r2": "reviewer-2"}.get(
-                    answer.reviewer_id,
-                    answer.reviewer_id,
-                )
-            }
-        )
-        for answer in _full_blind_review_answers(pack.answer_key)
-    ]
+    selected_answers = _full_blind_review_answers(pack)
     _write_collected_answers_from_models(
         answers_path,
         reviewer_packet_dir / "reviewer_answer_template.csv",
-        pack.condition_key,
+        pack,
         selected_answers,
     )
     seal = subprocess.run(
@@ -4156,6 +4373,14 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
             str(answers_path),
             "--reviewer-packet",
             str(reviewer_packet_dir),
+            "--protocol-json",
+            str(protocol_path),
+            "--answer-key-json",
+            str(answer_key_path),
+            "--condition-key-json",
+            str(condition_key_path),
+            "--precollection-commitment",
+            precollection_commitment_digest(full_files),
         ],
         check=False,
         capture_output=True,
@@ -4190,6 +4415,8 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
             str(answer_key_path),
             "--condition-key-json",
             str(condition_key_path),
+            "--expected-precollection-commitment",
+            precollection_commitment_digest(full_files),
             "--trusted-attestor",
             "Independent Systems Lab",
         ],
@@ -4256,6 +4483,8 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
             str(artifact_pack_path),
             "--attested-commands-transcript",
             str(commands_transcript_path),
+            "--expected-precollection-commitment",
+            precollection_commitment_digest(full_files),
             "--trusted-attestor",
             "Independent Systems Lab",
             "--trusted-attestor",
@@ -4268,49 +4497,38 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
 
     assert attestation.returncode == 0
     attestation_payload = json.loads(attestation.stdout)
-    assert attestation_payload["success_evidence"] is True
+    assert attestation_payload["success_evidence"] is False
 
 
-def _full_blind_review_answers(answer_key: dict[str, dict[str, str]]) -> list[ReviewerAnswer]:
+def _full_blind_review_answers(pack: BenchmarkArtifactPack) -> list[ReviewerAnswer]:
     answers: list[ReviewerAnswer] = []
-    for incident_id, incident_answers in answer_key.items():
+    for incident_id, incident_answers in pack.answer_key.items():
         for question_id, ground_truth in incident_answers.items():
-            for reviewer_id in ("r1", "r2"):
-                answers.append(
-                    ReviewerAnswer(
-                        incident_id=incident_id,
-                        artifact_condition="ungoverned_raw_logs",
-                        reviewer_id=reviewer_id,
-                        question_id=question_id,
-                        answer="unknown",
-                        ground_truth=ground_truth,
-                        confidence=0.4,
-                        elapsed_seconds=90,
+            for reviewer_id in DEFAULT_REVIEWER_IDS:
+                condition = pack.condition_key[
+                    reviewer_assignment(incident_id, reviewer_id)
+                ]
+                if condition == "ungoverned_raw_logs":
+                    answer, confidence, elapsed_seconds = "unknown", 0.4, 90
+                elif condition == "centralized_structured_logs":
+                    answer = (
+                        ground_truth
+                        if int(reviewer_id.removeprefix("reviewer-")) % 2
+                        else "ambiguous"
                     )
-                )
-                central_answer = ground_truth if reviewer_id == "r1" else "ambiguous"
+                    confidence, elapsed_seconds = 0.6, 75
+                else:
+                    answer, confidence, elapsed_seconds = ground_truth, 0.9, 30
                 answers.append(
                     ReviewerAnswer(
                         incident_id=incident_id,
-                        artifact_condition="centralized_structured_logs",
+                        artifact_condition=condition,
                         reviewer_id=reviewer_id,
                         question_id=question_id,
-                        answer=central_answer,
+                        answer=answer,
                         ground_truth=ground_truth,
-                        confidence=0.6,
-                        elapsed_seconds=75,
-                    )
-                )
-                answers.append(
-                    ReviewerAnswer(
-                        incident_id=incident_id,
-                        artifact_condition="acgs_receipts_and_audit_artifacts",
-                        reviewer_id=reviewer_id,
-                        question_id=question_id,
-                        answer=ground_truth,
-                        ground_truth=ground_truth,
-                        confidence=0.9,
-                        elapsed_seconds=30,
+                        confidence=confidence,
+                        elapsed_seconds=elapsed_seconds,
                     )
                 )
     return answers
@@ -4392,6 +4610,25 @@ def _write_text_tree(root: Path, files: dict[str, str]) -> None:
         target = root / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
+
+
+def _kit_precollection_commitment(kit_dir: Path) -> str:
+    payload = json.loads(
+        (kit_dir / "coordinator_pack" / "precollection_commitment.json").read_text()
+    )
+    return str(payload["digest"])
+
+
+def _kit_canonical_input_args(kit_dir: Path) -> list[str]:
+    coordinator_pack = kit_dir / "coordinator_pack"
+    return [
+        "--protocol-json",
+        str(coordinator_pack / "protocol.json"),
+        "--answer-key-json",
+        str(coordinator_pack / "answer_key.json"),
+        "--condition-key-json",
+        str(coordinator_pack / "condition_key.json"),
+    ]
 
 
 def _complete_replication_command() -> str:
@@ -4478,6 +4715,7 @@ class _BuiltResultBundle:
     bundle: BenchmarkResultBundle
     evidence_root: Path
     evidence_paths: dict[str, str]
+    precollection_commitment: str
 
 
 def _build_result_bundle_fixture(
@@ -4492,18 +4730,15 @@ def _build_result_bundle_fixture(
     reviewer_packet_dir = evidence_root / "reviewer_packet"
     evidence_root.mkdir(parents=True, exist_ok=True)
     selected_answers = (
-        answers if answers is not None else _full_blind_review_answers(pack.answer_key)
+        answers if answers is not None else _full_blind_review_answers(pack)
     )
     full_files = artifact_pack_to_files(pack)
-    reviewer_ids = tuple(sorted({answer.reviewer_id for answer in selected_answers}))
-    full_files["reviewer_answer_template.csv"] = reviewer_answer_template_csv(
-        pack,
-        reviewer_ids=reviewer_ids,
-    )
-    full_files["reviewer_manifest.json"] = (
-        json.dumps(reviewer_artifact_manifest(full_files), indent=2, sort_keys=True) + "\n"
-    )
-    reviewer_files = reviewer_packet_files(full_files)
+    precollection_commitment = precollection_commitment_digest(full_files)
+    manifest_files = json.loads(full_files["reviewer_manifest.json"])["files"]
+    reviewer_files = {
+        relative_path: full_files[relative_path]
+        for relative_path in manifest_files
+    }
     reviewer_files["reviewer_manifest.json"] = full_files["reviewer_manifest.json"]
     _write_text_tree(reviewer_packet_dir, reviewer_files)
 
@@ -4511,20 +4746,27 @@ def _build_result_bundle_fixture(
     _write_collected_answers_from_models(
         answers_path,
         reviewer_packet_dir / "reviewer_answer_template.csv",
-        pack.condition_key,
+        pack,
         selected_answers,
     )
+    answer_key_path = evidence_root / "answer_key.json"
+    condition_key_path = evidence_root / "condition_key.json"
+    protocol_path = evidence_root / "protocol.json"
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
+    protocol_path.write_text(full_files["protocol.json"])
     seal_path = evidence_root / "collected-answers-seal.json"
     seal_result = _seal_collected_blind_answers(
         seal_path,
         answers_path,
         reviewer_packet_dir,
+        precollection_commitment,
+        protocol_path=protocol_path,
+        answer_key_path=answer_key_path,
+        condition_key_path=condition_key_path,
     )
     assert seal_result["valid"] is True
 
-    (evidence_root / "answer_key.json").write_text(full_files["answer_key.json"])
-    (evidence_root / "condition_key.json").write_text(full_files["condition_key.json"])
-    (evidence_root / "protocol.json").write_text(full_files["protocol.json"])
     replication = external_replication or _complete_external_replication_record()
     (evidence_root / "replication_metadata.json").write_text(
         replication.model_dump_json()
@@ -4544,11 +4786,13 @@ def _build_result_bundle_fixture(
         evidence_root=evidence_root,
         evidence_paths=evidence_paths,
         answers=selected_answers,
+        expected_precollection_commitment=precollection_commitment,
     )
     return _BuiltResultBundle(
         bundle=bundle,
         evidence_root=evidence_root,
         evidence_paths=evidence_paths,
+        precollection_commitment=precollection_commitment,
     )
 
 
@@ -4560,23 +4804,28 @@ def _complete_answer_evidence() -> CollectedAnswerEvidence:
         answer_seal_sha256="b" * 64,
         reviewer_manifest_sha256="c" * 64,
         answers_bytes=365655,
-        row_count=50 * 2 * len(FORENSIC_QUESTIONNAIRE) * len(BASELINES),
-        reviewer_count=2,
+        row_count=50 * len(DEFAULT_REVIEWER_IDS) * len(FORENSIC_QUESTIONNAIRE),
+        reviewer_count=len(DEFAULT_REVIEWER_IDS),
     )
 
 
 def _write_collected_answers_from_models(
     path: Path,
     template_path: Path,
-    condition_key: Mapping[str, str],
+    pack: BenchmarkArtifactPack,
     answers: list[ReviewerAnswer],
 ) -> None:
     inverse_condition_key = {
-        condition: label for label, condition in condition_key.items()
+        condition: label for label, condition in pack.condition_key.items()
     }
     by_cell = {
         (
-            answer.incident_id,
+            reviewer_incident_pseudonym(
+                pack.pack_nonce,
+                answer.incident_id,
+                answer.artifact_condition,
+                answer.reviewer_id,
+            ),
             inverse_condition_key[answer.artifact_condition],
             answer.reviewer_id,
             answer.question_id,
