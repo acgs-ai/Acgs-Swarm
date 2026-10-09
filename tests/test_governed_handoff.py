@@ -268,6 +268,9 @@ def test_cli_run_verify_and_pack(
 
     assert main(["run", "--task", str(task)]) == 0
     assert main(["verify", "--bundle", ".acgs/evidence/cli-task.bundle.json"]) == 1
+    with pytest.raises(FileExistsError):
+        main(["pack", "--task", "cli-task"])
+    (tmp_path / ".acgs/evidence/cli-task.bundle.json").unlink()
     assert main(["pack", "--task", "cli-task"]) == 0
 
 
