@@ -10,10 +10,13 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import inspect
 import json
 import os
 import re
+import secrets
 import shlex
+import stat
 import subprocess
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -36,7 +39,42 @@ ZERO_HASH = "0" * 64
 
 # Domain separator for the bundle attestation pre-image. Versioned so the signed
 # pre-image can never be confused with any other Ed25519 message in the system.
-BUNDLE_SIG_DOMAIN = "acgs.governed-handoff.bundle-attestation.v1"
+BUNDLE_SCHEMA_VERSION = 2
+BUNDLE_SIG_DOMAIN = "acgs.governed-handoff.bundle-attestation.v2"
+
+# Repository metadata and tool-configuration roots are security boundaries, not
+# caller policy. Local configuration may add protected paths but can never remove
+# these roots or the code-owned path patterns below.
+IMMUTABLE_PROTECTED_ROOTS: frozenset[str] = frozenset(
+    {".git", ".github", ".acgs", ".claude", ".vscode", ".husky"}
+)
+CODE_OWNED_PROTECTED_PATHS: tuple[str, ...] = (
+    ".env",
+    ".envrc",
+    ".pre-commit-config.yaml",
+    "secrets",
+    "secrets/**",
+)
+
+
+def _normalize_protected_pattern(pattern: Any) -> str | None:
+    normalized = os.path.normpath(str(pattern).replace("\\", "/"))
+    folded = normalized.replace("\\", "/").casefold()
+    return None if folded in {"", "."} else folded
+
+# Capture platform support before tests or callers can wrap the ``os`` functions.
+# Membership in ``supports_dir_fd`` is by function identity, so checking it at
+# write time would incorrectly reject a safe platform whenever ``os.open`` is
+# instrumented for auditing or deterministic race testing.
+_HAS_SAFE_DIR_FD_OPERATIONS = all(
+    function in os.supports_dir_fd for function in (os.open, os.mkdir, os.unlink)
+)
+try:
+    _HAS_SAFE_DIR_FD_REPLACE = {"src_dir_fd", "dst_dir_fd"}.issubset(
+        inspect.signature(os.replace).parameters
+    )
+except (TypeError, ValueError):
+    _HAS_SAFE_DIR_FD_REPLACE = False
 
 # Code-owned default tool/test command allowlist. The deterministic ``tool_call``
 # gate is default-DENY against this set. Keep this to inert commands; interpreter
@@ -146,8 +184,21 @@ class PolicyEngine:
         policy = (
             constitution.get("policy", {}) if isinstance(constitution, dict) else {}
         )
-        self.protected_paths = list(
-            policy.get("protected_paths", [".acgs/**", ".env", "secrets/**"])
+        configured_paths = policy.get("protected_paths")
+        if not isinstance(configured_paths, list):
+            configured_paths = []
+        normalized_configured_paths = [
+            normalized
+            for pattern in configured_paths
+            if (normalized := _normalize_protected_pattern(pattern)) is not None
+        ]
+        self.protected_paths = tuple(
+            dict.fromkeys(
+                (
+                    *CODE_OWNED_PROTECTED_PATHS,
+                    *normalized_configured_paths,
+                )
+            )
         )
         self.secret_patterns = [
             re.compile(str(pattern), re.IGNORECASE)
@@ -248,17 +299,66 @@ class PolicyEngine:
         return PolicyDecision("tool_call", command, ALLOW, "tool command allowed")
 
     def _file_write(self, raw_path: str) -> PolicyDecision:
-        resolved = (self.repo_root / raw_path).resolve()
+        decision, _ = self._evaluate_file_write(raw_path)
+        return decision
+
+    def _evaluate_file_write(
+        self, raw_path: str
+    ) -> tuple[PolicyDecision, Path | None]:
+        lexical = Path(os.path.normpath(str(self.repo_root / raw_path)))
+        if not lexical.is_absolute():
+            lexical = lexical.absolute()
+        if not lexical.is_relative_to(self.repo_root):
+            return PolicyDecision(
+                "file_write", raw_path, DENY, "path escapes repository root"
+            ), None
+        try:
+            resolved = lexical.resolve()
+        except (OSError, RuntimeError) as exc:
+            return PolicyDecision(
+                "file_write",
+                raw_path,
+                DENY,
+                f"path cannot be resolved safely: {exc}",
+            ), None
         if not resolved.is_relative_to(self.repo_root):
             return PolicyDecision(
                 "file_write", raw_path, DENY, "path escapes repository root"
-            )
-        normalized = resolved.relative_to(self.repo_root).as_posix()
-        if any(fnmatch(normalized, pattern) for pattern in self.protected_paths):
+            ), None
+        if lexical == self.repo_root or resolved == self.repo_root:
             return PolicyDecision(
-                "file_write", normalized, REVIEW, "protected path requires human review"
-            )
-        return PolicyDecision("file_write", normalized, ALLOW, "file write allowed")
+                "file_write",
+                raw_path,
+                DENY,
+                "repository root is not a valid file write target",
+            ), None
+        lexical_relative = lexical.relative_to(self.repo_root).as_posix()
+        resolved_relative = resolved.relative_to(self.repo_root).as_posix()
+        if any(
+            self._is_protected_path(candidate)
+            for candidate in (lexical_relative, resolved_relative)
+        ):
+            return PolicyDecision(
+                "file_write",
+                resolved_relative,
+                REVIEW,
+                "protected path requires human review",
+            ), resolved
+        return (
+            PolicyDecision(
+                "file_write", resolved_relative, ALLOW, "file write allowed"
+            ),
+            resolved,
+        )
+
+    def _is_protected_path(self, relative_path: str) -> bool:
+        folded = relative_path.casefold()
+        if any(
+            component in IMMUTABLE_PROTECTED_ROOTS
+            for component in folded.split("/")
+        ):
+            return True
+        return any(fnmatch(folded, pattern) for pattern in self.protected_paths)
 
     def _state_transition(self, transition: str) -> PolicyDecision:
         allowed = {
@@ -417,31 +517,14 @@ def _load_bundle_signer() -> BundleSigner | None:
 
 
 def _bundle_attestation_preimage(bundle: dict[str, Any]) -> bytes:
-    """Canonical, domain-separated bytes binding a bundle's authoritative summary.
+    """Canonical bytes binding every v2 payload field except the signature block."""
 
-    Signing THIS (not the whole file) is what makes verification prove authorship:
-    any change to the chain, the constitution/version pin, the final state, the
-    task identity, or the event count invalidates the signature. The ``signature``
-    block itself is excluded from the pre-image.
-    """
-
-    task_metadata = bundle.get("task_metadata") or {}
-    final_state = bundle.get("final_state") or {}
-    summary = {
+    payload = {key: value for key, value in bundle.items() if key != "signature"}
+    attestation = {
         "domain": BUNDLE_SIG_DOMAIN,
-        "schema_version": bundle.get("schema_version"),
-        "task_id": task_metadata.get("task_id"),
-        "task_hash": task_metadata.get("task_hash"),
-        "constitution_hash": bundle.get("constitution_hash"),
-        "constitutional_version": bundle.get("constitutional_version"),
-        "workflow_hash": bundle.get("workflow_hash"),
-        "final_state": (
-            final_state.get("state") if isinstance(final_state, dict) else final_state
-        ),
-        "event_count": len(bundle.get("audit_events") or []),
-        "chain_hash": bundle.get("chain_hash"),
+        "payload": payload,
     }
-    return canonical_json(summary).encode("utf-8")
+    return canonical_json(attestation).encode("utf-8")
 
 
 def _verify_bundle_signature(
@@ -459,19 +542,96 @@ def _verify_bundle_signature(
     block = bundle.get("signature")
     if not isinstance(block, dict) or not block.get("sig"):
         return "unsigned"
+    if bundle.get("schema_version") != BUNDLE_SCHEMA_VERSION:
+        return "unsupported_schema"
+    if (
+        block.get("alg") != "ed25519"
+        or block.get("domain") != BUNDLE_SIG_DOMAIN
+        or not isinstance(block.get("key_id"), str)
+        or not isinstance(block.get("public_key"), str)
+        or not isinstance(block.get("sig"), str)
+    ):
+        return "invalid"
     if not trusted_public_keys:
         return "no_trust_anchor"
     public_hex = trusted_public_keys.get(str(block.get("key_id", "")))
     if public_hex is None:
         return "untrusted_key"
     try:
+        if bytes.fromhex(str(block["public_key"])) != bytes.fromhex(public_hex):
+            return "invalid"
         public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
         public_key.verify(
-            base64.b64decode(str(block["sig"])), _bundle_attestation_preimage(bundle)
+            base64.b64decode(str(block["sig"]), validate=True),
+            _bundle_attestation_preimage(bundle),
         )
     except (InvalidSignature, ValueError, KeyError, TypeError):
         return "invalid"
     return "valid"
+
+
+_BUNDLE_SUMMARY_FIELDS: tuple[str, ...] = (
+    "constitution_hash",
+    "constitutional_version",
+    "workflow_hash",
+    "task_metadata",
+    "role_assignments",
+    "policy_decisions",
+    "tool_events",
+    "file_changes",
+    "tests_run",
+    "final_state",
+)
+
+
+def _derived_bundle_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive every verifier-facing summary from replayable audit evidence."""
+
+    if not isinstance(events, list):
+        raise ValueError("audit_events must be a list")
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"audit event {index} must be an object")
+
+    run_metadata = _required_latest_payload(events, "run_metadata")
+    return {
+        "constitution_hash": run_metadata.get("constitution_hash"),
+        "constitutional_version": run_metadata.get("constitutional_version"),
+        "workflow_hash": run_metadata.get("workflow_hash"),
+        "task_metadata": _required_latest_payload(events, "task_metadata"),
+        "role_assignments": _required_latest_payload(events, "role_assignments"),
+        "policy_decisions": _mapping_payloads(events, "policy_decision"),
+        "tool_events": _mapping_payloads(events, "tool_event"),
+        "file_changes": _mapping_payloads(events, "file_change"),
+        "tests_run": _mapping_payloads(events, "test_run"),
+        "final_state": _required_latest_payload(events, "final_state"),
+    }
+
+
+def _required_latest_payload(
+    events: list[dict[str, Any]], event_type: str
+) -> dict[str, Any]:
+    for event in reversed(events):
+        if event.get("event_type") == event_type:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError(f"{event_type} payload must be an object")
+            return payload
+    raise ValueError(f"missing {event_type} audit event")
+
+
+def _mapping_payloads(
+    events: list[dict[str, Any]], event_type: str
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_type") != event_type:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"{event_type} payload must be an object")
+        payloads.append(payload)
+    return payloads
 
 
 def build_bundle(
@@ -485,19 +645,21 @@ def build_bundle(
 ) -> dict[str, Any]:
     events = read_audit(audit_path)
     chain_hash = replay_hashes(events)
-    bundle = {
-        "schema_version": 1,
-        "audit_path": str(audit_path),
+    summary = _derived_bundle_summary(events)
+    expected_metadata = {
         "constitution_hash": constitution_hash,
         "constitutional_version": constitutional_version,
         "workflow_hash": workflow_hash,
-        "task_metadata": _latest_payload(events, "task_metadata"),
-        "role_assignments": _latest_payload(events, "role_assignments"),
-        "policy_decisions": _payloads(events, "policy_decision"),
-        "tool_events": _payloads(events, "tool_event"),
-        "file_changes": _payloads(events, "file_change"),
-        "tests_run": _payloads(events, "test_run"),
-        "final_state": _latest_payload(events, "final_state"),
+    }
+    for field, expected in expected_metadata.items():
+        if summary[field] != expected:
+            raise ValueError(
+                f"{field} does not match signed run_metadata audit evidence"
+            )
+    bundle = {
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "audit_path": str(audit_path),
+        **summary,
         "chain_hash": chain_hash,
         "audit_events": [
             {k: v for k, v in event.items() if k != "_line"} for event in events
@@ -534,8 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="KEYID=HEXPUBKEY",
         help=(
-            "Trusted Ed25519 public key as KEYID=HEX (repeatable). When any is "
-            "given, a valid signature is REQUIRED for ok=true."
+            "Trusted Ed25519 public key as KEYID=HEX (repeatable). At least one "
+            "trusted key and a valid signature are required for ok=true; "
+            "omitting trust anchors yields diagnostic-only failure."
         ),
     )
 
@@ -698,6 +861,7 @@ def run_task(task_path: Path, *, repo_root: Path = Path(".")) -> RunResult:
         {
             "constitution_path": str(constitution_path),
             "constitution_hash": constitution_hash,
+            "constitutional_version": CONSTITUTIONAL_HASH,
             "workflow_path": str(swarm_path),
             "workflow_hash": workflow_hash,
         },
@@ -786,45 +950,92 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _failed_bundle_verification(
+    error: str,
+    *,
+    expected_chain_hash: Any = None,
+    event_count: int = 0,
+    signature_status: str = "invalid",
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "chain_ok": False,
+        "summary_ok": False,
+        "chain_hash": None,
+        "expected_chain_hash": expected_chain_hash,
+        "event_count": event_count,
+        "signature_status": signature_status,
+        "summary_mismatches": [],
+        "error": error,
+    }
+
+
 def verify_bundle(
     bundle_path: Path, *, trusted_public_keys: dict[str, str] | None = None
 ) -> dict[str, Any]:
-    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-    audit_path = Path(bundle["audit_path"])
-    events = (
-        read_audit(audit_path)
-        if audit_path.exists()
-        else bundle.get("audit_events", [])
-    )
+    try:
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _failed_bundle_verification(f"invalid bundle: {exc}")
+    if not isinstance(bundle, dict):
+        return _failed_bundle_verification("bundle must be an object")
+
+    events = bundle.get("audit_events")
     signature_status = _verify_bundle_signature(bundle, trusted_public_keys)
+    if not isinstance(events, list):
+        return _failed_bundle_verification(
+            "audit_events must be a list",
+            expected_chain_hash=bundle.get("chain_hash"),
+            signature_status=signature_status,
+        )
     try:
         chain_hash = replay_hashes(events)
-    except ValueError as exc:
+        derived_summary = _derived_bundle_summary(events)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
         return {
             "ok": False,
             "chain_ok": False,
+            "summary_ok": False,
             "chain_hash": None,
             "expected_chain_hash": bundle.get("chain_hash"),
             "event_count": len(events),
             "signature_status": signature_status,
+            "summary_mismatches": [],
             "error": str(exc),
         }
     chain_ok = chain_hash == bundle.get("chain_hash")
-    # With a trust anchor, authorship is REQUIRED: a self-consistent chain that is
-    # unsigned or signed by an untrusted/forged key fails (closing the
-    # fabricate-a-coherent-chain-from-scratch hole). Without an anchor, ``ok``
-    # reflects chain-consistency only and ``signature_status`` reports honestly.
-    if trusted_public_keys:
-        ok = chain_ok and signature_status == "valid"
-    else:
-        ok = chain_ok
+    # Attestation success requires replay, derived summaries, schema v2, and an
+    # out-of-band trust anchor. Individual diagnostics remain available on failure.
+    summary_mismatches = [
+        field
+        for field in _BUNDLE_SUMMARY_FIELDS
+        if bundle.get(field) != derived_summary[field]
+    ]
+    summary_ok = not summary_mismatches
+    schema_ok = bundle.get("schema_version") == BUNDLE_SCHEMA_VERSION
+    ok = schema_ok and chain_ok and summary_ok and signature_status == "valid"
+    error = None
+    if not schema_ok:
+        error = (
+            f"unsupported bundle schema {bundle.get('schema_version')!r}; "
+            f"expected {BUNDLE_SCHEMA_VERSION}"
+        )
+    elif not chain_ok:
+        error = "bundle chain_hash does not match embedded audit events"
+    elif not summary_ok:
+        error = "bundle summary mismatch: " + ", ".join(summary_mismatches)
+    elif signature_status != "valid":
+        error = f"bundle signature is not trusted and valid: {signature_status}"
     return {
         "ok": ok,
         "chain_ok": chain_ok,
+        "summary_ok": summary_ok,
         "chain_hash": chain_hash,
         "expected_chain_hash": bundle.get("chain_hash"),
         "event_count": len(events),
         "signature_status": signature_status,
+        "summary_mismatches": summary_mismatches,
+        **({"error": error} if error else {}),
     }
 
 
@@ -895,13 +1106,15 @@ def _handle_write_action(
     repo_root: Path,
     file_changes: list[dict[str, Any]],
 ) -> dict[str, bool]:
-    decision = policy.decide("file_write", action.value)
+    decision, target = policy._evaluate_file_write(action.value)
     _record_decision(logger, decision)
     if decision.outcome == REVIEW:
         return {"blocked": False, "human_review_required": True}
     if decision.outcome != ALLOW:
         return {"blocked": True, "human_review_required": False}
-    change = _write_file(repo_root, action)
+    if target is None:
+        raise AssertionError("allowed write must have a canonical target")
+    change = _write_file(repo_root, target, action.content)
     file_changes.append(change)
     logger.emit("executor", "file_change", change)
     return {"blocked": False, "human_review_required": False}
@@ -1044,18 +1257,139 @@ def _transition(policy: PolicyEngine, logger: AuditLogger, transition: str) -> N
     logger.emit("observer", "state_transition", {"transition": transition})
 
 
-def _write_file(repo_root: Path, action: Action) -> dict[str, Any]:
+def _require_safe_write_primitives() -> None:
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    missing = [name for name in required_flags if not hasattr(os, name)]
+    if not _HAS_SAFE_DIR_FD_OPERATIONS:
+        missing.append("dir_fd file operations")
+    if not _HAS_SAFE_DIR_FD_REPLACE:
+        missing.append("dir_fd atomic replace")
+    if missing:
+        raise RuntimeError(
+            "safe governed writes are unsupported on this platform: "
+            + ", ".join(missing)
+        )
+
+
+def _hash_open_file(file_descriptor: int) -> str:
+    digest = hashlib.sha256()
+    while chunk := os.read(file_descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _open_directory(name: str | Path, *, dir_fd: int | None = None) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    return os.open(name, flags, dir_fd=dir_fd)
+
+
+def _write_file(
+    repo_root: Path, target: Path, content: str | None
+) -> dict[str, Any]:
+    _require_safe_write_primitives()
     repo_root = repo_root.resolve()
-    target = (repo_root / action.value).resolve()
     if not target.is_relative_to(repo_root):
         raise ValueError("file write target escapes repository root")
-    before_hash = hash_file(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(action.content or "", encoding="utf-8")
+    relative = target.relative_to(repo_root)
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("file write target is not a safe repository-relative path")
+
+    directory_fds: list[int] = []
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
+    before_hash: str | None = None
+    data = (content or "").encode("utf-8")
+    try:
+        current_fd = _open_directory(repo_root)
+        directory_fds.append(current_fd)
+        for component in relative.parts[:-1]:
+            try:
+                child_fd = _open_directory(component, dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                child_fd = _open_directory(component, dir_fd=current_fd)
+            directory_fds.append(child_fd)
+            current_fd = child_fd
+
+        filename = relative.parts[-1]
+        read_flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        existing_mode: int | None = None
+        try:
+            existing_fd = os.open(filename, read_flags, dir_fd=current_fd)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                existing_stat = os.fstat(existing_fd)
+                if not stat.S_ISREG(existing_stat.st_mode):
+                    raise ValueError("file write target must be a regular file")
+                existing_mode = stat.S_IMODE(existing_stat.st_mode)
+                before_hash = _hash_open_file(existing_fd)
+            finally:
+                os.close(existing_fd)
+
+        create_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        for _ in range(32):
+            candidate = f".{filename}.acgs-{secrets.token_hex(8)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate, create_flags, 0o666, dir_fd=current_fd
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise FileExistsError("could not allocate a unique temporary write target")
+
+        if existing_mode is not None:
+            os.fchmod(temporary_fd, existing_mode)
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("short write while creating governed file")
+            remaining = remaining[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=current_fd,
+            dst_dir_fd=current_fd,
+        )
+        temporary_name = None
+        os.fsync(current_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_name is not None and directory_fds:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fds[-1])
+            except FileNotFoundError:
+                pass
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
     return {
-        "path": target.relative_to(repo_root).as_posix(),
+        "path": relative.as_posix(),
         "before_hash": before_hash,
-        "after_hash": hash_file(target),
+        "after_hash": hashlib.sha256(data).hexdigest(),
         "action": "write",
     }
 

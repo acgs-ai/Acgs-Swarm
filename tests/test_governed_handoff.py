@@ -228,7 +228,10 @@ def test_one_passing_test_proof_allows_handoff(tmp_path: Path) -> None:
         "chain_hash",
     ]:
         assert key in bundle
-    assert verify_bundle(result.bundle_path)["ok"] is True
+    verification = verify_bundle(result.bundle_path)
+    assert verification["chain_ok"] is True
+    assert verification["signature_status"] == "unsigned"
+    assert verification["ok"] is False
     assert read_audit(result.audit_path)[-1]["event_hash"] == bundle["chain_hash"]
 
 
@@ -264,7 +267,7 @@ def test_cli_run_verify_and_pack(
     monkeypatch.chdir(tmp_path)
 
     assert main(["run", "--task", str(task)]) == 0
-    assert main(["verify", "--bundle", ".acgs/evidence/cli-task.bundle.json"]) == 0
+    assert main(["verify", "--bundle", ".acgs/evidence/cli-task.bundle.json"]) == 1
     assert main(["pack", "--task", "cli-task"]) == 0
 
 
@@ -321,8 +324,10 @@ def test_unsigned_self_consistent_chain_rejected_under_trust_anchor(
     result = run_task(_happy_task(tmp_path, "unsigned"), repo_root=tmp_path)
     assert result.final_state == "handoff_ready"
 
-    # Backward-compatible: chain-only verification (no anchor) still passes.
-    assert verify_bundle(result.bundle_path)["ok"] is True
+    # Chain diagnostics remain available, but attestation fails without an anchor.
+    unanchored = verify_bundle(result.bundle_path)
+    assert unanchored["chain_ok"] is True
+    assert unanchored["ok"] is False
 
     _, pub_hex = _keypair()
     verdict = verify_bundle(

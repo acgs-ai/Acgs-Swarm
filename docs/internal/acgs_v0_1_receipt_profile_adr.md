@@ -50,8 +50,9 @@ rooting, human authorization, or key custody outside the agent process.
 
 Default verification fails closed for invalid schema, broken hash chains, missing
 decisions, role-separation violations, tampering, invalid signatures, and replay
-mismatch. Explicit report mode may mark signatures as unverifiable without failing
-solely for that status.
+mismatch. Explicit report mode is diagnostic only: it reports per-signature status
+but stays fail-closed (an unsigned or unverifiable bundle is `valid: false` and the
+CLI exits non-zero).
 
 ## Alternatives
 

@@ -111,8 +111,11 @@ Replicas converge to the same head set without a coordinator
    `SignatureRecord`s.
 3. Bundle receipts → `GovernanceReceiptBundle`; serialize with `bundle_to_json`.
 4. **Independent verification:** `verify_bundle(bundle)` re-derives every digest
-   and checks signatures with **no trust in the producer** → `VerificationVerdict`.
-   CLI: `acgs-verify-receipts bundle.json`.
+   and checks signatures against caller-supplied trusted keys with **no trust in
+   the producer** → `VerificationVerdict`. Report mode retains all diagnostics
+   but remains fail-closed, so unsigned or unverifiable bundles have
+   `valid: false`. Validator IDs are stripped and case-folded before blank and
+   duplicate checks. CLI: `acgs-verify-receipts bundle.json`.
 5. **Supply-chain projection (optional):** `to_dsse_envelope(receipt, DsseSigner)`
    / `to_in_toto_statement(...)` for DSSE / in-toto consumers;
    `verify_dsse_envelope` checks them.
@@ -146,18 +149,20 @@ The productized, hardened flow (`governed_handoff.py`).
 2. An adapter (`MockAdapter` / `ExternalAgentAdapter` for Codex/Claude) proposes
    `Action`s.
 3. `PolicyEngine.decide(action)` → `PolicyDecision`. The `tool_call` gate is
-   **default-DENY** against `DEFAULT_COMMAND_ALLOWLIST = (python, python3, pytest)`;
+   **default-DENY** against `DEFAULT_COMMAND_ALLOWLIST = (true, echo)`;
    the constitution may extend, never weaken it.
 4. Approved actions execute; each step is hash-linked into an audit chain
    (`AuditLogger`, `replay_hashes`).
-5. `build_bundle(signer=BundleSigner, constitutional_version=...)` Ed25519-signs a
-   domain-separated attestation (`BUNDLE_SIG_DOMAIN`) binding chain_hash +
-   constitution_hash + version pin + final_state + task identity.
+5. Schema v2 `build_bundle(signer=BundleSigner, constitutional_version=...)`
+   Ed25519-signs a domain-separated canonical attestation (`BUNDLE_SIG_DOMAIN`)
+   over every bundle payload field except the `signature` block.
 6. `acgs-swarm verify --trusted-key KEYID=HEX` →
-   `verify_bundle(..., trusted_public_keys=...)` **requires** a valid signature for
-   `ok`; trust derives only from the out-of-band key, never the embedded one.
-   With no anchor, it still returns `ok` on chain-consistency and reports
-   `signed: false` honestly.
+   `verify_bundle(..., trusted_public_keys=...)` replays the embedded
+   `audit_events`, re-derives all verifier-facing summaries, and compares them
+   with the signed payload. It treats `audit_path` only as signed provenance and
+   never opens it during verification. `ok` requires a valid signature under an
+   out-of-band trust anchor; unsigned, unanchored, and schema v1 bundles return
+   `ok: false` with diagnostic status.
 
 ---
 

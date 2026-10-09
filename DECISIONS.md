@@ -91,6 +91,10 @@ security claims hold:
 `ACGS_SIGNING_KEY_ID`, CLI `acgs-swarm verify --trusted-key KEYID=HEX`. Backward
 compatible: with no signer/anchor, `verify_bundle(path)` still returns `ok` on
 chain-consistency and runs stay unsigned (honestly reported as `signed: false`).
+**Superseded 2026-10-08 (C3 attestation fix):** unanchored or unsigned bundles now
+return `ok: false`; every summary field (`tests_run`, `policy_decisions`,
+`file_changes`, `tool_events`, `role_assignments`) is bound into the v2 signed
+pre-image and re-derived from replayed events.
 The constitutional hash constant itself is **unchanged** — this only adds
 enforcement that references it. Signing uses the core `cryptography` dep (no new
 optional extra). Deferred: REVIEW-halts-loop and full executor loop-ification
