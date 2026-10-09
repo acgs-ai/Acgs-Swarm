@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -17,9 +16,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from acgs_lite import Constitution  # noqa: E402
-from constitutional_swarm import AgentDNA, RemoteVoteReplayError  # noqa: E402
+from constitutional_swarm import AgentDNA  # noqa: E402
 from constitutional_swarm.mesh import MeshProof, RemoteVoteRequest, ValidationVote  # noqa: E402
-from constitutional_swarm.mesh.core import ConstitutionalMesh  # noqa: E402
 from constitutional_swarm.mesh.settlement import _compute_merkle_root  # noqa: E402
 from constitutional_swarm.protocol import (  # noqa: E402
     canonical_content_hash,
@@ -32,6 +30,8 @@ from constitutional_swarm.protocol import (  # noqa: E402
     encode_vote_payload_v1,
     legacy_content_hash,
     legacy_remote_vote_request_payload_bytes,
+    legacy_vote_hash,
+    legacy_vote_payload_bytes,
     protocol_sha256_hex,
 )
 from constitutional_swarm.settlement_store import (  # noqa: E402
@@ -82,6 +82,62 @@ def _write_json(output_dir: Path, name: str, payload: dict[str, Any]) -> str:
     return protocol_sha256_hex(data)
 
 
+def _frozen_vote_v1(vote: ValidationVote) -> dict[str, Any]:
+    """Project a vote onto the historical Rust fixture schema."""
+    return {
+        "approved": vote.approved,
+        "assignment_id": vote.assignment_id,
+        "constitutional_hash": vote.constitutional_hash,
+        "content_hash": vote.content_hash,
+        "reason": vote.reason,
+        "signature": vote.signature,
+        "timestamp": vote.timestamp,
+        "voter_id": vote.voter_id,
+    }
+
+
+def _frozen_request_v0(request: RemoteVoteRequest) -> dict[str, Any]:
+    """Project a request onto the historical Rust fixture schema."""
+    return {
+        "artifact_id": request.artifact_id,
+        "assignment_id": request.assignment_id,
+        "constitutional_hash": request.constitutional_hash,
+        "content": request.content,
+        "content_hash": request.content_hash,
+        "nonce": request.nonce,
+        "producer_id": request.producer_id,
+        "request_signature": request.request_signature,
+        "request_signer_public_key": request.request_signer_public_key,
+        "timestamp": request.timestamp,
+        "voter_id": request.voter_id,
+        "voter_public_key": request.voter_public_key,
+    }
+
+
+def _frozen_proof_v1(proof: MeshProof) -> dict[str, Any]:
+    """Project a proof onto the historical Rust fixture schema."""
+    return {
+        "assignment_id": proof.assignment_id,
+        "content_hash": proof.content_hash,
+        "constitutional_hash": proof.constitutional_hash,
+        "vote_hashes": list(proof.vote_hashes),
+        "root_hash": proof.root_hash,
+        "accepted": proof.accepted,
+        "timestamp": proof.timestamp,
+    }
+
+
+def _frozen_replay_rejection_v0() -> dict[str, Any]:
+    """Reproduce the historical request-verifier replay result."""
+    return {
+        "error_type": "RemoteVoteReplayError",
+        "message": (
+            f"Remote vote request nonce '{NONCE}' was already used inside the replay window"
+        ),
+        "nonce_cache": {NONCE: REQUEST_TIMESTAMP},
+    }
+
+
 def _validation_fixture() -> dict[str, Any]:
     dna = AgentDNA(constitution=Constitution.default(), agent_id="rust-fixture", strict=False)
     result = dna.validate(CONTENT)
@@ -128,7 +184,7 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
     voter_public_key = _public_key_hex(voter_key)
     request_public_key = _public_key_hex(request_key)
 
-    vote_payload = ConstitutionalMesh.build_vote_payload(
+    vote_payload = legacy_vote_payload_bytes(
         assignment_id=ASSIGNMENT_ID,
         voter_id=VOTER_ID,
         approved=True,
@@ -173,29 +229,12 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
         timestamp=REQUEST_TIMESTAMP,
         request_signer_public_key=request_public_key,
         request_signature=request_key.sign(remote_payload).hex(),
+        protocol_version=0,
     )
-    nonce_cache: OrderedDict[str, float] = OrderedDict()
-    ConstitutionalMesh.verify_remote_vote_request(
-        remote_request,
-        nonce_cache=nonce_cache,
-        now=REQUEST_TIMESTAMP,
-    )
-    try:
-        ConstitutionalMesh.verify_remote_vote_request(
-            remote_request,
-            nonce_cache=nonce_cache,
-            now=REQUEST_TIMESTAMP + 1.0,
-        )
-    except RemoteVoteReplayError as exc:
-        replay_error = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-            "nonce_cache": dict(nonce_cache),
-        }
-    else:  # pragma: no cover - fixture invariant
-        raise AssertionError("remote vote replay was not rejected")
+    replay_error = _frozen_replay_rejection_v0()
 
-    vote_hashes = (vote.vote_hash,)
+    vote_hash = legacy_vote_hash(vote)
+    vote_hashes = (vote_hash,)
     proof = MeshProof(
         assignment_id=ASSIGNMENT_ID,
         content_hash=content_hash,
@@ -210,13 +249,15 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
         ),
         accepted=True,
         timestamp=PROOF_TIMESTAMP,
+        protocol_version=1,
     )
+    frozen_proof = _frozen_proof_v1(proof)
     result = {
         "accepted": True,
         "assignment_id": ASSIGNMENT_ID,
         "constitutional_hash": CONSTITUTIONAL_HASH,
         "pending_votes": 0,
-        "proof": asdict(proof),
+        "proof": frozen_proof,
         "quorum_met": True,
         "settled": True,
         "settled_at": SETTLED_AT,
@@ -261,8 +302,8 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
             ).hex(),
             "legacy_bytes_hex": vote_payload.hex(),
             "signature_hex": vote_signature,
-            "vote": asdict(vote),
-            "vote_hash": vote.vote_hash,
+            "vote": _frozen_vote_v1(vote),
+            "vote_hash": vote_hash,
             "voter_public_key": voter_public_key,
         },
         "remote_vote_request.json": {
@@ -271,11 +312,11 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
                 remote_request
             ).hex(),
             "legacy_bytes_hex": remote_payload.hex(),
-            "request": asdict(remote_request),
+            "request": _frozen_request_v0(remote_request),
         },
         "mesh_proof.json": {
             "canonical_bytes_hex": encode_mesh_proof_v1(proof).hex(),
-            "proof": asdict(proof),
+            "proof": frozen_proof,
             "verified": proof.verify(),
         },
         "settlement_record.json": {

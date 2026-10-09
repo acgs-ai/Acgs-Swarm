@@ -15,15 +15,16 @@ Zero-retraining architecture (as specified in §5 of the Q&A doc):
   • Bayesian weight updates are separate from the retrieval index
 
 Key invariants:
-  • PrecedentRecord is stored only when its reported aggregate tally has at
-    least 3 approvals and at least 5 total votes
-  • A miner judgment cannot become precedent unless its caller reports that
-    aggregate 3-of-5 acceptance and the constitutional hash matches
+  • PrecedentRecord is stored only after at least five distinct authorized
+    voter envelopes verify, with at least three approvals and a strict majority
+  • Tallies and acceptance are recomputed from signatures bound to the task,
+    artifact, producer, judgment content, and constitutional hash
   • Rollback: any precedent can be revoked by marking it inactive
 
-Trust boundary: admission validates caller-supplied counts, acceptance state,
-and constitutional hash. The store does not authenticate voter identities,
-validator signatures, or task origin; those remain producer responsibilities.
+Trust boundary: voter keys and roles come only from an independently
+provisioned VoteSignerRegistry. Unsigned or aggregate-only evidence fails
+closed, and caller-supplied counts and proof roots are checked against the
+verified envelopes.
 
 Roadmap reference: 08-subnet-implementation-roadmap.md § Phase 3
 Q&A reference:    07-subnet-concept-qa-responses.md § 5
@@ -32,6 +33,7 @@ Q&A reference:    07-subnet-concept-qa-responses.md § 5
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 import threading
 import time
@@ -42,6 +44,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from constitutional_swarm.bittensor.protocol import EscalationType
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteEnvelope,
+    VoteSignerRegistry,
+    compute_vote_envelope_root,
+    normalize_voter_id,
+    verify_vote_envelopes,
+)
 
 # ---------------------------------------------------------------------------
 # Vector utilities
@@ -122,6 +131,10 @@ class PrecedentRecord:
     # Metadata
     recorded_at: float
     is_active: bool = True  # False = revoked/rolled back
+    assignment_id: str = ""
+    artifact_id: str = ""
+    content_hash: str = ""
+    vote_envelopes: tuple[VoteEnvelope, ...] = ()
 
     @classmethod
     def create(
@@ -138,6 +151,10 @@ class PrecedentRecord:
         impact_vector: dict[str, float],
         constitutional_hash: str,
         ambiguous_dimensions: tuple[str, ...] = (),
+        assignment_id: str = "",
+        artifact_id: str = "",
+        content_hash: str = "",
+        vote_envelopes: tuple[VoteEnvelope, ...] = (),
     ) -> PrecedentRecord:
         total_votes = votes_for + votes_against
         grade = votes_for / total_votes if total_votes > 0 else 0.0
@@ -158,6 +175,10 @@ class PrecedentRecord:
             ambiguous_dimensions=ambiguous_dimensions,
             constitutional_hash=constitutional_hash,
             recorded_at=time.time(),
+            assignment_id=assignment_id,
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            vote_envelopes=tuple(vote_envelopes),
         )
 
 
@@ -224,9 +245,9 @@ class PrecedentStore:
     arrives, call retrieve() to find similar past cases and optionally
     get an auto-resolution if confidence is high enough.
 
-    Admission enforces aggregate count, acceptance-state, and constitutional-
-    hash consistency on caller-supplied records. It does not authenticate voter
-    identities, validator signatures, or task origin.
+    Admission independently authenticates voter identities and signatures,
+    verifies every evidence binding, recomputes tallies and acceptance, and
+    rejects proof roots that do not match the verified envelopes.
 
     Usage::
 
@@ -267,6 +288,7 @@ class PrecedentStore:
         auto_resolve_threshold: float = 0.85,
         min_votes_for_precedent: int = 3,
         min_total_validators: int = 5,
+        vote_registry: VoteSignerRegistry | None = None,
     ) -> None:
         if (
             isinstance(min_votes_for_precedent, bool)
@@ -290,6 +312,9 @@ class PrecedentStore:
         self._auto_resolve_threshold = auto_resolve_threshold
         self._min_votes = min_votes_for_precedent
         self._min_total_validators = min_total_validators
+        self._vote_registry = (
+            None if vote_registry is None else vote_registry.frozen_copy()
+        )
         self._records: dict[str, PrecedentRecord] = {}
         self._revocation_log: list[dict[str, Any]] = []
         self._lock = threading.RLock()
@@ -301,6 +326,153 @@ class PrecedentStore:
     @property
     def constitutional_hash(self) -> str:
         return self._constitutional_hash
+
+    @property
+    def vote_registry(self) -> VoteSignerRegistry | None:
+        """Return the independently provisioned voter trust registry."""
+        return self._vote_registry
+
+    def _validate_tally(self, record: PrecedentRecord) -> int:
+        for name, value in (
+            ("votes_for", record.votes_for),
+            ("votes_against", record.votes_against),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} vote count must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} vote count cannot be negative")
+        total_votes = record.votes_for + record.votes_against
+        if record.votes_for < self._min_votes:
+            raise ValueError(
+                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
+            )
+        if total_votes < self._min_total_validators:
+            raise ValueError(
+                f"Insufficient total validators: got={total_votes} "
+                f"required={self._min_total_validators}"
+            )
+        if record.votes_for <= record.votes_against:
+            raise ValueError(
+                "Precedent admission requires a strict majority: more validator votes "
+                "for than against"
+            )
+        if record.votes_for * self._min_total_validators < self._min_votes * total_votes:
+            raise ValueError(
+                "Insufficient validator super-majority: "
+                f"got={record.votes_for}/{total_votes} "
+                f"required={self._min_votes}/{self._min_total_validators}"
+            )
+        return total_votes
+
+    def verify_evidence(self, record: PrecedentRecord) -> tuple[VoteEnvelope, ...]:
+        """Verify signer authorization, bindings, tallies, and the proof root."""
+        self._validate_tally(record)
+        return self.verify_validation_evidence(
+            task_id=record.task_id,
+            producer_id=record.miner_uid,
+            judgment=record.judgment,
+            votes_for=record.votes_for,
+            votes_against=record.votes_against,
+            accepted=record.validation_accepted,
+            proof_root_hash=record.proof_root_hash,
+            assignment_id=record.assignment_id,
+            artifact_id=record.artifact_id,
+            content_hash=record.content_hash,
+            constitutional_hash=record.constitutional_hash,
+            vote_envelopes=record.vote_envelopes,
+        )
+
+    def verify_validation_evidence(
+        self,
+        *,
+        task_id: str,
+        producer_id: str,
+        judgment: str,
+        votes_for: int,
+        votes_against: int,
+        accepted: bool,
+        proof_root_hash: str,
+        assignment_id: str,
+        artifact_id: str,
+        content_hash: str,
+        constitutional_hash: str,
+        vote_envelopes: Sequence[VoteEnvelope],
+    ) -> tuple[VoteEnvelope, ...]:
+        """Verify complete signed evidence for either validation outcome."""
+        if self._vote_registry is None:
+            raise ValueError("signed vote envelope admission requires a trust registry")
+        if not vote_envelopes:
+            raise ValueError("signed vote envelope evidence is required")
+        if not assignment_id:
+            raise ValueError("vote envelope assignment ID is required")
+        if not artifact_id:
+            raise ValueError("vote envelope artifact ID is required")
+        if not content_hash:
+            raise ValueError("vote envelope content hash is required")
+        expected_content_hash = hashlib.sha256(judgment.encode("utf-8")).hexdigest()[:32]
+        if content_hash != expected_content_hash:
+            raise ValueError("precedent content hash does not bind the recorded judgment")
+
+        verified = verify_vote_envelopes(
+            vote_envelopes,
+            self._vote_registry,
+            task_id=task_id,
+            assignment_id=assignment_id,
+            producer_id=normalize_voter_id(producer_id),
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            constitutional_hash=constitutional_hash,
+        )
+        electorate_size = verified[0].assigned_peer_count
+        signed_quorum = verified[0].quorum
+        if electorate_size < self._min_total_validators:
+            raise ValueError(
+                "signed electorate is too small for precedent admission: "
+                f"got={electorate_size} required={self._min_total_validators}"
+            )
+        if signed_quorum < self._min_votes:
+            raise ValueError(
+                "signed quorum is too small for precedent admission: "
+                f"got={signed_quorum} required={self._min_votes}"
+            )
+        if signed_quorum <= electorate_size // 2:
+            raise ValueError("signed precedent quorum must be a strict majority")
+        verified_votes_for = sum(
+            envelope.decision == "approved" for envelope in verified
+        )
+        verified_votes_against = len(verified) - verified_votes_for
+        if (votes_for, votes_against) != (
+            verified_votes_for,
+            verified_votes_against,
+        ):
+            raise ValueError(
+                "supplied vote tally does not match verified vote envelope count"
+            )
+        verified_accepted = (
+            verified_votes_for >= signed_quorum
+            and verified_votes_for > verified_votes_against
+        )
+        verified_rejected = (
+            verified_votes_against >= signed_quorum
+            and verified_votes_against > verified_votes_for
+        )
+        if not (verified_accepted or verified_rejected):
+            raise ValueError("verified vote tally has no strict-majority outcome")
+        if accepted != verified_accepted:
+            raise ValueError("validation acceptance does not match verified vote tally")
+        expected_root = compute_vote_envelope_root(
+            task_id=task_id,
+            assignment_id=assignment_id,
+            producer_id=normalize_voter_id(producer_id),
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            constitutional_hash=constitutional_hash,
+            accepted=verified_accepted,
+            envelopes=verified,
+        )
+        if proof_root_hash != expected_root:
+            raise ValueError("validation proof root does not match signed vote envelopes")
+        return verified
 
     @property
     def size(self) -> int:
@@ -350,41 +522,15 @@ class PrecedentStore:
             )
         if not record.is_active:
             raise ValueError(f"Precedent {record.precedent_id} is inactive or revoked")
-        for name, value in (
-            ("votes_for", record.votes_for),
-            ("votes_against", record.votes_against),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{name} vote count must be an integer")
-            if value < 0:
-                raise ValueError(f"{name} vote count cannot be negative")
-
-        total_votes = record.votes_for + record.votes_against
-        if record.votes_for < self._min_votes:
-            raise ValueError(
-                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
-            )
-        if total_votes < self._min_total_validators:
-            raise ValueError(
-                f"Insufficient total validators: got={total_votes} "
-                f"required={self._min_total_validators}"
-            )
-        if record.votes_for <= record.votes_against:
-            raise ValueError(
-                "Precedent admission requires a strict majority: more validator votes "
-                "for than against"
-            )
-        if record.votes_for * self._min_total_validators < self._min_votes * total_votes:
-            raise ValueError(
-                "Insufficient validator super-majority: "
-                f"got={record.votes_for}/{total_votes} "
-                f"required={self._min_votes}/{self._min_total_validators}"
-            )
+        total_votes = self._validate_tally(record)
+        verified = self.verify_evidence(record)
         canonical = dataclasses.replace(
             record,
             validator_grade=record.votes_for / total_votes,
             impact_vector=dict(record.impact_vector),
             ambiguous_dimensions=tuple(record.ambiguous_dimensions),
+            miner_uid=normalize_voter_id(record.miner_uid),
+            vote_envelopes=tuple(verified),
         )
         with self._lock:
             existing = self._records.get(record.precedent_id)
@@ -601,7 +747,11 @@ class PrecedentStore:
 
     @staticmethod
     def _copy_record(record: PrecedentRecord) -> PrecedentRecord:
-        return dataclasses.replace(record, impact_vector=dict(record.impact_vector))
+        return dataclasses.replace(
+            record,
+            impact_vector=dict(record.impact_vector),
+            vote_envelopes=tuple(record.vote_envelopes),
+        )
 
     def _active_records_by_id_locked(
         self,

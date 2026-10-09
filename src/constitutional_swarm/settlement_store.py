@@ -62,7 +62,7 @@ def normalize_receipt_digest(value: str | None) -> str | None:
 
     Empty string and ``None`` mean "no completed receipt binding". Any other
     value must be a 64-character lowercase hex digest. This field is a pointer
-    to a v0.1 receipt *payload digest*, not part of the settlement canonical
+    to a governance receipt *payload digest*, not part of the settlement canonical
     digest.
     """
 

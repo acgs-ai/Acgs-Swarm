@@ -35,6 +35,7 @@ from constitutional_swarm.bittensor.synapse_adapter import (
     GovernanceDeliberation,
     bt_to_deliberation,
     judgment_to_bt,
+    sign_judgment_response,
 )
 
 
@@ -52,10 +53,12 @@ class MinerAxonServer:
         *,
         trusted_validator_hotkeys: set[str] | None = None,
         allow_unauthenticated: bool = False,
+        response_signing_key: Any | None = None,
     ) -> None:
         self._miner = miner
         self._trusted_validator_hotkeys = set(trusted_validator_hotkeys or set())
         self._allow_unauthenticated = allow_unauthenticated
+        self._response_signing_key = response_signing_key
 
     @property
     def miner(self) -> ConstitutionalMiner:
@@ -80,6 +83,8 @@ class MinerAxonServer:
             judgment = await self._miner.process(delib)
             judgment_to_bt(judgment, synapse)
             synapse.response_timestamp = time.time()
+            if self._response_signing_key is not None:
+                sign_judgment_response(synapse, self._response_signing_key)
         except ConstitutionMismatchError as exc:
             synapse.error_message = f"Constitution mismatch: {exc}"
         except DNAPreCheckFailedError as exc:

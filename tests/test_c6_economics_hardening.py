@@ -365,9 +365,11 @@ def _c6_make_validator(
     return ConstitutionalValidator(
         ValidatorConfig(
             constitution_path=str(_c6_write_constitution(tmp_path)),
-            peers_per_validation=2,
-            quorum=1,
+            peers_per_validation=3,
+            quorum=2,
             use_manifold=use_manifold,
+            complete_evidence=False,
+            single_operator_dev=True,
         )
     )
 

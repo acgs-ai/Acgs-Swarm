@@ -14,10 +14,10 @@ even at ceiling.
 loop. It observes exact active snapshots from an explicit
 :class:`~constitutional_swarm.bittensor.precedent_store.PrecedentStore` and
 ignores the grid argument entirely, feeding its accumulated precedents into a
-real ``RuleCodifier``. Store admission enforces aggregate 3-of-5 evidence and
-the constitutional hash; it does not prove distinct signed validator identities
-or cryptographic task provenance. The coordinator stays precedent-agnostic;
-this codifier is where admitted precedent enters the pipeline.
+real ``RuleCodifier``. Store admission verifies at least five distinct authorized
+signed voter envelopes and recomputes the 3/5 outcome from their bound evidence.
+The coordinator stays precedent-agnostic; this codifier is where admitted
+precedent enters the pipeline.
 
 Usage::
 
@@ -29,7 +29,10 @@ Usage::
     )
     from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
-    store = PrecedentStore(CONSTITUTIONAL_HASH)
+    store = PrecedentStore(
+        CONSTITUTIONAL_HASH,
+        vote_registry=provisioned_vote_registry,
+    )
     codifier = PrecedentBackedCodifier(
         precedent_store=store,
         min_cluster_size=5,
@@ -115,14 +118,20 @@ class PrecedentBackedCodifier:
             similarity_threshold=similarity_threshold,
             precedent_store=precedent_store,
         )
-        self.precedent_store = self.inner.precedent_store
         self._precedent_ids: list[str] = []
         if precedents:
             self.observe_many(precedents)
 
     @property
+    def precedent_store(self) -> PrecedentStore:
+        """Return the explicit admission store or fail before evidence use."""
+        return self.inner.precedent_store
+
+    @property
     def precedents(self) -> list[PrecedentRecord]:
         """Defensive snapshots of observed records that remain active."""
+        if not self._precedent_ids:
+            return []
         active = {record.precedent_id: record for record in self.precedent_store.active_records()}
         return [active[precedent_id] for precedent_id in self._precedent_ids if precedent_id in active]
 

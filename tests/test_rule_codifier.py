@@ -11,12 +11,21 @@ from constitutional_swarm.bittensor.rule_codifier import (
     PrecedentCluster,
     RuleCandidate,
     RuleCandidateStatus,
-    RuleCodifier,
+    RuleCodifier as _RuleCodifier,
     _append_rule_to_yaml,
     _cosine,
     _generate_rule_text,
     _infer_severity,
 )
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store,
+)
+
+
+def RuleCodifier(constitutional_hash, *args, **kwargs):  # type: ignore[no-untyped-def]
+    kwargs.setdefault("precedent_store", c14_precedent_test_store(constitutional_hash))
+    return _RuleCodifier(constitutional_hash, *args, **kwargs)
 
 CONST_HASH = "608508a9bd224290"
 
@@ -47,7 +56,7 @@ def _make_rec(
     judgment: str = "Privacy wins",
     grade: float = 0.92,
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
         task_id=f"task-{case_id}",
         miner_uid="miner-01",
@@ -55,7 +64,6 @@ def _make_rec(
         reasoning="rationale",
         votes_for=9,
         votes_against=1,
-        proof_root_hash="abc",
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=vector or _PRIVACY_VEC,
         constitutional_hash=CONST_HASH,
@@ -417,7 +425,7 @@ class TestRuleCodificationE2E:
         judgment: str = "Default judgment",
         grade: float = 0.95,
     ) -> PrecedentRecord:
-        return PrecedentRecord.create(
+        return c14_precedent_signed_record(
             case_id=case_id,
             task_id=f"task-{case_id}",
             miner_uid="miner-e2e",
@@ -425,7 +433,6 @@ class TestRuleCodificationE2E:
             reasoning="e2e rationale",
             votes_for=9,
             votes_against=1,
-            proof_root_hash="e2ehash",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=vector,
             constitutional_hash=CONST_HASH,

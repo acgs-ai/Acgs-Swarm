@@ -20,12 +20,294 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 BRAINTRUST_PROJECT = "acgs-swarm"
+
+
+class _AuthorizedVoter:
+    __slots__ = ("public_key", "route")
+
+    def __init__(
+        self,
+        public_key: Ed25519PublicKey,
+        route: tuple[str, int],
+    ) -> None:
+        self.public_key = public_key
+        self.route = route
+
+
+def _load_authorized_voter_keys(path: str) -> dict[str, _AuthorizedVoter]:
+    """Load public-only voter trust grants and remote vote routes."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("an authorized voter key file is required")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"authorized voter key file is unreadable: {path}") from exc
+    if not isinstance(document, Mapping):
+        raise ValueError("authorized voter key file must contain a JSON object")
+    raw_grants = document.get("authorized_voters")
+    if not isinstance(raw_grants, list) or not raw_grants:
+        raise ValueError("authorized voter key file must contain a non-empty authorized_voters list")
+
+    from constitutional_swarm.mesh.vote_envelope import (
+        key_id_for_public_key,
+        normalize_voter_id,
+    )
+
+    voter_keys: dict[str, _AuthorizedVoter] = {}
+    key_owners: dict[str, str] = {}
+    for index, grant in enumerate(raw_grants):
+        if not isinstance(grant, Mapping):
+            raise ValueError(f"authorized voter grant {index} must be a JSON object")
+        if set(grant) != {"identity_id", "public_key_hex", "vote_host", "vote_port"}:
+            raise ValueError(
+                f"authorized voter grant {index} must contain only identity_id, "
+                "public_key_hex, vote_host, and vote_port"
+            )
+        identity_value = grant["identity_id"]
+        key_hex = grant["public_key_hex"]
+        vote_host = grant["vote_host"]
+        vote_port = grant["vote_port"]
+        if not isinstance(identity_value, str):
+            raise ValueError(f"authorized voter grant {index} identity_id must be a string")
+        if (
+            not isinstance(key_hex, str)
+            or len(key_hex) != 64
+            or key_hex != key_hex.lower()
+            or any(character not in "0123456789abcdef" for character in key_hex)
+        ):
+            raise ValueError(
+                f"authorized voter grant {index} public_key_hex must be 64 lowercase hex chars"
+            )
+        if not isinstance(vote_host, str) or not vote_host.strip():
+            raise ValueError(f"authorized voter grant {index} vote_host must be non-empty")
+        if isinstance(vote_port, bool) or not isinstance(vote_port, int) or not 1 <= vote_port <= 65535:
+            raise ValueError(f"authorized voter grant {index} vote_port must be in 1..65535")
+        identity = normalize_voter_id(identity_value)
+        if identity in voter_keys:
+            raise ValueError(f"duplicate authorized voter identity: {identity!r}")
+        public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(key_hex))
+        key_id = key_id_for_public_key(public_key)
+        previous_owner = key_owners.get(key_id)
+        if previous_owner is not None:
+            raise ValueError(
+                f"authorized voter key is shared by {previous_owner!r} and {identity!r}"
+            )
+        voter_keys[identity] = _AuthorizedVoter(
+            public_key=public_key,
+            route=(vote_host.strip(), vote_port),
+        )
+        key_owners[key_id] = identity
+    if len(voter_keys) < 6:
+        raise ValueError(
+            "at least 6 authorized voter identities are required to collect 5 distinct "
+            "votes while excluding the judgment producer"
+        )
+    return voter_keys
+
+
+def _build_validator_runtime(
+    constitution_path: str,
+    voter_keys: Mapping[str, _AuthorizedVoter],
+    *,
+    peers: int = 5,
+    quorum: int = 3,
+):
+    """Build separated validator and frozen owner voter trust roots."""
+    from constitutional_swarm.bittensor.protocol import ValidatorConfig
+    from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
+    from constitutional_swarm.bittensor.validator import ConstitutionalValidator
+    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+
+    config = ValidatorConfig(
+        constitution_path=constitution_path,
+        peers_per_validation=peers,
+        quorum=quorum,
+        use_manifold=True,
+    )
+    required_signers = config.peers_per_validation + 1
+    if len(voter_keys) < required_signers:
+        raise ValueError(
+            f"validator runtime requires at least {required_signers} authorized voter "
+            "identities so the judgment producer can be excluded"
+        )
+    validator_registry = VoteSignerRegistry()
+    validator = ConstitutionalValidator(
+        config,
+        vote_registry=validator_registry,
+    )
+    owner_registry = VoteSignerRegistry()
+    for identity, grant in voter_keys.items():
+        if not isinstance(grant, _AuthorizedVoter) or not isinstance(
+            grant.public_key, Ed25519PublicKey
+        ):
+            raise TypeError(
+                "validator runtime accepts only public-key authorized voter grants"
+            )
+        validator.register_miner(
+            identity,
+            domain="governance",
+            vote_public_key=grant.public_key,
+        )
+        owner_registry.register(
+            identity,
+            grant.public_key,
+            roles={"voter", "validator"},
+        )
+    owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
+    return validator, owner
+
+
+def _authorized_metagraph_axons(metagraph, authorized_identities: set[str] | frozenset[str]):
+    """Resolve configured identities to metagraph axons or fail closed."""
+    from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
+
+    authorized = {normalize_voter_id(identity) for identity in authorized_identities}
+    resolved: dict[str, tuple[str, object]] = {}
+    for hotkey, axon in zip(metagraph.hotkeys, metagraph.axons, strict=True):
+        identity = normalize_voter_id(hotkey)
+        if identity in resolved:
+            raise RuntimeError(f"metagraph contains duplicate canonical hotkey {identity!r}")
+        if identity in authorized:
+            resolved[identity] = (hotkey, axon)
+    missing = sorted(authorized - resolved.keys())
+    if missing:
+        raise RuntimeError(
+            "metagraph is missing configured authorized voter identities: "
+            + ", ".join(missing)
+        )
+    return [resolved[identity] for identity in sorted(resolved)]
+
+
+def _weight_values_for_metagraph(
+    weights: Mapping[str, float],
+    hotkeys: list[str],
+) -> list[float]:
+    """Map canonical validator weights back onto raw metagraph hotkeys."""
+    from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
+
+    return [weights.get(normalize_voter_id(hotkey), 0.0) for hotkey in hotkeys]
+
+
+def _verify_axon_response_signature(
+    response,
+    *,
+    expected_axon_hotkey: str,
+    expected_dendrite_hotkey: str,
+) -> None:
+    """Verify the SDK's axon response-authentication tuple.
+
+    Bittensor 10.2 signs response routing metadata only. This authenticates the
+    selected axon key but does not provide payload-integrity evidence.
+    """
+    import bittensor as bt
+
+    axon = getattr(response, "axon", None)
+    dendrite = getattr(response, "dendrite", None)
+    response_axon_hotkey = getattr(axon, "hotkey", None)
+    response_dendrite_hotkey = getattr(dendrite, "hotkey", None)
+    nonce = getattr(axon, "nonce", None)
+    uuid = getattr(axon, "uuid", None)
+    signature = getattr(axon, "signature", None)
+    if response_axon_hotkey != expected_axon_hotkey:
+        raise ValueError("response axon hotkey does not match the selected request target")
+    if response_dendrite_hotkey != expected_dendrite_hotkey:
+        raise ValueError("response dendrite hotkey does not match the local requester")
+    if isinstance(nonce, bool) or not isinstance(nonce, int):
+        raise ValueError("response axon signature is missing its nonce")
+    if not isinstance(uuid, str) or not uuid:
+        raise ValueError("response axon signature is missing its UUID")
+    if not isinstance(signature, str) or not signature:
+        raise ValueError("response axon signature is missing")
+    message = f"{nonce}.{expected_dendrite_hotkey}.{expected_axon_hotkey}.{uuid}"
+    try:
+        verified = bt.Keypair(ss58_address=expected_axon_hotkey).verify(message, signature)
+    except Exception as exc:
+        raise ValueError("response axon signature is invalid") from exc
+    if not verified:
+        raise ValueError("response axon signature is invalid")
+
+
+async def _record_authenticated_response(
+    response,
+    *,
+    expected_hotkey: str,
+    expected_dendrite_hotkey: str,
+    authorized_identities: set[str] | frozenset[str],
+    validator,
+    owner,
+    case,
+    peer_routes: Mapping[str, tuple[str, int]],
+    vote_client=None,
+):
+    """Authenticate a response producer before validation or precedent admission."""
+    from dataclasses import replace
+
+    from constitutional_swarm.bittensor.synapse_adapter import (
+        bt_to_judgment,
+        verify_judgment_response_signature,
+    )
+    from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
+
+    _verify_axon_response_signature(
+        response,
+        expected_axon_hotkey=expected_hotkey,
+        expected_dendrite_hotkey=expected_dendrite_hotkey,
+    )
+    verify_judgment_response_signature(
+        response,
+        expected_signer_hotkey=expected_hotkey,
+        expected_dendrite_hotkey=expected_dendrite_hotkey,
+    )
+    axon = getattr(response, "axon", None)
+    authenticated_hotkey = getattr(axon, "hotkey", None)
+    if not isinstance(authenticated_hotkey, str) or not authenticated_hotkey.strip():
+        raise ValueError("response is missing an authenticated hotkey")
+    if not isinstance(expected_hotkey, str) or not expected_hotkey.strip():
+        raise ValueError("request target is missing an authenticated hotkey")
+
+    authenticated_identity = normalize_voter_id(authenticated_hotkey)
+    expected_identity = normalize_voter_id(expected_hotkey)
+    if authenticated_identity != expected_identity:
+        raise ValueError(
+            f"authenticated response identity {authenticated_identity!r} does not match "
+            f"request target {expected_identity!r}"
+        )
+    authorized = {normalize_voter_id(identity) for identity in authorized_identities}
+    if authenticated_identity not in authorized:
+        raise ValueError(
+            f"authenticated response identity {authenticated_identity!r} is not authorized"
+        )
+
+    payload_identity = getattr(response, "miner_uid", None)
+    if not isinstance(payload_identity, str) or not payload_identity.strip():
+        raise ValueError("response payload is missing miner_uid")
+    canonical_payload_identity = normalize_voter_id(payload_identity)
+    if canonical_payload_identity != authenticated_identity:
+        raise ValueError(
+            f"payload miner_uid {canonical_payload_identity!r} does not match authenticated "
+            f"identity {authenticated_identity!r}"
+        )
+    expected_request_hash = getattr(case.synapse, "content_hash", None)
+    if response.request_content_hash != expected_request_hash:
+        raise ValueError("signed judgment response does not match the dispatched request")
+
+    judgment = replace(bt_to_judgment(response), miner_uid=authenticated_identity)
+    validation = await validator.validate_remote(
+        judgment,
+        peer_routes=dict(peer_routes),
+        client=vote_client,
+    )
+    return owner.record_result(case, judgment, validation)
 
 
 def _configure_braintrust(detail: str) -> object | None:
@@ -181,6 +463,7 @@ def cmd_local(args: argparse.Namespace) -> None:
             quorum=2,
             seed=0,
             use_manifold=True,
+            evidence_mode="single_operator_dev",
         )
         _braintrust_log(
             braintrust,
@@ -197,7 +480,10 @@ def cmd_local(args: argparse.Namespace) -> None:
             mesh.register_local_signer(agent_id, domain="general")
 
     print("Running local Constitutional Swarm testnet simulation...")
-    print("  Mode: local (no Bittensor SDK, wallet, RPC, axon, or external network)")
+    print(
+        "  Mode: local single-operator development simulation "
+        "(evidence is not eligible for precedent admission)"
+    )
     print(f"  Constitution: {args.constitution}")
     print(f"  Constitution hash: {mesh.constitutional_hash}")
     print(f"  Agents registered: {len(agents)}")
@@ -368,7 +654,7 @@ def cmd_miner(args: argparse.Namespace) -> None:
 
     config = MinerConfig(
         constitution_path=args.constitution,
-        agent_id=wallet.hotkey_str,
+        agent_id=wallet.hotkey.ss58_address,
         capabilities=tuple(args.capabilities.split(","))
         if args.capabilities
         else ("governance-judgment",),
@@ -379,7 +665,7 @@ def cmd_miner(args: argparse.Namespace) -> None:
         config=config,
         deliberation_handler=_deliberation_handler,
     )
-    server = MinerAxonServer(miner)
+    server = MinerAxonServer(miner, response_signing_key=wallet.hotkey)
 
     print(f"  Constitution hash: {miner.constitution_hash}")
     print(f"  Agent ID: {config.agent_id}")
@@ -419,25 +705,24 @@ def cmd_miner(args: argparse.Namespace) -> None:
 
 def cmd_validator(args: argparse.Namespace) -> None:
     """Start a constitutional governance validator on testnet."""
+    voter_keys = _load_authorized_voter_keys(getattr(args, "authorized_voters", ""))
+    if not os.path.exists(args.constitution):
+        raise ValueError(f"constitution file not found: {args.constitution}")
+    validator, owner = _build_validator_runtime(
+        args.constitution,
+        voter_keys,
+        peers=args.peers,
+        quorum=args.quorum,
+    )
     _check_bittensor()
     import asyncio
-    import os
     import time
 
     import bittensor as bt
-    from constitutional_swarm.bittensor.protocol import ValidatorConfig
-    from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
     from constitutional_swarm.bittensor.synapse_adapter import (
         GovernanceDeliberation,
-        bt_to_judgment,
         deliberation_to_bt,
     )
-    from constitutional_swarm.bittensor.validator import ConstitutionalValidator
-
-    if not os.path.exists(args.constitution):
-        print(f"ERROR: Constitution file not found: {args.constitution}")
-        print("  Create a constitution.yaml or use the sample in examples/constitution.yaml")
-        sys.exit(1)
 
     wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
 
@@ -450,23 +735,19 @@ def cmd_validator(args: argparse.Namespace) -> None:
     print(f"Starting Constitutional Validator on testnet (netuid={args.netuid})...")
     print(f"  Constitution: {args.constitution}")
 
-    config = ValidatorConfig(
-        constitution_path=args.constitution,
-        peers_per_validation=args.peers,
-        quorum=args.quorum,
-        use_manifold=True,
-    )
-
-    validator = ConstitutionalValidator(config=config)
-    owner = SubnetOwner(args.constitution)
-
     print(f"  Constitution hash: {validator.constitution_hash}")
 
     # Register on the metagraph
     subtensor.register(wallet=wallet, netuid=args.netuid)
     metagraph = subtensor.metagraph(netuid=args.netuid)
+    authorized_identities = frozenset(voter_keys)
+    peer_routes = {
+        identity: grant.route for identity, grant in voter_keys.items()
+    }
+    authorized_targets = _authorized_metagraph_axons(metagraph, authorized_identities)
 
     print(f"  Registered. Metagraph has {metagraph.n} neurons.")
+    print(f"  Authorized voter hotkeys present: {len(authorized_targets)}")
     print("  Validator is running. Press Ctrl+C to stop.")
 
     dendrite = bt.Dendrite(wallet=wallet)
@@ -485,14 +766,12 @@ def cmd_validator(args: argparse.Namespace) -> None:
                         print(f"  WARNING: metagraph.sync() failed after 3 attempts: {_exc}")
                     time.sleep(2**_attempt)
 
-            # Register any new miners we discover
-            for uid in range(metagraph.n):
-                hotkey = metagraph.hotkeys[uid]
-                if hotkey not in validator._known_miners:
-                    validator.register_miner(hotkey)
-
             # Query miners with a governance case via adapter layer
             if metagraph.n > 0:
+                authorized_targets = _authorized_metagraph_axons(
+                    metagraph,
+                    authorized_identities,
+                )
                 case = owner.package_case(
                     "Periodic governance validation",
                     "general",
@@ -502,7 +781,7 @@ def cmd_validator(args: argparse.Namespace) -> None:
                 try:
                     responses = loop.run_until_complete(
                         dendrite(
-                            axons=metagraph.axons,
+                            axons=[axon for _, axon in authorized_targets],
                             synapse=bt_syn,
                             timeout=args.epoch_seconds * 0.8,
                         )
@@ -511,23 +790,45 @@ def cmd_validator(args: argparse.Namespace) -> None:
                     print(f"  WARNING: dendrite query failed: {_exc}")
                     responses = []
 
-                for resp in responses:
+                if len(responses) != len(authorized_targets):
+                    print(
+                        "  WARNING: dendrite returned "
+                        f"{len(responses)} responses for {len(authorized_targets)} "
+                        "authorized targets"
+                    )
+                for (expected_hotkey, _axon), resp in zip(authorized_targets, responses):
                     if not isinstance(resp, GovernanceDeliberation):
                         continue
                     if not resp.has_response or resp.error_message is not None:
                         continue
                     try:
-                        judgment = bt_to_judgment(resp)
-                        validation = validator.validate(judgment)
-                        owner.record_result(case, judgment, validation)
-                    except (ValueError, KeyError):
+                        loop.run_until_complete(
+                            _record_authenticated_response(
+                                resp,
+                                expected_hotkey=expected_hotkey,
+                                expected_dendrite_hotkey=wallet.hotkey.ss58_address,
+                                authorized_identities=authorized_identities,
+                                validator=validator,
+                                owner=owner,
+                                case=case,
+                                peer_routes=peer_routes,
+                            )
+                        )
+                    except (ValueError, KeyError) as exc:
+                        print(
+                            f"  WARNING: rejected response for {expected_hotkey!r}: {exc}",
+                            file=sys.stderr,
+                        )
                         continue
 
             # Compute and set weights every epoch
             weights = validator.compute_emission_weights()
             if weights:
                 uids = list(range(metagraph.n))
-                weight_values = [weights.get(metagraph.hotkeys[uid], 0.0) for uid in uids]
+                weight_values = _weight_values_for_metagraph(
+                    weights,
+                    [metagraph.hotkeys[uid] for uid in uids],
+                )
                 try:
                     subtensor.set_weights(
                         wallet=wallet,
@@ -593,9 +894,18 @@ def main() -> None:
     val.add_argument("--wallet-name", required=True)
     val.add_argument("--wallet-hotkey", required=True)
     val.add_argument("--constitution", required=True, help="Path to constitution YAML")
+    val.add_argument(
+        "--authorized-voters",
+        required=True,
+        help=(
+            "JSON public voter grants containing identity_id, public_key_hex, vote_host, "
+            "and vote_port; each identity_id must equal the remote voter's authenticated "
+            "Bittensor axon hotkey, and at least --peers + 1 identities are required"
+        ),
+    )
     val.add_argument("--netuid", type=int, required=True)
-    val.add_argument("--peers", type=int, default=3)
-    val.add_argument("--quorum", type=int, default=2)
+    val.add_argument("--peers", type=int, default=5)
+    val.add_argument("--quorum", type=int, default=3)
     val.add_argument("--epoch-seconds", type=int, default=60)
 
     args = parser.parse_args()

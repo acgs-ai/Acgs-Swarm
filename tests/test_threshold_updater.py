@@ -12,6 +12,7 @@ from constitutional_swarm.bittensor.threshold_updater import (
     _fill_defaults,
     _normalize,
 )
+from tests.test_c14_protocol_hardening import c14_precedent_signed_record
 
 CONST_HASH = "608508a9bd224290"
 
@@ -28,7 +29,7 @@ def _make_record(
     grade: float = 0.91,
     case_id: str = "c1",
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
         task_id="t1",
         miner_uid="miner-01",
@@ -36,7 +37,6 @@ def _make_record(
         reasoning="Rationale",
         votes_for=3,
         votes_against=0,
-        proof_root_hash="abc",
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=impact_vector
         or {

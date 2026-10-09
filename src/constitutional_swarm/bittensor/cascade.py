@@ -35,6 +35,13 @@ from constitutional_swarm.mesh import (
     SettlementPersistenceError,
     UnauthorizedVoterError,
 )
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteSignerRegistry,
+    compute_vote_envelope_root,
+    normalize_voter_id,
+    verify_vote_envelopes,
+    vote_envelope_hash,
+)
 
 
 class CascadeStage(Enum):
@@ -174,6 +181,7 @@ class PrecedentCascade:
         consensus_threshold: float = 0.8,
         min_consensus_miners: int = 3,
         seed: int | None = None,
+        vote_registry: VoteSignerRegistry | None = None,
     ) -> None:
         if (
             isinstance(consensus_threshold, bool)
@@ -197,6 +205,9 @@ class PrecedentCascade:
         self._issued: dict[str, PrecedentCandidate] = {}
         self._mesh_results: dict[str, MeshResult] = {}
         self._seed = seed
+        self._vote_registry = (
+            vote_registry.frozen_copy() if vote_registry is not None else None
+        )
 
     @property
     def metrics(self) -> CascadeMetrics:
@@ -428,22 +439,70 @@ class PrecedentCascade:
         establish signed task or candidate provenance.
         """
         proof = result.proof
+        if proof is None or proof.protocol_version != 2 or self._vote_registry is None:
+            return False
+        if (
+            proof.task_id != candidate.candidate_id
+            or proof.artifact_id != candidate.candidate_id
+            or proof.producer_id != normalize_voter_id(candidate.miner_uid)
+        ):
+            return False
         expected_content_hash = hashlib.sha256(
             candidate.judgment_text.encode("utf-8")
         ).hexdigest()[:32]
-        total_votes = result.votes_for + result.votes_against
+        try:
+            envelopes = verify_vote_envelopes(
+                result.vote_envelopes,
+                self._vote_registry,
+                task_id=proof.task_id,
+                assignment_id=proof.assignment_id,
+                producer_id=proof.producer_id,
+                artifact_id=proof.artifact_id,
+                content_hash=expected_content_hash,
+                constitutional_hash=self._constitution.hash,
+                expected_quorum=result.vote_envelopes[0].quorum
+                if result.vote_envelopes
+                else None,
+                require_independent=True,
+            )
+        except (IndexError, TypeError, ValueError):
+            return False
+        votes_for = sum(envelope.approved for envelope in envelopes)
+        votes_against = len(envelopes) - votes_for
+        quorum = envelopes[0].quorum
+        accepted = votes_for >= quorum and votes_for > votes_against
+        expected_root = compute_vote_envelope_root(
+            task_id=proof.task_id,
+            assignment_id=proof.assignment_id,
+            producer_id=proof.producer_id,
+            artifact_id=proof.artifact_id,
+            content_hash=expected_content_hash,
+            constitutional_hash=self._constitution.hash,
+            accepted=accepted,
+            envelopes=envelopes,
+        )
+        expected_hashes = tuple(
+            vote_envelope_hash(envelope)
+            for envelope in sorted(
+                envelopes, key=lambda envelope: (envelope.voter_id, envelope.key_id)
+            )
+        )
         return (
-            result.accepted
+            accepted
+            and result.accepted == accepted
+            and result.votes_for == votes_for
+            and result.votes_against == votes_against
+            and result.pending_votes == 0
             and result.quorum_met
             and result.settled
-            and proof is not None
             and proof.verify()
             and proof.assignment_id == result.assignment_id
             and proof.content_hash == expected_content_hash
             and proof.constitutional_hash == self._constitution.hash
             and result.constitutional_hash == self._constitution.hash
-            and proof.accepted == result.accepted
-            and len(proof.vote_hashes) == total_votes
+            and proof.accepted == accepted
+            and proof.root_hash == expected_root
+            and proof.vote_hashes == expected_hashes
         )
 
     def _stage_compatibility(self, candidate: PrecedentCandidate) -> CascadeResult:

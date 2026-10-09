@@ -231,6 +231,7 @@ def _cascade_with_signed_mesh(constitution):
         peers_per_validation=3,
         quorum=3,
         seed=42,
+        evidence_mode="single_operator_dev",
     )
     mesh.register_local_signer("miner-01")
     for index in range(3):
@@ -246,7 +247,7 @@ def _cascade_with_signed_mesh(constitution):
 class TestPrecedentCascade:
     """Four-stage cascade for constitution evolution."""
 
-    def test_valid_judgment_passes_all_stages(self, constitution_path):
+    def test_single_operator_judgment_fails_closed_at_mesh_stage(self, constitution_path):
         from acgs_lite import Constitution
 
         constitution = Constitution.from_yaml(constitution_path)
@@ -258,8 +259,8 @@ class TestPrecedentCascade:
             domain="privacy",
             miner_uid="miner-01",
         )
-        assert candidate.alive is True
-        assert candidate.stages_passed == 4
+        assert candidate.alive is False
+        assert candidate.stages_passed == 1
 
     def test_violating_judgment_rejected_at_stage1(self, constitution_path):
         from acgs_lite import Constitution
@@ -276,7 +277,7 @@ class TestPrecedentCascade:
         assert candidate.alive is False
         assert candidate.stages_passed < 4
 
-    def test_accept_creates_delta(self, constitution_path):
+    def test_rejected_single_operator_candidate_creates_no_delta(self, constitution_path):
         from acgs_lite import Constitution
 
         constitution = Constitution.from_yaml(constitution_path)
@@ -289,10 +290,8 @@ class TestPrecedentCascade:
             miner_uid="miner-01",
         )
         delta = cascade.accept(candidate)
-        assert delta is not None
-        assert isinstance(delta, ConstitutionDelta)
-        assert delta.domain == "fairness"
-        assert len(cascade.accepted_deltas) == 1
+        assert delta is None
+        assert len(cascade.accepted_deltas) == 0
     def test_reject_does_not_create_delta(self, constitution_path):
         from acgs_lite import Constitution
 

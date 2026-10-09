@@ -19,6 +19,10 @@ from pathlib import Path
 
 from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
 from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_registry,
+)
 
 _EXAMPLE = Path(__file__).parent.parent / "examples" / "mac_acgs_autonomous_research.py"
 _spec = importlib.util.spec_from_file_location("mac_acgs_autonomous_research", _EXAMPLE)
@@ -28,15 +32,9 @@ sys.modules["mac_acgs_autonomous_research"] = example
 _spec.loader.exec_module(example)
 
 
-def _run_cycles(loop: MacAcgsLoop, codifier=None, store=None, cycles: int = 8) -> None:
+def _run_cycles(loop: MacAcgsLoop, cycles: int = 8) -> None:
     rng = random.Random(42)
     for cycle in range(1, cycles + 1):
-        if codifier is not None:
-            assert store is not None
-            first_record = example.synth_precedent(rng, 2 * cycle)
-            second_record = example.synth_precedent(rng, 2 * cycle + 1)
-            codifier.observe(store.admit(first_record))
-            codifier.observe(store.admit(second_record))
         loop.run_cycle(example.synth_approaches(rng, cycle))
 
 
@@ -70,11 +68,31 @@ def test_default_codifier_evolve_cycle_never_proposes_rules() -> None:
 
 
 def test_precedent_backed_codifier_commits_constitutional_update() -> None:
-    store = example.PrecedentStore(example.CONSTITUTIONAL_HASH)
-    codifier = example.PrecedentBackedCodifier(precedent_store=store)
-    loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
-    loop.add_external_challenger("human-reviewer-1")
-    _run_cycles(loop, codifier=codifier, store=store)
+    precedents = [
+        c14_precedent_signed_record(
+            case_id=f"example-case-{index}",
+            task_id=f"example-task-{index}",
+            miner_uid=f"miner-{index % 12}",
+            judgment="deny: irreversible side effect without receipt",
+            reasoning="Side-effectful action lacked a valid decision receipt.",
+            votes_for=5,
+            votes_against=0,
+            impact_vector={
+                "safety": 0.9,
+                "security": 0.8,
+                "privacy": 0.1,
+                "fairness": 0.1,
+                "reliability": 0.2,
+                "transparency": 0.1,
+                "efficiency": 0.1,
+            },
+        )
+        for index in range(16)
+    ]
+    loop, store, codifier = example.run_with_precedents(
+        precedents,
+        c14_precedent_test_registry(),
+    )
 
     updates = loop.constitution_updates()
     assert len(updates) >= 1

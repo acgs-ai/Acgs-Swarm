@@ -7,7 +7,6 @@ import subprocess
 import sys
 
 from acgs_lite import Constitution
-from cryptography.hazmat.primitives import serialization
 from constitutional_swarm import (
     ConstitutionalMesh,
     JSONLSettlementStore,
@@ -17,24 +16,24 @@ from constitutional_swarm import (
     verify_bundle,
 )
 from constitutional_swarm.governance_receipts_dsse import to_dsse_envelope
-
-
-def _trusted_signers(mesh: ConstitutionalMesh) -> dict[str, str]:
-    return {
-        "settlement-receipt": mesh._receipt_signing_public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        ).hex()
-    }
+def _trusted_signers(mesh: ConstitutionalMesh) -> dict[str, object]:
+    return mesh.receipt_trust_registry()
 
 
 def _settled_mesh(tmp_path):
     store = JSONLSettlementStore(tmp_path / "settlements.jsonl")
-    mesh = ConstitutionalMesh(Constitution.default(), seed=42, settlement_store=store)
+    mesh = ConstitutionalMesh(
+        Constitution.default(),
+        seed=42,
+        peers_per_validation=3,
+        quorum=3,
+        settlement_store=store,
+        evidence_mode="single_operator_dev",
+    )
     for index in range(4):
         mesh.register_local_signer(f"agent-{index:02d}")
     assignment = mesh.request_validation("agent-00", "summarize notes", "artifact-1")
-    for voter in assignment.peers[:2]:
+    for voter in assignment.peers:
         mesh.validate_and_vote(assignment.assignment_id, voter)
     result = mesh.get_result(assignment.assignment_id)
     assert result is not None

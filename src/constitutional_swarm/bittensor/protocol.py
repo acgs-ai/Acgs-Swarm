@@ -76,11 +76,35 @@ class ValidatorConfig:
     """
 
     constitution_path: str
-    peers_per_validation: int = 3
-    quorum: int = 2
+    peers_per_validation: int = 5
+    quorum: int = 3
     use_manifold: bool = True
     authenticity_detection: bool = False
     reputation_decay_rate: float = 0.01
+    complete_evidence: bool = True
+    single_operator_dev: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject configurations that cannot produce admissible precedent evidence."""
+        for name, value in (
+            ("peers_per_validation", self.peers_per_validation),
+            ("quorum", self.quorum),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.quorum > self.peers_per_validation:
+            raise ValueError("quorum cannot exceed peers_per_validation")
+        if self.quorum <= self.peers_per_validation // 2:
+            raise ValueError("quorum must be a strict majority of peers_per_validation")
+        if type(self.complete_evidence) is not bool:
+            raise TypeError("complete_evidence must be a boolean")
+        if type(self.single_operator_dev) is not bool:
+            raise TypeError("single_operator_dev must be a boolean")
+        if self.complete_evidence:
+            if self.peers_per_validation < 5:
+                raise ValueError("complete evidence requires at least 5 validation peers")
+            if self.quorum < 3:
+                raise ValueError("complete evidence requires a quorum of at least 3")
 
 
 @dataclass

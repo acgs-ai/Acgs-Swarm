@@ -12,9 +12,25 @@ base class is lazy-imported so the package works without bittensor installed.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+from constitutional_swarm.mesh.vote_envelope import VoteEnvelope
+
+_SYNAPSE_HASH_DOMAIN = b"constitutional-swarm.bittensor-synapse.v1\x00"
+
+
+def _canonical_synapse_hash(kind: str, payload: dict[str, str]) -> str:
+    encoded = json.dumps(
+        {"kind": kind, "protocol_version": 1, **payload},
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(_SYNAPSE_HASH_DOMAIN + encoded).hexdigest()[:32]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,8 +56,14 @@ class DeliberationSynapse:
     @property
     def content_hash(self) -> str:
         """Deterministic hash of the deliberation request."""
-        payload = f"{self.task_id}:{self.constitution_hash}:{self.task_dag_json}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+        return _canonical_synapse_hash(
+            "deliberation",
+            {
+                "task_id": self.task_id,
+                "constitutional_hash": self.constitution_hash,
+                "task_dag_json": self.task_dag_json,
+            },
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,8 +93,15 @@ class JudgmentSynapse:
     @property
     def content_hash(self) -> str:
         """Deterministic hash of the judgment."""
-        payload = f"{self.task_id}:{self.miner_uid}:{self.judgment}:{self.constitutional_hash}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+        return _canonical_synapse_hash(
+            "judgment",
+            {
+                "task_id": self.task_id,
+                "miner_uid": self.miner_uid,
+                "judgment": self.judgment,
+                "constitutional_hash": self.constitutional_hash,
+            },
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,11 +128,12 @@ class ValidationSynapse:
     trust_update: dict[str, Any] = field(default_factory=dict)
     authenticity_score: float = 0.0
     timestamp: float = field(default_factory=time.time)
+    vote_envelopes: tuple[VoteEnvelope, ...] = ()
 
     @property
     def is_verified(self) -> bool:
-        """Check if the proof can be locally verified."""
-        return bool(self.proof_root_hash and self.proof_vote_hashes)
+        """Report whether all structural proof components are present."""
+        return bool(self.proof_root_hash and self.proof_vote_hashes and self.vote_envelopes)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

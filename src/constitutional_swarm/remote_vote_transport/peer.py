@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
+import threading
 
 from acgs_lite import Constitution
 from cryptography.hazmat.primitives import serialization
@@ -12,6 +13,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
+from constitutional_swarm.mesh.vote_envelope import (
+    key_id_for_public_key,
+    normalize_voter_id,
+    sign_vote_envelope,
+)
 from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
 
 
@@ -38,22 +44,30 @@ class LocalRemotePeer:
         allow_untrusted_request_signers: bool = False,
         replay_window_seconds: float = 300.0,
     ) -> None:
-        self.agent_id = agent_id
+        if allow_untrusted_request_signers:
+            raise ValueError(
+                "allow_untrusted_request_signers is insecure; configure trusted_request_signers"
+            )
+        self.agent_id = normalize_voter_id(agent_id)
         self.strict = strict
         self._constitution = constitution.model_copy(deep=True)
         self._constitutional_hash = self._constitution.hash
         self._constitution_fingerprint = _constitution_fingerprint(self._constitution)
         self._dna = AgentDNA(
             constitution=self._constitution,
-            agent_id=agent_id,
+            agent_id=self.agent_id,
             strict=strict,
         )
         self._private_key = self._coerce_private_key(vote_private_key)
         self._public_key = self._private_key.public_key()
-        self._trusted_request_signers = set(trusted_request_signers or set())
-        self._allow_untrusted_request_signers = allow_untrusted_request_signers
+        self._trusted_request_signers = set()
+        for public_key in trusted_request_signers or set():
+            key_id_for_public_key(public_key)
+            self._trusted_request_signers.add(public_key)
         self._replay_window_seconds = replay_window_seconds
+        self._request_nonce_caches: dict[str, OrderedDict[str, float]] = {}
         self._request_nonce_cache: OrderedDict[str, float] = OrderedDict()
+        self._nonce_lock = threading.Lock()
 
     @property
     def public_key_hex(self) -> str:
@@ -86,15 +100,23 @@ class LocalRemotePeer:
         if request.constitutional_hash != local_constitutional_hash:
             raise ValueError("Remote vote request constitutional hash does not match local constitution")
         if (
-            not self._allow_untrusted_request_signers
-            and request.request_signer_public_key not in self._trusted_request_signers
+            request.request_signer_public_key not in self._trusted_request_signers
         ):
             raise ValueError("Remote vote request signer is not trusted")
         ConstitutionalMesh.verify_remote_vote_request(
             request,
             replay_window_seconds=self._replay_window_seconds,
-            nonce_cache=self._request_nonce_cache,
         )
+        with self._nonce_lock:
+            signer_cache = self._request_nonce_caches.setdefault(
+                request.request_signer_public_key, OrderedDict()
+            )
+            ConstitutionalMesh.verify_remote_vote_request(
+                request,
+                replay_window_seconds=self._replay_window_seconds,
+                nonce_cache=signer_cache,
+            )
+            self._request_nonce_cache = signer_cache
         if hashlib.sha256(request.content.encode("utf-8")).hexdigest()[:32] != request.content_hash:
             raise ValueError("Remote vote request content does not match content hash")
 
@@ -104,25 +126,24 @@ class LocalRemotePeer:
             raise RuntimeError("Remote peer validator used an unexpected constitution")
         approved = result.valid
         reason = "constitutional check passed" if result.valid else "; ".join(result.violations)
-        signature = self._private_key.sign(
-            ConstitutionalMesh.build_vote_payload(
-                assignment_id=request.assignment_id,
-                voter_id=request.voter_id,
-                approved=approved,
-                reason=reason,
-                constitutional_hash=local_constitutional_hash,
-                content_hash=request.content_hash,
-            )
-        ).hex()
-        return RemoteVoteResponse(
-            assignment_id=request.assignment_id,
+        envelope = sign_vote_envelope(
+            self._private_key,
             voter_id=request.voter_id,
-            approved=approved,
-            reason=reason,
-            constitutional_hash=local_constitutional_hash,
+            task_id=request.task_id or request.artifact_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
             content_hash=request.content_hash,
-            signature=signature,
+            constitutional_hash=local_constitutional_hash,
+            decision="approved" if approved else "denied",
+            reason=reason,
+            nonce=request.nonce,
+            issued_at=request.timestamp,
+            assigned_peers=request.assigned_peers,
+            quorum=request.quorum,
+            evidence_mode=request.evidence_mode,
         )
+        return RemoteVoteResponse(envelope)
 
     @staticmethod
     def _coerce_private_key(

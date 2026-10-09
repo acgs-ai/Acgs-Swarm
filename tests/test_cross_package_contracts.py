@@ -62,6 +62,11 @@ class _FakeConnectContext:
         return None
 
 
+def _dev_mesh(*args, **kwargs) -> ConstitutionalMesh:
+    kwargs.setdefault("evidence_mode", "single_operator_dev")
+    return ConstitutionalMesh(*args, **kwargs)
+
+
 def _register_mesh_agents(mesh: ConstitutionalMesh, count: int = 5) -> None:
     for index in range(count):
         mesh.register_local_signer(f"agent-{index}", domain=f"domain-{index % 2}")
@@ -70,7 +75,7 @@ def _register_mesh_agents(mesh: ConstitutionalMesh, count: int = 5) -> None:
 def test_public_api_accepts_acgs_lite_constitution_instances() -> None:
     constitution = Constitution.default()
     dna = AgentDNA(constitution=constitution, agent_id="contract-agent")
-    mesh = ConstitutionalMesh(constitution, seed=13)
+    mesh = _dev_mesh(constitution, seed=13)
 
     assert dna.hash == constitution.hash
     assert mesh.constitutional_hash == constitution.hash
@@ -78,7 +83,7 @@ def test_public_api_accepts_acgs_lite_constitution_instances() -> None:
 
 def test_assignment_and_result_preserve_constitutional_hash_contract() -> None:
     constitution = Constitution.default()
-    mesh = ConstitutionalMesh(constitution, seed=17)
+    mesh = _dev_mesh(constitution, seed=17)
     _register_mesh_agents(mesh)
 
     assignment = mesh.request_validation("agent-0", "safe governance contract check", "art-4")
@@ -101,7 +106,7 @@ async def test_top_level_remote_validation_contract_returns_verified_mesh_result
     )
 
     constitution = Constitution.default()
-    mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=3, seed=37)
+    mesh = _dev_mesh(constitution, peers_per_validation=3, quorum=3, seed=37)
     remote_peer = LocalRemotePeer(
         agent_id="peer-remote",
         constitution=constitution,

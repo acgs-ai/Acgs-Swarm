@@ -576,9 +576,12 @@ rules:
         from constitutional_swarm.bittensor.protocol import MinerConfig, ValidatorConfig
         from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
         from constitutional_swarm.bittensor.validator import ConstitutionalValidator
+        from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+        from tests.test_c14_protocol_hardening import c14_trust_validator_voters
 
         # Setup
-        owner = SubnetOwner(constitution_path)
+        owner_registry = VoteSignerRegistry()
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
         client = ValidatorDendriteClient(constitution_path=constitution_path)
 
         async def deliberate(task, ctx, meta):
@@ -602,12 +605,19 @@ rules:
                 constitution_path=constitution_path,
                 peers_per_validation=5,
                 quorum=5,
+                single_operator_dev=True,
             ),
         )
         for i in range(3):
             validator.register_miner(f"e2e-miner-{i}", domain="privacy")
         for i in range(3):
             validator.register_miner(f"extra-peer-{i}")
+        c14_trust_validator_voters(
+            owner_registry,
+            validator,
+            tuple(f"e2e-miner-{i}" for i in range(3))
+            + tuple(f"extra-peer-{i}" for i in range(3)),
+        )
 
         # Step 1: Package case
         case = owner.package_case(
@@ -626,9 +636,8 @@ rules:
         assert validation.votes_for + validation.votes_against == 5
 
         # Step 4: Record result
-        precedent = owner.record_result(case, judgments[0], validation)
-        assert precedent is not None
-        assert precedent.validation_accepted is True
+        with pytest.raises(ValueError, match="independent vote evidence"):
+            owner.record_result(case, judgments[0], validation)
 
 
 # ---------------------------------------------------------------------------

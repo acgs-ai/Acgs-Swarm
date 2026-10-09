@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -521,16 +522,30 @@ class TestC3ProtectedPaths:
 
 
 def c3_transport_handler(request):
+    from constitutional_swarm.mesh.vote_envelope import VoteEnvelope, canonical_assigned_peers_hash
     from constitutional_swarm.remote_vote_transport import RemoteVoteResponse
 
     return RemoteVoteResponse(
-        assignment_id=request.assignment_id,
-        voter_id=request.voter_id,
-        approved=True,
-        reason="ok",
-        constitutional_hash=request.constitutional_hash,
-        content_hash=request.content_hash,
-        signature="00" * 64,
+        VoteEnvelope(
+            protocol_version=2,
+            voter_id=request.voter_id,
+            key_id="00" * 32,
+            task_id=request.task_id or request.artifact_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
+            content_hash=request.content_hash,
+            constitutional_hash=request.constitutional_hash,
+            decision="approved",
+            reason="ok",
+            nonce=request.nonce,
+            issued_at=request.timestamp,
+            signature="00" * 64,
+            assigned_peers_hash=canonical_assigned_peers_hash(request.assigned_peers),
+            assigned_peer_count=len(request.assigned_peers),
+            quorum=request.quorum,
+            evidence_mode=request.evidence_mode,
+        )
     )
 
 
@@ -579,6 +594,11 @@ def c3_transport_request(
                 voter_public_key=request.voter_public_key,
                 nonce=request.nonce,
                 timestamp=request.timestamp,
+                task_id=request.task_id,
+                assigned_peers=request.assigned_peers,
+                quorum=request.quorum,
+                evidence_mode=request.evidence_mode,
+                protocol_version=request.protocol_version,
             )
         ).hex()
         request = replace(
@@ -750,7 +770,10 @@ class TestC3Transport:
 
     def test_matching_constitution_response_is_signed_over_local_hash(self):
         from acgs_lite import Constitution
-        from constitutional_swarm import ConstitutionalMesh
+        from constitutional_swarm.mesh.vote_envelope import (
+            VoteSignerRegistry,
+            verify_vote_envelope,
+        )
 
         constitution = Constitution.default()
         peer, request = c3_transport_request(
@@ -761,16 +784,18 @@ class TestC3Transport:
         response = peer.handle_vote_request(request)
 
         assert response.constitutional_hash == constitution.hash
-        assert ConstitutionalMesh.verify_vote_signature(
-            public_key=peer.public_key_hex,
-            assignment_id=response.assignment_id,
-            voter_id=response.voter_id,
-            approved=response.approved,
-            reason=response.reason,
+        registry = VoteSignerRegistry()
+        registry.register(response.voter_id, peer.public_key_hex, roles={"voter"})
+        assert verify_vote_envelope(
+            response.envelope,
+            registry,
+            task_id=request.task_id or request.artifact_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
+            content_hash=request.content_hash,
             constitutional_hash=constitution.hash,
-            content_hash=response.content_hash,
-            signature=response.signature,
-        )
+        ) == response.envelope
 
     def test_authenticated_untrusted_request_does_not_mutate_nonce_cache(self):
         from collections import OrderedDict
@@ -876,7 +901,6 @@ class TestC3Transport:
         from acgs_lite import Constitution
         from constitutional_swarm.remote_vote_transport import (
             RemoteVoteClient,
-            RemoteVoteResponse,
             encode_remote_vote_response,
         )
 
@@ -885,15 +909,7 @@ class TestC3Transport:
             peer_constitution=constitution,
             request_constitution=constitution,
         )
-        response = RemoteVoteResponse(
-            assignment_id=request.assignment_id,
-            voter_id=request.voter_id,
-            approved=True,
-            reason="ok",
-            constitutional_hash=request.constitutional_hash,
-            content_hash=request.content_hash,
-            signature="00" * 64,
-        )
+        response = c3_transport_handler(request)
         supplied = ssl.create_default_context()
         captured = {}
 
@@ -999,6 +1015,46 @@ def c3_receipt_payload(
     decision: str = "approved",
     votes: list[ValidatorVote] | None = None,
 ) -> ReceiptPayload:
+    validator_votes = votes or [
+        ValidatorVote(
+            validator_id=f"c3-validator-{index}", decision="approve", rationale="ok"
+        )
+        for index in range(3)
+    ]
+    from constitutional_swarm.mesh.vote_envelope import (
+        sign_vote_envelope,
+        vote_envelope_to_dict,
+    )
+
+    assigned_peers = tuple(vote.validator_id for vote in validator_votes)
+    quorum = max(3, len(assigned_peers) // 2 + 1) if len(assigned_peers) >= 3 else len(assigned_peers) // 2 + 1
+    envelopes = []
+    for index, vote in enumerate(validator_votes):
+        if vote.decision == "abstain":
+            continue
+        private_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(vote.validator_id.encode()).digest()
+        )
+        envelopes.append(
+            vote_envelope_to_dict(
+                sign_vote_envelope(
+                    private_key,
+                    voter_id=vote.validator_id,
+                    task_id="c3-task",
+                    assignment_id="c3-assignment",
+                    producer_id="c3-producer",
+                    artifact_id="release governed artifact",
+                    content_hash="sha256:c3-artifact",
+                    constitutional_hash="sha256:c3-policy",
+                    decision="approved" if vote.decision == "approve" else "denied",
+                    reason=vote.rationale,
+                    nonce=f"c3-{index}-{vote.validator_id}",
+                    issued_at=float(index + 1),
+                    assigned_peers=assigned_peers,
+                    quorum=quorum,
+                )
+            )
+        )
     return ReceiptPayload(
         receipt_id="c3-receipt",
         action="release governed artifact",
@@ -1010,15 +1066,28 @@ def c3_receipt_payload(
         },
         evidence_hashes={"artifact": "sha256:c3-artifact"},
         decision=decision,
-        validator_votes=votes
-        or [ValidatorVote(validator_id="c3-validator", decision="approve", rationale="ok")],
+        validator_votes=validator_votes,
+        vote_envelopes=envelopes or None,
+        assigned_peers=list(assigned_peers),
         rejected_alternative="release without governance evidence",
+        metadata={
+            "assignment_id": "c3-assignment",
+            "assigned_peer_count": str(len(validator_votes)),
+            "artifact_id": "release governed artifact",
+            "content_hash": "sha256:c3-artifact",
+            "vote_evidence_mode": "independent",
+            "producer_id": "c3-producer",
+            "quorum": str(quorum),
+            "signer_role": "settlement",
+            "task_id": "c3-task",
+            "vote_evidence_version": "constitutional-swarm.vote-envelope.v2",
+        },
     )
 
 
 def c3_receipt_signed_bundle(
     payload: ReceiptPayload,
-) -> tuple[GovernanceReceiptBundle, dict[str, str]]:
+) -> tuple[GovernanceReceiptBundle, dict[str, object]]:
     private_key = Ed25519PrivateKey.from_private_bytes(bytes([31]) * 32)
     public_hex = private_key.public_key().public_bytes(
         encoding=c3_receipt_serialization.Encoding.Raw,
@@ -1035,12 +1104,33 @@ def c3_receipt_signed_bundle(
         payload_digest=payload_digest(payload),
         signatures=[signature],
     )
-    return GovernanceReceiptBundle.model_construct(
+    trusted: dict[str, object] = {
+        "c3-auditor-key": {
+            "identity_id": "c3-coordinator",
+            "public_key_hex": public_hex,
+            "roles": ["settlement"],
+        }
+    }
+    for envelope in payload.vote_envelopes or []:
+        voter_id = str(envelope["voter_id"])
+        voter_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(voter_id.encode()).digest()
+        ).public_key()
+        trusted[str(envelope["key_id"])] = {
+            "identity_id": voter_id,
+            "public_key_hex": voter_key.public_bytes(
+                encoding=c3_receipt_serialization.Encoding.Raw,
+                format=c3_receipt_serialization.PublicFormat.Raw,
+            ).hex(),
+            "roles": ["validator"],
+        }
+    bundle = GovernanceReceiptBundle.model_construct(
         profile_version="acgs.local.intoto-dsse-shaped.v0.1",
         receipts=[receipt],
         answer_key={},
         benchmark_metadata={},
-    ), {"c3-auditor-key": public_hex}
+    )
+    return bundle, trusted
 
 
 class TestC3Receipts:
@@ -1109,7 +1199,7 @@ class TestC3Receipts:
         assert build_receipt(payload=payload).payload.decision == "approved"
         assert verify_receipt_bundle(bundle, trusted_signers=trusted).valid is True
 
-    def test_denied_receipt_accepts_two_approves_two_denies(self) -> None:
+    def test_denied_receipt_rejects_two_approves_two_denies_tie(self) -> None:
         votes = [
             *[
                 ValidatorVote(
@@ -1133,7 +1223,10 @@ class TestC3Receipts:
         bundle, trusted = c3_receipt_signed_bundle(payload)
 
         assert build_receipt(payload=payload).payload.decision == "denied"
-        assert verify_receipt_bundle(bundle, trusted_signers=trusted).valid is True
+        verdict = verify_receipt_bundle(bundle, trusted_signers=trusted)
+        assert verdict.valid is False
+        assert "vote_tally_no_majority" in {issue.code for issue in verdict.issues}
+        assert verdict.signature_status == "valid"
 
     def test_denied_receipt_rejects_three_approves_two_denies_across_bypasses(
         self,
@@ -1183,7 +1276,7 @@ class TestC3Receipts:
             ValidatorVote(validator_id="same-validator", decision="deny", rationale="second"),
         ]
 
-        with pytest.raises(ValidationError, match="validator IDs must be unique"):
+        with pytest.raises(ValueError, match="distinct voter identities"):
             c3_receipt_payload(votes=duplicate_votes)
 
     def test_payload_constructor_rejects_normalized_duplicate_validator_ids(self) -> None:
@@ -1192,16 +1285,16 @@ class TestC3Receipts:
             ValidatorVote(validator_id="VALIDATOR-A ", decision="deny", rationale="alias"),
         ]
 
-        with pytest.raises(ValidationError, match="validator IDs must be unique"):
+        with pytest.raises(ValueError, match="distinct voter identities"):
             c3_receipt_payload(votes=alias_votes)
 
     def test_payload_constructor_rejects_blank_validator_id(self) -> None:
-        blank_vote = ValidatorVote(
-            validator_id="   ", decision="approve", rationale="blank identity"
-        )
-
-        with pytest.raises(ValidationError, match="validator IDs must be non-blank"):
-            c3_receipt_payload(votes=[blank_vote])
+        with pytest.raises((ValueError, ValidationError), match="empty|blank"):
+            ValidatorVote(
+                validator_id="   ",
+                decision="approve",
+                rationale="blank identity",
+            )
 
     @pytest.mark.parametrize(
         ("decision", "vote_decision"),
@@ -1318,7 +1411,7 @@ class TestC3Receipts:
 
     @pytest.mark.parametrize(
         ("decision", "vote_decision"),
-        [("approved", "approve"), ("denied", "deny"), ("escalated", "abstain")],
+        [("approved", "approve"), ("denied", "deny")],
     )
     def test_supported_decisions_remain_valid(
         self, decision: str, vote_decision: str
@@ -1327,13 +1420,33 @@ class TestC3Receipts:
             decision=decision,
             votes=[
                 ValidatorVote(
-                    validator_id="c3-validator", decision=vote_decision, rationale="supported"
+                    validator_id=f"c3-validator-{index}",
+                    decision=vote_decision,
+                    rationale="supported",
                 )
+                for index in range(3)
             ],
         )
         bundle, trusted = c3_receipt_signed_bundle(payload)
 
         assert verify_receipt_bundle(bundle, trusted_signers=trusted).valid is True
+
+    def test_escalated_aggregate_receipt_is_not_proof_grade(self) -> None:
+        payload = c3_receipt_payload(
+            decision="escalated",
+            votes=[
+                ValidatorVote(
+                    validator_id="c3-validator",
+                    decision="abstain",
+                    rationale="human review required",
+                )
+            ],
+        )
+        bundle, trusted = c3_receipt_signed_bundle(payload)
+
+        verdict = verify_receipt_bundle(bundle, trusted_signers=trusted)
+        assert verdict.valid is False
+        assert "vote_envelope_missing" in {issue.code for issue in verdict.issues}
 
     def test_shipped_fixtures_use_distinct_multi_validator_tallies(self) -> None:
         trusted = fixture_trusted_signers()
@@ -1343,10 +1456,15 @@ class TestC3Receipts:
             assert verify_receipt_bundle(bundle, trusted_signers=trusted).valid is True
             for receipt in bundle.receipts:
                 votes = receipt.payload.validator_votes
+                envelopes = receipt.payload.vote_envelopes
                 validator_ids = {vote.validator_id.strip().casefold() for vote in votes}
                 approve_count = sum(vote.decision == "approve" for vote in votes)
                 deny_count = sum(vote.decision == "deny" for vote in votes)
 
+                assert envelopes is not None
+                assert [envelope["voter_id"] for envelope in envelopes] == [
+                    vote.validator_id for vote in votes
+                ]
                 assert len(votes) > 1
                 assert len(validator_ids) == len(votes)
                 if receipt.payload.decision == "approved":
@@ -1357,7 +1475,7 @@ class TestC3Receipts:
 
         collusion = collusion_bundle()
         assert collusion.receipts[0].payload.metadata["k_compromised"] == "1"
-        assert collusion.receipts[0].payload.metadata["n_validators"] == "3"
+        assert collusion.receipts[0].payload.metadata["n_validators"] == "4"
         assert collusion.receipts[0].payload.metadata["first_failure_k"] == "1"
         collusion_votes = {
             vote.validator_id: vote for vote in collusion.receipts[0].payload.validator_votes
@@ -1381,21 +1499,30 @@ class TestC3Receipts:
         from acgs_lite import Constitution
 
         from constitutional_swarm import ConstitutionalMesh, JSONLSettlementStore
+        from constitutional_swarm.mesh.vote_envelope import key_id_for_public_key
+        from constitutional_swarm.settlement_evidence import RECEIPT_SIGNER_KEY_ID
 
         store = JSONLSettlementStore(tmp_path / "c3-majority-mesh.jsonl")
+        receipt_key = Ed25519PrivateKey.generate()
+        voter_keys = {
+            f"c3-majority-agent-{index}": Ed25519PrivateKey.generate()
+            for index in range(5)
+        }
         mesh = ConstitutionalMesh(
             Constitution.default(),
             peers_per_validation=3,
-            quorum=2,
+            quorum=3,
             seed=41,
             settlement_store=store,
+            evidence_mode="single_operator_dev",
+            receipt_signing_private_key=receipt_key,
         )
-        for index in range(5):
-            mesh.register_local_signer(f"c3-majority-agent-{index}")
+        for voter_id, voter_key in voter_keys.items():
+            mesh.register_local_signer(voter_id, vote_private_key=voter_key)
         assignment = mesh.request_validation(
             "c3-majority-agent-0", "safe", "c3-majority-artifact"
         )
-        for voter in assignment.peers[:2]:
+        for voter in assignment.peers:
             reason = "majority approval"
             mesh.submit_vote(
                 assignment.assignment_id,
@@ -1413,85 +1540,42 @@ class TestC3Receipts:
         bundle = bundle_from_json(
             mesh._receipt_bundle_path(assignment.assignment_id).read_text(encoding="utf-8")
         )
-        public_hex = mesh._receipt_signing_public_key.public_bytes(
-            encoding=c3_receipt_serialization.Encoding.Raw,
-            format=c3_receipt_serialization.PublicFormat.Raw,
-        ).hex()
-
+        trusted_signers = {
+            RECEIPT_SIGNER_KEY_ID: {
+                "identity_id": "mesh-settlement",
+                "public_key_hex": receipt_key.public_key().public_bytes_raw().hex(),
+                "roles": ["settlement"],
+            }
+        }
+        for voter_id, voter_key in voter_keys.items():
+            public_key = voter_key.public_key()
+            trusted_signers[key_id_for_public_key(public_key)] = {
+                "identity_id": voter_id,
+                "public_key_hex": public_key.public_bytes_raw().hex(),
+                "roles": ["validator"],
+            }
         assert bundle.receipts[0].payload.decision == "approved"
-        assert verify_receipt_bundle(
-            bundle, trusted_signers={"settlement-receipt": public_hex}
-        ).valid is True
+        assert verify_receipt_bundle(bundle, trusted_signers=trusted_signers).valid is True
 
-    def test_low_quorum_mesh_tie_fails_receipt_persistence_loudly(
+    def test_tie_capable_mesh_configuration_fails_before_persistence(
         self, tmp_path: Path
     ) -> None:
         from acgs_lite import Constitution
 
-        from constitutional_swarm import (
-            ConstitutionalMesh,
-            JSONLSettlementStore,
-            SettlementPersistenceError,
-        )
+        from constitutional_swarm import ConstitutionalMesh, JSONLSettlementStore
 
         store = JSONLSettlementStore(tmp_path / "c3-tied-mesh.jsonl")
-        mesh = ConstitutionalMesh(
-            Constitution.default(),
-            peers_per_validation=4,
-            quorum=2,
-            seed=43,
-            settlement_store=store,
-        )
-        for index in range(6):
-            mesh.register_local_signer(f"c3-tie-agent-{index}")
-        assignment = mesh.request_validation("c3-tie-agent-0", "safe", "c3-tie-artifact")
-
-        for voter in assignment.peers[:2]:
-            reason = "denial before low-quorum approval"
-            mesh.submit_vote(
-                assignment.assignment_id,
-                voter,
-                approved=False,
-                reason=reason,
-                signature=mesh.sign_vote(
-                    assignment.assignment_id,
-                    voter,
-                    approved=False,
-                    reason=reason,
-                ),
-            )
-        for voter in assignment.peers[2:3]:
-            reason = "first approval"
-            mesh.submit_vote(
-                assignment.assignment_id,
-                voter,
-                approved=True,
-                reason=reason,
-                signature=mesh.sign_vote(
-                    assignment.assignment_id,
-                    voter,
-                    approved=True,
-                    reason=reason,
-                ),
-            )
-
-        final_voter = assignment.peers[3]
-        final_reason = "second approval creates a tied accepted snapshot"
-        with pytest.raises(SettlementPersistenceError, match="could not be persisted"):
-            mesh.submit_vote(
-                assignment.assignment_id,
-                final_voter,
-                approved=True,
-                reason=final_reason,
-                signature=mesh.sign_vote(
-                    assignment.assignment_id,
-                    final_voter,
-                    approved=True,
-                    reason=final_reason,
-                ),
+        with pytest.raises(ValueError, match="quorum must be a strict majority"):
+            ConstitutionalMesh(
+                Constitution.default(),
+                peers_per_validation=4,
+                quorum=2,
+                seed=43,
+                settlement_store=store,
             )
 
         assert store.load_all() == []
+        assert store.load_pending() == []
 
     def test_mesh_does_not_emit_denial_for_approve_only_insufficient_quorum(
         self, tmp_path
@@ -1504,9 +1588,10 @@ class TestC3Receipts:
         mesh = ConstitutionalMesh(
             Constitution.default(),
             peers_per_validation=3,
-            quorum=2,
+            quorum=3,
             seed=31,
             settlement_store=store,
+            evidence_mode="single_operator_dev",
         )
         for index in range(4):
             mesh.register_local_signer(f"c3-agent-{index}")

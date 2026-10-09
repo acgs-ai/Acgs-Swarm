@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +19,12 @@ class PeerAssignment:
     peers: tuple[str, ...]
     constitutional_hash: str
     timestamp: float
+    task_id: str = ""
     is_recovered: bool = False
+    assigned_peers_hash: str = ""
+    assigned_peer_count: int = 0
+    quorum: int = 0
+    evidence_mode: Literal["independent", "single_operator_dev"] | None = None
 
 
 @dataclass

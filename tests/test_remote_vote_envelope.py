@@ -53,6 +53,9 @@ def _build_signed_request(
             voter_public_key=peer.public_key_hex,
             nonce=nonce,
             timestamp=timestamp,
+            task_id=assignment.task_id,
+            assigned_peers=assignment.peers,
+            quorum=2,
         )
     ).hex()
     return (
@@ -71,6 +74,9 @@ def _build_signed_request(
             timestamp=timestamp,
             request_signer_public_key=mesh.get_request_signing_public_key(),
             request_signature=signature,
+            task_id=assignment.task_id,
+            assigned_peers=assignment.peers,
+            quorum=2,
         ),
     )
 
@@ -129,7 +135,7 @@ def test_missing_nonce_or_timestamp_is_rejected_with_clear_error() -> None:
 
     with pytest.raises(ValueError, match="missing nonce"):
         ConstitutionalMesh.verify_remote_vote_request(replace(request, nonce=""))
-    with pytest.raises(ValueError, match="missing timestamp"):
+    with pytest.raises(ValueError, match="timestamp must be a finite float"):
         ConstitutionalMesh.verify_remote_vote_request(
             replace(request, timestamp=None),  # type: ignore[arg-type]
         )

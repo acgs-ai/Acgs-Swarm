@@ -14,7 +14,7 @@ from constitutional_swarm.bittensor.protocol import EscalationType
 from constitutional_swarm.bittensor.rule_codifier import PrecedentCluster, RuleCodifier
 from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
 from constitutional_swarm.bittensor.synapses import JudgmentSynapse, ValidationSynapse
-from constitutional_swarm.mesh.settlement import MeshProof, _compute_merkle_root
+from constitutional_swarm.mesh.settlement import MeshProof
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 from acgs_lite import Constitution
 from constitutional_swarm import ConstitutionalMesh
@@ -33,16 +33,27 @@ from constitutional_swarm.bittensor.axon_server import MinerAxonServer
 from constitutional_swarm.bittensor.emission_calculator import MinerEmissionInput
 from constitutional_swarm.bittensor.governance_coordinator import CoordinatorConfig, GovernanceCoordinator
 from constitutional_swarm.bittensor.protocol import MinerTier
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_registry,
+    c14_precedent_test_store,
+)
 
 
 class _GuardTrackingStore(PrecedentStore):
     def __init__(self, constitutional_hash: str) -> None:
-        super().__init__(constitutional_hash)
+        super().__init__(
+            constitutional_hash,
+            vote_registry=c14_precedent_test_registry(),
+        )
         self.guarded_source_sets: list[tuple[str, ...]] = []
 
     def guard_active_sources(self, precedent_ids):  # type: ignore[no-untyped-def]
         self.guarded_source_sets.append(tuple(precedent_ids))
         return super().guard_active_sources(precedent_ids)
+
+
+PrecedentStore = c14_precedent_test_store
 
 def _admission_record(
     *,
@@ -54,7 +65,7 @@ def _admission_record(
     judgment: str = "deny unsafe request",
     vector: dict[str, float] | None = None,
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
         task_id=task_id,
         miner_uid="miner-admission",
@@ -62,7 +73,6 @@ def _admission_record(
         reasoning="constitutional rationale",
         votes_for=votes_for,
         votes_against=votes_against,
-        proof_root_hash="proof-admission",
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=vector or {"safety": 0.9, "security": 0.8},
         constitutional_hash=constitutional_hash,
@@ -136,7 +146,7 @@ def test_admission_source_identity_cannot_be_replayed_with_one_changed_id(
     replay = dataclasses.replace(
         record, precedent_id="replayed-id", case_id=case_id, task_id=task_id
     )
-    with pytest.raises(ValueError, match="already|duplicate"):
+    with pytest.raises(ValueError, match="already|duplicate|binding"):
         store.add(replay)
     assert store.size == 1
 
@@ -472,6 +482,7 @@ def _nmc_mesh(constitution: Constitution, *, quorum: int) -> ConstitutionalMesh:
         peers_per_validation=3,
         quorum=quorum,
         seed=42,
+        evidence_mode="single_operator_dev",
     )
     mesh.register_local_signer("producer")
     for index in range(3):
@@ -516,12 +527,12 @@ def test_cascade_rejects_mesh_settlement_below_required_miner_quorum() -> None:
     candidate = _nmc_run_cascade(cascade)
 
     assert candidate.alive is False
-    assert candidate.stage_results[-1].stage is CascadeStage.MULTI_MINER_CONSENSUS
+    assert candidate.stage_results[-1].stage is CascadeStage.MESH_VALIDATION
     assert candidate.stage_results[-1].passed is False
-    assert "2/3" in candidate.stage_results[-1].detail
+    assert "invalid or unbound mesh settlement" in candidate.stage_results[-1].detail
 
 
-def test_cascade_accepts_real_signature_verified_three_miner_quorum() -> None:
+def test_cascade_rejects_single_operator_dev_mesh_evidence() -> None:
     constitution = Constitution.default()
     mesh = _nmc_mesh(constitution, quorum=3)
     cascade = PrecedentCascade(
@@ -533,11 +544,11 @@ def test_cascade_accepts_real_signature_verified_three_miner_quorum() -> None:
 
     candidate = _nmc_run_cascade(cascade)
 
-    assert candidate.alive is True
-    assert [result.stage for result in candidate.stage_results] == STAGE_ORDER
-    assert candidate.stage_results[1].passed is True
-    assert candidate.stage_results[2].passed is True
-    assert cascade.accept(candidate) is not None
+    assert candidate.alive is False
+    assert [result.stage for result in candidate.stage_results] == STAGE_ORDER[:2]
+    assert candidate.stage_results[0].passed is True
+    assert candidate.stage_results[-1].passed is False
+    assert cascade.accept(candidate) is None
 
 
 def test_cascade_accept_rejects_forged_completed_candidate() -> None:
@@ -665,7 +676,7 @@ def test_cascade_consensus_configuration_is_validated(kwargs, message) -> None:
         PrecedentCascade(Constitution.default(), **kwargs)
 
 
-def test_cascade_accept_is_instance_bound_and_single_use() -> None:
+def test_cascade_rejected_candidate_cannot_be_accepted() -> None:
     constitution = Constitution.default()
     cascade = PrecedentCascade(
         constitution,
@@ -675,7 +686,6 @@ def test_cascade_accept_is_instance_bound_and_single_use() -> None:
     candidate = _nmc_run_cascade(cascade)
 
     assert cascade.accept(dataclasses.replace(candidate)) is None
-    assert cascade.accept(candidate) is not None
     assert cascade.accept(candidate) is None
 
 
@@ -773,6 +783,13 @@ def test_codifier_guards_sources_during_each_state_transition() -> None:
 
 
 def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-def]
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from constitutional_swarm.mesh.vote_envelope import (
+        compute_vote_envelope_root,
+        sign_vote_envelope,
+        vote_envelope_hash,
+    )
+
     case = owner.package_case(
         "proof-bound safety conflict",
         "safety",
@@ -789,13 +806,39 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
     )
     assignment_id = "assignment-proof"
     content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
-    vote_hashes = tuple(hashlib.sha256(f"vote-{i}".encode()).hexdigest()[:32] for i in range(5))
-    root_hash = _compute_merkle_root(
-        assignment_id,
-        content_hash,
-        owner.constitution_hash,
-        vote_hashes,
-        True,
+    assigned_peers = tuple(f"c14-test-voter-{index}" for index in range(5))
+    envelopes = tuple(
+        sign_vote_envelope(
+            Ed25519PrivateKey.from_private_bytes(
+                hashlib.sha256(f"c14-test-voter-{index}".encode()).digest()
+            ),
+            voter_id=f"c14-test-voter-{index}",
+            task_id=case.synapse.task_id,
+            assignment_id=assignment_id,
+            producer_id=judgment.miner_uid,
+            artifact_id=judgment.artifact_hash,
+            content_hash=content_hash,
+            constitutional_hash=owner.constitution_hash,
+            decision="approved" if index < 3 else "denied",
+            reason="C4 signed fixture vote",
+            nonce=f"c4-{case.synapse.task_id}-{index}",
+            issued_at=float(index + 1),
+            assigned_peers=assigned_peers,
+            quorum=3,
+        )
+        for index in range(5)
+    )
+    ordered = tuple(sorted(envelopes, key=lambda item: (item.voter_id, item.key_id)))
+    vote_hashes = tuple(vote_envelope_hash(item) for item in ordered)
+    root_hash = compute_vote_envelope_root(
+        task_id=case.synapse.task_id,
+        assignment_id=assignment_id,
+        producer_id=judgment.miner_uid,
+        artifact_id=judgment.artifact_hash,
+        content_hash=content_hash,
+        constitutional_hash=owner.constitution_hash,
+        accepted=True,
+        envelopes=ordered,
     )
     proof = MeshProof(
         assignment_id=assignment_id,
@@ -805,6 +848,9 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
         root_hash=root_hash,
         accepted=True,
         timestamp=time.time(),
+        task_id=case.synapse.task_id,
+        producer_id=judgment.miner_uid,
+        artifact_id=judgment.artifact_hash,
     )
     assert proof.verify()
     validation = ValidationSynapse(
@@ -819,12 +865,16 @@ def _proof_bound_owner_inputs(owner: SubnetOwner):  # type: ignore[no-untyped-de
         proof_content_hash=proof.content_hash,
         constitutional_hash=owner.constitution_hash,
         timestamp=proof.timestamp,
+        vote_envelopes=envelopes,
     )
     return case, judgment, validation
 
 
 def test_subnet_owner_accepts_complete_judgment_bound_mesh_proof(tmp_path) -> None:
-    owner = SubnetOwner(_admission_constitution_file(tmp_path))
+    owner = SubnetOwner(
+        _admission_constitution_file(tmp_path),
+        vote_registry=c14_precedent_test_registry(),
+    )
     case, judgment, validation = _proof_bound_owner_inputs(owner)
     precedent = owner.record_result(case, judgment, validation)
     assert precedent is not None
@@ -1112,7 +1162,7 @@ class TestC4ReviewProtocol:
         candidate = _nmc_run_cascade(cascade)
 
         assert candidate.alive is False
-        assert candidate.current_stage is CascadeStage.CONSTITUTIONAL_COMPATIBILITY
+        assert candidate.current_stage is CascadeStage.MULTI_MINER_CONSENSUS
         assert candidate.candidate_id not in cascade._issued
         assert candidate.candidate_id not in cascade._mesh_results
 

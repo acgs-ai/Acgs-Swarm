@@ -12,6 +12,10 @@ from constitutional_swarm.bittensor.authenticity_detector import (
 )
 from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store as PrecedentStore,
+)
 
 CONST_HASH = "608508a9bd224290"
 
@@ -303,7 +307,7 @@ class TestPrecedentCompatibility:
     def test_similar_precedent_boosts_score(self):
         det = AuthenticityDetector()
         store = PrecedentStore(CONST_HASH)
-        rec = PrecedentRecord.create(
+        rec = c14_precedent_signed_record(
             case_id="c1",
             task_id="t1",
             miner_uid="m",
@@ -311,7 +315,6 @@ class TestPrecedentCompatibility:
             reasoning="ECHR applies",
             votes_for=3,
             votes_against=2,
-            proof_root_hash="abc",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=_PRIVACY_VEC,
             constitutional_hash=CONST_HASH,
@@ -327,7 +330,7 @@ class TestPrecedentCompatibility:
     def test_high_similarity_flag(self):
         det = AuthenticityDetector()
         store = PrecedentStore(CONST_HASH)
-        rec = PrecedentRecord.create(
+        rec = c14_precedent_signed_record(
             case_id="c1",
             task_id="t1",
             miner_uid="m",
@@ -335,7 +338,6 @@ class TestPrecedentCompatibility:
             reasoning="reason",
             votes_for=3,
             votes_against=2,
-            proof_root_hash="abc",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=_PRIVACY_VEC,
             constitutional_hash=CONST_HASH,

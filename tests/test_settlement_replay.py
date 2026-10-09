@@ -27,9 +27,10 @@ def _make_mesh(
     mesh = ConstitutionalMesh(
         constitution,
         peers_per_validation=3,
-        quorum=2,
+        quorum=3,
         seed=seed,
         settlement_store=store,
+        evidence_mode="single_operator_dev",
     )
     for index in range(5):
         mesh.register_local_signer(f"agent-{index:02d}")
@@ -38,7 +39,7 @@ def _make_mesh(
 
 def _settle_assignment(mesh: ConstitutionalMesh, artifact_id: str) -> str:
     assignment = mesh.request_validation("agent-00", "safe output", artifact_id)
-    for peer_id in assignment.peers[:2]:
+    for peer_id in assignment.peers:
         signature = mesh.sign_vote(
             assignment.assignment_id,
             peer_id,
@@ -93,7 +94,13 @@ def test_retry_pending_settlements_skips_recovered_entries(tmp_path, store_facto
     assignment_id = _settle_assignment(writer, "art-retry-skip")
     recovered_record = store.load_all()[0]
 
-    reader = ConstitutionalMesh(constitution, seed=53, settlement_store=store)
+    reader = ConstitutionalMesh(
+        constitution,
+        seed=53,
+        settlement_store=store,
+        quorum=3,
+        vote_registry=writer.vote_registry,
+    )
     store.mark_pending(replace(recovered_record, is_recovered=False))
 
     report = reader.retry_pending_settlements()
@@ -116,7 +123,13 @@ def test_recovered_assignment_round_trips_from_store(tmp_path, store_factory) ->
 
     assignment_id = _settle_assignment(writer, "art-round-trip")
 
-    reader = ConstitutionalMesh(constitution, seed=61, settlement_store=store)
+    reader = ConstitutionalMesh(
+        constitution,
+        seed=61,
+        settlement_store=store,
+        quorum=3,
+        vote_registry=writer.vote_registry,
+    )
     restored = reader.get_result(assignment_id)
 
     assert restored.settled is True

@@ -11,16 +11,14 @@ The SN Owner:
 Bittensor SDK is NOT required — this module uses constitutional_swarm
 primitives only.
 
-Accepted results are checked for field, judgment-content, and Merkle-root
-coherence before admission. These checks do not establish signed validator
-identity or cryptographic task provenance; the validation producer remains
-responsible for those properties.
+Accepted results are admitted only after independently verifying authorized
+voter signatures, task and artifact bindings, judgment content, canonical
+proof root, and tallies recomputed from the signed vote envelopes.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -39,7 +37,11 @@ from constitutional_swarm.bittensor.synapses import (
     ValidationSynapse,
 )
 from constitutional_swarm.compiler import DAGCompiler, GoalSpec
-from constitutional_swarm.mesh.settlement import MeshProof
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteSignerRegistry,
+    normalize_voter_id,
+    vote_envelope_hash,
+)
 from constitutional_swarm.swarm import TaskDAG
 
 
@@ -56,9 +58,9 @@ class EscalatedCase:
 class SubnetOwner:
     """Bittensor SN Owner runtime for constitutional governance subnet.
 
-    Accepted validation proofs are checked for field, content-hash, tally, and
-    Merkle-root coherence. This owner does not verify signed voter identities
-    or cryptographically bind validator votes to task provenance.
+    Accepted validation proofs are checked against an independently provisioned
+    voter trust registry and cryptographically bound to the task, artifact,
+    producer, judgment content, and constitution before precedent admission.
 
     Usage:
         owner = SubnetOwner(constitution_path="governance.yaml")
@@ -84,6 +86,7 @@ class SubnetOwner:
         *,
         dag_compiler: DAGCompiler | None = None,
         precedent_store: PrecedentStore | None = None,
+        vote_registry: VoteSignerRegistry | None = None,
     ) -> None:
         self._constitution = Constitution.from_yaml(constitution_path)
         self._compiler = dag_compiler or DAGCompiler()
@@ -94,7 +97,22 @@ class SubnetOwner:
             and precedent_store.constitutional_hash != self._constitution.hash
         ):
             raise ValueError("PrecedentStore constitutional hash does not match owner constitution")
-        self._precedent_store = precedent_store or PrecedentStore(self._constitution.hash)
+        if (
+            precedent_store is not None
+            and vote_registry is not None
+            and (
+                precedent_store.vote_registry is None
+                or precedent_store.vote_registry.trust_grants(role="voter")
+                != vote_registry.trust_grants(role="voter")
+            )
+        ):
+            raise ValueError(
+                "PrecedentStore and owner voter trust grants must match"
+            )
+        self._precedent_store = precedent_store or PrecedentStore(
+            self._constitution.hash,
+            vote_registry=vote_registry,
+        )
         self._active_cases: dict[str, EscalatedCase] = {}
 
     @property
@@ -207,11 +225,23 @@ class SubnetOwner:
             or validation.constitutional_hash != expected_hash
         ):
             raise ValueError("Case, judgment, and validation constitutional hash must match")
-        if validation.accepted and not validation.quorum_met:
-            raise ValueError("Accepted validation must have validator quorum")
-        if validation.accepted:
-            self._verify_validation_proof(judgment, validation)
-
+        if not validation.quorum_met:
+            raise ValueError("Completed validation evidence must have validator quorum")
+        self._precedent_store.verify_validation_evidence(
+            task_id=task_id,
+            producer_id=judgment.miner_uid,
+            judgment=judgment.judgment,
+            votes_for=validation.votes_for,
+            votes_against=validation.votes_against,
+            accepted=validation.accepted,
+            proof_root_hash=validation.proof_root_hash,
+            assignment_id=validation.assignment_id,
+            artifact_id=judgment.artifact_hash,
+            content_hash=validation.proof_content_hash,
+            constitutional_hash=expected_hash,
+            vote_envelopes=validation.vote_envelopes,
+        )
+        self._verify_validation_proof(judgment, validation)
         if validation.accepted:
             precedent = PrecedentRecord.create(
                 case_id=case.case_id,
@@ -226,8 +256,12 @@ class SubnetOwner:
                 impact_vector=dict(case.synapse.impact_vector),
                 constitutional_hash=expected_hash,
                 ambiguous_dimensions=tuple(sorted(case.synapse.impact_vector)),
+                assignment_id=validation.assignment_id,
+                artifact_id=judgment.artifact_hash,
+                content_hash=validation.proof_content_hash,
+                vote_envelopes=validation.vote_envelopes,
             )
-            self._precedent_store.add(precedent)
+            precedent = self._precedent_store.admit(precedent)
 
         self._metrics.total_judgments += 1
         self._metrics.total_validations += 1
@@ -274,25 +308,21 @@ class SubnetOwner:
             raise ValueError("validation proof vote hashes must be non-empty")
         if len(set(vote_hashes)) != len(vote_hashes):
             raise ValueError("validation proof vote hashes must be distinct")
-        total_votes = validation.votes_for + validation.votes_against
-        if len(vote_hashes) != total_votes:
+        if len(vote_hashes) != len(validation.vote_envelopes):
             raise ValueError("validation proof vote count must match the validation tally")
 
         expected_content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
-        if not hmac.compare_digest(validation.proof_content_hash, expected_content_hash):
+        if validation.proof_content_hash != expected_content_hash:
             raise ValueError("validation proof content hash does not bind the judgment")
-
-        proof = MeshProof(
-            assignment_id=validation.assignment_id,
-            content_hash=validation.proof_content_hash,
-            constitutional_hash=validation.constitutional_hash,
-            vote_hashes=vote_hashes,
-            root_hash=validation.proof_root_hash,
-            accepted=validation.accepted,
-            timestamp=validation.timestamp,
+        expected_vote_hashes = tuple(
+            vote_envelope_hash(envelope)
+            for envelope in sorted(
+                validation.vote_envelopes,
+                key=lambda envelope: (normalize_voter_id(envelope.voter_id), envelope.key_id),
+            )
         )
-        if not proof.verify():
-            raise ValueError("validation proof root hash is invalid")
+        if vote_hashes != expected_vote_hashes:
+            raise ValueError("validation proof vote hashes do not match signed vote envelopes")
 
     def summary(self) -> dict[str, Any]:
         """SN Owner operational summary."""

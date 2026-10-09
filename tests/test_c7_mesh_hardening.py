@@ -467,6 +467,9 @@ def _c7_mesh_with_agents(**kwargs):
     from acgs_lite import Constitution
     from constitutional_swarm.mesh import ConstitutionalMesh
 
+    kwargs.setdefault("evidence_mode", "single_operator_dev")
+    if "settlement_store" in kwargs or "settlement_store_path" in kwargs:
+        kwargs.setdefault("quorum", 3)
     mesh = ConstitutionalMesh(Constitution.default(), seed=17, **kwargs)
     for agent_id in ("a", "b", "c", "d"):
         mesh.register_local_signer(agent_id)
@@ -637,7 +640,9 @@ class TestC7MeshConstitutionBoundaries:
         writer = _c7_mesh_with_agents(settlement_store_path=path)
         settled = writer.full_validation("a", "safe output", "artifact")
 
-        reader = ConstitutionalMesh(_c7_other_constitution(), settlement_store_path=path)
+        reader = ConstitutionalMesh(
+            _c7_other_constitution(), quorum=3, settlement_store_path=path
+        )
 
         try:
             reader.get_result(settled.assignment_id)
@@ -798,8 +803,10 @@ class TestC7MeshCapacity:
 
         reader = ConstitutionalMesh(
             writer._constitution,
+            quorum=3,
             settlement_store_path=path,
             max_settled_results=1,
+            vote_registry=writer.vote_registry,
         )
 
         assert len(reader._final_results) == 1
@@ -1252,6 +1259,8 @@ class TestC7Runtime:
 
 
 class TestC7ResumeMeshReview:
+    _vote_registries = {}
+
     class _CapturingStore:
         def __init__(self, *, fail_append=False, block_mark_pending=False, block_append=False):
             import threading
@@ -1301,15 +1310,30 @@ class TestC7ResumeMeshReview:
         import pytest
 
         from constitutional_swarm.mesh import ConstitutionalMesh, SettlementPersistenceError
+        from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
         store = cls._CapturingStore(fail_append=True)
-        mesh = ConstitutionalMesh(constitution, seed=917, settlement_store=store)
+        registry = VoteSignerRegistry()
+        mesh = ConstitutionalMesh(
+            constitution,
+            seed=917,
+            quorum=3,
+            settlement_store=store,
+            vote_registry=registry,
+            evidence_mode="single_operator_dev",
+        )
         for agent_id in ("a", "b", "c", "d"):
             mesh.register_local_signer(agent_id)
         with pytest.raises(SettlementPersistenceError):
             mesh.full_validation("a", "safe output", artifact_id)
         assert len(store.pending) == 1
-        return next(iter(store.pending.values()))
+        record = next(iter(store.pending.values()))
+        cls._vote_registries[str(record.assignment["assignment_id"])] = registry
+        return record
+
+    @classmethod
+    def _registry_for(cls, record):
+        return cls._vote_registries[str(record.assignment["assignment_id"])]
 
     @staticmethod
     def _store(kind, path):
@@ -1344,7 +1368,7 @@ class TestC7ResumeMeshReview:
         original_constitution = mesh._constitution
         assignment = mesh.request_validation("a", "safe output", "settle-race")
         monkeypatch.setattr(mesh, "_maybe_finalize_result", lambda _assignment_id: False)
-        for voter in assignment.peers[:2]:
+        for voter in assignment.peers:
             mesh.validate_and_vote(assignment.assignment_id, voter)
 
         errors = []
@@ -1385,8 +1409,10 @@ class TestC7ResumeMeshReview:
         mesh = ConstitutionalMesh(
             constitution,
             seed=919,
+            quorum=3,
             settlement_store=store,
             auto_reconcile=False,
+            vote_registry=self._registry_for(record),
         )
         reports = []
 
@@ -1425,7 +1451,13 @@ class TestC7ResumeMeshReview:
             store = self._store(kind, tmp_path / f"mixed-{kind}")
             store.append(historical_record)
             store.append(current_record)
-            mesh = ConstitutionalMesh(current, settlement_store=store, auto_reconcile=False)
+            mesh = ConstitutionalMesh(
+                current,
+                quorum=3,
+                settlement_store=store,
+                auto_reconcile=False,
+                vote_registry=self._registry_for(current_record),
+            )
 
             assert mesh.get_result(current_id).constitutional_hash == current.hash
             with pytest.raises(KeyError):
@@ -1466,6 +1498,7 @@ class TestC7ResumeMeshReview:
                 with pytest.raises(ValueError, match="constitutional hash"):
                     ConstitutionalMesh(
                         constitution,
+                        quorum=3,
                         settlement_store=store,
                         auto_reconcile=False,
                     )
@@ -1481,6 +1514,7 @@ class TestC7ResumeMeshReview:
         store.mark_pending(record)
         mesh = ConstitutionalMesh(
             Constitution.default(),
+            quorum=3,
             settlement_store=store,
             auto_reconcile=False,
         )
@@ -1548,8 +1582,10 @@ class TestC7ResumeMeshReview:
             mesh = ConstitutionalMesh(
                 constitution,
                 seed=923,
+                quorum=3,
                 settlement_store=store,
                 auto_reconcile=False,
+                vote_registry=self._registry_for(record),
             )
             reports = []
 
@@ -1593,8 +1629,10 @@ class TestC7ResumeMeshReview:
         store = JSONLSettlementStore(tmp_path / "durable-conflict.jsonl")
         mesh = ConstitutionalMesh(
             constitution,
+            quorum=3,
             settlement_store=store,
             auto_reconcile=False,
+            vote_registry=self._registry_for(pending),
         )
         conflicting = replace(
             pending,
@@ -2137,7 +2175,8 @@ class TestC7CurrentMeshRepair:
         assert record is not None
         assert record.votes
         assert all(vote["signature"] for vote in record.votes)
-        assert all(vote["public_key_hex"] for vote in record.votes)
+        assert all(vote["key_id"] for vote in record.votes)
+        assert all("public_key_hex" not in vote for vote in record.votes)
 
     def test_normal_settlement_retains_votes_in_jsonl_and_sqlite(self, tmp_path):
         for backend in ("jsonl", "sqlite"):

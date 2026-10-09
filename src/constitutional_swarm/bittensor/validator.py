@@ -14,6 +14,7 @@ primitives only.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
@@ -21,6 +22,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from acgs_lite import Constitution
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from constitutional_swarm.bittensor._validation import _validate_finite
 from constitutional_swarm.bittensor.emission_calculator import (
@@ -32,6 +37,12 @@ from constitutional_swarm.bittensor.emission_calculator import (
 from constitutional_swarm.bittensor.protocol import MinerTier, ValidatorConfig
 from constitutional_swarm.bittensor.synapses import JudgmentSynapse, ValidationSynapse
 from constitutional_swarm.mesh import ConstitutionalMesh, MeshResult
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteSignerRegistry,
+    normalize_voter_id,
+    verify_vote_envelopes,
+    vote_envelope_hash,
+)
 
 
 @dataclass
@@ -59,6 +70,33 @@ class ValidatorStats:
 
 class UnknownMinerError(ValueError):
     """Raised when an unregistered miner submits a judgment."""
+
+
+def _vote_private_key(
+    value: Ed25519PrivateKey | bytes | str | None,
+) -> Ed25519PrivateKey:
+    """Canonicalize locally managed vote-signing key material."""
+    if value is None:
+        return Ed25519PrivateKey.generate()
+    if isinstance(value, Ed25519PrivateKey):
+        return value
+    if isinstance(value, str):
+        if (
+            len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("vote private key must be 64 lowercase hex chars")
+        try:
+            value = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError("vote private key must be 64 lowercase hex chars") from exc
+    if not isinstance(value, bytes):
+        raise TypeError("vote private key must be Ed25519 key material")
+    try:
+        return Ed25519PrivateKey.from_private_bytes(value)
+    except ValueError as exc:
+        raise ValueError("vote private key must contain exactly 32 bytes") from exc
 
 
 def _validate_manifold_snapshot(
@@ -181,7 +219,12 @@ class ConstitutionalValidator:
         weights = validator.compute_emission_weights()
     """
 
-    def __init__(self, config: ValidatorConfig) -> None:
+    def __init__(
+        self,
+        config: ValidatorConfig,
+        *,
+        vote_registry: VoteSignerRegistry | None = None,
+    ) -> None:
         self._config = config
         self._constitution = Constitution.from_yaml(config.constitution_path)
         self._mesh = ConstitutionalMesh(
@@ -189,12 +232,18 @@ class ConstitutionalValidator:
             peers_per_validation=config.peers_per_validation,
             quorum=config.quorum,
             use_manifold=config.use_manifold,
+            complete_evidence=config.complete_evidence,
+            vote_registry=vote_registry,
+            evidence_mode=(
+                "single_operator_dev" if config.single_operator_dev else "independent"
+            ),
         )
         self._stats = ValidatorStats()
         self._stats_lock = threading.Lock()
         self._known_miners: set[str] = set()
         self._miner_tiers: dict[str, MinerTier] = {}
         self._miner_domains: dict[str, str] = {}
+        self._miner_vote_private_keys: dict[str, Ed25519PrivateKey] = {}
         self._previous_hash: str | None = None
         self._registry_lock = threading.RLock()
 
@@ -222,10 +271,31 @@ class ConstitutionalValidator:
                 peers_per_validation=self._config.peers_per_validation,
                 quorum=self._config.quorum,
                 use_manifold=self._config.use_manifold,
+                complete_evidence=self._config.complete_evidence,
+                vote_registry=self._mesh.vote_registry,
+                evidence_mode=(
+                    "single_operator_dev"
+                    if self._config.single_operator_dev
+                    else "independent"
+                ),
             )
             for miner_uid in self._known_miners:
                 domain = self._miner_domains.get(miner_uid, "")
-                new_mesh.register_local_signer(miner_uid, domain=domain)
+                private_key = self._miner_vote_private_keys.get(miner_uid)
+                if private_key is not None:
+                    new_mesh.register_local_signer(
+                        miner_uid,
+                        domain=domain,
+                        vote_private_key=private_key,
+                    )
+                else:
+                    new_mesh.register_remote_agent(
+                        miner_uid,
+                        domain=domain,
+                        vote_public_key=bytes.fromhex(
+                            self._mesh.get_vote_public_key(miner_uid)
+                        ),
+                    )
             self._constitution = new_constitution
             self._mesh = new_mesh
             self._previous_hash = old_hash
@@ -245,25 +315,70 @@ class ConstitutionalValidator:
         miner_uid: str,
         domain: str = "",
         tier: MinerTier = MinerTier.APPRENTICE,
+        *,
+        vote_private_key: Ed25519PrivateKey | bytes | str | None = None,
+        vote_public_key: Ed25519PublicKey | bytes | str | None = None,
     ) -> None:
         """Register a miner as a mesh participant.
 
         Adds the miner to the known set, mesh, tier map, and domain map.
         Only miners registered via this method may submit judgments.
         """
+        canonical_uid = normalize_voter_id(miner_uid)
         with self._registry_lock:
-            self._mesh.register_local_signer(miner_uid, domain=domain)
-            self._known_miners.add(miner_uid)
-            self._miner_tiers[miner_uid] = tier
-            self._miner_domains[miner_uid] = domain
+            if canonical_uid in self._known_miners:
+                raise ValueError(f"canonical miner identity {canonical_uid!r} is already registered")
+            if self._config.single_operator_dev:
+                if vote_public_key is not None:
+                    raise ValueError(
+                        "single-operator dev registration accepts a local private key, "
+                        "not a remote public key"
+                    )
+                private_key = _vote_private_key(vote_private_key)
+            else:
+                if vote_private_key is not None:
+                    raise ValueError(
+                        "default validator mode refuses voter private keys; provision "
+                        "the remote voter's public key"
+                    )
+                if vote_public_key is None:
+                    if self._miner_vote_private_keys:
+                        raise ValueError(
+                            "default validator mode may hold only its own local identity key; "
+                            "provision every voter with a remote public key"
+                        )
+                    private_key = _vote_private_key(None)
+                else:
+                    private_key = None
+            if private_key is None:
+                if vote_public_key is None:
+                    raise RuntimeError("remote voter registration requires a public key")
+                self._mesh.register_remote_agent(
+                    canonical_uid,
+                    domain=domain,
+                    vote_public_key=vote_public_key,
+                )
+            else:
+                self._mesh.register_local_signer(
+                    canonical_uid,
+                    domain=domain,
+                    vote_private_key=private_key,
+                )
+            self._known_miners.add(canonical_uid)
+            self._miner_tiers[canonical_uid] = tier
+            self._miner_domains[canonical_uid] = domain
+            if private_key is not None:
+                self._miner_vote_private_keys[canonical_uid] = private_key
 
     def unregister_miner(self, miner_uid: str) -> None:
         """Remove a miner from the mesh."""
+        canonical_uid = normalize_voter_id(miner_uid)
         with self._registry_lock:
-            self._mesh.unregister_agent(miner_uid)
-            self._known_miners.discard(miner_uid)
-            self._miner_tiers.pop(miner_uid, None)
-            self._miner_domains.pop(miner_uid, None)
+            self._mesh.unregister_agent(canonical_uid)
+            self._known_miners.discard(canonical_uid)
+            self._miner_tiers.pop(canonical_uid, None)
+            self._miner_domains.pop(canonical_uid, None)
+            self._miner_vote_private_keys.pop(canonical_uid, None)
 
     def validate(self, synapse: JudgmentSynapse) -> ValidationSynapse:
         """Validate a miner's governance judgment.
@@ -287,13 +402,14 @@ class ConstitutionalValidator:
             UnknownMinerError: If the miner is not pre-registered.
         """
         start = time.monotonic()
+        producer_id = normalize_voter_id(synapse.miner_uid)
 
         with self._registry_lock:
             current_hash = self._constitution.hash
             accepted_hashes = {current_hash}
             if self._previous_hash is not None:
                 accepted_hashes.add(self._previous_hash)
-            known_miner = synapse.miner_uid in self._known_miners
+            known_miner = producer_id in self._known_miners
             mesh = self._mesh
 
         if synapse.constitutional_hash not in accepted_hashes:
@@ -316,11 +432,18 @@ class ConstitutionalValidator:
                 f"Call register_miner() before submitting judgments."
             )
 
+        if not self._config.single_operator_dev:
+            raise RuntimeError(
+                "default validator mode uses remote public-key voters; call "
+                "validate_remote() with explicit peer routes"
+            )
+
         # Step 3: Full mesh validation
         result = mesh.full_validation(
-            producer_id=synapse.miner_uid,
+            producer_id=producer_id,
             content=synapse.judgment,
             artifact_id=synapse.artifact_hash,
+            task_id=synapse.task_id,
         )
 
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -333,7 +456,64 @@ class ConstitutionalValidator:
                 self._stats.judgments_rejected += 1
 
         # Step 4: Build ValidationSynapse
-        return self._result_to_synapse(synapse.task_id, result)
+        return self._result_to_synapse(synapse, result)
+
+    async def validate_remote(
+        self,
+        synapse: JudgmentSynapse,
+        *,
+        peer_routes: dict[str, tuple[str, int]],
+        client: Any | None = None,
+        timeout: float = 5.0,
+    ) -> ValidationSynapse:
+        """Validate by collecting signatures from public-key-only remote voters."""
+        start = time.monotonic()
+        producer_id = normalize_voter_id(synapse.miner_uid)
+        with self._registry_lock:
+            current_hash = self._constitution.hash
+            accepted_hashes = {current_hash}
+            if self._previous_hash is not None:
+                accepted_hashes.add(self._previous_hash)
+            known_miner = producer_id in self._known_miners
+            mesh = self._mesh
+        if synapse.constitutional_hash not in accepted_hashes:
+            with self._stats_lock:
+                self._stats.constitution_mismatches += 1
+            return ValidationSynapse(
+                task_id=synapse.task_id,
+                assignment_id="",
+                accepted=False,
+                votes_for=0,
+                votes_against=0,
+                quorum_met=False,
+                constitutional_hash=current_hash,
+            )
+        if not known_miner:
+            raise UnknownMinerError(
+                f"Miner {synapse.miner_uid!r} is not registered. "
+                f"Call register_miner() before submitting judgments."
+            )
+        assignment = mesh.request_validation(
+            producer_id,
+            synapse.judgment,
+            synapse.artifact_hash,
+            task_id=synapse.task_id,
+        )
+        result = await mesh.collect_remote_votes(
+            assignment.assignment_id,
+            peer_routes=peer_routes,
+            client=client,
+            timeout=timeout,
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        with self._stats_lock:
+            self._stats.total_validation_time_ms += elapsed_ms
+            self._stats.validations_performed += 1
+            if result.accepted:
+                self._stats.judgments_accepted += 1
+            else:
+                self._stats.judgments_rejected += 1
+        return self._result_to_synapse(synapse, result)
 
     def compute_emission_weights(
         self,
@@ -421,20 +601,89 @@ class ConstitutionalValidator:
 
     def _result_to_synapse(
         self,
-        task_id: str,
+        judgment: JudgmentSynapse,
         result: MeshResult,
     ) -> ValidationSynapse:
         proof = result.proof
-        return ValidationSynapse(
-            task_id=task_id,
+        producer_id = normalize_voter_id(judgment.miner_uid)
+        content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
+        with self._registry_lock:
+            current_constitutional_hash = self._constitution.hash
+            mesh = self._mesh
+            vote_registry = mesh.vote_registry
+        authoritative_result = mesh.get_result(result.assignment_id)
+        expected_assigned_peers = tuple(
+            envelope.voter_id for envelope in authoritative_result.vote_envelopes
+        )
+        if result.constitutional_hash != current_constitutional_hash:
+            raise ValueError("mesh result constitution does not match validator constitution")
+        verified_envelopes = verify_vote_envelopes(
+            result.vote_envelopes,
+            vote_registry,
+            task_id=judgment.task_id,
             assignment_id=result.assignment_id,
-            accepted=result.accepted,
-            votes_for=result.votes_for,
-            votes_against=result.votes_against,
-            quorum_met=result.quorum_met,
-            proof_root_hash=proof.root_hash if proof else "",
-            proof_vote_hashes=proof.vote_hashes if proof else (),
-            proof_content_hash=proof.content_hash if proof else "",
+            producer_id=producer_id,
+            artifact_id=judgment.artifact_hash,
+            content_hash=content_hash,
             constitutional_hash=result.constitutional_hash,
+            expected_assigned_peers=expected_assigned_peers,
+            require_independent=not self._config.single_operator_dev,
+        )
+        if verified_envelopes != authoritative_result.vote_envelopes:
+            raise ValueError("vote envelopes differ from authoritative mesh evidence")
+        votes_for = sum(
+            envelope.decision == "approved" for envelope in verified_envelopes
+        )
+        votes_against = len(verified_envelopes) - votes_for
+        signed_quorum = verified_envelopes[0].quorum
+        strict_majority = len(verified_envelopes) // 2 + 1
+        expected_quorum = max(self._config.quorum, strict_majority)
+        if signed_quorum != expected_quorum:
+            raise ValueError("signed vote quorum does not match validator policy")
+        if (
+            self._config.complete_evidence
+            and len(verified_envelopes) < self._config.peers_per_validation
+        ):
+            raise ValueError("signed vote evidence is below the complete-evidence peer floor")
+        accepted = votes_for >= signed_quorum and votes_for >= strict_majority
+        rejected = votes_against >= signed_quorum and votes_against >= strict_majority
+        quorum_met = accepted or rejected
+        if (votes_for, votes_against) != (result.votes_for, result.votes_against):
+            raise ValueError("mesh result tally does not match signed vote envelopes")
+        if (result.accepted, result.quorum_met) != (accepted, quorum_met):
+            raise ValueError("mesh result outcome does not match signed vote envelopes")
+        if proof is None:
+            raise ValueError("mesh result is missing its protocol v2 proof")
+        ordered_envelopes = sorted(
+            verified_envelopes, key=lambda item: (item.voter_id, item.key_id)
+        )
+        expected_vote_hashes = tuple(
+            vote_envelope_hash(envelope) for envelope in ordered_envelopes
+        )
+        if (
+            proof.protocol_version != 2
+            or proof.task_id != judgment.task_id
+            or proof.assignment_id != result.assignment_id
+            or proof.producer_id != producer_id
+            or proof.artifact_id != judgment.artifact_hash
+            or proof.content_hash != content_hash
+            or proof.constitutional_hash != current_constitutional_hash
+            or proof.accepted != accepted
+            or proof.vote_hashes != expected_vote_hashes
+            or not proof.verify()
+        ):
+            raise ValueError("mesh result proof does not match signed vote envelopes")
+        return ValidationSynapse(
+            task_id=judgment.task_id,
+            assignment_id=result.assignment_id,
+            accepted=accepted,
+            votes_for=votes_for,
+            votes_against=votes_against,
+            quorum_met=quorum_met,
+            proof_root_hash=proof.root_hash,
+            proof_vote_hashes=proof.vote_hashes,
+            proof_content_hash=proof.content_hash,
+            constitutional_hash=current_constitutional_hash,
+            vote_envelopes=verified_envelopes,
             trust_update=self._mesh.manifold_summary() or {},
         )

@@ -1,4 +1,4 @@
-"""CLI entrypoint for ACGS v0.1 governance receipt verification."""
+"""CLI entrypoint for fail-closed governance receipt verification."""
 
 from __future__ import annotations
 
@@ -32,7 +32,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--trusted-signers",
         type=Path,
-        help="JSON object mapping trusted key_id values to public key hex strings.",
+        help=(
+            "JSON object mapping key IDs to objects containing identity_id, "
+            "public_key_hex, and authorized roles"
+        ),
     )
     parser.add_argument(
         "--settlement-store",
@@ -42,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--assignment-id",
         help="Assignment to verify against --settlement-store.",
+    )
+    parser.add_argument(
+        "--expected-signer-role",
+        choices=("validator", "coordinator", "settlement"),
+        help="Verifier-selected required signer role for non-settlement receipts.",
     )
     args = parser.parse_args(argv)
 
@@ -68,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
                 if path.suffix == ".db"
                 else JSONLSettlementStore(path)
             )
+            if args.expected_signer_role not in (None, "settlement"):
+                raise ValueError(
+                    "committed settlement receipts require --expected-signer-role settlement"
+                )
             verdict = verify_committed_settlement_receipt(
                 store,
                 args.assignment_id,
@@ -81,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
                 bundle,
                 report_mode=args.report_mode,
                 trusted_signers=trusted_signers,
+                expected_signer_role=args.expected_signer_role,
             )
     except Exception as exc:
         print(

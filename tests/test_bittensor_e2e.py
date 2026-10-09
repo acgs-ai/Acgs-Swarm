@@ -25,6 +25,8 @@ from constitutional_swarm.bittensor.validator import (  # noqa: E402
     ConstitutionalValidator,
     UnknownMinerError,
 )
+from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry  # noqa: E402
+from tests.test_c14_protocol_hardening import c14_trust_validator_voters  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -91,6 +93,7 @@ def validator(constitution_path):
             peers_per_validation=5,
             quorum=3,
             use_manifold=True,
+            single_operator_dev=True,
         ),
     )
     # Register validator peers (validators also act as mesh peers)
@@ -332,9 +335,9 @@ class TestEndToEnd:
     """Full pipeline: SN Owner packages case → Miner deliberates → Validator grades."""
 
     @pytest.mark.asyncio
-    async def test_full_pipeline(self, constitution_path):
+    async def test_single_operator_pipeline_cannot_create_precedent(self, constitution_path):
         # Setup all three parties
-        owner = SubnetOwner(constitution_path)
+        owner_registry = VoteSignerRegistry()
         miner = ConstitutionalMiner(
             config=MinerConfig(
                 constitution_path=constitution_path,
@@ -350,6 +353,7 @@ class TestEndToEnd:
                 peers_per_validation=5,
                 quorum=5,
                 use_manifold=True,
+                single_operator_dev=True,
             ),
         )
         # Register enough peers for quorum
@@ -359,6 +363,12 @@ class TestEndToEnd:
         validator.register_miner("peer-3", domain="finance")
         validator.register_miner("peer-4", domain="finance")
         validator.register_miner("peer-5", domain="finance")
+        c14_trust_validator_voters(
+            owner_registry,
+            validator,
+            ("peer-1", "peer-2", "peer-3", "peer-4", "peer-5"),
+        )
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
         # Step 1: SN Owner packages case
         case = owner.package_case(
@@ -384,17 +394,10 @@ class TestEndToEnd:
         assert validation.votes_for + validation.votes_against == 5
         assert validation.proof_root_hash  # Merkle proof exists
 
-        # Step 4: SN Owner records the result
-        precedent = owner.record_result(case, judgment, validation)
-        assert precedent is not None
-        assert precedent.validation_accepted is True
-        assert precedent.miner_uid == "miner-e2e"
-        assert precedent.escalation_type == EscalationType.CONSTITUTIONAL_CONFLICT
-
-        # Step 5: Verify metrics
-        assert owner.metrics.precedents_created == 1
-        dist = owner.metrics.escalation_distribution()
-        assert "constitutional_conflict" in dist
+        # Step 4: Default owner rejects evidence produced by one operator.
+        with pytest.raises(ValueError, match="independent vote evidence"):
+            owner.record_result(case, judgment, validation)
+        assert owner.metrics.precedents_created == 0
 
         # Step 6: Verify emission weights reflect the miner's contribution
         weights = validator.compute_emission_weights()
@@ -402,9 +405,9 @@ class TestEndToEnd:
         assert weights["miner-e2e"] > 0
 
     @pytest.mark.asyncio
-    async def test_multi_case_pipeline(self, constitution_path):
-        """Multiple cases of different types through the pipeline."""
-        owner = SubnetOwner(constitution_path)
+    async def test_multi_case_dev_pipeline_never_creates_precedent(self, constitution_path):
+        """Multiple simulated cases remain non-precedent evidence."""
+        owner_registry = VoteSignerRegistry()
         miner = ConstitutionalMiner(
             config=MinerConfig(
                 constitution_path=constitution_path,
@@ -417,6 +420,7 @@ class TestEndToEnd:
                 constitution_path=constitution_path,
                 peers_per_validation=5,
                 quorum=5,
+                single_operator_dev=True,
             ),
         )
         validator.register_miner("miner-multi")
@@ -425,6 +429,12 @@ class TestEndToEnd:
         validator.register_miner("peer-c")
         validator.register_miner("peer-d")
         validator.register_miner("peer-e")
+        c14_trust_validator_voters(
+            owner_registry,
+            validator,
+            ("peer-a", "peer-b", "peer-c", "peer-d", "peer-e"),
+        )
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
         escalation_types = [
             EscalationType.CONSTITUTIONAL_CONFLICT,
@@ -443,17 +453,10 @@ class TestEndToEnd:
             judgment = await miner.process(case.synapse)
             validation = validator.validate(judgment)
             assert validation.votes_for + validation.votes_against == 5
-            owner.record_result(case, judgment, validation)
+            with pytest.raises(ValueError, match="independent vote evidence"):
+                owner.record_result(case, judgment, validation)
 
-        # Verify empirical distribution
-        dist = owner.metrics.escalation_distribution()
-        assert dist["constitutional_conflict"] == pytest.approx(0.4)
-        assert dist["context_sensitivity"] == pytest.approx(0.2)
-        assert dist["edge_case_ambiguity"] == pytest.approx(0.2)
-        assert dist["stakeholder_irreconcilability"] == pytest.approx(0.2)
-
-        # All should have been accepted (valid judgments)
-        assert owner.metrics.precedents_created == 5
+        assert owner.metrics.precedents_created == 0
         assert miner.stats.judgments_submitted == 5
         assert validator.stats.validations_performed == 5
 
@@ -464,7 +467,13 @@ class TestEndToEnd:
         The ConstitutionalMesh excludes the producer from peers.
         """
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=3,
+                quorum=2,
+                complete_evidence=False,
+                single_operator_dev=True,
+            ),
         )
         # Only register the miner and one additional peer
         # With quorum=2 and only 1 available peer (excluding producer),
@@ -553,7 +562,13 @@ class TestQuorumFailure:
         """An accepted result below the precedent vote floor fails closed."""
         owner = SubnetOwner(constitution_path)
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=3,
+                quorum=2,
+                complete_evidence=False,
+                single_operator_dev=True,
+            ),
         )
         validator.register_miner("miner-rej")
         validator.register_miner("peer-a")
@@ -572,7 +587,7 @@ class TestQuorumFailure:
         )
         validation = validator.validate(judgment)
         assert validation.accepted is True
-        with pytest.raises(ValueError, match="validator"):
+        with pytest.raises(ValueError, match="trust registry"):
             owner.record_result(case, judgment, validation)
         assert owner.precedents == []
 
@@ -639,7 +654,13 @@ rules:
         import tempfile
 
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=3,
+                quorum=2,
+                complete_evidence=False,
+                single_operator_dev=True,
+            ),
         )
         validator.register_miner("miner-v-rotate")
         validator.register_miner("peer-1")
@@ -688,9 +709,12 @@ class TestConcurrentAccess:
         import threading
 
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                single_operator_dev=True,
+            ),
         )
-        for i in range(5):
+        for i in range(6):
             validator.register_miner(f"miner-{i}")
 
         errors: list[Exception] = []

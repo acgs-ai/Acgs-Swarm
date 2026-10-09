@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import random
 import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -67,9 +69,21 @@ from constitutional_swarm.mesh.settlement import (
     MeshProof,
     MeshResult,
     ReconciliationReport,
-    _compute_merkle_root,
 )
 from constitutional_swarm.mesh.voting import RemoteVoteRequest, ValidationVote
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteEnvelope,
+    VoteSignerRegistry,
+    canonical_assigned_peers_hash,
+    normalize_voter_id,
+    sign_vote_envelope as create_vote_envelope,
+    compute_vote_envelope_root,
+    verify_vote_envelope,
+    verify_vote_envelopes,
+    vote_envelope_from_dict,
+    vote_envelope_hash,
+    vote_envelope_to_dict,
+)
 from constitutional_swarm.mesh.trust import TrustSnapshot, _TrustState
 from constitutional_swarm.settlement_store import (
     DuplicateSettlementError,
@@ -132,6 +146,9 @@ class ConstitutionalMesh:
         max_pending_assignments: int = 10_000,
         max_settled_results: int = 10_000,
         max_shadow_metrics: int = 1_000,
+        complete_evidence: bool = False,
+        vote_registry: VoteSignerRegistry | None = None,
+        evidence_mode: Literal["independent", "single_operator_dev"] = "independent",
     ) -> None:
         if peers_per_validation < 1:
             raise ValueError("peers_per_validation must be at least 1")
@@ -140,6 +157,12 @@ class ConstitutionalMesh:
                 f"Quorum ({quorum}) must be between 1 and peers_per_validation "
                 f"({peers_per_validation})"
             )
+        if quorum <= peers_per_validation // 2:
+            raise ValueError("quorum must be a strict majority of peers_per_validation")
+        if evidence_mode not in {"independent", "single_operator_dev"}:
+            raise ValueError("invalid evidence_mode")
+        if (settlement_store is not None or settlement_store_path is not None) and quorum < 3:
+            raise ValueError("persistent proof-grade settlements require quorum >= 3")
         for name, value in (
             ("max_pending_assignments", max_pending_assignments),
             ("max_settled_results", max_settled_results),
@@ -181,11 +204,14 @@ class ConstitutionalMesh:
         self._risk_scoring = risk_scoring
         self._peers_per_validation = peers_per_validation
         self._quorum = quorum
+        self._complete_evidence = complete_evidence
+        self._evidence_mode = evidence_mode
         # Seeded randomness is only used for deterministic peer assignment in tests/benchmarks.
         self._rng = random.Random(seed) if seed is not None else random.SystemRandom()
         self._agents: dict[str, _AgentInfo] = {}
         self._agent_vote_public_keys: dict[str, Ed25519PublicKey] = {}
         self._agent_vote_private_keys: dict[str, Ed25519PrivateKey] = {}
+        self._vote_registry = vote_registry or VoteSignerRegistry()
         self._request_signing_private_key = (
             Ed25519PrivateKey.generate()
             if request_signing_private_key is None
@@ -194,10 +220,9 @@ class ConstitutionalMesh:
         self._request_signing_public_key = (
             self._request_signing_private_key.public_key()
         )
-        # Dedicated settlement-receipt key. Request/vote signatures use a
-        # different key and a different pre-image (colon-joined vote bytes vs
-        # canonical receipt payload). Callers may pass the same material, but
-        # the default is a distinct key.
+        # Dedicated settlement-receipt key. Request, vote-envelope, and receipt
+        # signatures use distinct domain-separated canonical payloads. Callers
+        # may pass the same material, but the default is a distinct key.
         self._receipt_signing_private_key = (
             Ed25519PrivateKey.generate()
             if receipt_signing_private_key is None
@@ -208,6 +233,10 @@ class ConstitutionalMesh:
         )
         self._assignments: dict[str, PeerAssignment] = {}
         self._votes: dict[str, list[ValidationVote]] = {}
+        self._vote_envelopes: dict[str, list[VoteEnvelope]] = {}
+        self._signed_envelopes_by_signature: OrderedDict[str, VoteEnvelope] = (
+            OrderedDict()
+        )
         self._final_results: OrderedDict[str, MeshResult] = OrderedDict()
         self._max_pending_assignments = max_pending_assignments
         self._max_settled_results = max_settled_results
@@ -300,6 +329,11 @@ class ConstitutionalMesh:
         return self._constitution.hash
 
     @property
+    def vote_registry(self) -> VoteSignerRegistry:
+        """Return the locked signer registry used to authorize vote evidence."""
+        return self._vote_registry
+
+    @property
     def agent_count(self) -> int:
         """Number of registered agents."""
         with self._lock:
@@ -318,11 +352,14 @@ class ConstitutionalMesh:
 
         The mesh can verify this agent's votes but cannot sign on their behalf.
         """
+        agent_id = normalize_voter_id(agent_id)
+        public_key = self._coerce_public_key(vote_public_key)
         with self._lock:
-            self._agents[agent_id] = _AgentInfo(agent_id=agent_id, domain=domain)
-            self._agent_vote_public_keys[agent_id] = self._coerce_public_key(
-                vote_public_key
+            self._vote_registry.replace(
+                agent_id, public_key, roles={"voter", "validator"}
             )
+            self._agents[agent_id] = _AgentInfo(agent_id=agent_id, domain=domain)
+            self._agent_vote_public_keys[agent_id] = public_key
             self._agent_vote_private_keys.pop(agent_id, None)
             if self._use_manifold and agent_id not in self._agent_indices:
                 self._trust_state.register(agent_id)
@@ -338,13 +375,17 @@ class ConstitutionalMesh:
         vote_private_key: Ed25519PrivateKey | bytes | str | None = None,
     ) -> None:
         """Register an in-process signer whose private key is managed locally."""
+        agent_id = normalize_voter_id(agent_id)
+        private_key = (
+            self._coerce_private_key(vote_private_key)
+            if vote_private_key is not None
+            else Ed25519PrivateKey.generate()
+        )
         with self._lock:
-            self._agents[agent_id] = _AgentInfo(agent_id=agent_id, domain=domain)
-            private_key = (
-                self._coerce_private_key(vote_private_key)
-                if vote_private_key is not None
-                else Ed25519PrivateKey.generate()
+            self._vote_registry.replace(
+                agent_id, private_key.public_key(), roles={"voter", "validator"}
             )
+            self._agents[agent_id] = _AgentInfo(agent_id=agent_id, domain=domain)
             self._agent_vote_private_keys[agent_id] = private_key
             self._agent_vote_public_keys[agent_id] = private_key.public_key()
             if self._use_manifold and agent_id not in self._agent_indices:
@@ -364,10 +405,12 @@ class ConstitutionalMesh:
 
     def unregister_agent(self, agent_id: str) -> None:
         """Remove an agent from the mesh, archiving their trust relationships."""
+        agent_id = normalize_voter_id(agent_id)
         with self._lock:
             self._agents.pop(agent_id, None)
             self._agent_vote_public_keys.pop(agent_id, None)
             self._agent_vote_private_keys.pop(agent_id, None)
+            self._vote_registry.unregister(agent_id)
             if self._use_manifold and agent_id in self._agent_indices:
                 self._trust_state.unregister(agent_id)
                 self._sync_trust_aliases()
@@ -447,6 +490,7 @@ class ConstitutionalMesh:
 
     def get_reputation(self, agent_id: str) -> float:
         """Get an agent's reputation score."""
+        agent_id = normalize_voter_id(agent_id)
         with self._lock:
             info = self._agents.get(agent_id)
             if info is None:
@@ -460,6 +504,8 @@ class ConstitutionalMesh:
         producer_id: str,
         content: str,
         artifact_id: str,
+        *,
+        task_id: str | None = None,
     ) -> PeerAssignment:
         """Request peer validation of a producer's output.
 
@@ -474,10 +520,13 @@ class ConstitutionalMesh:
             MeshHaltedError: Mesh is halted.
             MeshSnapshotStaleError: Snapshot became invalid and retries exhausted.
         """
+        producer_id = normalize_voter_id(producer_id)
         last_stale: MeshSnapshotStaleError | None = None
         for _ in range(3):
             try:
-                return self._request_validation_once(producer_id, content, artifact_id)
+                return self._request_validation_once(
+                    producer_id, content, artifact_id, task_id or artifact_id
+                )
             except MeshSnapshotStaleError as exc:
                 last_stale = exc
         assert last_stale is not None
@@ -488,7 +537,9 @@ class ConstitutionalMesh:
         producer_id: str,
         content: str,
         artifact_id: str,
+        task_id: str | None = None,
     ) -> PeerAssignment:
+        task_id = task_id or artifact_id
         with self._lock:
             self._check_halted()
             self._discard_stale_assignments_locked()
@@ -526,6 +577,12 @@ class ConstitutionalMesh:
                 agent_indices=agent_indices,
             )
         )
+        self._validate_selected_peers(
+            peers,
+            available=available,
+            needed=needed,
+            custom_policy=self._custom_trust_policy is not None,
+        )
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
         assignment = PeerAssignment(
@@ -537,6 +594,7 @@ class ConstitutionalMesh:
             peers=peers,
             constitutional_hash=snapshot_hash,
             timestamp=time.time(),
+            task_id=task_id,
         )
 
         with self._lock:
@@ -608,10 +666,17 @@ class ConstitutionalMesh:
         if self._custom_trust_policy is not None:
             # Detached, immutable inputs: the callable must not observe live
             # mesh state and cannot mutate the snapshot peer list in place.
-            selected = self._custom_trust_policy(
-                tuple(available), int(needed), str(producer_id)
-            )
-            return list(selected)[:needed]
+            try:
+                selected = list(
+                    self._custom_trust_policy(
+                        tuple(available), int(needed), str(producer_id)
+                    )
+                )
+            except TypeError as exc:
+                raise ValueError(
+                    "custom peer selection must return an iterable of peer identities"
+                ) from exc
+            return selected[:needed]
         if not self._use_manifold or trust_raw is None or producer_id not in indices:
             return list(self._rng.sample(available, k=needed))
         producer_idx = indices[producer_id]
@@ -622,6 +687,38 @@ class ConstitutionalMesh:
             weight = trust_row[idx] if idx is not None else 0.01
             weight_map[aid] = max(weight, 0.01)
         return self._sample_weighted_peers(available, needed, weight_map)
+
+    @staticmethod
+    def _validate_selected_peers(
+        selected: tuple[Any, ...],
+        *,
+        available: list[str],
+        needed: int,
+        custom_policy: bool,
+    ) -> None:
+        """Reject invalid routing output before assignment state is constructed."""
+
+        prefix = "custom peer selection" if custom_policy else "peer selection"
+        if len(selected) != needed:
+            raise ValueError(f"{prefix} must return exactly {needed} peers")
+        canonical: list[str] = []
+        for peer in selected:
+            if not isinstance(peer, str):
+                raise ValueError(f"{prefix} must return string peer identities")
+            try:
+                normalized = normalize_voter_id(peer)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{prefix} must return canonical peer identities"
+                ) from exc
+            if peer != normalized:
+                raise ValueError(f"{prefix} must return canonical peer identities")
+            canonical.append(normalized)
+        if len(set(canonical)) != len(canonical):
+            raise ValueError(f"{prefix} must return distinct peer identities")
+        available_set = set(available)
+        if any(peer not in available_set for peer in canonical):
+            raise ValueError(f"{prefix} returned an unavailable or producer identity")
 
     def submit_vote(
         self,
@@ -665,31 +762,34 @@ class ConstitutionalMesh:
                 raise UnauthorizedVoterError(
                     f"{voter_id} is not a registered mesh agent"
                 )
-            public_key = self._agent_vote_public_keys.get(voter_id)
-            if public_key is None:
-                raise UnauthorizedVoterError(
-                    f"{voter_id} has no registered vote public key"
-                )
             try:
-                public_key.verify(
-                    bytes.fromhex(signature),
-                    self._vote_payload_bytes(
-                        assignment_id=assignment_id,
-                        voter_id=voter_id,
-                        approved=approved,
-                        reason=reason,
-                        constitutional_hash=assignment.constitutional_hash,
-                        content_hash=assignment.content_hash,
-                    ),
+                envelope = self._signed_envelopes_by_signature[signature]
+                verified = verify_vote_envelope(
+                    envelope,
+                    self._vote_registry,
+                    task_id=assignment.task_id,
+                    assignment_id=assignment.assignment_id,
+                    producer_id=assignment.producer_id,
+                    artifact_id=assignment.artifact_id,
+                    content_hash=assignment.content_hash,
+                    constitutional_hash=assignment.constitutional_hash,
                 )
-            except (ValueError, InvalidSignature) as exc:
+                self._verify_envelope_assignment_metadata(verified, assignment)
+                if (
+                    verified.voter_id != normalize_voter_id(voter_id)
+                    or verified.approved is not approved
+                    or verified.reason != reason
+                ):
+                    raise ValueError("vote envelope does not match submitted vote")
+            except (KeyError, ValueError, InvalidSignature) as exc:
                 raise InvalidVoteSignatureError(
-                    f"Invalid vote signature for {voter_id} on {assignment_id}"
+                    f"Invalid or unsigned vote envelope for {voter_id} on {assignment_id}"
                 ) from exc
 
             existing = self._votes.get(assignment_id, [])
             if any(v.voter_id == voter_id for v in existing):
                 raise DuplicateVoteError(f"{voter_id} already voted on {assignment_id}")
+            self._signed_envelopes_by_signature.pop(signature, None)
 
             vote = ValidationVote(
                 assignment_id=assignment_id,
@@ -702,6 +802,10 @@ class ConstitutionalMesh:
                 timestamp=time.time(),
             )
             self._votes[assignment_id] = [*existing, vote]
+            self._vote_envelopes[assignment_id] = [
+                *self._vote_envelopes.get(assignment_id, []),
+                verified,
+            ]
             self._total_votes += 1
 
             if voter_id in self._agents:
@@ -778,10 +882,11 @@ class ConstitutionalMesh:
                     accepted=preview.accepted,
                     timestamp=settled_at,
                 ),
+                vote_envelopes=preview.vote_envelopes,
                 settled=True,
                 settled_at=settled_at,
             )
-            settled_votes = list(self._votes.get(assignment_id, []))
+            settled_votes = list(self._vote_envelopes.get(assignment_id, []))
             pending_record = self._record_with_serialized_votes(
                 self._build_settlement_record(assignment, final),
                 settled_votes,
@@ -890,6 +995,8 @@ class ConstitutionalMesh:
         producer_id: str,
         content: str,
         artifact_id: str,
+        *,
+        task_id: str | None = None,
     ) -> MeshResult:
         """End-to-end validation for locally managed signer peers only.
 
@@ -901,7 +1008,9 @@ class ConstitutionalMesh:
           4. submit_vote()
           5. get_result()/settle()
         """
-        assignment = self.request_validation(producer_id, content, artifact_id)
+        assignment = self.request_validation(
+            producer_id, content, artifact_id, task_id=task_id
+        )
         for peer_id in assignment.peers:
             try:
                 self.validate_and_vote(assignment.assignment_id, peer_id)
@@ -1034,6 +1143,10 @@ class ConstitutionalMesh:
                     voter_public_key=voter_public_key,
                     nonce=nonce,
                     timestamp=timestamp,
+                    task_id=assignment.task_id,
+                    assigned_peers=assignment.peers,
+                    quorum=self._effective_quorum(assignment),
+                    evidence_mode=self._assignment_evidence_mode(assignment),
                 )
             ).hex()
             return RemoteVoteRequest(
@@ -1049,6 +1162,10 @@ class ConstitutionalMesh:
                 timestamp=timestamp,
                 request_signer_public_key=request_signer_public_key,
                 request_signature=request_signature,
+                task_id=assignment.task_id,
+                assigned_peers=assignment.peers,
+                quorum=self._effective_quorum(assignment),
+                evidence_mode=self._assignment_evidence_mode(assignment),
             )
 
     def _submit_remote_vote_response(
@@ -1057,31 +1174,26 @@ class ConstitutionalMesh:
         voter_id: str,
         response: RemoteVoteResponse,
     ) -> ValidationVote:
-        if response.assignment_id != assignment_id:
+        envelope = response.envelope
+        if envelope.assignment_id != assignment_id:
             raise ValueError(
                 f"Remote vote response assignment mismatch:"
-                f" {response.assignment_id} != {assignment_id}"
+                f" {envelope.assignment_id} != {assignment_id}"
             )
-        if response.voter_id != voter_id:
+        if envelope.voter_id != voter_id:
             raise ValueError(
-                f"Remote vote response voter mismatch: {response.voter_id} != {voter_id}"
+                f"Remote vote response voter mismatch: {envelope.voter_id} != {voter_id}"
             )
         with self._lock:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
             self._require_current_assignment_constitution(assignment)
-            if response.constitutional_hash != assignment.constitutional_hash:
+            if envelope.constitutional_hash != assignment.constitutional_hash:
                 raise ValueError("Remote vote response constitution mismatch")
-            if response.content_hash != assignment.content_hash:
+            if envelope.content_hash != assignment.content_hash:
                 raise ValueError("Remote vote response content hash mismatch")
-        return self.submit_vote(
-            assignment_id,
-            voter_id,
-            approved=response.approved,
-            reason=response.reason,
-            signature=response.signature,
-        )
+        return self.submit_vote_envelope(envelope)
 
     @staticmethod
     def build_remote_vote_request_payload(
@@ -1096,13 +1208,47 @@ class ConstitutionalMesh:
         voter_public_key: str,
         nonce: str,
         timestamp: float,
+        task_id: str = "",
+        assigned_peers: Sequence[str] = (),
+        quorum: int = 0,
+        evidence_mode: Literal["independent", "single_operator_dev"] = "independent",
+        protocol_version: int = 2,
     ) -> bytes:
-        payload = (
-            f"{assignment_id}:{voter_id}:{producer_id}:{artifact_id}:"
-            f"{content}:{content_hash}:{constitutional_hash}:{voter_public_key}:"
-            f"{nonce}:{format(timestamp, '.17g')}"
-        )
-        return payload.encode("utf-8")
+        import json
+
+        if protocol_version != 2:
+            raise ValueError("unsupported remote vote request protocol version")
+        canonical_peers = tuple(sorted(normalize_voter_id(peer) for peer in assigned_peers))
+        if not canonical_peers or len(canonical_peers) != len(set(canonical_peers)):
+            raise ValueError("remote vote request requires distinct assigned peers")
+        if normalize_voter_id(voter_id) not in canonical_peers:
+            raise ValueError("remote vote request voter is not in assigned_peers")
+        if type(quorum) is not int or not 1 <= quorum <= len(canonical_peers):
+            raise ValueError("remote vote request quorum is outside the electorate")
+        if quorum <= len(canonical_peers) // 2:
+            raise ValueError("remote vote request quorum must be a strict majority")
+        if evidence_mode not in {"independent", "single_operator_dev"}:
+            raise ValueError("remote vote request evidence_mode is invalid")
+        payload = {
+            "artifact_id": artifact_id,
+            "assignment_id": assignment_id,
+            "constitutional_hash": constitutional_hash,
+            "content": content,
+            "content_hash": content_hash,
+            "nonce": nonce,
+            "producer_id": producer_id,
+            "protocol_version": 2,
+            "assigned_peers": canonical_peers,
+            "quorum": quorum,
+            "evidence_mode": evidence_mode,
+            "timestamp": format(timestamp, ".17g"),
+            "task_id": task_id or artifact_id,
+            "voter_id": voter_id,
+            "voter_public_key": voter_public_key,
+        }
+        return b"constitutional-swarm.remote-vote-request.v2\x00" + json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
 
     @staticmethod
     def _evict_remote_vote_nonce_cache_entries(
@@ -1127,14 +1273,32 @@ class ConstitutionalMesh:
         now: float | None = None,
     ) -> bool:
         """Verify a remote vote request signature."""
+        if type(request.protocol_version) is not int or request.protocol_version != 2:
+            raise ValueError("Remote vote request uses an unsupported protocol version")
+        if type(request.timestamp) is not float or not math.isfinite(request.timestamp):
+            raise ValueError("Remote vote request timestamp must be a finite float")
+        string_fields = (
+            request.assignment_id,
+            request.voter_id,
+            request.producer_id,
+            request.artifact_id,
+            request.content,
+            request.content_hash,
+            request.constitutional_hash,
+            request.voter_public_key,
+            request.nonce,
+            request.request_signer_public_key,
+            request.request_signature,
+            request.task_id,
+        )
+        if any(not isinstance(value, str) for value in string_fields):
+            raise ValueError("Remote vote request contains a non-string field")
         if replay_window_seconds <= 0:
             raise ValueError("Remote vote replay window must be positive")
         current_time = time.time() if now is None else now
         if not request.nonce:
             raise ValueError("Remote vote request is missing nonce")
-        if request.timestamp is None:
-            raise ValueError("Remote vote request is missing timestamp")
-        if abs(current_time - float(request.timestamp)) > replay_window_seconds:
+        if abs(current_time - request.timestamp) > replay_window_seconds:
             raise ValueError("Remote vote request timestamp is outside replay window")
         try:
             public_key = ConstitutionalMesh._coerce_public_key(
@@ -1153,6 +1317,11 @@ class ConstitutionalMesh:
                     voter_public_key=request.voter_public_key,
                     nonce=request.nonce,
                     timestamp=float(request.timestamp),
+                    task_id=request.task_id or request.artifact_id,
+                    assigned_peers=request.assigned_peers,
+                    quorum=request.quorum,
+                    evidence_mode=request.evidence_mode,
+                    protocol_version=request.protocol_version,
                 ),
             )
         except (ValueError, InvalidSignature) as exc:
@@ -1168,10 +1337,12 @@ class ConstitutionalMesh:
                     f"Remote vote request nonce {request.nonce!r}"
                     " was already used inside the replay window"
                 )
+            if len(nonce_cache) >= 10_000:
+                raise RemoteVoteReplayError(
+                    "Remote vote request nonce capacity reached for signer"
+                )
             nonce_cache[request.nonce] = current_time
             nonce_cache.move_to_end(request.nonce)
-            while len(nonce_cache) > 10_000:
-                nonce_cache.popitem(last=False)
         return True
 
     @staticmethod
@@ -1602,9 +1773,12 @@ class ConstitutionalMesh:
         total_peers = len(assignment.peers)
         pending = total_peers - len(votes)
 
-        accepted = votes_for >= self._quorum
-        rejected = votes_against > (total_peers - self._quorum)
+        accepted, rejected = self._settlement_outcomes(
+            assignment, votes_for=votes_for, votes_against=votes_against
+        )
         quorum_met = accepted or rejected
+        if pending:
+            quorum_met = False
 
         return MeshResult(
             assignment_id=assignment.assignment_id,
@@ -1615,9 +1789,45 @@ class ConstitutionalMesh:
             pending_votes=pending,
             constitutional_hash=assignment.constitutional_hash,
             proof=None,
+            vote_envelopes=tuple(
+                self._vote_envelopes.get(assignment.assignment_id, ())
+            ),
             settled=False,
             settled_at=None,
         )
+
+    def _settlement_outcomes(
+        self,
+        assignment: PeerAssignment,
+        *,
+        votes_for: int,
+        votes_against: int,
+    ) -> tuple[bool, bool]:
+        """Return mutually exclusive outcomes using the actual assigned peer set."""
+        strict_majority = len(assignment.peers) // 2 + 1
+        quorum = self._effective_quorum(assignment)
+        accepted = votes_for >= quorum and votes_for >= strict_majority
+        rejected = votes_against >= quorum and votes_against >= strict_majority
+        return accepted, rejected
+
+    def _effective_quorum(self, assignment: PeerAssignment) -> int:
+        """Return the signed quorum floor for the actual assigned electorate."""
+        if assignment.quorum:
+            return assignment.quorum
+        return max(self._quorum, len(assignment.peers) // 2 + 1)
+
+    def _verify_envelope_assignment_metadata(
+        self, envelope: VoteEnvelope, assignment: PeerAssignment
+    ) -> None:
+        """Bind one signed response to the mesh's complete assignment metadata."""
+        if (
+            envelope.assigned_peer_count != len(assignment.peers)
+            or envelope.assigned_peers_hash
+            != canonical_assigned_peers_hash(assignment.peers)
+            or envelope.quorum != self._effective_quorum(assignment)
+            or envelope.evidence_mode != self._assignment_evidence_mode(assignment)
+        ):
+            raise ValueError("vote envelope electorate metadata does not match assignment")
 
     def _build_proof(
         self,
@@ -1627,14 +1837,18 @@ class ConstitutionalMesh:
         timestamp: float,
     ) -> MeshProof:
         """Build a stable proof snapshot for a settled assignment."""
-        votes = self._votes.get(assignment.assignment_id, [])
-        vote_hashes = tuple(v.vote_hash for v in votes)
-        root_hash = _compute_merkle_root(
-            assignment.assignment_id,
-            assignment.content_hash,
-            assignment.constitutional_hash,
-            vote_hashes,
-            accepted,
+        envelopes = tuple(self._vote_envelopes.get(assignment.assignment_id, ()))
+        ordered = tuple(sorted(envelopes, key=lambda item: (item.voter_id, item.key_id)))
+        vote_hashes = tuple(vote_envelope_hash(item) for item in ordered)
+        root_hash = compute_vote_envelope_root(
+            task_id=assignment.task_id,
+            assignment_id=assignment.assignment_id,
+            producer_id=assignment.producer_id,
+            artifact_id=assignment.artifact_id,
+            content_hash=assignment.content_hash,
+            constitutional_hash=assignment.constitutional_hash,
+            accepted=accepted,
+            envelopes=ordered,
         )
         return MeshProof(
             assignment_id=assignment.assignment_id,
@@ -1644,6 +1858,10 @@ class ConstitutionalMesh:
             root_hash=root_hash,
             accepted=accepted,
             timestamp=timestamp,
+            task_id=assignment.task_id,
+            producer_id=assignment.producer_id,
+            artifact_id=assignment.artifact_id,
+            protocol_version=2,
         )
 
     def _persist_settlement(
@@ -1694,6 +1912,7 @@ class ConstitutionalMesh:
             unsigned = receipt_from_mesh_settlement(
                 completed_record,
                 list(completed_record.votes),
+                trusted_signers=self.receipt_trust_registry(),
             )
             payload_bytes = payload_canonical_bytes(unsigned.payload)
             signing_key = self._receipt_signing_private_key
@@ -1766,7 +1985,18 @@ class ConstitutionalMesh:
             result = self._deserialize_result(record.result)
             if not self._stored_record_is_current(record, assignment, result):
                 continue
+            try:
+                envelopes, result = self._verified_settlement_evidence(
+                    record, assignment, result
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "quarantining settlement %s without authorized vote evidence",
+                    assignment.assignment_id,
+                )
+                continue
             self._assignments[assignment.assignment_id] = assignment
+            self._vote_envelopes[assignment.assignment_id] = list(envelopes)
             self._votes.setdefault(assignment.assignment_id, [])
             self._remember_final_result_locked(assignment.assignment_id, result)
             self._total_validations += 1
@@ -1789,6 +2019,72 @@ class ConstitutionalMesh:
         if result.proof is not None and result.proof.constitutional_hash not in tags:
             raise ValueError("Persisted settlement proof constitutional hash disagrees")
         return assignment.constitutional_hash == self.constitutional_hash
+
+    def _verified_settlement_evidence(
+        self,
+        record: SettlementRecord,
+        assignment: PeerAssignment,
+        result: MeshResult,
+    ) -> tuple[tuple[VoteEnvelope, ...], MeshResult]:
+        """Verify schema-v2 voter evidence and recompute every derived result field."""
+        if record.schema_version != 2:
+            raise ValueError("proof-grade mesh settlement requires schema version 2")
+        if not record.votes:
+            raise ValueError("mesh settlement has no vote envelopes")
+        envelopes = verify_vote_envelopes(
+            record.votes,
+            self._vote_registry,
+            task_id=assignment.task_id,
+            assignment_id=assignment.assignment_id,
+            producer_id=assignment.producer_id,
+            artifact_id=assignment.artifact_id,
+            content_hash=assignment.content_hash,
+            constitutional_hash=assignment.constitutional_hash,
+            expected_assigned_peers=assignment.peers,
+            expected_quorum=self._effective_quorum(assignment),
+            require_independent=False,
+        )
+        for envelope in envelopes:
+            self._verify_envelope_assignment_metadata(envelope, assignment)
+        assigned = {normalize_voter_id(peer) for peer in assignment.peers}
+        if any(item.voter_id not in assigned for item in envelopes):
+            raise ValueError("mesh settlement contains an unassigned voter")
+        if self._complete_evidence and len(envelopes) != len(assignment.peers):
+            raise ValueError("complete-evidence settlement is missing peer votes")
+
+        votes_for = sum(item.approved for item in envelopes)
+        votes_against = len(envelopes) - votes_for
+        accepted, rejected = self._settlement_outcomes(
+            assignment, votes_for=votes_for, votes_against=votes_against
+        )
+        if accepted == rejected:
+            raise ValueError("mesh settlement has no unique quorum outcome")
+        proof = result.proof
+        envelope_hashes = tuple(
+            vote_envelope_hash(item)
+            for item in sorted(envelopes, key=lambda item: (item.voter_id, item.key_id))
+        )
+        if (
+            result.assignment_id != assignment.assignment_id
+            or result.votes_for != votes_for
+            or result.votes_against != votes_against
+            or result.pending_votes != len(assignment.peers) - len(envelopes)
+            or result.accepted != accepted
+            or not result.quorum_met
+            or proof is None
+            or proof.protocol_version != 2
+            or proof.assignment_id != assignment.assignment_id
+            or proof.task_id != assignment.task_id
+            or proof.producer_id != assignment.producer_id
+            or proof.artifact_id != assignment.artifact_id
+            or proof.content_hash != assignment.content_hash
+            or proof.constitutional_hash != assignment.constitutional_hash
+            or proof.accepted != accepted
+            or proof.vote_hashes != envelope_hashes
+            or not proof.verify()
+        ):
+            raise ValueError("mesh settlement disagrees with verified vote envelopes")
+        return envelopes, replace(result, vote_envelopes=envelopes)
 
     def reconcile_pending_settlements(self) -> ReconciliationReport:
         """Replay durable pending settlements into the primary store once."""
@@ -1844,9 +2140,10 @@ class ConstitutionalMesh:
                             errors=errors,
                         )
                         continue
-                if not record.votes:
-                    raise ValueError("pending settlement has no authentic votes")
-                recovered_votes = self._authenticated_vote_dicts(list(record.votes))
+                envelopes, result = self._verified_settlement_evidence(
+                    record, assignment, result
+                )
+                recovered_votes = list(envelopes)
 
                 report = replace(
                     report,
@@ -1904,6 +2201,7 @@ class ConstitutionalMesh:
                         )
                     if assignment.assignment_id not in self._final_results:
                         self._remember_final_result_locked(assignment.assignment_id, result)
+                    self._vote_envelopes[assignment.assignment_id] = list(envelopes)
                     self._votes.pop(assignment.assignment_id, None)
                     self._settled_assignments.discard(assignment.assignment_id)
                     self._settled_voters.pop(assignment.assignment_id, None)
@@ -1943,6 +2241,7 @@ class ConstitutionalMesh:
         receipt = receipt_from_mesh_settlement(
             completed_record,
             list(completed_record.votes),
+            trusted_signers=self.receipt_trust_registry(),
         )
         return replace(completed_record, receipt_digest=receipt.payload_digest)
 
@@ -2008,9 +2307,37 @@ class ConstitutionalMesh:
             format=serialization.PublicFormat.Raw,
         ).hex()
 
+    def receipt_trust_registry(self) -> dict[str, dict[str, Any]]:
+        """Export public grants without mutating the mesh trust registry.
+
+        A verifier must obtain and pin these grants through an external trust
+        channel. The signer's own export is not itself an attestation.
+        """
+        from constitutional_swarm.settlement_evidence import RECEIPT_SIGNER_KEY_ID
+
+        grants: dict[str, dict[str, Any]] = self._vote_registry.trust_grants(
+            role="validator"
+        )
+        with self._lock:
+            receipt_public = self._receipt_signing_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            ).hex()
+        grants[RECEIPT_SIGNER_KEY_ID] = {
+            "identity_id": "mesh-settlement",
+            "public_key_hex": receipt_public,
+            "roles": ["settlement"],
+        }
+        return grants
+
     def _vote_dicts(self, votes: list[Any]) -> tuple[dict[str, Any], ...]:
+        from constitutional_swarm.mesh.vote_envelope import vote_envelope_to_dict
+
         payload: list[dict[str, Any]] = []
         for vote in votes:
+            if isinstance(vote, VoteEnvelope):
+                payload.append(vote_envelope_to_dict(vote))
+                continue
             if isinstance(vote, dict):
                 item = dict(vote)
                 if not item.get("public_key_hex"):
@@ -2032,33 +2359,6 @@ class ConstitutionalMesh:
             )
         return tuple(payload)
 
-    def _authenticated_vote_dicts(self, votes: list[Any]) -> list[Any]:
-        authenticated: list[dict[str, Any]] = []
-        for vote in self._vote_dicts(votes):
-            public_hex = vote.get("public_key_hex")
-            signature = vote.get("signature")
-            if not public_hex or not signature:
-                raise ValueError("pending vote missing public key or signature")
-            try:
-                public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(public_hex)))
-                public_key.verify(
-                    bytes.fromhex(str(signature)),
-                    self._vote_payload_bytes(
-                        assignment_id=str(vote.get("assignment_id", "")),
-                        voter_id=str(vote.get("voter_id", "")),
-                        approved=bool(vote.get("approved")),
-                        reason=str(vote.get("reason", "")),
-                        constitutional_hash=str(vote.get("constitutional_hash", "")),
-                        content_hash=str(vote.get("content_hash", "")),
-                    ),
-                )
-            except (ValueError, InvalidSignature) as exc:
-                raise ValueError(
-                    f"pending vote {vote.get('voter_id')} is not authentic"
-                ) from exc
-            authenticated.append(vote)
-        return authenticated
-
     def _build_settlement_record(
         self, assignment: PeerAssignment, result: MeshResult
     ) -> SettlementRecord:
@@ -2067,16 +2367,21 @@ class ConstitutionalMesh:
             result=self._serialize_result(result),
             constitutional_hash=assignment.constitutional_hash,
             is_recovered=assignment.is_recovered,
+            schema_version=2,
         )
 
-    @staticmethod
-    def _serialize_assignment(assignment: PeerAssignment) -> dict[str, Any]:
+    def _serialize_assignment(self, assignment: PeerAssignment) -> dict[str, Any]:
         return {
             "assignment_id": assignment.assignment_id,
+            "task_id": assignment.task_id,
             "producer_id": assignment.producer_id,
             "artifact_id": assignment.artifact_id,
             "content_hash": assignment.content_hash,
             "peers": list(assignment.peers),
+            "assigned_peers_hash": canonical_assigned_peers_hash(assignment.peers),
+            "assigned_peer_count": len(assignment.peers),
+            "quorum": self._effective_quorum(assignment),
+            "evidence_mode": self._assignment_evidence_mode(assignment),
             "constitutional_hash": assignment.constitutional_hash,
             "timestamp": assignment.timestamp,
             "is_recovered": assignment.is_recovered,
@@ -2084,16 +2389,57 @@ class ConstitutionalMesh:
 
     @staticmethod
     def _deserialize_assignment(data: dict[str, Any]) -> PeerAssignment:
+        required_metadata = {
+            "assigned_peers_hash",
+            "assigned_peer_count",
+            "quorum",
+            "evidence_mode",
+        }
+        missing = required_metadata - data.keys()
+        if missing:
+            raise ValueError(
+                f"Persisted settlement assignment missing {sorted(missing)[0]}"
+            )
+        peers = tuple(str(peer) for peer in data["peers"])
+        assigned_peer_count = data["assigned_peer_count"]
+        quorum = data["quorum"]
+        evidence_mode = data["evidence_mode"]
+        assigned_peers_hash = data["assigned_peers_hash"]
+        if (
+            isinstance(assigned_peer_count, bool)
+            or not isinstance(assigned_peer_count, int)
+            or assigned_peer_count != len(peers)
+        ):
+            raise ValueError("Persisted settlement assigned_peer_count is invalid")
+        if (
+            not isinstance(assigned_peers_hash, str)
+            or assigned_peers_hash != canonical_assigned_peers_hash(peers)
+        ):
+            raise ValueError("Persisted settlement assigned_peers_hash is invalid")
+        if (
+            isinstance(quorum, bool)
+            or not isinstance(quorum, int)
+            or quorum <= len(peers) // 2
+            or quorum > len(peers)
+        ):
+            raise ValueError("Persisted settlement quorum is invalid")
+        if evidence_mode not in {"independent", "single_operator_dev"}:
+            raise ValueError("Persisted settlement evidence_mode is invalid")
         return PeerAssignment(
             assignment_id=str(data["assignment_id"]),
             producer_id=str(data["producer_id"]),
             artifact_id=str(data["artifact_id"]),
             content=str(data.get("content", "")),
             content_hash=str(data["content_hash"]),
-            peers=tuple(str(peer) for peer in data["peers"]),
+            peers=peers,
             constitutional_hash=str(data["constitutional_hash"]),
             timestamp=float(data["timestamp"]),
+            task_id=str(data.get("task_id", data["artifact_id"])),
             is_recovered=bool(data.get("is_recovered", False)),
+            assigned_peers_hash=assigned_peers_hash,
+            assigned_peer_count=assigned_peer_count,
+            quorum=quorum,
+            evidence_mode=evidence_mode,
         )
 
     @staticmethod
@@ -2108,12 +2454,18 @@ class ConstitutionalMesh:
             "root_hash": proof.root_hash,
             "accepted": proof.accepted,
             "timestamp": proof.timestamp,
+            "task_id": proof.task_id,
+            "producer_id": proof.producer_id,
+            "artifact_id": proof.artifact_id,
+            "protocol_version": proof.protocol_version,
         }
 
     @staticmethod
     def _deserialize_proof(data: dict[str, Any] | None) -> MeshProof | None:
         if data is None:
             return None
+        if "protocol_version" not in data:
+            raise ValueError("persisted mesh proof is missing protocol_version")
         return MeshProof(
             assignment_id=str(data["assignment_id"]),
             content_hash=str(data["content_hash"]),
@@ -2122,6 +2474,10 @@ class ConstitutionalMesh:
             root_hash=str(data["root_hash"]),
             accepted=bool(data["accepted"]),
             timestamp=float(data["timestamp"]),
+            task_id=str(data.get("task_id", "")),
+            producer_id=str(data.get("producer_id", "")),
+            artifact_id=str(data.get("artifact_id", "")),
+            protocol_version=int(data["protocol_version"]),
         )
 
     def _serialize_result(self, result: MeshResult) -> dict[str, Any]:
@@ -2136,6 +2492,9 @@ class ConstitutionalMesh:
             "proof": self._serialize_proof(result.proof),
             "settled": result.settled,
             "settled_at": result.settled_at,
+            "vote_envelopes": [
+                vote_envelope_to_dict(item) for item in result.vote_envelopes
+            ],
         }
 
     def _deserialize_result(self, data: dict[str, Any]) -> MeshResult:
@@ -2148,6 +2507,10 @@ class ConstitutionalMesh:
             pending_votes=int(data["pending_votes"]),
             constitutional_hash=str(data["constitutional_hash"]),
             proof=self._deserialize_proof(data.get("proof")),
+            vote_envelopes=tuple(
+                vote_envelope_from_dict(item)
+                for item in data.get("vote_envelopes", [])
+            ),
             settled=bool(data.get("settled", False)),
             settled_at=(
                 float(data["settled_at"])
@@ -2170,6 +2533,7 @@ class ConstitutionalMesh:
         In distributed deployments, agents should hold their own private key and
         produce the same signature client-side.
         """
+        voter_id = normalize_voter_id(voter_id)
         with self._lock:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
@@ -2180,19 +2544,97 @@ class ConstitutionalMesh:
                 raise UnauthorizedVoterError(
                     f"{voter_id} has no registered vote signing key"
                 )
-            return signing_key.sign(
-                self._vote_payload_bytes(
-                    assignment_id=assignment_id,
-                    voter_id=voter_id,
-                    approved=approved,
-                    reason=reason,
-                    constitutional_hash=assignment.constitutional_hash,
-                    content_hash=assignment.content_hash,
+            envelope = create_vote_envelope(
+                signing_key,
+                voter_id=voter_id,
+                task_id=assignment.task_id,
+                assignment_id=assignment.assignment_id,
+                producer_id=assignment.producer_id,
+                artifact_id=assignment.artifact_id,
+                content_hash=assignment.content_hash,
+                constitutional_hash=assignment.constitutional_hash,
+                decision="approved" if approved else "denied",
+                reason=reason,
+                nonce=uuid.uuid4().hex,
+                issued_at=time.time(),
+                assigned_peers=assignment.peers,
+                quorum=self._effective_quorum(assignment),
+                evidence_mode=self._assignment_evidence_mode(assignment),
+            )
+            if len(self._signed_envelopes_by_signature) >= 10_000:
+                raise MeshCapacityError("pending locally signed vote capacity reached")
+            self._signed_envelopes_by_signature[envelope.signature] = envelope
+            return envelope.signature
+
+    def _assignment_evidence_mode(
+        self, assignment: PeerAssignment
+    ) -> Literal["independent", "single_operator_dev"]:
+        """Classify signer custody for the entire assigned electorate."""
+        if assignment.evidence_mode is not None:
+            return assignment.evidence_mode
+        locally_held = sum(
+            peer in self._agent_vote_private_keys for peer in assignment.peers
+        )
+        if locally_held > 1 and self._evidence_mode != "single_operator_dev":
+            raise ValueError(
+                "signing for multiple assigned voter identities requires explicit "
+                "evidence_mode='single_operator_dev'"
+            )
+        if self._evidence_mode == "single_operator_dev":
+            return "single_operator_dev"
+        return "independent"
+
+    def sign_vote_envelope(
+        self,
+        assignment_id: str,
+        voter_id: str,
+        *,
+        approved: bool,
+        reason: str = "",
+    ) -> VoteEnvelope:
+        signature = self.sign_vote(
+            assignment_id, voter_id, approved=approved, reason=reason
+        )
+        with self._lock:
+            return self._signed_envelopes_by_signature[signature]
+
+    def submit_vote_envelope(self, envelope: VoteEnvelope) -> ValidationVote:
+        with self._lock:
+            assignment = self._assignments.get(envelope.assignment_id)
+            if assignment is None:
+                raise KeyError(f"Assignment {envelope.assignment_id} not found")
+            if envelope.voter_id not in assignment.peers:
+                raise UnauthorizedVoterError(
+                    f"{envelope.voter_id} is not assigned to validation "
+                    f"{envelope.assignment_id}"
                 )
-            ).hex()
+            verify_vote_envelope(
+                envelope,
+                self._vote_registry,
+                task_id=assignment.task_id,
+                assignment_id=assignment.assignment_id,
+                producer_id=assignment.producer_id,
+                artifact_id=assignment.artifact_id,
+                content_hash=assignment.content_hash,
+                constitutional_hash=assignment.constitutional_hash,
+            )
+            self._verify_envelope_assignment_metadata(envelope, assignment)
+            self._signed_envelopes_by_signature[envelope.signature] = envelope
+        try:
+            return self.submit_vote(
+                envelope.assignment_id,
+                envelope.voter_id,
+                approved=envelope.approved,
+                reason=envelope.reason,
+                signature=envelope.signature,
+            )
+        finally:
+            with self._lock:
+                self._signed_envelopes_by_signature.pop(envelope.signature, None)
 
     def get_vote_public_key(self, agent_id: str) -> str:
         """Return the registered Ed25519 public key as a hex string."""
+        agent_id = normalize_voter_id(agent_id)
         with self._lock:
             public_key = self._agent_vote_public_keys.get(agent_id)
             if public_key is None:
@@ -2221,6 +2663,7 @@ class ConstitutionalMesh:
         constitutional_hash: str,
         content_hash: str,
         signature: str,
+        protocol_version: int = 2,
     ) -> bool:
         """Verify a detached Ed25519 vote signature."""
         key = cls._coerce_public_key(public_key)
@@ -2234,6 +2677,7 @@ class ConstitutionalMesh:
                     reason=reason,
                     constitutional_hash=constitutional_hash,
                     content_hash=content_hash,
+                    protocol_version=protocol_version,
                 ),
             )
         except (ValueError, InvalidSignature):
@@ -2250,8 +2694,9 @@ class ConstitutionalMesh:
         reason: str,
         constitutional_hash: str,
         content_hash: str,
+        protocol_version: int = 2,
     ) -> bytes:
-        """Build the legacy colon-joined byte payload that remote peers currently sign."""
+        """Build an explicitly versioned detached vote payload."""
         return cls._vote_payload_bytes(
             assignment_id=assignment_id,
             voter_id=voter_id,
@@ -2259,6 +2704,7 @@ class ConstitutionalMesh:
             reason=reason,
             constitutional_hash=constitutional_hash,
             content_hash=content_hash,
+            protocol_version=protocol_version,
         )
 
     @staticmethod
@@ -2286,6 +2732,21 @@ class ConstitutionalMesh:
         reason: str,
         constitutional_hash: str,
         content_hash: str,
+        protocol_version: int,
     ) -> bytes:
-        payload = f"{assignment_id}:{voter_id}:{approved}:{reason}:{constitutional_hash}:{content_hash}"
-        return payload.encode("utf-8")
+        if protocol_version != 2:
+            raise ValueError("unsupported detached vote payload protocol version")
+        import json
+
+        structured_payload = {
+            "approved": approved,
+            "assignment_id": assignment_id,
+            "constitutional_hash": constitutional_hash,
+            "content_hash": content_hash,
+            "protocol_version": 2,
+            "reason": reason,
+            "voter_id": normalize_voter_id(voter_id),
+        }
+        return b"constitutional-swarm.detached-vote.v2\x00" + json.dumps(
+            structured_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")

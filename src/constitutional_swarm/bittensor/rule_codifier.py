@@ -214,7 +214,7 @@ class RuleCodifier:
         self._candidates: dict[str, RuleCandidate] = {}
         self._rule_counter: int = 0
         self._activated_rules: list[RuleCandidate] = []
-        self._precedent_store = precedent_store or PrecedentStore(constitutional_hash)
+        self._precedent_store = precedent_store
         self._cluster_fingerprints: dict[str, tuple[Any, ...]] = {}
 
     @property
@@ -223,7 +223,7 @@ class RuleCodifier:
 
     @property
     def precedent_store(self) -> PrecedentStore:
-        return self._precedent_store
+        return self._require_precedent_store()
 
     @property
     def pending_candidates(self) -> list[RuleCandidate]:
@@ -259,10 +259,11 @@ class RuleCodifier:
         Returns:
             list of PrecedentCluster (all sizes, pre-filtered)
         """
-        self._ensure_store_current()
-        active = list(self._precedent_store.require_canonical_records(precedents))
-        if not active:
+        if not precedents:
             return []
+        store = self._require_precedent_store()
+        self._ensure_store_current()
+        active = list(store.require_canonical_records(precedents))
 
         clusters: list[dict] = []
 
@@ -340,13 +341,16 @@ class RuleCodifier:
         Returns:
             list of RuleCandidate in PENDING state
         """
+        if not clusters:
+            return []
+        store = self._require_precedent_store()
         proposed: list[RuleCandidate] = []
 
         for cluster in clusters:
             snapshot = self._copy_cluster(cluster)
             self._ensure_store_current()
             self._validate_cluster(snapshot)
-            with self._precedent_store.guard_active_sources(snapshot.precedent_ids):
+            with store.guard_active_sources(snapshot.precedent_ids):
                 if snapshot.size < self._min_size:
                     continue
                 if snapshot.validator_agreement < self._min_agreement:
@@ -369,7 +373,7 @@ class RuleCodifier:
         """
         self._ensure_store_current()
         c = self._get_candidate(candidate_id, RuleCandidateStatus.PENDING)
-        with self._precedent_store.guard_active_sources(c.source_precedent_ids):
+        with self._require_precedent_store().guard_active_sources(c.source_precedent_ids):
             updated = dataclasses.replace(
                 c,
                 status=RuleCandidateStatus.APPROVED,
@@ -404,7 +408,7 @@ class RuleCodifier:
         """
         self._ensure_store_current()
         c = self._get_candidate(candidate_id, RuleCandidateStatus.APPROVED)
-        with self._precedent_store.guard_active_sources(c.source_precedent_ids):
+        with self._require_precedent_store().guard_active_sources(c.source_precedent_ids):
             new_yaml = _append_rule_to_yaml(constitution_yaml, c.to_yaml_block())
             new_hash = hashlib.sha256(new_yaml.encode()).hexdigest()[:16]
 
@@ -508,11 +512,20 @@ class RuleCodifier:
             raise ValueError(f"Cluster {cluster.cluster_id!r} is not a canonical cluster source")
 
     def _ensure_store_current(self) -> None:
-        if self._precedent_store.constitutional_hash != self._precedent_constitutional_hash:
+        store = self._require_precedent_store()
+        if store.constitutional_hash != self._precedent_constitutional_hash:
             raise ValueError(
                 "PrecedentStore constitutional hash does not match the codifier's "
                 "precedent-admission epoch"
             )
+
+    def _require_precedent_store(self) -> PrecedentStore:
+        if self._precedent_store is None:
+            raise ValueError(
+                "precedent admission and codification require an injected trusted "
+                "PrecedentStore"
+            )
+        return self._precedent_store
 
     @staticmethod
     def _cluster_fingerprint(cluster: PrecedentCluster) -> tuple[Any, ...]:

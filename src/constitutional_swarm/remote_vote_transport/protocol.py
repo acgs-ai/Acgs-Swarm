@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 from dataclasses import asdict, dataclass
+
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteEnvelope,
+    vote_envelope_from_dict,
+    vote_envelope_to_dict,
+)
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -92,19 +99,41 @@ def _build_ssl_context(
 
 @dataclass(frozen=True, slots=True)
 class RemoteVoteResponse:
-    """Detached signed vote decision returned by a remote peer."""
+    """Original signed vote envelope returned unchanged by a remote peer."""
 
-    assignment_id: str
-    voter_id: str
-    approved: bool
-    reason: str
-    constitutional_hash: str
-    content_hash: str
-    signature: str
+    envelope: VoteEnvelope
+
+    @property
+    def assignment_id(self) -> str:
+        return self.envelope.assignment_id
+
+    @property
+    def voter_id(self) -> str:
+        return self.envelope.voter_id
+
+    @property
+    def approved(self) -> bool:
+        return self.envelope.approved
+
+    @property
+    def reason(self) -> str:
+        return self.envelope.reason
+
+    @property
+    def constitutional_hash(self) -> str:
+        return self.envelope.constitutional_hash
+
+    @property
+    def content_hash(self) -> str:
+        return self.envelope.content_hash
+
+    @property
+    def signature(self) -> str:
+        return self.envelope.signature
 
 
 def encode_remote_vote_request(request: RemoteVoteRequest) -> str:
-    return json.dumps(asdict(request), separators=(",", ":"))
+    return json.dumps(asdict(request), separators=(",", ":"), allow_nan=False)
 
 
 def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
@@ -114,27 +143,59 @@ def decode_remote_vote_request(message: str) -> RemoteVoteRequest:
         raise ValueError(f"Malformed remote vote request: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Malformed remote vote request: expected object, got {type(payload)}")
+    expected = {
+        "assignment_id", "voter_id", "producer_id", "artifact_id", "content",
+        "content_hash", "constitutional_hash", "voter_public_key", "nonce",
+        "timestamp", "request_signer_public_key", "request_signature", "task_id",
+        "assigned_peers", "quorum", "evidence_mode", "protocol_version",
+    }
+    missing = expected - set(payload)
+    extra = set(payload) - expected
+    if missing:
+        raise ValueError(
+            f"Malformed remote vote request: missing {sorted(missing)[0]}"
+        )
+    if extra:
+        raise ValueError("Malformed remote vote request: exact versioned schema required")
+    string_fields = expected - {
+        "timestamp", "assigned_peers", "quorum", "protocol_version"
+    }
+    if any(not isinstance(payload[name], str) for name in string_fields):
+        raise ValueError("Malformed remote vote request: string field has invalid type")
+    if type(payload["timestamp"]) is not float or not math.isfinite(payload["timestamp"]):
+        raise ValueError("Malformed remote vote request: timestamp must be a finite float")
+    if not isinstance(payload["assigned_peers"], list) or any(
+        not isinstance(peer, str) for peer in payload["assigned_peers"]
+    ):
+        raise ValueError("Malformed remote vote request: assigned_peers must be strings")
+    if type(payload["quorum"]) is not int:
+        raise ValueError("Malformed remote vote request: quorum must be an integer")
+    if type(payload["protocol_version"]) is not int or payload["protocol_version"] != 2:
+        raise ValueError("Malformed remote vote request: unsupported protocol version")
     try:
         return RemoteVoteRequest(
-            assignment_id=str(payload["assignment_id"]),
-            voter_id=str(payload["voter_id"]),
-            producer_id=str(payload["producer_id"]),
-            artifact_id=str(payload["artifact_id"]),
-            content=str(payload["content"]),
-            content_hash=str(payload["content_hash"]),
-            constitutional_hash=str(payload["constitutional_hash"]),
-            voter_public_key=str(payload["voter_public_key"]),
-            nonce=str(payload["nonce"]),
-            timestamp=float(payload["timestamp"]),
-            request_signer_public_key=str(payload["request_signer_public_key"]),
-            request_signature=str(payload["request_signature"]),
+            assignment_id=payload["assignment_id"], voter_id=payload["voter_id"],
+            producer_id=payload["producer_id"], artifact_id=payload["artifact_id"],
+            content=payload["content"], content_hash=payload["content_hash"],
+            constitutional_hash=payload["constitutional_hash"],
+            voter_public_key=payload["voter_public_key"], nonce=payload["nonce"],
+            timestamp=payload["timestamp"],
+            request_signer_public_key=payload["request_signer_public_key"],
+            request_signature=payload["request_signature"], task_id=payload["task_id"],
+            assigned_peers=tuple(payload["assigned_peers"]), quorum=payload["quorum"],
+            evidence_mode=payload["evidence_mode"],
+            protocol_version=payload["protocol_version"],
         )
     except KeyError as exc:
         raise ValueError(f"Malformed remote vote request: missing {exc.args[0]}") from exc
 
 
 def encode_remote_vote_response(response: RemoteVoteResponse) -> str:
-    return json.dumps(asdict(response), separators=(",", ":"))
+    return json.dumps(
+        {"envelope": vote_envelope_to_dict(response.envelope)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def decode_remote_vote_response(message: str) -> RemoteVoteResponse:
@@ -144,19 +205,10 @@ def decode_remote_vote_response(message: str) -> RemoteVoteResponse:
         raise ValueError(f"Malformed remote vote response: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Malformed remote vote response: expected object, got {type(payload)}")
-    approved = payload.get("approved")
-    if not isinstance(approved, bool):
-        raise ValueError("Malformed remote vote response: approved must be a boolean")
     try:
-        return RemoteVoteResponse(
-            assignment_id=str(payload["assignment_id"]),
-            voter_id=str(payload["voter_id"]),
-            approved=approved,
-            reason=str(payload.get("reason", "")),
-            constitutional_hash=str(payload["constitutional_hash"]),
-            content_hash=str(payload["content_hash"]),
-            signature=str(payload["signature"]),
-        )
+        if set(payload) != {"envelope"} or not isinstance(payload["envelope"], dict):
+            raise ValueError("Malformed remote vote response: exact envelope required")
+        return RemoteVoteResponse(vote_envelope_from_dict(payload["envelope"]))
     except KeyError as exc:
         raise ValueError(f"Malformed remote vote response: missing {exc.args[0]}") from exc
 

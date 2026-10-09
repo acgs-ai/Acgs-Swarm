@@ -5,11 +5,14 @@ from __future__ import annotations
 import pytest
 from constitutional_swarm.bittensor.precedent_store import (
     PrecedentRecord,
-    PrecedentStore,
     _cosine_similarity,
     _euclidean_distance,
 )
 from constitutional_swarm.bittensor.protocol import EscalationType
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store as PrecedentStore,
+)
 
 CONST_HASH = "608508a9bd224290"
 
@@ -121,7 +124,7 @@ def _make_record(
     constitutional_hash: str = CONST_HASH,
     case_id: str = "case-001",
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
         task_id=f"task-{case_id}",
         miner_uid=miner_uid,
@@ -129,7 +132,6 @@ def _make_record(
         reasoning=reasoning,
         votes_for=votes_for,
         votes_against=votes_against,
-        proof_root_hash="abc123",
         escalation_type=escalation_type,
         impact_vector=impact_vector or PRIVACY_HEAVY,
         constitutional_hash=constitutional_hash,
@@ -595,24 +597,18 @@ class TestPrecedentStoreScale:
         # Generate and insert 10,000 precedents with random 7-vectors
         for i in range(10_000):
             vec = {d: random.random() for d in dims}
-            rec = PrecedentRecord(
-                precedent_id=f"scale-{i:05d}",
+            rec = c14_precedent_signed_record(
                 case_id=f"case-{i:05d}",
                 task_id=f"task-{i:05d}",
                 miner_uid=f"miner-{i % 100:03d}",
                 judgment=f"Judgment for case {i}",
                 reasoning=f"Reasoning {i}",
-                validation_accepted=True,
                 votes_for=3,
                 votes_against=2,
-                proof_root_hash=f"hash-{i}",
-                validator_grade=0.6,
                 escalation_type=esc_types[i % len(esc_types)],
                 impact_vector=vec,
-                ambiguous_dimensions=(),
                 constitutional_hash=CONST_HASH,
-                recorded_at=_time.time(),
-                is_active=True,
+                ambiguous_dimensions=(),
             )
             store.add(rec)
 

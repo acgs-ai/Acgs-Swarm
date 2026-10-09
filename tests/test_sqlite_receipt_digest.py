@@ -14,7 +14,6 @@ from constitutional_swarm import (
     verify_bundle,
 )
 from constitutional_swarm.settlement_store import DuplicateSettlementError, normalize_receipt_digest
-from cryptography.hazmat.primitives import serialization
 
 _DIGEST = "ab" * 32
 
@@ -128,23 +127,24 @@ def test_supplied_digest_is_not_silently_dropped(tmp_path) -> None:
 
 def test_sqlite_settlement_receipt_verifies(tmp_path) -> None:
     store = SQLiteSettlementStore(tmp_path / "s.db")
-    mesh = ConstitutionalMesh(Constitution.default(), seed=42, settlement_store=store)
+    mesh = ConstitutionalMesh(
+        Constitution.default(),
+        seed=42,
+        settlement_store=store,
+        quorum=3,
+        evidence_mode="single_operator_dev",
+    )
     for index in range(4):
         mesh.register_local_signer(f"agent-{index:02d}")
     assignment = mesh.request_validation("agent-00", "summarize notes", "art")
-    for voter in assignment.peers[:2]:
+    for voter in assignment.peers:
         mesh.validate_and_vote(assignment.assignment_id, voter)
     loaded = store.get(assignment.assignment_id)
     assert loaded is not None
     assert loaded.receipt_digest
     receipt_path = mesh._receipt_bundle_path(assignment.assignment_id)
     bundle = bundle_from_json(receipt_path.read_text(encoding="utf-8"))
-    trusted = {
-        "settlement-receipt": mesh._receipt_signing_public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        ).hex()
-    }
+    trusted = mesh.receipt_trust_registry()
     assert bundle.receipts[0].payload_digest == loaded.receipt_digest
     from constitutional_swarm.settlement_evidence import verify_committed_settlement_receipt
 

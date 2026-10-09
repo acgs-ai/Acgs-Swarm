@@ -59,6 +59,11 @@ class _FakeConnectContext:
         return None
 
 
+def _dev_mesh(*args, **kwargs) -> ConstitutionalMesh:
+    kwargs.setdefault("evidence_mode", "single_operator_dev")
+    return ConstitutionalMesh(*args, **kwargs)
+
+
 def _register_mesh_agents(mesh: ConstitutionalMesh, count: int = 5) -> None:
     for index in range(count):
         mesh.register_local_signer(f"agent-{index}", domain=f"domain-{index % 2}")
@@ -67,7 +72,7 @@ def _register_mesh_agents(mesh: ConstitutionalMesh, count: int = 5) -> None:
 def test_default_constitution_flows_through_dna_and_mesh() -> None:
     constitution = Constitution.default()
     dna = AgentDNA(constitution=constitution, agent_id="dna-agent", strict=False)
-    mesh = ConstitutionalMesh(constitution, seed=7)
+    mesh = _dev_mesh(constitution, seed=7)
     _register_mesh_agents(mesh)
 
     validation = dna.validate("safe collaborative planning update")
@@ -99,7 +104,7 @@ def test_custom_acgs_lite_rules_drive_mesh_validation_flow() -> None:
         ],
         name="constitutional-swarm-integration",
     )
-    mesh = ConstitutionalMesh(constitution, seed=11)
+    mesh = _dev_mesh(constitution, seed=11)
     _register_mesh_agents(mesh)
 
     result = mesh.full_validation(
@@ -123,7 +128,7 @@ async def test_remote_validation_e2e_preserves_acgs_lite_constitution_contract()
     )
 
     constitution = Constitution.default()
-    mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=3, seed=31)
+    mesh = _dev_mesh(constitution, peers_per_validation=3, quorum=3, seed=31)
     remote_peer = LocalRemotePeer(
         agent_id="peer-remote",
         constitution=constitution,
