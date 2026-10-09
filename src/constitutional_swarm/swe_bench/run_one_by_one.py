@@ -62,7 +62,7 @@ _DEFAULT_RUN_ROOT = Path(".omc/swe_bench_runs")
 
 
 def _safe_path_component(value: str, *, field_name: str) -> str:
-    if not value or value in {".", ".."}:
+    if not value or value in {".", ".."} or "\x00" in value:
         raise ValueError(f"{field_name} must be a non-empty path component")
     candidate = Path(value)
     if candidate.is_absolute() or len(candidate.parts) != 1:
@@ -155,7 +155,11 @@ def _load_specific_task(instance_id: str, *, dataset: str, split: str) -> dict[s
 
 
 def _normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
-    """Coerce SWE-bench Lite's str-encoded list fields back into Python lists."""
+    """Validate task identity and normalize str-encoded list fields."""
+    instance_id = raw.get("instance_id")
+    if not isinstance(instance_id, str):
+        raise ValueError("instance_id must be a string path component")
+    _safe_path_component(instance_id, field_name="instance_id")
     ftp = raw.get("FAIL_TO_PASS", "[]")
     if isinstance(ftp, str):
         try:
@@ -169,13 +173,14 @@ def _normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             ptp = []
     return {
-        "instance_id": raw["instance_id"],
+        "instance_id": instance_id,
         "repo": raw["repo"],
         "base_commit": raw["base_commit"],
         "problem_statement": raw["problem_statement"],
         "hints_text": raw.get("hints_text", ""),
         "FAIL_TO_PASS": ftp,
         "PASS_TO_PASS": ptp,
+        "test_patch": raw.get("test_patch", ""),
     }
 
 
@@ -284,6 +289,22 @@ def _save_patch(run_id: str, instance_id: str, patch: str) -> None:
     patch_dir = _run_dir(run_id) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = (patch_dir / f"{safe_instance_id}.diff").resolve()
+    if not patch_path.is_relative_to(patch_dir.resolve()):
+        raise ValueError("instance_id escapes patch directory")
+    patch_path.write_text(patch)
+
+
+def _save_candidate_patch(
+    run_id: str,
+    instance_id: str,
+    agent_index: int,
+    patch: str,
+) -> None:
+    """Persist one best-of-K candidate beneath the run's patch directory."""
+    safe_instance_id = _safe_path_component(instance_id, field_name="instance_id")
+    patch_dir = _run_dir(run_id) / "patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = (patch_dir / f"{safe_instance_id}.agent{agent_index}.diff").resolve()
     if not patch_path.is_relative_to(patch_dir.resolve()):
         raise ValueError("instance_id escapes patch directory")
     patch_path.write_text(patch)
@@ -516,8 +537,8 @@ def run_swarm_batch(
         print(f"Swarm batch {batch_id} ({k} agents, model={model}, dataset={dataset}):")
         print(
             f"  CRDT size: {aggregate['crdt_size']}"
-            f"  resolved: {aggregate['resolved']}/{aggregate['total']}"
-            f"  resolve_rate: {aggregate['resolve_rate']:.3f}"
+            f"  patch_generated: {aggregate['patch_generated']}/{aggregate['total']}"
+            f"  patch_rate: {aggregate['patch_rate']:.3f}"
         )
         print(
             f"  governed_count: {aggregate['governed_count']}"
@@ -595,6 +616,7 @@ def run_best_of_k_batch(
             raise RuntimeError(
                 f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
             )
+        _safe_path_component(task["instance_id"], field_name="instance_id")
 
         # Build agent roster (heterogeneous if --models given).
         if models:
@@ -623,11 +645,35 @@ def run_best_of_k_batch(
         batch_id = f"bok-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}-{picker}"
         candidates: list[Any] = []
         elapsed_per_agent: list[float] = []
-        for _, agent in enumerate(agents):
+        cand_records: list[dict[str, Any]] = []
+        for i, agent in enumerate(agents):
             t0 = time.time()
             result = agent.solve(task)
-            elapsed_per_agent.append(time.time() - t0)
+            elapsed = time.time() - t0
+            elapsed_per_agent.append(elapsed)
             candidates.append(result)
+            rec = _record_from_solve(
+                task=task,
+                result=result,
+                model=roster[i],
+                elapsed_s=elapsed,
+                batch_id=batch_id,
+                agent_index=i,
+            )
+            rec["provider"] = provider
+            rec["mode"] = "best-of-k"
+            rec["picker"] = picker
+            rec["is_winner"] = False
+            rec["candidate_count"] = k
+            cand_records.append(rec)
+            _append_result(run_id, rec)
+            if result.patch:
+                _save_candidate_patch(
+                    run_id,
+                    task["instance_id"],
+                    i,
+                    result.patch,
+                )
 
         # Picker selection.
         picker_fn = PICKERS[picker]
@@ -645,30 +691,6 @@ def run_best_of_k_batch(
             winner_idx, picker_reason = picker_fn(candidates, dna)
         else:
             winner_idx, picker_reason = picker_fn(candidates)
-
-        # Persist k candidate records.
-        cand_records: list[dict[str, Any]] = []
-        for i, result in enumerate(candidates):
-            rec = _record_from_solve(
-                task=task,
-                result=result,
-                model=roster[i],
-                elapsed_s=elapsed_per_agent[i],
-                batch_id=batch_id,
-                agent_index=i,
-            )
-            rec["provider"] = provider
-            rec["mode"] = "best-of-k"
-            rec["picker"] = picker
-            rec["is_winner"] = False
-            rec["candidate_count"] = k
-            cand_records.append(rec)
-            _append_result(run_id, rec)
-            # Per-candidate patch file for audit.
-            if result.patch:
-                patch_dir = _run_dir(run_id) / "patches"
-                patch_dir.mkdir(parents=True, exist_ok=True)
-                (patch_dir / f"{task['instance_id']}.agent{i}.diff").write_text(result.patch)
 
         # Build winner record.
         if winner_idx < 0:

@@ -32,6 +32,7 @@ def test_init_state_default_keys_and_values():
     assert state["violations"] == []
     assert state["peer_votes"] == {}
     assert state["quorum_reached"] is False
+    assert state["settled"] is False
     assert state["active_agent"] == ""
 
     expected_keys = {
@@ -47,6 +48,7 @@ def test_init_state_default_keys_and_values():
         "violations",
         "peer_votes",
         "quorum_reached",
+        "settled",
         "active_agent",
     }
     assert set(state.keys()) == expected_keys

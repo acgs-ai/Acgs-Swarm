@@ -8,13 +8,16 @@ compiled LangGraph (via LangGraphSWEBenchAgent).
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
-from dataclasses import asdict
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, replace
 from functools import partial
 from typing import Any
 
+from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 from constitutional_swarm.merkle_crdt import MerkleCRDT
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, SWEPatch
+from constitutional_swarm.swe_bench.harness import _patch_generation_metrics
 
 
 def run_langgraph(
@@ -24,6 +27,7 @@ def run_langgraph(
     graph_factory: Callable[[SWEBenchAgent], Any] | None = None,
     max_tasks: int | None = None,
     routing_weights: list[list[float]] | None = None,
+    constitutional_hash: str | None = CONSTITUTIONAL_HASH,
 ) -> dict[str, Any]:
     """Run agents through a LangGraph runtime; aggregate via shared MerkleCRDT.
 
@@ -43,14 +47,27 @@ def run_langgraph(
         Cap on tasks to process.
     routing_weights:
         Same shape as SwarmCoordinator.run_in_memory (n_agents x n_tasks).
+    constitutional_hash:
+        Constitution hash forwarded to graph-backed agents and stamped into
+        result metadata. ``None`` retains backward compatibility by selecting
+        the package constitutional hash.
 
     Returns
     -------
-    dict with keys: ``patches``, ``total``, ``resolved``, ``resolve_rate``,
-    ``crdt_size``, ``governed_count``, ``mean_intervention``.
+    The canonical outcome keys are ``patch_generated`` and ``patch_rate``;
+    deprecated ``resolved`` aliases remain for compatibility. The result also
+    includes ``patches``, ``crdt_size``, and shared generation diagnostics.
     """
     if not agents:
         raise ValueError("run_langgraph requires at least one agent.")
+    configured_hash = (
+        CONSTITUTIONAL_HASH if constitutional_hash is None else constitutional_hash
+    )
+    if configured_hash != CONSTITUTIONAL_HASH:
+        raise ValueError(
+            "configured constitutional hash mismatch: "
+            f"expected {CONSTITUTIONAL_HASH!r}, got {configured_hash!r}"
+        )
 
     subset = list(tasks) if max_tasks is None else list(tasks)[:max_tasks]
     n_agents = len(agents)
@@ -64,7 +81,10 @@ def run_langgraph(
         )
 
         effective_agents = [
-            LangGraphSWEBenchAgent(graph_factory=partial(graph_factory, a))
+            LangGraphSWEBenchAgent(
+                graph_factory=partial(graph_factory, a),
+                constitutional_hash=configured_hash,
+            )
             for a in agents
         ]
 
@@ -94,31 +114,174 @@ def run_langgraph(
     shared_crdt = MerkleCRDT("coordinator")
     patches: list[SWEPatch] = []
     for agent, task in assignments:
-        result = agent.solve(task)
+        result, bodes_passed, artifact_hash = _normalize_result(
+            agent.solve(task),
+            configured_hash=configured_hash,
+        )
         patches.append(result)
-        payload = json.dumps(asdict(result))
-        shared_crdt.append(payload=payload, bodes_passed=result.governed)
+        payload = json.dumps(asdict(result), allow_nan=False)
+        shared_crdt.append(
+            payload=payload,
+            bodes_passed=bodes_passed,
+            constitutional_hash=artifact_hash,
+        )
 
     return _aggregate(patches, shared_crdt)
 
 
-def _aggregate(patches: list[SWEPatch], crdt: MerkleCRDT) -> dict[str, Any]:
-    total = len(patches)
-    resolved = sum(1 for p in patches if p.success)
-    governed = [p for p in patches if p.governed]
-    mean_intervention = (
-        sum(p.intervention_rate for p in governed) / len(governed)
-        if governed
-        else 0.0
+def _normalize_result(
+    result: SWEPatch,
+    *,
+    configured_hash: str,
+) -> tuple[SWEPatch, bool, str]:
+    """Bind one result to the configured constitution without aborting a batch."""
+    if not isinstance(result.metadata, Mapping):
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="invalid_metadata",
+            diagnostic_key="reported_metadata_type",
+            diagnostic_value=result.metadata,
+        )
+    try:
+        metadata = dict(result.metadata)
+    except (TypeError, ValueError) as exc:
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="invalid_metadata",
+            diagnostic_key="metadata_conversion_error",
+            diagnostic_value=exc,
+        )
+    result_hash = metadata.get("constitutional_hash")
+    governance_status = metadata.get("governance_status")
+
+    if not isinstance(result_hash, (str, type(None))):
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="constitutional_hash_mismatch",
+            diagnostic_key="actual_constitutional_hash",
+            diagnostic_value=result_hash,
+            extra={"expected_constitutional_hash": configured_hash},
+        )
+    if governance_status is not None and not isinstance(governance_status, str):
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="invalid_governance_status",
+            diagnostic_key="reported_governance_status",
+            diagnostic_value=governance_status,
+        )
+    governance_attempted = result.governed or governance_status in {
+        "accepted",
+        "rejected",
+        "halted",
+    }
+
+    if result_hash in (None, ""):
+        metadata["constitutional_hash"] = configured_hash
+    elif result_hash != configured_hash:
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="constitutional_hash_mismatch",
+            diagnostic_key="actual_constitutional_hash",
+            diagnostic_value=result_hash,
+            extra={"expected_constitutional_hash": configured_hash},
+        )
+
+    try:
+        json.dumps(metadata, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        return _reject_malformed_result(
+            result,
+            configured_hash=configured_hash,
+            error="invalid_metadata",
+            diagnostic_key="metadata_serialization_error",
+            diagnostic_value=exc,
+        )
+
+    if governance_status in {"rejected", "halted"}:
+        metadata.setdefault("error", f"governance_{governance_status}")
+        normalized = replace(
+            result,
+            patch="",
+            success=False,
+            governed=False,
+            metadata=metadata,
+        )
+        bodes_passed = False
+    elif governance_status == "accepted":
+        normalized = replace(result, metadata=metadata)
+        bodes_passed = True
+    elif governance_status is None:
+        normalized = replace(result, metadata=metadata)
+        bodes_passed = result.governed
+    else:
+        metadata.update(
+            {
+                "governance_status": "rejected",
+                "error": "invalid_governance_status",
+                "reported_governance_status": governance_status,
+            }
+        )
+        normalized = replace(
+            result,
+            patch="",
+            success=False,
+            governed=False,
+            metadata=metadata,
+        )
+        bodes_passed = False
+    artifact_hash = configured_hash if governance_attempted else ""
+    return normalized, bodes_passed, artifact_hash
+
+
+def _reject_malformed_result(
+    result: SWEPatch,
+    *,
+    configured_hash: str,
+    error: str,
+    diagnostic_key: str | None = None,
+    diagnostic_value: object = None,
+    extra: Mapping[str, object] | None = None,
+) -> tuple[SWEPatch, bool, str]:
+    """Return a JSON-safe per-result rejection for malformed agent metadata."""
+    metadata: dict[str, Any] = {
+        "constitutional_hash": configured_hash,
+        "governance_status": "rejected",
+        "error": error,
+    }
+    if diagnostic_key is not None:
+        metadata[diagnostic_key] = _json_safe_diagnostic(diagnostic_value)
+    if extra is not None:
+        metadata.update(extra)
+    rejected = replace(
+        result,
+        patch="",
+        success=False,
+        governed=False,
+        metadata=metadata,
     )
+    return rejected, False, configured_hash
+
+
+def _json_safe_diagnostic(value: object) -> object:
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return {"type": "float", "value": "non-finite"}
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    return {"type": type(value).__name__}
+
+
+def _aggregate(patches: list[SWEPatch], crdt: MerkleCRDT) -> dict[str, Any]:
     return {
         "patches": patches,
-        "total": total,
-        "resolved": resolved,
-        "resolve_rate": resolved / total if total > 0 else 0.0,
+        **_patch_generation_metrics(patches),
         "crdt_size": crdt.size,
-        "governed_count": len(governed),
-        "mean_intervention": mean_intervention,
     }
 
 

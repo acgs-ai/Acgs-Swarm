@@ -59,6 +59,8 @@ def test_project_id_falls_back_to_google_cloud_project_env() -> None:
         mock_vertex.assert_called_once_with(
             project_id="fallback-project-123",
             region="global",
+            timeout=180.0,
+            max_retries=0,
         )
 
 
@@ -74,6 +76,8 @@ def test_explicit_project_overrides_env() -> None:
         mock_vertex.assert_called_once_with(
             project_id="explicit-project",
             region="us-east5",
+            timeout=180.0,
+            max_retries=0,
         )
 
 

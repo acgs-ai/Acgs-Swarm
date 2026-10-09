@@ -93,7 +93,7 @@ def test_validate_node_handles_none_risk_score() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_generate_node_returns_patch_and_constitutional_hash() -> None:
+def test_generate_node_returns_patch_without_rewriting_constitutional_hash() -> None:
     generator = MagicMock(
         return_value=("--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n", {"intervention_rate": 0.25})
     )
@@ -104,7 +104,7 @@ def test_generate_node_returns_patch_and_constitutional_hash() -> None:
     generator.assert_called_once_with(state)
     assert out["patch"].startswith("--- a")
     assert out["intervention_rate"] == pytest.approx(0.25)
-    assert out["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in out
 
 
 def test_generate_node_defaults_intervention_rate_to_zero() -> None:
@@ -113,7 +113,7 @@ def test_generate_node_defaults_intervention_rate_to_zero() -> None:
     out = generate_node({}, generator=generator)
 
     assert out["intervention_rate"] == 0.0
-    assert out["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +125,12 @@ def test_append_crdt_node_serializes_state_and_returns_cid() -> None:
     crdt = MagicMock()
     crdt.append.return_value = SimpleNamespace(cid="bafy-cid-001")
 
-    state = {"patch": "P", "governed": True, "_h_next": "private"}
+    state = {
+        "patch": "P",
+        "governed": True,
+        "constitutional_hash": CONSTITUTIONAL_HASH,
+        "_h_next": "private",
+    }
     out = append_crdt_node(state, crdt=crdt)
 
     crdt.append.assert_called_once()
@@ -136,6 +141,7 @@ def test_append_crdt_node_serializes_state_and_returns_cid() -> None:
     assert decoded["patch"] == "P"
     assert decoded["governed"] is True
     assert kwargs["bodes_passed"] is True
+    assert kwargs["constitutional_hash"] == CONSTITUTIONAL_HASH
     assert out == {"cid": "bafy-cid-001"}
 
 
@@ -143,7 +149,10 @@ def test_append_crdt_node_defaults_governed_flag_to_false() -> None:
     crdt = MagicMock()
     crdt.append.return_value = SimpleNamespace(cid="bafy-cid-002")
 
-    out = append_crdt_node({"patch": "P"}, crdt=crdt)
+    out = append_crdt_node(
+        {"patch": "P", "constitutional_hash": CONSTITUTIONAL_HASH},
+        crdt=crdt,
+    )
 
     kwargs = crdt.append.call_args.kwargs
     assert kwargs["bodes_passed"] is False
@@ -156,7 +165,10 @@ def test_append_crdt_node_accepts_string_cid_return() -> None:
     crdt = MagicMock()
     crdt.append.return_value = "raw-cid-string"
 
-    out = append_crdt_node({"patch": "P"}, crdt=crdt)
+    out = append_crdt_node(
+        {"patch": "P", "constitutional_hash": CONSTITUTIONAL_HASH},
+        crdt=crdt,
+    )
 
     assert out == {"cid": "raw-cid-string"}
 

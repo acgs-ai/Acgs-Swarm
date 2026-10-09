@@ -7,7 +7,7 @@ task's lifecycle. Total=False so partial updates are valid (LangGraph convention
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 try:
     from langgraph.graph.message import add_messages
@@ -30,11 +30,21 @@ class SwarmGraphState(TypedDict, total=False):
     violations: list[str]
     peer_votes: dict[str, str]
     quorum_reached: bool
+    settled: bool
+    governance_status: Literal["accepted", "rejected", "halted"]
     active_agent: str
 
 
-def init_state(task: dict[str, Any]) -> SwarmGraphState:
-    """Initialize a graph state for one SWE-bench-style task."""
+def init_state(
+    task: dict[str, Any],
+    *,
+    constitutional_hash: str | None = None,
+) -> SwarmGraphState:
+    """Initialize graph state while preserving caller-supplied hash provenance."""
+    task_hash = task.get("constitutional_hash", "")
+    initial_hash = constitutional_hash if constitutional_hash is not None else task_hash
+    if not isinstance(initial_hash, str):
+        initial_hash = ""
     return SwarmGraphState(
         task_id=task.get("instance_id", "unknown"),
         problem_statement=task.get("problem_statement", ""),
@@ -43,11 +53,12 @@ def init_state(task: dict[str, Any]) -> SwarmGraphState:
         cid="",
         governed=False,
         intervention_rate=0.0,
-        constitutional_hash="",
+        constitutional_hash=initial_hash,
         risk_score=0.0,
         violations=[],
         peer_votes={},
         quorum_reached=False,
+        settled=False,
         active_agent="",
     )
 

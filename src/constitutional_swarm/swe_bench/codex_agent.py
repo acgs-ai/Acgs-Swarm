@@ -25,6 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from constitutional_swarm.swe_bench._subprocess import _run_process
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 _log = logging.getLogger(__name__)
@@ -136,13 +137,10 @@ class CodexSWEBenchAgent(SWEBenchAgent):
             cmd.extend(self.extra_args)
 
             try:
-                proc = subprocess.run(
+                proc = _run_process(
                     cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_s,
-                    check=False,
+                    input_text=prompt,
+                    timeout_s=self.timeout_s,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"codex exec timed out after {self.timeout_s}s") from exc
@@ -155,6 +153,7 @@ class CodexSWEBenchAgent(SWEBenchAgent):
             }
             if proc.returncode != 0:
                 _log.warning("codex exec failed (%s): %s", proc.returncode, proc.stderr[-500:])
+                stats["error"] = "codex_exit_nonzero"
                 stats["stderr_tail"] = proc.stderr[-500:]
                 return "", stats
 

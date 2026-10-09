@@ -98,13 +98,21 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
+        if extra_kwargs and "timeout" in extra_kwargs:
+            raise ValueError("extra_kwargs cannot override the configured timeout")
         try:
             import anthropic
         except ImportError as exc:
             raise ImportError(
                 "anthropic package is required. Install with `pip install anthropic`."
             ) from exc
-        self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.timeout_s,
+            "max_retries": 0,
+        }
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        self._client = anthropic.Anthropic(**client_kwargs)
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_kwargs: dict[str, Any] = dict(extra_kwargs or {})
 
@@ -148,14 +156,14 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
             stats["error"] = f"api_status_{exc.status_code}"
             stats["stderr_tail"] = str(exc.message)[:500]
             return "", stats
+        except anthropic.APITimeoutError:
+            _log.warning("Anthropic request timed out after %.0fs", self.timeout_s)
+            stats["error"] = "timeout"
+            return "", stats
         except anthropic.APIConnectionError as exc:
             _log.warning("Anthropic connection error: %s", exc)
             stats["error"] = "connection_error"
             stats["stderr_tail"] = str(exc)[:500]
-            return "", stats
-        except anthropic.APITimeoutError:
-            _log.warning("Anthropic request timed out after %.0fs", self.timeout_s)
-            stats["error"] = "timeout"
             return "", stats
 
         raw = ""

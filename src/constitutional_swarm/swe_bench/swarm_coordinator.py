@@ -27,6 +27,7 @@ from typing import Any
 
 from constitutional_swarm.merkle_crdt import MerkleCRDT
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, SWEPatch
+from constitutional_swarm.swe_bench.harness import _patch_generation_metrics
 
 log = logging.getLogger(__name__)
 
@@ -88,8 +89,12 @@ class SwarmCoordinator:
 
         Returns
         -------
-        dict with keys: ``patches``, ``total``, ``resolved``, ``resolve_rate``,
-        ``crdt_size``, ``governed_count``, ``mean_intervention``.
+        Dict containing ``patches``, ``total``, the canonical patch-generation
+        metrics ``patch_generated`` and ``patch_rate``, and
+        ``evaluation_mode="patch_generation_only"``. The deprecated
+        ``resolved`` and ``resolve_rate`` keys remain aliases for those
+        generation metrics. Additional diagnostics include ``crdt_size``,
+        ``governed_count``, ``mean_intervention``, and ``mean_duration_s``.
         """
         subset = tasks if max_tasks is None else tasks[:max_tasks]
         n_agents = len(self.agents)
@@ -194,18 +199,9 @@ class SwarmCoordinator:
 
     @staticmethod
     def _aggregate(patches: list[SWEPatch], crdt: MerkleCRDT) -> dict[str, Any]:
-        total = len(patches)
-        resolved = sum(1 for p in patches if p.success)
-        governed = [p for p in patches if p.governed]
-        mean_intervention = (
-            sum(p.intervention_rate for p in governed) / len(governed) if governed else 0.0
-        )
+        metrics = _patch_generation_metrics(patches)
         return {
             "patches": patches,
-            "total": total,
-            "resolved": resolved,
-            "resolve_rate": resolved / total if total > 0 else 0.0,
+            **metrics,
             "crdt_size": crdt.size,
-            "governed_count": len(governed),
-            "mean_intervention": mean_intervention,
         }

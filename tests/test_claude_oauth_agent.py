@@ -151,7 +151,11 @@ def test_agent_constructs_with_valid_creds(tmp_path: Path) -> None:
     ):
         agent = ClaudeOAuthSWEBenchAgent(cred_path=cred)
         assert agent._model == "claude-sonnet-4-6"
-        fake_module.Anthropic.assert_called_once_with(auth_token="sk-ant-oat01-fake")
+        fake_module.Anthropic.assert_called_once_with(
+            auth_token="sk-ant-oat01-fake",
+            timeout=180.0,
+            max_retries=0,
+        )
 
 
 def test_agent_constructs_with_custom_model(tmp_path: Path) -> None:
@@ -210,7 +214,11 @@ def test_agent_generate_patch_dispatches_via_oauth_client(tmp_path: Path) -> Non
     assert stats["model"] == "claude-sonnet-4-6"
     assert stats["auth"] == "oauth"
     assert stats["input_tokens"] == 10
-    fake_module.Anthropic.assert_called_once_with(auth_token="real-oauth-tok")
+    fake_module.Anthropic.assert_called_once_with(
+        auth_token="real-oauth-tok",
+        timeout=180.0,
+        max_retries=0,
+    )
     call_kwargs = mock_client.messages.create.call_args.kwargs
     assert call_kwargs["model"] == "claude-sonnet-4-6"
 
