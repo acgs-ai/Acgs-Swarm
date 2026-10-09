@@ -243,19 +243,31 @@ class TestDPNoiseHelpers:
     def test_calibrate_sigma_returns_positive(self) -> None:
         from constitutional_swarm.swarm_ode import calibrate_sigma
 
-        sigma = calibrate_sigma(r=1.0, residual_alpha=0.1, epsilon=1.0, delta=1e-5)
+        sigma = calibrate_sigma(
+            certified_spectral_bound=1.0,
+            matrix_dimension=50,
+            epsilon=1.0,
+            delta=1e-5,
+        )
         assert sigma > 0, "sigma must be positive"
 
-    def test_calibrate_sigma_decreases_with_alpha(self) -> None:
-        """Higher α → smaller sensitivity → smaller σ (NDSS paper claim)."""
+    def test_calibrate_sigma_scales_with_matrix_l2_sensitivity(self) -> None:
+        """Certified spectral bounds convert to Frobenius sensitivity via sqrt(n)."""
         from constitutional_swarm.swarm_ode import calibrate_sigma
 
-        sigma_low_alpha = calibrate_sigma(r=1.0, residual_alpha=0.1, epsilon=1.0, delta=1e-5)
-        sigma_high_alpha = calibrate_sigma(r=1.0, residual_alpha=0.5, epsilon=1.0, delta=1e-5)
-        assert sigma_high_alpha < sigma_low_alpha, (
-            f"Higher α should reduce σ: α=0.1 → σ={sigma_low_alpha:.4f}, "  # noqa: RUF001
-            f"α=0.5 → σ={sigma_high_alpha:.4f}"  # noqa: RUF001
+        sigma_n25 = calibrate_sigma(
+            certified_spectral_bound=1.0,
+            matrix_dimension=25,
+            epsilon=1.0,
+            delta=1e-5,
         )
+        sigma_n100 = calibrate_sigma(
+            certified_spectral_bound=1.0,
+            matrix_dimension=100,
+            epsilon=1.0,
+            delta=1e-5,
+        )
+        assert sigma_n100 == pytest.approx(2.0 * sigma_n25)
 
     def test_add_dp_noise_changes_matrix(self) -> None:
         import torch
@@ -270,9 +282,19 @@ class TestDPNoiseHelpers:
         from constitutional_swarm.swarm_ode import calibrate_sigma
 
         with pytest.raises(ValueError):
-            calibrate_sigma(r=1.0, residual_alpha=0.0, epsilon=1.0, delta=1e-5)  # alpha=0 invalid
+            calibrate_sigma(
+                certified_spectral_bound=1.0,
+                matrix_dimension=0,
+                epsilon=1.0,
+                delta=1e-5,
+            )
         with pytest.raises(ValueError):
-            calibrate_sigma(r=1.0, residual_alpha=0.1, epsilon=-1.0, delta=1e-5)  # neg epsilon
+            calibrate_sigma(
+                certified_spectral_bound=1.0,
+                matrix_dimension=50,
+                epsilon=-1.0,
+                delta=1e-5,
+            )
 
 
 # ---------------------------------------------------------------------------
