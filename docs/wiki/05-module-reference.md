@@ -314,9 +314,23 @@ The largest subpackage; a full incentive subnet. By role:
   **nullifiers** block double-voting per epoch; tally is deterministic.
 
 ### `federated_bridge.py` — cross-org credential gate
-- **Surface:** `FederatedConstitutionBridge` (`.register_credential`, `.gate`,
-  `.audit_log`, `.summary`), `AgentCredential` (`.fingerprint`, `.is_expired`,
-  `.authorised_for`), `FederationDecision`, `CredentialStatus`.
+- **Surface:** `FederatedConstitutionBridge` (`.register_credential`,
+  `.renew_credential`, `.gate(agent_id, *, org_id, domain)`,
+  `.revoke(agent_id, *, org_id)`, `.audit_log`, `.summary`), `AgentCredential`
+  (`.fingerprint`, `.is_expired`, `.is_not_yet_valid`, `.authorised_for`),
+  `FederationDecision`, `CredentialStatus`, `ALL_DOMAINS`.
+- **Credential semantics:** credentials are scoped by `(org_id, agent_id)`;
+  revocation remains sticky across same-key renewal and is cleared only when a
+  newer credential changes `pubkey_fingerprint` to a key that was never revoked
+  (fingerprints are compared case- and whitespace-insensitively; rotating back
+  to any previously revoked key stays blocked). An empty `domains` tuple
+  grants no domains; unrestricted access requires the explicit `ALL_DOMAINS`
+  wildcard.
+- **Audit semantics:** the retained decision log is bounded to 1000 entries by
+  default. `summary()` exposes the overflow count, and an optional
+  `audit_overflow_sink` receives evicted immutable decisions after the bridge
+  lock is released. `audit_log()` rejects a truncated log unless callers opt
+  into the retained suffix with `require_complete=False`.
 
 ### `mac_acgs_loop.py` — auto-constitution pipeline
 - **Surface:** `MacAcgsLoop` (`.run_cycle`, `.add_external_challenger`,
