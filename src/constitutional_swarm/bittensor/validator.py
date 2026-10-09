@@ -6,7 +6,7 @@ validator that:
   2. Runs full mesh validation (DNA pre-check + peer votes + Merkle proof)
   3. Updates trust manifold (Sinkhorn-Knopp projection)
   4. Returns grading result with cryptographic proof (ValidationSynapse)
-  5. Computes TAO emission weights from projected trust matrix
+  5. Computes TAO emission weights from validated raw-trust signals
 
 Bittensor SDK is NOT required — this module uses constitutional_swarm
 primitives only.
@@ -14,17 +14,22 @@ primitives only.
 
 from __future__ import annotations
 
+import math
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from acgs_lite import Constitution
 
-from constitutional_swarm.bittensor.protocol import (
-    TIER_TAO_MULTIPLIER,
-    MinerTier,
-    ValidatorConfig,
+from constitutional_swarm.bittensor._validation import _validate_finite
+from constitutional_swarm.bittensor.emission_calculator import (
+    DEFAULT_EMISSION_WEIGHTS,
+    EmissionCalculator,
+    EmissionWeights,
+    MinerEmissionInput,
 )
+from constitutional_swarm.bittensor.protocol import MinerTier, ValidatorConfig
 from constitutional_swarm.bittensor.synapses import JudgmentSynapse, ValidationSynapse
 from constitutional_swarm.mesh import ConstitutionalMesh, MeshResult
 
@@ -56,6 +61,107 @@ class UnknownMinerError(ValueError):
     """Raised when an unregistered miner submits a judgment."""
 
 
+def _validate_manifold_snapshot(
+    mesh_agents: set[str],
+    indices: dict[str, int],
+    raw_trust: tuple[tuple[float, ...], ...] | None,
+    *,
+    manifold_present: bool,
+) -> None:
+    """Reject inconsistent or unsafe trust snapshots before scoring miners."""
+    for agent_id, index in indices.items():
+        if type(index) is not int:
+            raise ValueError(f"manifold index for {agent_id!r} must be an integer")
+
+    size = len(indices)
+    if set(indices.values()) != set(range(size)):
+        raise ValueError("manifold indices must be unique and contiguous from zero")
+
+    if not manifold_present:
+        if indices:
+            raise ValueError("manifold indices exist while the manifold is disabled")
+        return
+
+    if set(indices) != mesh_agents:
+        raise ValueError("manifold indices must cover every registered mesh agent")
+    if raw_trust is None:
+        return
+    if len(raw_trust) != size or any(len(row) != size for row in raw_trust):
+        raise ValueError(f"manifold raw trust matrix must be square with size {size}")
+
+    for row_index, row in enumerate(raw_trust):
+        for column_index, value in enumerate(row):
+            _validate_finite(
+                f"manifold raw trust[{row_index}][{column_index}]",
+                value,
+                minimum=None,
+            )
+
+
+def _snapshot_mesh_emission_state(
+    mesh: ConstitutionalMesh,
+    requested_uids: list[str],
+) -> tuple[
+    set[str],
+    dict[str, float],
+    dict[str, int],
+    tuple[tuple[float, ...], ...] | None,
+    bool,
+]:
+    """Capture detached emission inputs under the mesh lock.
+
+    TODO: replace this private compatibility boundary with a public
+    ``ConstitutionalMesh.emission_snapshot()`` API.
+    """
+    with mesh._lock:
+        mesh_agents = set(mesh._agents)
+        reputations = {
+            uid: mesh._agents[uid].reputation
+            for uid in requested_uids
+            if uid in mesh._agents
+        }
+        indices = dict(mesh._agent_indices)
+        manifold = mesh._manifold
+        raw = None if manifold is None else getattr(manifold, "_raw_trust", None)
+        raw_trust = None if raw is None else tuple(tuple(row) for row in raw)
+    return mesh_agents, reputations, indices, raw_trust, manifold is not None
+
+
+def _manifold_signals(
+    indices: dict[str, int],
+    raw_trust: tuple[tuple[float, ...], ...] | None,
+) -> dict[str, float] | None:
+    """Return shifted raw column-mass signals, or None without variation."""
+    if raw_trust is None or not raw_trust:
+        return None
+    scale = max(abs(value) for row in raw_trust for value in row)
+    if scale == 0.0:
+        return None
+    size = len(raw_trust)
+    column_mass = [
+        math.fsum(row[column] / scale for row in raw_trust) / size
+        for column in range(size)
+    ]
+    low = min(column_mass)
+    if max(column_mass) == low:
+        return None
+    shifted = [value - low for value in column_mass]
+    return {uid: shifted[index] for uid, index in indices.items()}
+
+
+def _weights_without_manifold() -> EmissionWeights:
+    """Redistribute the unavailable manifold coefficient proportionally."""
+    weights = DEFAULT_EMISSION_WEIGHTS
+    remainder = 1.0 - weights.manifold_trust
+    return EmissionWeights(
+        manifold_trust=0.0,
+        reputation=weights.reputation / remainder,
+        tier=weights.tier / remainder,
+        precedent=weights.precedent / remainder,
+        authenticity=weights.authenticity / remainder,
+    )
+
+
 class ConstitutionalValidator:
     """Bittensor validator runtime for constitutional governance subnet.
 
@@ -85,18 +191,22 @@ class ConstitutionalValidator:
             use_manifold=config.use_manifold,
         )
         self._stats = ValidatorStats()
+        self._stats_lock = threading.Lock()
         self._known_miners: set[str] = set()
         self._miner_tiers: dict[str, MinerTier] = {}
         self._miner_domains: dict[str, str] = {}
         self._previous_hash: str | None = None
+        self._registry_lock = threading.RLock()
 
     @property
     def constitution_hash(self) -> str:
-        return self._constitution.hash
+        with self._registry_lock:
+            return self._constitution.hash
 
     @property
     def previous_hash(self) -> str | None:
-        return self._previous_hash
+        with self._registry_lock:
+            return self._previous_hash
 
     def rotate_constitution(self, new_constitution: Constitution) -> None:
         """Rotate to a new constitution, preserving the old hash as a grace window.
@@ -105,27 +215,30 @@ class ConstitutionalValidator:
         previous constitution hash are accepted. Call this again to close
         the window (the previous hash advances to the now-old current hash).
         """
-        old_hash = self._constitution.hash
-        self._constitution = new_constitution
-        self._mesh = ConstitutionalMesh(
-            new_constitution,
-            peers_per_validation=self._config.peers_per_validation,
-            quorum=self._config.quorum,
-            use_manifold=self._config.use_manifold,
-        )
-        # Re-register all known miners in the new mesh
-        for miner_uid in self._known_miners:
-            domain = self._miner_domains.get(miner_uid, "")
-            self._mesh.register_local_signer(miner_uid, domain=domain)
-        self._previous_hash = old_hash
+        with self._registry_lock:
+            old_hash = self._constitution.hash
+            new_mesh = ConstitutionalMesh(
+                new_constitution,
+                peers_per_validation=self._config.peers_per_validation,
+                quorum=self._config.quorum,
+                use_manifold=self._config.use_manifold,
+            )
+            for miner_uid in self._known_miners:
+                domain = self._miner_domains.get(miner_uid, "")
+                new_mesh.register_local_signer(miner_uid, domain=domain)
+            self._constitution = new_constitution
+            self._mesh = new_mesh
+            self._previous_hash = old_hash
 
     @property
     def stats(self) -> ValidatorStats:
-        return self._stats
+        with self._stats_lock:
+            return replace(self._stats)
 
     @property
     def mesh(self) -> ConstitutionalMesh:
-        return self._mesh
+        with self._registry_lock:
+            return self._mesh
 
     def register_miner(
         self,
@@ -138,17 +251,19 @@ class ConstitutionalValidator:
         Adds the miner to the known set, mesh, tier map, and domain map.
         Only miners registered via this method may submit judgments.
         """
-        self._known_miners = self._known_miners | {miner_uid}
-        self._mesh.register_local_signer(miner_uid, domain=domain)
-        self._miner_tiers = {**self._miner_tiers, miner_uid: tier}
-        self._miner_domains = {**self._miner_domains, miner_uid: domain}
+        with self._registry_lock:
+            self._mesh.register_local_signer(miner_uid, domain=domain)
+            self._known_miners.add(miner_uid)
+            self._miner_tiers[miner_uid] = tier
+            self._miner_domains[miner_uid] = domain
 
     def unregister_miner(self, miner_uid: str) -> None:
         """Remove a miner from the mesh."""
-        self._mesh.unregister_agent(miner_uid)
-        self._known_miners = self._known_miners - {miner_uid}
-        self._miner_tiers = {k: v for k, v in self._miner_tiers.items() if k != miner_uid}
-        self._miner_domains = {k: v for k, v in self._miner_domains.items() if k != miner_uid}
+        with self._registry_lock:
+            self._mesh.unregister_agent(miner_uid)
+            self._known_miners.discard(miner_uid)
+            self._miner_tiers.pop(miner_uid, None)
+            self._miner_domains.pop(miner_uid, None)
 
     def validate(self, synapse: JudgmentSynapse) -> ValidationSynapse:
         """Validate a miner's governance judgment.
@@ -173,13 +288,17 @@ class ConstitutionalValidator:
         """
         start = time.monotonic()
 
-        # Step 1: Verify constitution hash (accept current or previous during rollover)
-        accepted_hashes = {self._constitution.hash}
-        if self._previous_hash is not None:
-            accepted_hashes = accepted_hashes | {self._previous_hash}
+        with self._registry_lock:
+            current_hash = self._constitution.hash
+            accepted_hashes = {current_hash}
+            if self._previous_hash is not None:
+                accepted_hashes.add(self._previous_hash)
+            known_miner = synapse.miner_uid in self._known_miners
+            mesh = self._mesh
 
         if synapse.constitutional_hash not in accepted_hashes:
-            self._stats.constitution_mismatches += 1
+            with self._stats_lock:
+                self._stats.constitution_mismatches += 1
             return ValidationSynapse(
                 task_id=synapse.task_id,
                 assignment_id="",
@@ -187,31 +306,31 @@ class ConstitutionalValidator:
                 votes_for=0,
                 votes_against=0,
                 quorum_met=False,
-                constitutional_hash=self._constitution.hash,
+                constitutional_hash=current_hash,
             )
 
         # Step 2: Reject unknown miners — no auto-registration
-        if synapse.miner_uid not in self._known_miners:
+        if not known_miner:
             raise UnknownMinerError(
                 f"Miner {synapse.miner_uid!r} is not registered. "
                 f"Call register_miner() before submitting judgments."
             )
 
         # Step 3: Full mesh validation
-        result = self._mesh.full_validation(
+        result = mesh.full_validation(
             producer_id=synapse.miner_uid,
             content=synapse.judgment,
             artifact_id=synapse.artifact_hash,
         )
 
         elapsed_ms = (time.monotonic() - start) * 1000
-        self._stats.total_validation_time_ms += elapsed_ms
-        self._stats.validations_performed += 1
-
-        if result.accepted:
-            self._stats.judgments_accepted += 1
-        else:
-            self._stats.judgments_rejected += 1
+        with self._stats_lock:
+            self._stats.total_validation_time_ms += elapsed_ms
+            self._stats.validations_performed += 1
+            if result.accepted:
+                self._stats.judgments_accepted += 1
+            else:
+                self._stats.judgments_rejected += 1
 
         # Step 4: Build ValidationSynapse
         return self._result_to_synapse(synapse.task_id, result)
@@ -220,39 +339,60 @@ class ConstitutionalValidator:
         self,
         miner_uids: list[str] | None = None,
     ) -> dict[str, float]:
-        """Compute TAO emission weights from the governance manifold.
+        """Compute weights with the canonical emission formula.
 
-        Weight formula:
-          base_weight = manifold trust (column sum in projected matrix)
-          tier_multiplier = TIER_TAO_MULTIPLIER[miner_tier]
-          reputation = mesh reputation score
-          final_weight = base_weight * tier_multiplier * reputation
-
-        Returns normalized weights (sum to 1.0).
+        Raw trust column mass is used because projected Birkhoff columns are
+        constant by construction. When raw trust is unavailable or has no
+        spread, its coefficient is dropped and the other coefficients are
+        renormalized. Explicit unknown UIDs remain in the result with zero
+        weight; duplicate requests are deduplicated in first-seen order, and an
+        explicit empty list requests no miners.
         """
-        uids = miner_uids or list(self._miner_tiers.keys())
-        if not uids:
-            return {}
+        with self._registry_lock:
+            requested = list(self._miner_tiers) if miner_uids is None else list(miner_uids)
+            uids = list(dict.fromkeys(requested))
+            if not uids:
+                return {}
+            tiers = dict(self._miner_tiers)
+            known_miners = set(self._known_miners)
+            mesh = self._mesh
+            mesh_agents, reputations, indices, raw_trust, manifold_present = (
+                _snapshot_mesh_emission_state(mesh, uids)
+            )
 
-        raw_weights: dict[str, float] = {}
+        _validate_manifold_snapshot(
+            mesh_agents,
+            indices,
+            raw_trust,
+            manifold_present=manifold_present,
+        )
+        manifold_signals = _manifold_signals(indices, raw_trust)
+        emission_weights = (
+            DEFAULT_EMISSION_WEIGHTS
+            if manifold_signals is not None
+            else _weights_without_manifold()
+        )
+        registered = known_miners & mesh_agents
+        inputs: list[MinerEmissionInput] = []
         for uid in uids:
-            # Base: reputation from mesh
-            try:
-                reputation = self._mesh.get_reputation(uid)
-            except KeyError:
-                reputation = 1.0
+            inputs.append(
+                MinerEmissionInput(
+                    miner_uid=uid,
+                    tier=tiers.get(uid, MinerTier.APPRENTICE),
+                    manifold_trust=(
+                        0.0 if manifold_signals is None else manifold_signals.get(uid, 0.0)
+                    ),
+                    reputation=reputations.get(uid, 0.0),
+                    precedent_contributions=0,
+                    avg_authenticity=0.0,
+                )
+            )
 
-            # Tier multiplier
-            tier = self._miner_tiers.get(uid, MinerTier.APPRENTICE)
-            multiplier = TIER_TAO_MULTIPLIER[tier]
-
-            raw_weights[uid] = reputation * multiplier
-
-        # Normalize to sum to 1.0
-        total = sum(raw_weights.values())
-        if total == 0:
-            return {uid: 1.0 / len(uids) for uid in uids}
-        return {uid: w / total for uid, w in raw_weights.items()}
+        calculated = EmissionCalculator(
+            weights=emission_weights,
+            registered_miners=registered,
+        ).compute(inputs).as_weight_dict()
+        return {uid: calculated[uid] for uid in uids}
 
     def get_miner_reputation(self, miner_uid: str) -> float:
         """Get a miner's current reputation score."""
@@ -260,18 +400,23 @@ class ConstitutionalValidator:
 
     def summary(self) -> dict[str, Any]:
         """Combined validator + mesh + manifold statistics."""
+        stats = self.stats
+        with self._registry_lock:
+            mesh = self._mesh
+            registered_miners = len(self._miner_tiers)
+            constitution_hash = self._constitution.hash
         return {
             "validator_stats": {
-                "validations": self._stats.validations_performed,
-                "accepted": self._stats.judgments_accepted,
-                "rejected": self._stats.judgments_rejected,
-                "acceptance_rate": self._stats.acceptance_rate,
-                "avg_validation_ms": self._stats.avg_validation_ms,
+                "validations": stats.validations_performed,
+                "accepted": stats.judgments_accepted,
+                "rejected": stats.judgments_rejected,
+                "acceptance_rate": stats.acceptance_rate,
+                "avg_validation_ms": stats.avg_validation_ms,
             },
-            "mesh": self._mesh.summary(),
-            "manifold": self._mesh.manifold_summary(),
-            "registered_miners": len(self._miner_tiers),
-            "constitution_hash": self._constitution.hash,
+            "mesh": mesh.summary(),
+            "manifold": mesh.manifold_summary(),
+            "registered_miners": registered_miners,
+            "constitution_hash": constitution_hash,
         }
 
     def _result_to_synapse(

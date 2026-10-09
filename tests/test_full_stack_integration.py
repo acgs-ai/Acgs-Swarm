@@ -435,7 +435,18 @@ class TestFullStackIntegration:
         )
 
         # Compute emission weights
-        weights = validator.compute_emission_weights(["miner-w", "peer-a"])
+        pair_weights = validator.compute_emission_weights(["miner-w", "peer-a"])
+        assert pair_weights == {
+            "miner-w": pytest.approx(0.5),
+            "peer-a": pytest.approx(0.5),
+        }
+
+        weights = validator.compute_emission_weights(["miner-w", "peer-a", "peer-b"])
         assert abs(sum(weights.values()) - 1.0) < 1e-9
-        # Journeyman miner should get higher weight than apprentice
-        assert weights["miner-w"] > weights["peer-a"]
+        # Canonical emission includes the validators' observed raw-trust signal;
+        # the validating peers earned more trust than the producing miner.
+        assert weights == {
+            "miner-w": pytest.approx(13 / 49),
+            "peer-a": pytest.approx(18 / 49),
+            "peer-b": pytest.approx(18 / 49),
+        }

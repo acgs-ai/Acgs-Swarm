@@ -4,7 +4,7 @@ Implements the full emission formula from the roadmap economic model,
 combining all five signal sources into a single normalized weight per miner:
 
   emission_weight(miner_i) = f(
-      manifold_trust[i],          GovernanceManifold projected column sum
+      manifold_trust[i],          Validated nonnegative trust signal
       reputation[i],              ConstitutionalMesh reputation score
       tier_multiplier[i],         MinerTier TAO bonus (1.0x - 4.0x)
       precedent_contribution[i],  PrecedentStore contribution count
@@ -21,10 +21,10 @@ Formula (configurable weights, defaults sum to 1.0):
   )
   emission_weight = normalize(raw_score) over all miners
 
-Safeguards (matching GovernanceManifold guarantees):
-  • Bounded influence: no miner exceeds max_weight_fraction (default 0.40)
+Safeguards:
+  • Bounded influence: no miner exceeds the feasible effective cap
   • Conservation: weights sum to exactly 1.0
-  • Minimum floor: every registered miner gets at least min_weight_fraction
+  • Minimum floor: every eligible miner gets min_weight_fraction / eligible count
   • Tier hard gate: miners below minimum_tier get zero weight
 
 Roadmap: 08-subnet-implementation-roadmap.md § Economic Model Integration
@@ -32,9 +32,11 @@ Roadmap: 08-subnet-implementation-roadmap.md § Economic Model Integration
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
+from constitutional_swarm.bittensor._validation import _validate_count, _validate_finite
 from constitutional_swarm.bittensor.protocol import TIER_TAO_MULTIPLIER, MinerTier
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,8 @@ class EmissionWeights:
     authenticity: float = 0.10
 
     def __post_init__(self) -> None:
+        for name in ("manifold_trust", "reputation", "tier", "precedent", "authenticity"):
+            _validate_finite(name, getattr(self, name), minimum=0.0, maximum=1.0)
         total = (
             self.manifold_trust + self.reputation + self.tier + self.precedent + self.authenticity
         )
@@ -74,11 +78,14 @@ class MinerEmissionInput:
 
     miner_uid: str
     tier: MinerTier = MinerTier.APPRENTICE
-    manifold_trust: float = 0.0  # from GovernanceManifold column sum
+    manifold_trust: float = 0.0  # validated nonnegative trust signal
     reputation: float = 1.0  # from ConstitutionalMesh
     precedent_contributions: int = 0  # from PrecedentStore
     avg_authenticity: float = 0.0  # from AuthenticityDetector rolling avg
     is_active: bool = True  # inactive miners get zero weight
+
+    def __post_init__(self) -> None:
+        _validate_miner_input(self)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +123,9 @@ class EmissionCycle:
     total_miners: int
     active_miners: int
     weights: EmissionWeights
+    configured_cap: float = 0.40
+    effective_cap: float = 0.40
+    cap_relaxed: bool = False
 
     @property
     def weight_sum(self) -> float:
@@ -128,6 +138,7 @@ class EmissionCycle:
         return max(e.emission_weight for e in self.emissions)
 
     def top_k(self, k: int) -> list[MinerEmission]:
+        _validate_count("k", k, minimum=0)
         return sorted(self.emissions, key=lambda e: e.emission_weight, reverse=True)[:k]
 
     def as_weight_dict(self) -> dict[str, float]:
@@ -139,6 +150,9 @@ class EmissionCycle:
             "active_miners": self.active_miners,
             "weight_sum": round(self.weight_sum, 9),
             "max_weight": round(self.max_weight, 6),
+            "configured_cap": self.configured_cap,
+            "effective_cap": self.effective_cap,
+            "cap_relaxed": self.cap_relaxed,
             "top_3": [
                 {"miner": e.miner_uid, "weight": round(e.emission_weight, 6)} for e in self.top_k(3)
             ],
@@ -157,7 +171,7 @@ class EmissionCalculator:
 
         calc = EmissionCalculator(
             weights=DEFAULT_EMISSION_WEIGHTS,
-            min_weight_fraction=0.01,    # floor: 1% per active miner
+            min_weight_fraction=0.01,    # floor: 1% total reserve across eligible miners
             max_weight_fraction=0.40,    # cap:  40% per miner
             minimum_tier=MinerTier.APPRENTICE,
         )
@@ -172,7 +186,7 @@ class EmissionCalculator:
         ]
         cycle = calc.compute(inputs)
         print(cycle.as_weight_dict())
-        # {"miner-01": 0.65, "miner-02": 0.35} (normalized, sum=1.0)
+        # {"miner-01": 0.5, "miner-02": 0.5} (40% cap relaxes to feasible 50%)
     """
 
     def __init__(
@@ -183,12 +197,24 @@ class EmissionCalculator:
         minimum_tier: MinerTier = MinerTier.APPRENTICE,
         registered_miners: set[str] | None = None,
     ) -> None:
+        _validate_finite(
+            "min_weight_fraction", min_weight_fraction, minimum=0.0, maximum=1.0
+        )
+        _validate_finite(
+            "max_weight_fraction", max_weight_fraction, minimum=0.0, maximum=1.0
+        )
+        if max_weight_fraction == 0.0:
+            raise ValueError("max_weight_fraction must be greater than 0")
+        if not isinstance(minimum_tier, MinerTier):
+            raise ValueError("minimum_tier must be a MinerTier")
         self._weights = weights
-        self._min_frac = min_weight_fraction
-        self._max_frac = max_weight_fraction
+        self._min_frac = float(min_weight_fraction)
+        self._max_frac = float(max_weight_fraction)
         self._min_tier = minimum_tier
         self._min_tier_order = _TIER_ORDER[minimum_tier]
-        self._registered: set[str] | None = registered_miners
+        self._registered: set[str] | None = (
+            None if registered_miners is None else set(registered_miners)
+        )
 
     def compute(self, inputs: list[MinerEmissionInput]) -> EmissionCycle:
         """Compute emission weights for all miners.
@@ -200,11 +226,18 @@ class EmissionCalculator:
           3. Apply formula weights → raw_score per miner
           4. Apply tier multiplier
           5. Normalize raw_scores → weights summing to 1.0
-          6. Apply floor (min_weight_fraction x count) and cap (max_weight_fraction)
-          7. Re-normalize after floor/cap adjustments
+          6. Apply floor (min_weight_fraction / active count) and effective cap
+          7. Redistribute the remaining mass without violating either bound
 
         Returns EmissionCycle with all MinerEmission records.
         """
+        seen: set[str] = set()
+        for inp in inputs:
+            _validate_miner_input(inp)
+            if inp.miner_uid in seen:
+                raise ValueError(f"duplicate miner_uid {inp.miner_uid!r}")
+            seen.add(inp.miner_uid)
+
         active = [
             inp
             for inp in inputs
@@ -229,6 +262,9 @@ class EmissionCalculator:
                 total_miners=len(inputs),
                 active_miners=0,
                 weights=self._weights,
+                configured_cap=self._max_frac,
+                effective_cap=self._max_frac,
+                cap_relaxed=False,
             )
 
         # --- Step 2: normalize each signal across active miners ---
@@ -265,7 +301,7 @@ class EmissionCalculator:
         # --- Step 6: floor and cap (iterative until stable) ---
         n = len(active)
         floor = self._min_frac / n if n > 0 else 0.0
-        cap = self._max_frac
+        cap = max(self._max_frac, 1.0 / n)
         final = _apply_floor_cap(raw_weights, floor, cap)
 
         # --- Build results ---
@@ -302,6 +338,9 @@ class EmissionCalculator:
             total_miners=len(inputs),
             active_miners=len(active),
             weights=self._weights,
+            configured_cap=self._max_frac,
+            effective_cap=cap,
+            cap_relaxed=cap > self._max_frac,
         )
 
 
@@ -318,66 +357,108 @@ _TIER_ORDER: dict[MinerTier, int] = {
 }
 
 
+def _validate_miner_input(inp: MinerEmissionInput) -> None:
+    if not isinstance(inp.miner_uid, str) or not inp.miner_uid:
+        raise ValueError("miner_uid must be a non-empty string")
+    if not isinstance(inp.tier, MinerTier):
+        raise ValueError("tier must be a MinerTier")
+    if not isinstance(inp.is_active, bool):
+        raise ValueError("is_active must be a bool")
+    _validate_finite("manifold_trust", inp.manifold_trust, minimum=0.0)
+    _validate_finite("reputation", inp.reputation, minimum=0.0, maximum=2.0)
+    _validate_count("precedent_contributions", inp.precedent_contributions, minimum=0)
+    _validate_finite("avg_authenticity", inp.avg_authenticity, minimum=0.0, maximum=1.0)
+
+
 def _apply_floor_cap(
     weights: list[float],
     floor: float,
     cap: float,
-    max_iter: int = 50,
 ) -> list[float]:
-    """Apply floor and cap iteratively until all weights are within bounds.
+    """Allocate one unit of mass on a feasible floor/cap bounded simplex."""
+    if not weights:
+        return []
+    n = len(weights)
+    _validate_finite("floor", floor, minimum=0.0, maximum=1.0)
+    _validate_finite("cap", cap, minimum=0.0, maximum=1.0)
+    if floor * n > 1.0 + 1e-12 or cap * n < 1.0 - 1e-12 or floor > cap:
+        raise ValueError("floor and cap do not define a feasible bounded simplex")
 
-    Algorithm:
-      1. Clamp all weights to [floor, cap]
-      2. Normalize to sum 1.0
-      3. Repeat until no weights violate cap (bounded by max_iter)
+    preferences = _safe_normalize(weights)
+    if all(floor <= weight <= cap for weight in preferences):
+        return preferences
 
-    With iterative redistribution, the dominant miner's share is capped
-    and the remainder is redistributed proportionally to other miners.
-    """
-    w = list(weights)
-    for _ in range(max_iter):
-        # Apply floor
-        w = [max(floor, v) for v in w]
-        total = sum(w)
-        if total > 0:
-            w = [v / total for v in w]
+    allocation = [floor] * n
+    capacity = [cap - floor] * n
+    remaining = 1.0 - math.fsum(allocation)
+    available = {i for i, headroom in enumerate(capacity) if headroom > 1e-15}
 
-        # Check if anyone exceeds cap
-        if not any(v > cap + 1e-9 for v in w):
+    while remaining > 1e-15:
+        if not available:
+            raise RuntimeError("bounded simplex allocation exhausted capacity")
+        preference_total = math.fsum(preferences[i] for i in available)
+        shares = (
+            {i: remaining / len(available) for i in available}
+            if preference_total == 0.0
+            else {
+                i: remaining * preferences[i] / preference_total for i in available
+            }
+        )
+        saturated = {i for i, share in shares.items() if share > capacity[i] + 1e-15}
+        if not saturated:
+            for i, share in shares.items():
+                allocation[i] += share
+            remaining = 0.0
             break
+        for i in saturated:
+            allocation[i] += capacity[i]
+            remaining -= capacity[i]
+            capacity[i] = 0.0
+        available.difference_update(saturated)
 
-        # Cap and redistribute: locked miners stay at cap,
-        # remaining budget flows to uncapped miners
-        excess = sum(max(0.0, v - cap) for v in w)
-        locked = [min(cap, v) for v in w]
-        uncapped_sum = sum(v for v in locked if v < cap - 1e-9)
-
-        if uncapped_sum <= 0:
-            # All miners at cap — just clamp and normalize
-            w = locked
-            break
-
-        # Redistribute excess proportionally to uncapped miners
-        w = [v + excess * (v / uncapped_sum) if v < cap - 1e-9 else v for v in locked]
-
-    # Final normalize
-    return _safe_normalize(w)
+    residual = 1.0 - math.fsum(allocation)
+    if residual > 0.0:
+        for i in range(n):
+            adjustment = min(residual, cap - allocation[i])
+            allocation[i] += adjustment
+            residual -= adjustment
+            if residual <= 1e-15:
+                break
+    elif residual < 0.0:
+        for i in range(n):
+            adjustment = min(-residual, allocation[i] - floor)
+            allocation[i] -= adjustment
+            residual += adjustment
+            if residual >= -1e-15:
+                break
+    total = math.fsum(allocation)
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError(f"bounded simplex allocation failed conservation: {total}")
+    if any(weight < floor - 1e-12 or weight > cap + 1e-12 for weight in allocation):
+        raise RuntimeError("bounded simplex allocation violated floor or cap")
+    return allocation
 
 
 def _normalize_vec(values: list[float]) -> list[float]:
     """Min-max normalize a list to [0, 1]. All-equal → uniform 0.5."""
     if not values:
         return []
-    lo, hi = min(values), max(values)
+    validated = [_validate_finite("value", value, minimum=0.0) for value in values]
+    lo, hi = min(validated), max(validated)
     if hi == lo:
-        return [0.5] * len(values)
-    return [(v - lo) / (hi - lo) for v in values]
+        return [0.5] * len(validated)
+    return [(value - lo) / (hi - lo) for value in validated]
 
 
 def _safe_normalize(weights: list[float]) -> list[float]:
     """Normalize weights to sum 1.0. All-zero → uniform."""
-    total = sum(weights)
-    if total == 0:
+    if not weights:
+        return []
+    validated = [_validate_finite("weight", weight, minimum=0.0) for weight in weights]
+    scale = max(validated)
+    if scale == 0.0:
         n = len(weights)
-        return [1.0 / n] * n if n > 0 else []
-    return [w / total for w in weights]
+        return [1.0 / n] * n
+    scaled = [weight / scale for weight in validated]
+    total = math.fsum(scaled)
+    return [weight / total for weight in scaled]

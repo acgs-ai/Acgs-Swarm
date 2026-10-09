@@ -301,10 +301,11 @@ class TestConstitutionalValidator:
     def test_emission_weights(self, validator):
         validator.register_miner("miner-a", tier=MinerTier.APPRENTICE)
         validator.register_miner("miner-b", tier=MinerTier.MASTER)
+        validator.register_miner("miner-c", tier=MinerTier.JOURNEYMAN)
 
-        weights = validator.compute_emission_weights(["miner-a", "miner-b"])
+        weights = validator.compute_emission_weights(["miner-a", "miner-b", "miner-c"])
         assert abs(sum(weights.values()) - 1.0) < 1e-9
-        # Master tier has higher multiplier
+        # Three miners keep the configured 40% cap feasible while preserving ordering.
         assert weights["miner-b"] > weights["miner-a"]
 
     def test_emission_weights_empty(self, validator):

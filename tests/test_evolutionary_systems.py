@@ -1291,15 +1291,16 @@ class TestMapElitesExtended:
         random.seed(42)
         grid = MinerQualityGrid(ceiling_window=3)
         for i in range(5):
+            quality = 0.1 * (i + 1)
             grid.challenge(
                 MinerApproach(
                     miner_uid=f"miner-{i}",
                     domain=GovernanceDomain.RELIABILITY,
                     strategy=DeliberationStrategy.HYBRID,
-                    fitness=0.1 * (i + 1),
-                    acceptance_rate=0.5,
-                    reasoning_quality=0.5,
-                    speed_ms=500,
+                    fitness=quality,
+                    acceptance_rate=quality,
+                    reasoning_quality=quality,
+                    speed_ms=1000 * (1.0 - quality),
                     sample_count=10,
                 )
             )
@@ -1330,15 +1331,16 @@ class TestMapElitesExtended:
         random.seed(42)
         grid = MinerQualityGrid()
         for i, d in enumerate(list(GovernanceDomain)[:3]):
+            quality = 0.3 * (i + 1)
             grid.challenge(
                 MinerApproach(
                     miner_uid=f"m-{i}",
                     domain=d,
                     strategy=DeliberationStrategy.HYBRID,
-                    fitness=0.3 * (i + 1),
-                    acceptance_rate=0.5,
-                    reasoning_quality=0.5,
-                    speed_ms=500,
+                    fitness=quality,
+                    acceptance_rate=quality,
+                    reasoning_quality=quality,
+                    speed_ms=1000 * (1.0 - quality),
                     sample_count=10,
                 )
             )
