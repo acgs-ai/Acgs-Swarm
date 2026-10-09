@@ -12,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-import httpx
 import pytest
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
@@ -252,7 +251,8 @@ def _c9_backend_write_oauth_credentials(tmp_path: Path) -> Path:
 
 
 def _c9_backend_anthropic_timeout() -> Exception:
-    import anthropic
+    anthropic = pytest.importorskip("anthropic")
+    httpx = pytest.importorskip("httpx")
 
     return anthropic.APITimeoutError(httpx.Request("POST", "https://example.invalid"))
 
@@ -286,6 +286,7 @@ def test_c9_backend_base_agent_enforces_timeout_invariant() -> None:
 
 
 def test_c9_backend_claude_client_has_hard_timeout_and_no_implicit_retries() -> None:
+    pytest.importorskip("anthropic")
     from constitutional_swarm.swe_bench.claude_agent import ClaudeSWEBenchAgent
 
     with patch("anthropic.Anthropic") as client_constructor:
@@ -300,6 +301,7 @@ def test_c9_backend_claude_client_has_hard_timeout_and_no_implicit_retries() -> 
 
 
 def test_c9_backend_claude_rejects_per_call_timeout_override() -> None:
+    pytest.importorskip("anthropic")
     from constitutional_swarm.swe_bench.claude_agent import ClaudeSWEBenchAgent
 
     with patch("anthropic.Anthropic"):
@@ -310,6 +312,7 @@ def test_c9_backend_claude_rejects_per_call_timeout_override() -> None:
 def test_c9_backend_oauth_client_has_hard_timeout_and_no_implicit_retries(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("anthropic")
     from constitutional_swarm.swe_bench.claude_oauth_agent import (
         ClaudeOAuthSWEBenchAgent,
     )
@@ -330,6 +333,7 @@ def test_c9_backend_oauth_client_has_hard_timeout_and_no_implicit_retries(
 
 
 def test_c9_backend_vertex_client_has_hard_timeout_and_no_implicit_retries() -> None:
+    pytest.importorskip("anthropic")
     from constitutional_swarm.swe_bench.vertex_agent import VertexClaudeSWEBenchAgent
 
     with patch("anthropic.AnthropicVertex") as client_constructor:
@@ -345,6 +349,7 @@ def test_c9_backend_vertex_client_has_hard_timeout_and_no_implicit_retries() -> 
 
 
 def test_c9_backend_gemini_client_has_hard_timeout_and_one_attempt() -> None:
+    pytest.importorskip("google.genai")
     from constitutional_swarm.swe_bench.gemini_agent import GeminiSWEBenchAgent
 
     with patch("google.genai.Client") as client_constructor:
@@ -357,6 +362,7 @@ def test_c9_backend_gemini_client_has_hard_timeout_and_one_attempt() -> None:
 
 
 def test_c9_backend_gemini_rejects_transport_override() -> None:
+    pytest.importorskip("google.genai")
     from constitutional_swarm.swe_bench.gemini_agent import GeminiSWEBenchAgent
 
     with patch("google.genai.Client"):
@@ -406,7 +412,7 @@ def test_c9_backend_anthropic_timeout_is_not_misclassified_as_connection_error(
 def test_c9_backend_oauth_timeout_is_not_misclassified_as_connection_error(
     tmp_path: Path,
 ) -> None:
-    import anthropic
+    anthropic = pytest.importorskip("anthropic")
 
     from constitutional_swarm.swe_bench.claude_oauth_agent import (
         ClaudeOAuthSWEBenchAgent,

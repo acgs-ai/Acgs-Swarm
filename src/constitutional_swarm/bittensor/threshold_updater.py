@@ -34,6 +34,7 @@ Q&A:     07-subnet-concept-qa-responses.md § 5 Mechanism 2
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from copy import deepcopy
@@ -550,7 +551,7 @@ def _fill_defaults(weights: dict[str, float]) -> dict[str, float]:
 
 def _normalize(weights: dict[str, float]) -> dict[str, float]:
     """Normalize a weight dict so values sum to 1.0."""
-    total = sum(weights.values())
+    total = math.fsum(weights.values())
     if total == 0:
         n = len(weights)
         return {k: 1.0 / n for k in weights}
@@ -568,7 +569,7 @@ def _project_bounded_simplex(
         dimension: max(lower[dimension], min(upper[dimension], requested[dimension]))
         for dimension in _DIMENSIONS
     }
-    difference = 1.0 - sum(result.values())
+    difference = 1.0 - math.fsum(result.values())
     if abs(difference) <= 1e-12:
         return result
 

@@ -51,7 +51,9 @@ def test_c16_registry_frozen_snapshot_has_no_mutation_capability() -> None:
     )
     frozen = registry.frozen_copy()
 
-    with pytest.raises(AttributeError):
+    # CPython <3.14 frozen+slots dataclasses raise TypeError from the generated
+    # __setattr__ for non-field names; 3.14 raises FrozenInstanceError. Both refuse.
+    with pytest.raises((AttributeError, TypeError)):
         frozen._frozen = False
 
     assert type(frozen).__name__ == "FrozenVoteSignerRegistry"

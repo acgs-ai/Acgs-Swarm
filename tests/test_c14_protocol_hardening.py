@@ -2414,8 +2414,7 @@ def test_c14_shipped_fixture_binds_signed_producer_to_declared_executor():
 def test_c14_testnet_verifies_axon_response_signature_against_selected_target():
     from types import SimpleNamespace
 
-    import bittensor as bt
-    import pytest
+    bt = pytest.importorskip("bittensor")
 
     deploy = _c14_load_testnet_deploy_module()
     target = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
@@ -2452,8 +2451,7 @@ def test_c14_testnet_verifies_axon_response_signature_against_selected_target():
 
 
 def test_c14_judgment_response_signature_binds_request_target_and_body():
-    import bittensor as bt
-    import pytest
+    bt = pytest.importorskip("bittensor")
 
     from constitutional_swarm.bittensor.synapse_adapter import (
         GovernanceDeliberation,
@@ -2507,7 +2505,7 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
     import time
     from types import SimpleNamespace
 
-    import bittensor as bt
+    bt = pytest.importorskip("bittensor")
 
     from constitutional_swarm.bittensor.synapse_adapter import (
         GovernanceDeliberation,
@@ -2661,7 +2659,7 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
 
 
 async def test_c14_miner_axon_signs_request_bound_judgment_body(tmp_path):
-    import bittensor as bt
+    bt = pytest.importorskip("bittensor")
 
     from constitutional_swarm.bittensor.axon_server import MinerAxonServer
     from constitutional_swarm.bittensor.miner import ConstitutionalMiner
@@ -2712,7 +2710,7 @@ def test_c14_testnet_miner_uses_wallet_address_as_signed_producer(
     import asyncio
     from types import SimpleNamespace
 
-    import bittensor as bt
+    bt = pytest.importorskip("bittensor")
 
     from constitutional_swarm.bittensor.synapse_adapter import (
         GovernanceDeliberation,
