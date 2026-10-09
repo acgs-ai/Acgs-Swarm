@@ -342,6 +342,17 @@ def _stack_and_validate(samples: Sequence[np.ndarray], name: str) -> np.ndarray:
     return arr
 
 
+def _orient_basis_toward_unsafe(
+    basis: np.ndarray, unsafe_direction: np.ndarray
+) -> np.ndarray:
+    """Orient basis rows so unsafe activations have positive coordinates."""
+    oriented = basis.copy()
+    for i in range(oriented.shape[0]):
+        if np.dot(oriented[i], unsafe_direction) < 0:
+            oriented[i] = -oriented[i]
+    return oriented
+
+
 def fit_subspace(
     safe: Sequence[np.ndarray],
     unsafe: Sequence[np.ndarray],
@@ -403,10 +414,7 @@ def fit_subspace(
     # Orient each basis vector so that the unsafe mean projects positively onto it.
     # steer() only attenuates positive coordinates, so if unsafe activations land
     # in the negative direction the steering is a no-op.
-    direction = unsafe_mean - safe_mean
-    for i in range(k):
-        if np.dot(basis[i], direction) < 0:
-            basis[i] = -basis[i]
+    basis = _orient_basis_toward_unsafe(basis, unsafe_mean - safe_mean)
     return ViolationSubspace(basis=basis, mean=pooled_mean)
 
 
@@ -490,6 +498,11 @@ def fit_leace(
     # Re-orthonormalize via QR to handle numerical drift
     q, _ = np.linalg.qr(basis.T)
     basis = q.T[: len(basis_rows)]
+    # QR is sign-ambiguous. Orient in whitened coordinates because ``basis`` and
+    # ``coordinates()`` live there, while ``steer()`` only attenuates positive
+    # coordinates.
+    unsafe_direction = (U.mean(axis=0) - S.mean(axis=0)) @ whitener.T
+    basis = _orient_basis_toward_unsafe(basis, unsafe_direction)
 
     return ViolationSubspace(
         basis=basis,
