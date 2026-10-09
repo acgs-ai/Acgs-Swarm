@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from constitutional_swarm.bittensor.chain_anchor import (
     AnchorRecord,
@@ -12,6 +14,10 @@ from constitutional_swarm.bittensor.chain_anchor import (
 )
 
 CONST_HASH = "608508a9bd224290"
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
 
 
 def _make_proof(
@@ -39,32 +45,32 @@ class TestMerkleRoot:
         assert root  # SHA-256 of empty bytes
 
     def test_single_leaf(self):
-        root = _compute_merkle_root(["abc"])
+        root = _compute_merkle_root([_digest("abc")])
         assert root  # valid hash
 
     def test_deterministic(self):
-        leaves = ["leaf1", "leaf2", "leaf3"]
+        leaves = [_digest(value) for value in ("leaf1", "leaf2", "leaf3")]
         r1 = _compute_merkle_root(leaves)
         r2 = _compute_merkle_root(leaves)
         assert r1 == r2
 
     def test_order_independent(self):
         """Sorted inputs → same root regardless of insertion order."""
-        r1 = _compute_merkle_root(["b", "a", "c"])
-        r2 = _compute_merkle_root(["c", "b", "a"])
+        r1 = _compute_merkle_root([_digest(value) for value in ("b", "a", "c")])
+        r2 = _compute_merkle_root([_digest(value) for value in ("c", "b", "a")])
         assert r1 == r2
 
     def test_different_leaves_different_root(self):
-        r1 = _compute_merkle_root(["leaf1", "leaf2"])
-        r2 = _compute_merkle_root(["leaf1", "leaf3"])
+        r1 = _compute_merkle_root([_digest("leaf1"), _digest("leaf2")])
+        r2 = _compute_merkle_root([_digest("leaf1"), _digest("leaf3")])
         assert r1 != r2
 
     def test_two_leaves(self):
-        root = _compute_merkle_root(["a", "b"])
+        root = _compute_merkle_root([_digest("a"), _digest("b")])
         assert len(root) == 64  # SHA-256 hex length
 
     def test_odd_number_of_leaves(self):
-        root = _compute_merkle_root(["a", "b", "c"])
+        root = _compute_merkle_root([_digest("a"), _digest("b"), _digest("c")])
         assert len(root) == 64
 
 
