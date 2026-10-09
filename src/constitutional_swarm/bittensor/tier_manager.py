@@ -5,10 +5,13 @@ TIER_REQUIREMENTS, promotes/demotes automatically, and routes governance
 tasks to miners whose tier is sufficient for the task complexity.
 
 Tier structure (from roadmap Phase 5.1):
-  APPRENTICE  < 10 validated, any reputation       LOW tasks only     1.0x TAO
-  JOURNEYMAN  ≥ 10 validated, reputation ≥ 1.2     LOW + MEDIUM       1.5x TAO
-  MASTER      ≥ 50 validated, reputation ≥ 1.5     ALL tiers          2.5x TAO
-  ELDER       ≥ 200 validated, reputation ≥ 1.8    Constitutional     4.0x TAO
+  APPRENTICE  entry tier                                      LOW tasks only  1.0x TAO
+  JOURNEYMAN  ≥ 10 accepted, reputation ≥ 1.2                 LOW + MEDIUM    1.5x TAO
+  MASTER      ≥ 50 accepted, reputation ≥ 1.5, specialist     ALL tiers       2.5x TAO
+  ELDER       ≥ 200 accepted, reputation ≥ 1.8, + precedent   Constitutional  4.0x TAO
+
+All promoted tiers also require the configured cumulative acceptance rate;
+higher tiers inherit every prerequisite of the tier below them.
 
 Task complexity mapping (from MEDIUM/HIGH impact routing):
   LOW     → any tier
@@ -33,6 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from constitutional_swarm.bittensor._validation import _validate_count, _validate_finite
 from constitutional_swarm.bittensor.protocol import (
     TIER_REQUIREMENTS,
     TIER_TAO_MULTIPLIER,
@@ -74,6 +78,15 @@ _TIER_ORDER: dict[MinerTier, int] = {
     MinerTier.ELDER: 3,
 }
 
+# Promotion-only acceptance gates. Keep keys aligned with TIER_REQUIREMENTS;
+# protocol.py can absorb this policy in a coordinated follow-up.
+TIER_PROMOTION_MIN_ACCEPTANCE_RATE: dict[MinerTier, float] = {
+    MinerTier.APPRENTICE: 0.0,
+    MinerTier.JOURNEYMAN: 0.8,
+    MinerTier.MASTER: 0.8,
+    MinerTier.ELDER: 0.8,
+}
+
 
 # ---------------------------------------------------------------------------
 # Miner performance record
@@ -99,6 +112,16 @@ class MinerPerformance:
     avg_authenticity: float = 0.0  # rolling average from AuthenticityDetector
     first_seen_at: float = field(default_factory=time.time)
     last_active_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        """Reject invalid state at every construction boundary."""
+        _validate_count("judgments_validated", self.judgments_validated)
+        _validate_count("judgments_rejected", self.judgments_rejected)
+        _validate_count("precedents_contributed", self.precedents_contributed)
+        _validate_finite("reputation", self.reputation, minimum=0.0, maximum=2.0)
+        _validate_finite("avg_authenticity", self.avg_authenticity, minimum=0.0, maximum=1.0)
+        _validate_finite("first_seen_at", self.first_seen_at, minimum=0.0)
+        _validate_finite("last_active_at", self.last_active_at, minimum=0.0)
 
     @property
     def acceptance_rate(self) -> float:
@@ -203,8 +226,26 @@ class TierManager:
             print(f"{p.miner_uid}: {p.from_tier.value} → {p.to_tier.value}")
     """
 
-    def __init__(self, registry: CapabilityRegistry | None = None) -> None:
+    def __init__(
+        self,
+        registry: CapabilityRegistry | None = None,
+        *,
+        min_acceptance_rate: float | None = None,
+    ) -> None:
         self._registry = registry or CapabilityRegistry()
+        self._promotion_min_acceptance_rate = dict(TIER_PROMOTION_MIN_ACCEPTANCE_RATE)
+        if min_acceptance_rate is not None:
+            validated_rate = _validate_finite(
+                "min_acceptance_rate",
+                min_acceptance_rate,
+                minimum=0.0,
+                maximum=1.0,
+            )
+            if validated_rate == 0.0:
+                raise ValueError("min_acceptance_rate must be greater than zero")
+            for tier in MinerTier:
+                if tier is not MinerTier.APPRENTICE:
+                    self._promotion_min_acceptance_rate[tier] = validated_rate
         self._miners: dict[str, MinerPerformance] = {}
         self._promotion_log: list[TierPromotion] = []
         self._lock = threading.Lock()
@@ -222,7 +263,7 @@ class TierManager:
         """Register a new miner. Idempotent — re-registration is a no-op."""
         with self._lock:
             if miner_uid in self._miners:
-                return self._miners[miner_uid]
+                return self._snapshot(self._miners[miner_uid])
 
             perf = MinerPerformance(
                 miner_uid=miner_uid,
@@ -231,7 +272,7 @@ class TierManager:
             )
             self._miners[miner_uid] = perf
             self._sync_registry(perf)
-            return perf
+            return self._snapshot(perf)
 
     def unregister_miner(self, miner_uid: str) -> None:
         """Remove a miner from tracking and the CapabilityRegistry."""
@@ -248,7 +289,7 @@ class TierManager:
         miner_uid: str,
         accepted: bool,
         domain: str = "",
-        authenticity: float = 0.0,
+        authenticity: float | None = None,
         reputation: float | None = None,
     ) -> TierPromotion | None:
         """Record a judgment outcome and optionally promote the miner.
@@ -266,10 +307,28 @@ class TierManager:
         Returns:
             TierPromotion if a tier change occurred, else None.
         """
+        if type(accepted) is not bool:
+            raise TypeError("accepted must be a bool")
+        if authenticity is not None:
+            authenticity = _validate_finite(
+                "authenticity",
+                authenticity,
+                minimum=0.0,
+                maximum=1.0,
+            )
+        if reputation is not None:
+            reputation = _validate_finite(
+                "reputation",
+                reputation,
+                minimum=0.0,
+                maximum=2.0,
+            )
+
         with self._lock:
             if miner_uid not in self._miners:
                 # _register_miner_unlocked avoids double-lock
-                self._register_miner_unlocked(miner_uid, domains={domain} if domain else None)
+                domains = {domain} if accepted and domain else None
+                self._register_miner_unlocked(miner_uid, domains=domains)
 
             perf = self._miners[miner_uid]
             if accepted:
@@ -277,13 +336,15 @@ class TierManager:
             else:
                 perf.judgments_rejected += 1
 
-            if domain:
+            if accepted and domain:
                 perf.domains.add(domain)
 
-            if authenticity > 0:
-                # Exponential moving average
+            if authenticity is not None:
+                # Zero is a measured detector result and must lower the average.
                 alpha = 0.2
-                perf.avg_authenticity = alpha * authenticity + (1 - alpha) * perf.avg_authenticity
+                perf.avg_authenticity = (
+                    alpha * authenticity + (1 - alpha) * perf.avg_authenticity
+                )
 
             if reputation is not None:
                 perf.reputation = reputation
@@ -378,7 +439,11 @@ class TierManager:
         """Return all miners eligible for a given task complexity."""
         with self._lock:
             min_order = _TIER_ORDER[_COMPLEXITY_MIN_TIER[complexity]]
-            return [p for p in self._miners.values() if _TIER_ORDER[p.current_tier] >= min_order]
+            return [
+                self._snapshot(p)
+                for p in self._miners.values()
+                if _TIER_ORDER[p.current_tier] >= min_order
+            ]
 
     # ------------------------------------------------------------------
     # Tier evaluation
@@ -395,12 +460,13 @@ class TierManager:
 
     def get_performance(self, miner_uid: str) -> MinerPerformance | None:
         with self._lock:
-            return self._miners.get(miner_uid)
+            perf = self._miners.get(miner_uid)
+            return self._snapshot(perf) if perf is not None else None
 
     @property
     def all_miners(self) -> list[MinerPerformance]:
         with self._lock:
-            return list(self._miners.values())
+            return [self._snapshot(perf) for perf in self._miners.values()]
 
     @property
     def promotion_log(self) -> list[TierPromotion]:
@@ -474,36 +540,66 @@ class TierManager:
         return event
 
     def _compute_tier(self, perf: MinerPerformance) -> MinerTier:
-        """Determine the highest tier the miner qualifies for."""
-        reqs = TIER_REQUIREMENTS
+        """Return the structural tier, applying acceptance gates only upward."""
+        descending = (MinerTier.ELDER, MinerTier.MASTER, MinerTier.JOURNEYMAN)
+        structural = next(
+            (tier for tier in descending if self._qualifies_structurally(perf, tier)),
+            MinerTier.APPRENTICE,
+        )
+        current_order = _TIER_ORDER[perf.current_tier]
+        if _TIER_ORDER[structural] < current_order:
+            return structural
 
-        # Check from highest to lowest
-        if (
-            perf.judgments_validated >= reqs[MinerTier.ELDER]["min_validated"]
-            and perf.reputation >= reqs[MinerTier.ELDER]["min_reputation"]
-        ):
-            return MinerTier.ELDER
+        for tier in descending:
+            tier_order = _TIER_ORDER[tier]
+            if not current_order < tier_order <= _TIER_ORDER[structural]:
+                continue
+            if perf.acceptance_rate >= self._promotion_min_acceptance_rate[tier]:
+                return tier
+        return perf.current_tier
 
-        if (
-            perf.judgments_validated >= reqs[MinerTier.MASTER]["min_validated"]
-            and perf.reputation >= reqs[MinerTier.MASTER]["min_reputation"]
-            and perf.is_domain_specialist
-        ):
-            return MinerTier.MASTER
+    def _qualifies_structurally(self, perf: MinerPerformance, tier: MinerTier) -> bool:
+        """Apply cumulative count, reputation, specialist, and precedent rules."""
+        prerequisite = {
+            MinerTier.MASTER: MinerTier.JOURNEYMAN,
+            MinerTier.ELDER: MinerTier.MASTER,
+        }.get(tier)
+        if prerequisite is not None and not self._qualifies_structurally(perf, prerequisite):
+            return False
 
-        if (
-            perf.judgments_validated >= reqs[MinerTier.JOURNEYMAN]["min_validated"]
-            and perf.reputation >= reqs[MinerTier.JOURNEYMAN]["min_reputation"]
-        ):
-            return MinerTier.JOURNEYMAN
-
-        return MinerTier.APPRENTICE
+        reqs = TIER_REQUIREMENTS[tier]
+        if perf.judgments_validated < reqs["min_validated"]:
+            return False
+        if perf.reputation < reqs["min_reputation"]:
+            return False
+        if tier is MinerTier.MASTER and not perf.is_domain_specialist:
+            return False
+        return tier is not MinerTier.ELDER or perf.precedents_contributed >= 1
 
     def _tier_reason(self, perf: MinerPerformance, tier: MinerTier) -> str:
         return (
             f"validated={perf.judgments_validated}, "
+            f"rejected={perf.judgments_rejected}, "
+            f"acceptance_rate={perf.acceptance_rate:.2f}, "
             f"reputation={perf.reputation:.2f}, "
-            f"domains={sorted(perf.domains)}"
+            f"domains={sorted(perf.domains)}, "
+            f"precedents={perf.precedents_contributed}"
+        )
+
+    @staticmethod
+    def _snapshot(perf: MinerPerformance) -> MinerPerformance:
+        """Return a detached record, including a copy of nested domains."""
+        return MinerPerformance(
+            miner_uid=perf.miner_uid,
+            current_tier=perf.current_tier,
+            judgments_validated=perf.judgments_validated,
+            judgments_rejected=perf.judgments_rejected,
+            precedents_contributed=perf.precedents_contributed,
+            reputation=perf.reputation,
+            domains=set(perf.domains),
+            avg_authenticity=perf.avg_authenticity,
+            first_seen_at=perf.first_seen_at,
+            last_active_at=perf.last_active_at,
         )
 
     def _sync_registry(self, perf: MinerPerformance) -> None:

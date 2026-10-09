@@ -257,8 +257,8 @@ class TestUpdateCycle:
         cycle = updater.update(evidence, domain="healthcare")
         sec = next(u for u in cycle.updates if u.dimension == "security")
 
-        # Expected shift: (0.872 - 0.5) x 0.08 ~= 0.030
-        assert sec.shift == pytest.approx(0.030, abs=0.005)
+        # Full-scale signed shift: (2 x 0.872 - 1) x 0.08 ~= 0.060
+        assert sec.shift == pytest.approx(0.060, abs=0.005)
         assert sec.direction == "increased"
         assert sec.posterior > sec.prior
 
@@ -305,8 +305,7 @@ class TestUpdateCycle:
 
     def test_max_shift_capped(self):
         updater = BayesianThresholdUpdater(max_shift_per_cycle=0.01, min_evidence_count=1)
-        # 100% confirmed -> raw_shift = (1.0 - 0.5) x 0.01 = 0.005 (not capped)
-        # But if max_shift is very small, bigger obs rates get capped
+        # 100% confirmed -> full positive shift of max_shift_per_cycle.
         evidence = [DimensionEvidence("safety", "", 100, 100.0, 0.0)]
         for dim in ("security", "privacy", "fairness", "reliability", "transparency", "efficiency"):
             evidence.append(DimensionEvidence(dim, "", 0, 0.0, 0.0))
