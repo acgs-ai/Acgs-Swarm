@@ -14,13 +14,16 @@ from constitutional_swarm.private_vote import (
     BallotChoice,
     CommitRecord,
     HashCommitmentProver,
+    InvalidCommitError,
     PrivateBallotBox,
     ValidityProver,
     ValidityStatement,
     ValidityWitness,
+    _signing_payload_commit,
     build_commit,
     tally,
 )
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 EPOCH = bytes.fromhex("00" * 16)
@@ -29,6 +32,39 @@ SUBJECT = bytes.fromhex("22" * 16)
 
 def _kp() -> Ed25519PrivateKey:
     return Ed25519PrivateKey.generate()
+
+
+def _pub(sk: Ed25519PrivateKey) -> bytes:
+    return sk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def _resign(sk: Ed25519PrivateKey, commit: CommitRecord) -> CommitRecord:
+    signature = sk.sign(
+        _signing_payload_commit(
+            commit.version,
+            commit.epoch,
+            commit.subject,
+            commit.voter,
+            commit.commit,
+            commit.nullifier,
+            commit.proof_scheme,
+            commit.validity_proof,
+        )
+    )
+    return CommitRecord(
+        version=commit.version,
+        epoch=commit.epoch,
+        subject=commit.subject,
+        voter=commit.voter,
+        commit=commit.commit,
+        nullifier=commit.nullifier,
+        signature=signature,
+        proof_scheme=commit.proof_scheme,
+        validity_proof=commit.validity_proof,
+    )
 
 
 def _v2_roundtrip(choice: BallotChoice = BallotChoice.YEA):
@@ -155,10 +191,15 @@ class TestHashCommitmentProver:
 class TestTallyV2:
     def _build_box(self, choices: list[BallotChoice], with_prover: bool):
         prover = HashCommitmentProver() if with_prover else None
-        box = PrivateBallotBox(epoch=EPOCH, subject=SUBJECT)
+        keys = [_kp() for _ in choices]
+        box = PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset(_pub(sk) for sk in keys),
+            provers={} if prover is None else {prover.scheme_id: prover},
+        )
         built = []
-        for i, ch in enumerate(choices):
-            sk = _kp()
+        for i, (sk, ch) in enumerate(zip(keys, choices, strict=True)):
             secret = f"voter-{i}".encode()
             commit, reveal = build_commit(
                 voter_private_key=sk,
@@ -179,19 +220,30 @@ class TestTallyV2:
         box, prover = self._build_box(
             [BallotChoice.YEA, BallotChoice.YEA, BallotChoice.NAY], with_prover=True
         )
-        result = box.tally(provers={prover.scheme_id: prover})
+        result = box.tally()
         assert result.totals[BallotChoice.YEA] == 2
         assert result.totals[BallotChoice.NAY] == 1
         assert result.rejected == ()
 
     def test_v2_without_prover_rejects_fail_closed(self):
-        """v2 commit with proof_scheme set but no verifier -> rejected."""
-        box, _ = self._build_box([BallotChoice.YEA, BallotChoice.NAY], with_prover=True)
-        result = box.tally(provers=None)
-        assert result.totals[BallotChoice.YEA] == 0
-        assert result.totals[BallotChoice.NAY] == 0
-        reasons = [r for _, r in result.rejected]
-        assert all("no verifier" in r for r in reasons)
+        """v2 commit with proof_scheme set but no verifier is rejected at admission."""
+        sk = _kp()
+        prover = HashCommitmentProver()
+        commit, _ = build_commit(
+            voter_private_key=sk,
+            voter_secret=b"voter",
+            epoch=EPOCH,
+            subject=SUBJECT,
+            choice=BallotChoice.YEA,
+            prover=prover,
+        )
+        box = PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk)}),
+        )
+        with pytest.raises(InvalidCommitError, match="no verifier"):
+            box.submit_commit(commit)
 
     def test_mixed_v1_v2_ballot_box_tallies_both_without_strict(self):
         sk1, sk2 = _kp(), _kp()
@@ -211,13 +263,18 @@ class TestTallyV2:
             choice=BallotChoice.YEA,
             prover=prover,
         )  # v2
-        box = PrivateBallotBox(epoch=EPOCH, subject=SUBJECT)
+        box = PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk1), _pub(sk2)}),
+            provers={prover.scheme_id: prover},
+        )
         box.submit_commit(c1)
         box.submit_commit(c2)
         box.close_commit_phase()
         box.submit_reveal(r1)
         box.submit_reveal(r2)
-        result = box.tally(provers={prover.scheme_id: prover})
+        result = box.tally()
         assert result.totals[BallotChoice.YEA] == 2
         assert result.rejected == ()
 
@@ -230,12 +287,23 @@ class TestTallyV2:
             subject=SUBJECT,
             choice=BallotChoice.YEA,
         )  # v1
-        box = PrivateBallotBox(epoch=EPOCH, subject=SUBJECT)
-        box.submit_commit(c1)
-        box.close_commit_phase()
-        box.submit_reveal(r1)
-        result = box.tally(strict_v2=True)
-        assert result.totals[BallotChoice.YEA] == 0
+        box = PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk1)}),
+            strict_v2=True,
+        )
+        with pytest.raises(InvalidCommitError, match="legacy v1"):
+            box.submit_commit(c1)
+        result = tally(
+            [c1],
+            [r1],
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk1)}),
+            strict_v2=True,
+        )
+        assert result.total_valid == 0
         assert any("strict_v2" in reason for _, reason in result.rejected)
 
     def test_v2_proof_tampering_detected_in_tally(self):
@@ -251,22 +319,26 @@ class TestTallyV2:
         )
         # tamper the proof
         bad_proof = bytes([commit.validity_proof[0] ^ 0xFF]) + commit.validity_proof[1:]
-        tampered = CommitRecord(
-            version=commit.version,
-            epoch=commit.epoch,
-            subject=commit.subject,
-            voter=commit.voter,
-            commit=commit.commit,
-            nullifier=commit.nullifier,
-            signature=commit.signature,
-            proof_scheme=commit.proof_scheme,
-            validity_proof=bad_proof,
+        tampered = _resign(
+            sk,
+            CommitRecord(
+                version=commit.version,
+                epoch=commit.epoch,
+                subject=commit.subject,
+                voter=commit.voter,
+                commit=commit.commit,
+                nullifier=commit.nullifier,
+                signature=commit.signature,
+                proof_scheme=commit.proof_scheme,
+                validity_proof=bad_proof,
+            ),
         )
         result = tally(
             [tampered],
             [reveal],
             epoch=EPOCH,
             subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk)}),
             provers={prover.scheme_id: prover},
         )
         assert result.totals[BallotChoice.YEA] == 0
@@ -283,16 +355,25 @@ class TestTallyV2:
             choice=BallotChoice.ABSTAIN,
         )
         # forge version=2 with no proof_scheme/proof (simulating legacy tool bump)
-        rebuilt = CommitRecord(
-            version=2,
-            epoch=commit.epoch,
-            subject=commit.subject,
-            voter=commit.voter,
-            commit=commit.commit,
-            nullifier=commit.nullifier,
-            signature=commit.signature,
-            proof_scheme=None,
-            validity_proof=None,
+        rebuilt = _resign(
+            sk,
+            CommitRecord(
+                version=2,
+                epoch=commit.epoch,
+                subject=commit.subject,
+                voter=commit.voter,
+                commit=commit.commit,
+                nullifier=commit.nullifier,
+                signature=commit.signature,
+                proof_scheme=None,
+                validity_proof=None,
+            ),
         )
-        result = tally([rebuilt], [reveal], epoch=EPOCH, subject=SUBJECT)
+        result = tally(
+            [rebuilt],
+            [reveal],
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk)}),
+        )
         assert result.totals[BallotChoice.ABSTAIN] == 1

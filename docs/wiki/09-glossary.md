@@ -32,7 +32,7 @@ Quick lookup for the vocabulary used across the codebase. Conceptual depth is in
 | **MAP-Elites** | Quality-diversity optimizer used for miner quality (`bittensor/map_elites.py`) and coverage-aware governance (`came_coordinator.py`). |
 | **MCFS** | Manifold-Constrained Federated Swarm — the research stack (latent DNA, swarm ODE, Merkle-CRDT, privacy/federation, bittensor, eval). |
 | **MeshProof** | Cryptographic proof object attached to a settled `MeshResult`; `verify()` re-checks it. |
-| **Nullifier** | A privacy-preserving double-vote tag in `private_vote.py`; a repeat in an epoch → `DoubleVoteError`. |
+| **Nullifier** | A public, recomputable double-vote tag derived from a registered Ed25519 public key, epoch, and subject by `private_vote.py`. It limits that key to one ballot in the scope; it does not conceal the key, identify a person, or provide Sybil resistance. |
 | **NMC** | The anti-collusion multi-miner commit-reveal deliberation protocol (`bittensor/nmc_protocol.py`). |
 | **Precedent** | A validated miner judgment recorded as constitutional case law (`bittensor/precedent_store.py`), retrievable by 7-vector similarity. |
 | **Projected RK4** | Runge-Kutta-4 integration that re-projects onto the spectral sphere each step (`swarm_ode.py`). |
