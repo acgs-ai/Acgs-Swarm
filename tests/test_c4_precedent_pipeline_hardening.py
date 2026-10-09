@@ -626,7 +626,7 @@ def test_coord_registered_miners_and_authenticity_work_without_manifold():
     cycle = gc.compute_emissions([
         MinerEmissionInput("auth-high", tier=MinerTier.MASTER),
         MinerEmissionInput("auth-low", tier=MinerTier.MASTER),
-        MinerEmissionInput("sybil", tier=MinerTier.MASTER, reputation=100.0)])
+        MinerEmissionInput("sybil", tier=MinerTier.MASTER, reputation=2.0)])  # max allowed (C6 range)
     by_uid = {e.miner_uid: e for e in cycle.emissions}
     assert cycle.active_miners == 2
     assert by_uid["auth-high"].raw_score > by_uid["auth-low"].raw_score
