@@ -8,11 +8,14 @@ import csv
 import hashlib
 import json
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
 
 from constitutional_swarm.forensic_benchmark import (
     ADVERSARIAL_TECHNIQUES,
     BASELINES,
+    BLINDED_CONDITION_LABELS,
     FORENSIC_QUESTIONNAIRE,
     BenchmarkResultBundle,
     BenchmarkScorecard,
@@ -23,6 +26,7 @@ from constitutional_swarm.forensic_benchmark import (
     ReviewerAnswer,
     ReviewerCohortManifest,
     artifact_pack_to_files,
+    attestor_is_allowed,
     build_result_bundle,
     default_protocol_manifest,
     generate_artifact_pack,
@@ -70,6 +74,77 @@ ANSWER_CELL_FIELDS = ("incident_id", "condition_label", "reviewer_id", "question
 RESPONSE_FIELDS = ("answer", "confidence", "elapsed_seconds")
 
 
+def _result_bundle_evidence_root(
+    bundle_path: Path,
+    evidence_root: Path | None,
+) -> Path:
+    return (evidence_root or bundle_path.parent).resolve()
+
+
+def _validate_loaded_result_bundle(
+    bundle: BenchmarkResultBundle,
+    *,
+    bundle_path: Path,
+    evidence_root: Path | None,
+    trusted_attestors: Iterable[str],
+):
+    return validate_result_bundle(
+        bundle,
+        evidence_root=_result_bundle_evidence_root(bundle_path, evidence_root),
+        trusted_attestors=trusted_attestors,
+    )
+
+
+def _load_result_bundle_with_issues(
+    bundle_path: Path,
+    *,
+    evidence_root: Path | None,
+    trusted_attestors: Iterable[str],
+) -> tuple[BenchmarkResultBundle | None, list[dict[str, str]]]:
+    try:
+        bundle = BenchmarkResultBundle.model_validate_json(bundle_path.read_text())
+    except (OSError, ValueError) as exc:
+        return None, [
+            {
+                "code": "invalid_result_bundle",
+                "message": str(exc),
+            }
+        ]
+    verdict = _validate_loaded_result_bundle(
+        bundle,
+        bundle_path=bundle_path,
+        evidence_root=evidence_root,
+        trusted_attestors=trusted_attestors,
+    )
+    return bundle, [issue.model_dump(mode="json") for issue in verdict.issues]
+
+
+def _relative_evidence_path(path: Path, evidence_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(evidence_root.resolve()).as_posix()
+    except ValueError as exc:
+        msg = f"evidence file {path} must be inside evidence root {evidence_root}"
+        raise ValueError(msg) from exc
+
+
+def _attestor_policy_issue(
+    identity: str,
+    trusted_attestors: Iterable[str],
+    *,
+    code: str,
+    identity_label: str,
+) -> dict[str, str] | None:
+    if attestor_is_allowed(identity, trusted_attestors=trusted_attestors):
+        return None
+    return {
+        "code": code,
+        "message": (
+            f"{identity_label} is denied or absent from the caller-supplied "
+            "trusted attestor allowlist"
+        ),
+    }
+
+
 def required_public_artifact_verification_commands() -> dict[str, tuple[str, ...]]:
     return {
         "public_blind_answer_matrix": (
@@ -78,22 +153,27 @@ def required_public_artifact_verification_commands() -> dict[str, tuple[str, ...
             "--protocol-json coordinator_pack/protocol.json "
             "--answer-key-json coordinator_pack/answer_key.json "
             "--condition-key-json coordinator_pack/condition_key.json "
-            "--answer-matrix-result-bundle result-bundle.json",
+            "--answer-matrix-result-bundle result-bundle.json --evidence-root . "
+            "--trusted-attestor TODO-independent-group-name",
         ),
         "pre_unblinding_answer_seal": (
             "python scripts/run_governance_benchmark.py "
             "--verify-collected-answers-seal collected-answers-seal.json "
             "--answers-csv answers.csv --reviewer-packet reviewer_packet "
-            "--answer-seal-result-bundle result-bundle.json",
+            "--answer-seal-result-bundle result-bundle.json --evidence-root . "
+            "--trusted-attestor TODO-independent-group-name",
         ),
         "external_reviewer_cohort_manifest": (
             "python scripts/run_governance_benchmark.py "
             "--validate-reviewer-cohort-manifest reviewer_cohort_manifest.json "
-            "--cohort-result-bundle result-bundle.json",
+            "--cohort-result-bundle result-bundle.json --evidence-root . "
+            "--trusted-attestor TODO-cohort-recruiting-organization "
+            "--trusted-attestor TODO-independent-group-name",
         ),
         "public_scorecard": (
             "python scripts/run_governance_benchmark.py "
-            "--validate-result-bundle result-bundle.json",
+            "--validate-result-bundle result-bundle.json --evidence-root . "
+            "--trusted-attestor TODO-independent-group-name",
             "python scripts/run_governance_benchmark.py "
             "--validate-scorecard scorecard.json "
             "--scorecard-result-bundle result-bundle.json",
@@ -106,7 +186,9 @@ def required_public_artifact_verification_commands() -> dict[str, tuple[str, ...
             "--attested-reviewer-cohort-manifest reviewer_cohort_manifest.json "
             "--attested-scorecard scorecard.json "
             "--attested-artifact-pack artifact-pack.tar.gz "
-            "--attested-commands-transcript commands-transcript.txt",
+            "--attested-commands-transcript commands-transcript.txt "
+            "--trusted-attestor TODO-independent-attestor-name "
+            "--trusted-attestor TODO-independent-group-name",
         ),
     }
 
@@ -388,6 +470,24 @@ def _verify_replication_kit(kit_dir: Path) -> dict[str, object]:
 
     issues: list[dict[str, str]] = []
     actual_files = _build_file_manifest(kit_dir)
+    condition_key_path = kit_dir / "coordinator_pack" / "condition_key.json"
+    if "coordinator_pack/condition_key.json" not in actual_files:
+        issues.append(
+            {
+                "code": "missing_condition_key",
+                "message": "replication kit must include coordinator_pack/condition_key.json",
+            }
+        )
+    else:
+        try:
+            _load_condition_key(condition_key_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            issues.append(
+                {
+                    "code": "invalid_condition_key",
+                    "message": str(exc),
+                }
+            )
     for relative_path, expected in expected_files.items():
         actual = actual_files.get(str(relative_path))
         if actual is None:
@@ -466,8 +566,12 @@ def _render_external_replication_submission_markdown(
     result_bundle_url: str,
     replication_metadata_url: str,
     commands_transcript_url: str,
+    trusted_attestors: Iterable[str],
 ) -> str:
-    independent_group = "acgs" not in replication_metadata.replicating_group.casefold()
+    independent_group = attestor_is_allowed(
+        replication_metadata.replicating_group,
+        trusted_attestors=trusted_attestors,
+    )
     reviewer_blind = bool(bundle_summary.get("reviewer_count", 0)) >= 2
     result_bundle_check = (
         "x" if result_bundle_url and not result_bundle_url.startswith("TODO") else " "
@@ -588,10 +692,17 @@ def _write_external_replication_submission_package(
     result_bundle_url: str | None = None,
     replication_metadata_url: str | None = None,
     commands_transcript_url: str | None = None,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
 ) -> dict[str, object]:
     public_request = _public_replication_request_template()
     bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
-    verdict = validate_result_bundle(bundle)
+    verdict = _validate_loaded_result_bundle(
+        bundle,
+        bundle_path=result_bundle_path,
+        evidence_root=evidence_root,
+        trusted_attestors=trusted_attestors,
+    )
     if not verdict.valid:
         return {
             "output_dir": str(output_dir),
@@ -614,6 +725,7 @@ def _write_external_replication_submission_package(
         result_bundle_url=result_bundle_url,
         replication_metadata_url=replication_metadata_url,
         commands_transcript_url=commands_transcript_url,
+        trusted_attestors=trusted_attestors,
     )
     submission_fields = {
         "replicating_group_name": bundle.external_replication.replicating_group,
@@ -682,6 +794,9 @@ def _validate_external_replication_submission_package(
     submission_path: Path,
     result_bundle_path: Path,
     submission_markdown_path: Path | None = None,
+    *,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
 ) -> dict[str, object]:
     if submission_path.is_dir():
         submission_json_path = submission_path / "submission.json"
@@ -693,7 +808,12 @@ def _validate_external_replication_submission_package(
     issues: list[dict[str, str]] = []
     public_request = _public_replication_request_template()
     bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
-    verdict = validate_result_bundle(bundle)
+    verdict = _validate_loaded_result_bundle(
+        bundle,
+        bundle_path=result_bundle_path,
+        evidence_root=evidence_root,
+        trusted_attestors=trusted_attestors,
+    )
     summary = _result_bundle_summary(bundle)
 
     if not verdict.valid:
@@ -1389,7 +1509,11 @@ def _verify_collected_blind_answers_seal(
     }
 
 
-def _study_readiness_report(kit_dir: Path) -> dict[str, object]:
+def _study_readiness_report(
+    kit_dir: Path,
+    *,
+    trusted_attestors: Iterable[str] = (),
+) -> dict[str, object]:
     issues: list[dict[str, str]] = []
     kit_verdict = _verify_replication_kit(kit_dir)
     if not kit_verdict["valid"]:
@@ -1428,7 +1552,10 @@ def _study_readiness_report(kit_dir: Path) -> dict[str, object]:
             }
         )
 
-    replication_verdict = _validate_replication_metadata(kit_dir / "replication_metadata.json")
+    replication_verdict = _validate_replication_metadata(
+        kit_dir / "replication_metadata.json",
+        trusted_attestors=trusted_attestors,
+    )
     return {
         "ready_for_blind_review": not issues,
         "success_evidence": False,
@@ -1564,6 +1691,9 @@ def _load_replication_metadata(path: Path) -> ExternalReplicationRecord:
 def _validate_reviewer_cohort_manifest(
     path: Path,
     result_bundle_path: Path | None = None,
+    *,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
 ) -> dict[str, object]:
     try:
         manifest = ReviewerCohortManifest.model_validate_json(path.read_text())
@@ -1580,13 +1710,13 @@ def _validate_reviewer_cohort_manifest(
         }
 
     issues: list[dict[str, str]] = []
-    if "acgs" in manifest.recruiting_organization.lower():
-        issues.append(
-            {
-                "code": "reviewer_cohort_not_external",
-                "message": "recruiting organization must be independent of ACGS",
-            }
-        )
+    if identity_issue := _attestor_policy_issue(
+        manifest.recruiting_organization,
+        trusted_attestors,
+        code="reviewer_cohort_not_trusted",
+        identity_label="reviewer cohort recruiting organization",
+    ):
+        issues.append(identity_issue)
     if not manifest.blind_to_ground_truth:
         issues.append(
             {
@@ -1616,8 +1746,13 @@ def _validate_reviewer_cohort_manifest(
             }
         )
     if result_bundle_path is not None:
-        bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
-        if manifest.reviewer_count != bundle.reviewer_count:
+        bundle, bundle_issues = _load_result_bundle_with_issues(
+            result_bundle_path,
+            evidence_root=evidence_root,
+            trusted_attestors=trusted_attestors,
+        )
+        issues.extend(bundle_issues)
+        if bundle is not None and manifest.reviewer_count != bundle.reviewer_count:
             issues.append(
                 {
                     "code": "reviewer_cohort_count_mismatch",
@@ -1639,6 +1774,9 @@ def _validate_reviewer_cohort_manifest(
 def _validate_scorecard_artifact(
     path: Path,
     result_bundle_path: Path | None = None,
+    *,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
 ) -> dict[str, object]:
     try:
         scorecard = BenchmarkScorecard.model_validate_json(path.read_text())
@@ -1656,8 +1794,13 @@ def _validate_scorecard_artifact(
 
     issues: list[dict[str, str]] = []
     if result_bundle_path is not None:
-        bundle = BenchmarkResultBundle.model_validate_json(result_bundle_path.read_text())
-        if scorecard != bundle.scorecard:
+        bundle, bundle_issues = _load_result_bundle_with_issues(
+            result_bundle_path,
+            evidence_root=evidence_root,
+            trusted_attestors=trusted_attestors,
+        )
+        issues.extend(bundle_issues)
+        if bundle is not None and scorecard != bundle.scorecard:
             issues.append(
                 {
                     "code": "scorecard_result_bundle_mismatch",
@@ -1683,6 +1826,9 @@ def _validate_replication_attestation(
     attested_scorecard_path: Path | None = None,
     attested_artifact_pack_path: Path | None = None,
     attested_commands_transcript_path: Path | None = None,
+    *,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
 ) -> dict[str, object]:
     try:
         attestation = ExternalReplicationAttestation.model_validate_json(
@@ -1702,13 +1848,13 @@ def _validate_replication_attestation(
 
     issues: list[dict[str, str]] = []
     record: ExternalReplicationRecord | None = None
-    if "acgs" in attestation.replicating_group.casefold():
-        issues.append(
-            {
-                "code": "attestation_replicating_group_not_external",
-                "message": "attestation replicating group must be independent of ACGS",
-            }
-        )
+    if identity_issue := _attestor_policy_issue(
+        attestation.attestor_name,
+        trusted_attestors,
+        code="attestation_attestor_not_trusted",
+        identity_label="attestation attestor",
+    ):
+        issues.append(identity_issue)
     if not attestation.conflict_of_interest_screened:
         issues.append(
             {
@@ -1749,6 +1895,12 @@ def _validate_replication_attestation(
                 }
             )
     if attested_result_bundle_path is not None:
+        _, bundle_issues = _load_result_bundle_with_issues(
+            attested_result_bundle_path,
+            evidence_root=evidence_root,
+            trusted_attestors=trusted_attestors,
+        )
+        issues.extend(bundle_issues)
         result_bundle_sha256 = _sha256_file(attested_result_bundle_path)
         if attestation.result_bundle_sha256 != result_bundle_sha256:
             issues.append(
@@ -1829,7 +1981,11 @@ def _validate_replication_attestation(
     }
 
 
-def _validate_replication_metadata(path: Path) -> dict[str, object]:
+def _validate_replication_metadata(
+    path: Path,
+    *,
+    trusted_attestors: Iterable[str] = (),
+) -> dict[str, object]:
     record = _load_replication_metadata(path)
     issues: list[dict[str, str]] = []
     if not record.completed:
@@ -1839,13 +1995,13 @@ def _validate_replication_metadata(path: Path) -> dict[str, object]:
                 "message": "replication metadata is not completed",
             }
         )
-    if "acgs" in record.replicating_group.lower():
-        issues.append(
-            {
-                "code": "replicating_group_not_external",
-                "message": "replicating group must be independent of ACGS",
-            }
-        )
+    if identity_issue := _attestor_policy_issue(
+        record.replicating_group,
+        trusted_attestors,
+        code="replicating_group_not_trusted",
+        identity_label="replicating group",
+    ):
+        issues.append(identity_issue)
     if "TODO" in record.model_dump_json():
         issues.append(
             {
@@ -2266,7 +2422,12 @@ def _public_blind_review_data_verified(
     return True
 
 
-def _v0_1_completion_audit(bundle_path: Path | None) -> dict[str, object]:
+def _v0_1_completion_audit(
+    bundle_path: Path | None,
+    *,
+    evidence_root: Path | None = None,
+    trusted_attestors: Iterable[str] = (),
+) -> dict[str, object]:
     required_questions = {
         "who_acted",
         "authority_existed",
@@ -2490,7 +2651,12 @@ def _v0_1_completion_audit(bundle_path: Path | None) -> dict[str, object]:
         )
     else:
         bundle = BenchmarkResultBundle.model_validate_json(bundle_path.read_text())
-        verdict = validate_result_bundle(bundle)
+        verdict = _validate_loaded_result_bundle(
+            bundle,
+            bundle_path=bundle_path,
+            evidence_root=evidence_root,
+            trusted_attestors=trusted_attestors,
+        )
         result_bundle_valid = verdict.valid
         result_bundle_summary = _result_bundle_summary(bundle)
         result_bundle_issues = [
@@ -2697,7 +2863,10 @@ def _v0_1_completion_audit(bundle_path: Path | None) -> dict[str, object]:
                         ),
                     }
                 ),
-                "satisfied": _public_blind_review_data_verified(result_bundle_summary),
+                "satisfied": bool(
+                    result_bundle_valid
+                    and _public_blind_review_data_verified(result_bundle_summary)
+                ),
             },
             {
                 "requirement": "non_acgs_external_replication_verified",
@@ -2773,7 +2942,28 @@ def _load_condition_key(path: Path | None) -> dict[str, str] | None:
     if path is None:
         return None
     data = json.loads(path.read_text())
-    return {str(label): str(condition) for label, condition in data.items()}
+    if not isinstance(data, dict) or set(data) != {"conditions", "pack_nonce"}:
+        msg = "condition key must contain only conditions and pack_nonce"
+        raise ValueError(msg)
+    conditions = data["conditions"]
+    if not isinstance(conditions, dict):
+        msg = "condition key conditions must be an object"
+        raise ValueError(msg)
+    parsed = {str(label): str(condition) for label, condition in conditions.items()}
+    if set(parsed) != set(BLINDED_CONDITION_LABELS) or set(parsed.values()) != set(
+        BASELINES
+    ):
+        msg = "condition key conditions must be a blinded-label baseline bijection"
+        raise ValueError(msg)
+    pack_nonce = data["pack_nonce"]
+    if (
+        not isinstance(pack_nonce, str)
+        or len(pack_nonce) != 64
+        or any(character not in "0123456789abcdef" for character in pack_nonce)
+    ):
+        msg = "condition key pack_nonce must be 64 lowercase hexadecimal characters"
+        raise ValueError(msg)
+    return parsed
 
 
 def _artifact_condition_for(
@@ -2826,7 +3016,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--condition-key-json",
         type=Path,
-        help="hidden condition key JSON used to score CSVs that omit artifact_condition",
+        help=(
+            "hidden condition-key envelope used to score CSVs that omit "
+            "artifact_condition"
+        ),
     )
     parser.add_argument(
         "--generate-incident-pack",
@@ -2870,6 +3063,23 @@ def main(argv: list[str] | None = None) -> int:
         "--validate-result-bundle",
         type=Path,
         help="validate a public-study result bundle JSON before claiming v0.1 success",
+    )
+    parser.add_argument(
+        "--evidence-root",
+        type=Path,
+        help=(
+            "directory containing result-bundle evidence files; defaults to the "
+            "result bundle's parent directory"
+        ),
+    )
+    parser.add_argument(
+        "--trusted-attestor",
+        action="append",
+        default=[],
+        help=(
+            "exact trusted external group or attestor name; repeat for multiple "
+            "identities"
+        ),
     )
     parser.add_argument(
         "--validate-scorecard",
@@ -3066,11 +3276,6 @@ def main(argv: list[str] | None = None) -> int:
         help="ExternalReplicationRecord JSON for --build-result-bundle",
     )
     parser.add_argument(
-        "--p-value",
-        type=float,
-        help="optional p-value versus strongest baseline; omitted means compute paired sign test",
-    )
-    parser.add_argument(
         "--incident-count",
         type=int,
         default=50,
@@ -3148,6 +3353,8 @@ def main(argv: list[str] | None = None) -> int:
             result_bundle_url=args.submission_result_bundle_url,
             replication_metadata_url=args.submission_replication_metadata_url,
             commands_transcript_url=args.submission_commands_transcript_url,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["valid"] else 1
@@ -3165,6 +3372,8 @@ def main(argv: list[str] | None = None) -> int:
             args.validate_external_replication_submission,
             args.submission_result_bundle,
             args.submission_package_md,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return 0 if verdict["valid"] else 1
@@ -3182,13 +3391,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if verdict["valid"] else 1
 
     if args.study_readiness_report:
-        report = _study_readiness_report(args.study_readiness_report)
+        report = _study_readiness_report(
+            args.study_readiness_report,
+            trusted_attestors=args.trusted_attestor,
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ready_for_blind_review"] else 1
 
     if args.validate_result_bundle:
         bundle = BenchmarkResultBundle.model_validate_json(args.validate_result_bundle.read_text())
-        verdict = validate_result_bundle(bundle)
+        verdict = _validate_loaded_result_bundle(
+            bundle,
+            bundle_path=args.validate_result_bundle,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
+        )
         print(
             json.dumps(
                 {
@@ -3206,17 +3423,26 @@ def main(argv: list[str] | None = None) -> int:
         verdict = _validate_scorecard_artifact(
             args.validate_scorecard,
             args.scorecard_result_bundle,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return 0 if verdict["success_evidence"] else 1
 
     if args.completion_audit or args.completion_audit_result_bundle:
-        audit = _v0_1_completion_audit(args.completion_audit_result_bundle)
+        audit = _v0_1_completion_audit(
+            args.completion_audit_result_bundle,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
+        )
         print(json.dumps(audit, indent=2, sort_keys=True))
         return 0 if audit["complete"] else 1
 
     if args.validate_replication_metadata:
-        verdict = _validate_replication_metadata(args.validate_replication_metadata)
+        verdict = _validate_replication_metadata(
+            args.validate_replication_metadata,
+            trusted_attestors=args.trusted_attestor,
+        )
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return 0 if verdict["success_evidence"] else 1
 
@@ -3224,6 +3450,8 @@ def main(argv: list[str] | None = None) -> int:
         verdict = _validate_reviewer_cohort_manifest(
             args.validate_reviewer_cohort_manifest,
             args.cohort_result_bundle,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return 0 if verdict["success_evidence"] else 1
@@ -3237,6 +3465,8 @@ def main(argv: list[str] | None = None) -> int:
             args.attested_scorecard,
             args.attested_artifact_pack,
             args.attested_commands_transcript,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return 0 if verdict["success_evidence"] else 1
@@ -3290,9 +3520,16 @@ def main(argv: list[str] | None = None) -> int:
             args.reviewer_packet,
         )
         if args.answer_seal_result_bundle is not None:
-            bundle = BenchmarkResultBundle.model_validate_json(
-                args.answer_seal_result_bundle.read_text()
+            bundle, bundle_issues = _load_result_bundle_with_issues(
+                args.answer_seal_result_bundle,
+                evidence_root=args.evidence_root,
+                trusted_attestors=args.trusted_attestor,
             )
+            cast(list[dict[str, str]], verdict["issues"]).extend(bundle_issues)
+            if bundle is None:
+                verdict["valid"] = False
+                print(json.dumps(verdict, indent=2, sort_keys=True))
+                return 1
             if _sha256_file(args.verify_collected_answers_seal) != (
                 bundle.answer_evidence.answer_seal_sha256
             ):
@@ -3402,10 +3639,19 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(verdict.model_dump(mode="json"), indent=2, sort_keys=True))
             return 0 if verdict.valid else 1
 
-        bundle = BenchmarkResultBundle.model_validate_json(
-            args.answer_matrix_result_bundle.read_text()
+        bundle, bundle_issues = _load_result_bundle_with_issues(
+            args.answer_matrix_result_bundle,
+            evidence_root=args.evidence_root,
+            trusted_attestors=args.trusted_attestor,
         )
-        issues = [issue.model_dump(mode="json") for issue in verdict.issues]
+        issues = [
+            *[issue.model_dump(mode="json") for issue in verdict.issues],
+            *bundle_issues,
+        ]
+        if bundle is None:
+            payload = {"valid": False, "issues": issues}
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 1
         answers_sha256 = _sha256_file(args.validate_answer_matrix)
         answers_bytes = args.validate_answer_matrix.stat().st_size
         reviewer_count = len({answer.reviewer_id for answer in answers})
@@ -3475,6 +3721,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("--protocol-json", args.protocol_json),
                 ("--replication-metadata", args.replication_metadata),
                 ("--answer-key-json", args.answer_key_json),
+                ("--condition-key-json", args.condition_key_json),
             )
             if value is None
         ]
@@ -3489,8 +3736,36 @@ def main(argv: list[str] | None = None) -> int:
         if not answer_seal["valid"]:
             print(json.dumps({"answer_seal": answer_seal}, indent=2, sort_keys=True))
             return 1
+        evidence_root = _result_bundle_evidence_root(
+            args.build_result_bundle,
+            args.evidence_root,
+        )
+        evidence_paths = {
+            "answers_csv": _relative_evidence_path(args.answers_csv, evidence_root),
+            "answer_seal": _relative_evidence_path(
+                args.answer_seal_json,
+                evidence_root,
+            ),
+            "reviewer_manifest": _relative_evidence_path(
+                args.reviewer_packet / "reviewer_manifest.json",
+                evidence_root,
+            ),
+            "answer_key": _relative_evidence_path(args.answer_key_json, evidence_root),
+            "condition_key": _relative_evidence_path(
+                args.condition_key_json,
+                evidence_root,
+            ),
+            "protocol": _relative_evidence_path(args.protocol_json, evidence_root),
+            "replication_metadata": _relative_evidence_path(
+                args.replication_metadata,
+                evidence_root,
+            ),
+        }
         bundle = build_result_bundle(
             protocol=_load_protocol(args.protocol_json),
+            external_replication=_load_replication_metadata(args.replication_metadata),
+            evidence_root=evidence_root,
+            evidence_paths=evidence_paths,
             answers=_load_reviewer_answers_csv(
                 args.answers_csv,
                 answer_key_path=args.answer_key_json,
@@ -3506,16 +3781,22 @@ def main(argv: list[str] | None = None) -> int:
                 row_count=int(answer_seal["validation"]["row_count"]),
                 reviewer_count=int(answer_seal["validation"]["reviewer_count"]),
             ),
-            p_value_vs_strongest_baseline=args.p_value,
-            external_replication=_load_replication_metadata(args.replication_metadata),
         )
-        args.build_result_bundle.write_text(bundle.model_dump_json(indent=2))
-        verdict = validate_result_bundle(bundle)
+        verdict = _validate_loaded_result_bundle(
+            bundle,
+            bundle_path=args.build_result_bundle,
+            evidence_root=evidence_root,
+            trusted_attestors=args.trusted_attestor,
+        )
+        if verdict.valid:
+            args.build_result_bundle.write_text(bundle.model_dump_json(indent=2))
         print(
             json.dumps(
                 {
                     "answer_seal": answer_seal,
-                    "result_bundle": str(args.build_result_bundle),
+                    "result_bundle": (
+                        str(args.build_result_bundle) if verdict.valid else None
+                    ),
                     "validation": verdict.model_dump(mode="json"),
                 },
                 indent=2,

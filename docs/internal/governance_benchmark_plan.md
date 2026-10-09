@@ -77,6 +77,47 @@ The fixed question identifiers live in
 artifacts must not include hidden ground truth; ground-truth answer keys are used
 only by the scoring script after blind review is complete.
 
+The leak boundary is structural. Reviewer artifacts are built from a closed,
+typed schema that cannot accept arbitrary answer fields. The packet audit parses
+each canonical JSON answer, normalizes strings and tokens, and rejects an
+artifact when its fields mechanically reproduce that hidden answer. This guard
+detects direct or trivially transformed copies; it does not prevent a reviewer
+from inferring an answer from legitimate observable evidence. The seven answers
+are synthetic assessment classifications derived deterministically from exposed
+incident attributes such as technique and timing; they do not contain supporting
+reference fields. `what_failed` is an assessment category rather than a copy of
+the typed failure-evidence record. Preventing direct field transcription does
+not establish that a human reviewer can reconstruct the answers, so the new
+study still requires empirical validation.
+
+Condition blinding is therefore partial. Every condition uses the same artifact
+schema and the generator equalizes integrity fields and evidence-strength
+fingerprints where they are not needed for the task. Evidence availability and
+content can still reveal which condition is richer. This information-content
+cue is an explicit study limitation and must be reported with the results; a
+blind label alone is not evidence that reviewers could not infer the condition.
+Raw-log fields without supported evidence use `unknown` or `unavailable`,
+including outcome timing, rather than asserting facts the raw trace cannot
+establish.
+
+**Open integrity limitations (unresolved as of 2026-10-08; results produced
+with this protocol must not be presented as tamper-evident):**
+
+1. *Post-collection key substitution.* The result seal binds the answers CSV
+   and the reviewer manifest, but `answer_key.json` and `condition_key.json`
+   are taken as supplied by the coordinator. A coordinator can swap condition
+   labels or rewrite the answer key after answers are collected and obtain a
+   "valid" significant result. Required fix (tracked follow-up): regenerate
+   the pack from `pack_nonce` and require byte equality for both keys and every
+   reviewer artifact, and bind a pre-collection commitment
+   (`sha256(answer_key ‖ condition_key ‖ H(nonce))`) that reviewers receive and
+   that the validator obtains through a separate channel.
+2. *Cross-condition linkage.* One reviewer packet contains all three
+   conditions under the same incident IDs, and the ACGS artifacts determine the
+   full answer key, so answers derived from them can be joined onto the baseline
+   rows. Required fix: per-condition unlinkable incident IDs, or disjoint
+   reviewer cohorts with assignment enforced during answer-matrix validation.
+
 ## Baselines
 
 The central baseline must be strong enough to survive reviewer scrutiny:
@@ -117,8 +158,17 @@ python scripts/run_governance_benchmark.py --write-replication-kit artifacts/v0_
 ```
 
 The kit writes `coordinator_pack/`, `reviewer_packet/`, `kit_manifest.json`,
-`replication_metadata.json`, and a `README.md` with the rerun commands. Verify a
-received or copied kit before use with:
+`replication_metadata.json`, and a `README.md` with the rerun commands.
+`coordinator_pack/condition_key.json` is mandatory in every kit. It contains the
+label-to-condition mapping under `conditions` and a secret per-pack
+`pack_nonce`. Incident-fact and evidence digests use canonical length-prefixed
+encoding and nonce-salted SHA-256, so public incident IDs and JSON structure
+alone cannot predict those digests. This is salting, not a keyed HMAC.
+Keep this file with the coordinator artifacts and withhold it from reviewers.
+Because a new nonce is generated for each pack, independently generated packs
+are intentionally not byte-for-byte reproducible; retaining the shipped
+condition key is required to validate and score that pack. Verify a received or
+copied kit before use with:
 
 ```bash
 python scripts/run_governance_benchmark.py --verify-replication-kit artifacts/v0_1_replication_kit
@@ -182,10 +232,12 @@ schema, and any answer CSV that no longer passes the blind collected-answer
 validator. It also reports `success_evidence: false`; the seal only preserves
 chain of custody before scoring.
 
-The generated `answer_key.json` is hidden ground truth and the generated
-`condition_key.json` maps reviewer-facing condition labels to true artifact
-conditions; both files must be withheld from blind reviewers until answer
-collection is complete. Reviewer-visible artifacts live under
+The generated `answer_key.json` is hidden ground truth. The generated
+`condition_key.json` binds reviewer-facing labels to true artifact conditions
+and carries the secret per-pack nonce used for length-prefixed, nonce-salted
+incident-fact and evidence digests. Both files must be withheld from blind reviewers until answer
+collection is complete and retained with the replication kit. Reviewer-visible
+artifacts live under
 `artifacts/v0_1_pack/reviewer_artifacts/<condition_label>/`. The generated
 `reviewer_protocol.json`, `reviewer_instructions.md`, and
 `reviewer_answer_template.csv` are the reviewer-facing study files; they use only
@@ -204,10 +256,14 @@ python scripts/run_governance_benchmark.py --audit-reviewer-packet artifacts/v0_
 ```
 
 The audit verifies the reviewer manifest checksums and fails if coordinator-only
-files, hidden answer keys, true condition names, or ground-truth fields are
-present in the reviewer-visible packet. `--verify-reviewer-manifest` remains
+files, hidden answer keys, true condition names, ground-truth fields, or
+normalized direct/mechanical copies of canonical hidden answers are present in
+the reviewer-visible packet. This audit does not claim that evidence content is
+condition-indistinguishable; the residual information-content limitation above
+still applies. `--verify-reviewer-manifest` remains
 available when only checksum verification is needed. Use
-`--validate-replication-metadata replication_metadata.json` to check that a
+`--validate-replication-metadata replication_metadata.json --trusted-attestor
+"Independent Replication Lab"` to check that a
 filled `ExternalReplicationRecord` has the required shape and does not contain
 placeholder or incomplete replication evidence. The generated
 `replication_metadata_template.json` and replication-kit
@@ -224,7 +280,8 @@ after collection, inside the scorer/bundle builder. After cohort recruitment, va
 
 ```bash
 python scripts/run_governance_benchmark.py \
-  --validate-reviewer-cohort-manifest reviewer_cohort_manifest.json
+  --validate-reviewer-cohort-manifest reviewer_cohort_manifest.json \
+  --trusted-attestor "Independent Recruiting Organization"
 ```
 
 After answer collection and
@@ -243,6 +300,8 @@ Then build the result bundle from files rather than hand-editing JSON:
 ```bash
 python scripts/run_governance_benchmark.py \
   --build-result-bundle result-bundle.json \
+  --evidence-root . \
+  --trusted-attestor "Independent Replication Lab" \
   --answers-csv answers.csv \
   --answer-seal-json collected-answers-seal.json \
   --answer-matrix-uri https://zenodo.org/records/<record>/files/answers.csv \
@@ -254,13 +313,24 @@ python scripts/run_governance_benchmark.py \
   --replication-metadata replication_metadata.json
 ```
 
-By default, the bundle builder computes `p_value_vs_strongest_baseline` with a
-paired sign test over matched reviewer answers. Use `--p-value` only when a
-pre-registered external statistic is being supplied instead.
+The bundle builder computes `p_value_vs_strongest_baseline` from the sealed
+answer matrix; callers cannot override it. The exact one-sided paired sign test
+uses the incident as the unit of independence. Reviewer-by-question cells are
+aggregated into each incident's matched ACGS-versus-baseline contrast and do not
+increase the binomial sample size. Earlier per-answer significance reporting,
+including the published value near `p ≈ 1.9e-211`, is superseded by this
+incident-level analysis and must be recomputed before it is cited as evidence.
 The bundle builder verifies `collected-answers-seal.json` before loading hidden
 keys and persists `answer_evidence` with answer-matrix URI, seal URI, SHA-256
 digests, byte count, row count, and reviewer count. Scoring fails closed if the
 answer CSV or reviewer manifest changed after the pre-unblinding seal.
+
+The result bundle also inventories the files on which its claims depend. The
+builder hashes the actual bytes and records their paths and SHA-256 digests. The
+validator resolves those paths against the bundle's evidence root, re-reads the
+files, and rejects missing files or byte/hash mismatches. A syntactically valid
+digest, a self-reported command line, or a claimed p-value is not integrity or
+success evidence by itself.
 
 Before making a v0.1 success claim, validate the public-study result bundle and run the conservative completion audit:
 
@@ -272,15 +342,26 @@ python scripts/run_governance_benchmark.py \
   --attested-reviewer-cohort-manifest reviewer_cohort_manifest.json \
   --attested-scorecard scorecard.json \
   --attested-artifact-pack artifact-pack.tar.gz \
-  --attested-commands-transcript commands-transcript.txt
-python scripts/run_governance_benchmark.py --validate-result-bundle result-bundle.json
-python scripts/run_governance_benchmark.py --completion-audit-result-bundle result-bundle.json
+  --attested-commands-transcript commands-transcript.txt \
+  --evidence-root . \
+  --trusted-attestor "Independent Attestor Name" \
+  --trusted-attestor "Independent Replication Lab"
+python scripts/run_governance_benchmark.py \
+  --validate-result-bundle result-bundle.json \
+  --evidence-root . \
+  --trusted-attestor "Independent Replication Lab"
+python scripts/run_governance_benchmark.py \
+  --completion-audit-result-bundle result-bundle.json \
+  --evidence-root . \
+  --trusted-attestor "Independent Replication Lab"
 ```
 
 The completion audit intentionally remains blocked until live public blind-review data and non-ACGS external replication artifacts are independently verified. The validator requires the fixed protocol, 50 to 200 incidents, at least two
 blind reviewers, all seven questions, all three artifact conditions, a positive
 ACGS delta against the strongest baseline, `p <= 0.05`, positive inter-reviewer
-agreement for the ACGS condition, and completed non-ACGS replication metadata.
+agreement for the ACGS condition, completed non-ACGS replication metadata, and
+successful re-hashing of every referenced evidence file. Metadata and command
+text alone cannot satisfy the gate.
 
 ## Public Study Gate
 
@@ -298,6 +379,10 @@ Adversarial incident generation must include collusion, memory poisoning, rule
 gaming, fragmented actions, and misleading traces. A non-ACGS group must be able
 to rerun the protocol from the manifest, regenerate the artifact sets, collect
 blind-review answers, and reproduce the scorecard.
+
+The legacy `blinded_condition_key()` helper is deprecated because its fixed
+mapping is predictable and not pack-bound. New code must consume the shipped
+`condition_key.json` for the specific pack.
 
 ## Receipt Profile Decision
 

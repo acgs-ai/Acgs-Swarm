@@ -8,14 +8,21 @@ multi-agent incidents from those artifacts.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import math
 import random
+import re
+import secrets
+import unicodedata
+import warnings
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from csv import DictWriter
+from csv import DictReader, DictWriter
 from decimal import Decimal, localcontext
 from io import StringIO
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -60,6 +67,14 @@ PLACEHOLDER_REFERENCE_MARKERS: tuple[str, ...] = (
     "records/<record>",
     "records/123456",
 )
+
+EvidenceStrength = Literal["unavailable", "observed", "corroborated"]
+EvidenceClass = Literal["unknown", "diff", "policy_evaluation", "runtime_trace"]
+BenchmarkCondition = Literal[
+    "ungoverned_raw_logs",
+    "centralized_structured_logs",
+    "acgs_receipts_and_audit_artifacts",
+]
 
 
 class ProtocolValidationIssue(BaseModel):
@@ -117,17 +132,13 @@ class ReviewerAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     incident_id: str = Field(min_length=1)
-    artifact_condition: Literal[
-        "ungoverned_raw_logs",
-        "centralized_structured_logs",
-        "acgs_receipts_and_audit_artifacts",
-    ]
+    artifact_condition: BenchmarkCondition
     reviewer_id: str = Field(min_length=1)
     question_id: str = Field(min_length=1)
     answer: str
     ground_truth: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    elapsed_seconds: float = Field(ge=0.0)
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    elapsed_seconds: float = Field(ge=0.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def require_known_question(self) -> ReviewerAnswer:
@@ -185,27 +196,217 @@ class IncidentSpec(BaseModel):
         return {question: str(getattr(self, question)) for question in FORENSIC_QUESTIONNAIRE}
 
 
+class _IncidentEvidenceSource(BaseModel):
+    """Condition-neutral source facts used to derive answers and evidence separately."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    incident_id: str = Field(pattern=r"^incident-[0-9]{3}$")
+    ordinal: int = Field(ge=1, le=200)
+    adversarial_technique: Literal[
+        "collusion",
+        "memory_poisoning",
+        "rule_gaming",
+        "fragmented_actions",
+        "misleading_traces",
+    ]
+
+
+class EvidenceReference(BaseModel):
+    """One typed evidence reference safe for blind-review distribution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_class: EvidenceClass
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    strength: EvidenceStrength
+
+
+class AuthorityEvidence(BaseModel):
+    """Condition-neutral authority evidence, separated from answer text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deploy_role_visible: bool | None
+    validator_approval_required: bool | None
+    auditor_receipt_required: bool | None
+    strength: EvidenceStrength
+
+
+class PolicyEvidence(BaseModel):
+    """Typed policy evidence that cannot carry free-form questionnaire answers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    family: Literal["unknown", "devops_high_risk"]
+    version: Literal["unknown", "v0.1"]
+    adversarial_signal: Literal[
+        "unknown",
+        "collusion",
+        "memory_poisoning",
+        "rule_gaming",
+        "fragmented_actions",
+        "misleading_traces",
+    ]
+    strength: EvidenceStrength
+
+
+class DecisionEvidence(BaseModel):
+    """Typed approval evidence with a fixed condition-neutral shape."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reviewing_role: Literal["unknown", "validator"]
+    reviewer_ordinal: int = Field(ge=0, le=200)
+    audit_role_present: bool | None
+    disposition: Literal["unknown", "denied"]
+    strength: EvidenceStrength
+
+
+class FailureEvidence(BaseModel):
+    """Typed failure evidence derived independently from the hidden answer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: Literal[
+        "unknown",
+        "coordinated_approval",
+        "poisoned_authorization",
+        "threshold_evasion",
+        "fragmented_tool_calls",
+        "misleading_trace_labels",
+    ]
+    step_ordinal: int = Field(ge=0, le=200)
+    strength: EvidenceStrength
+
+
+class OutcomeEvidence(BaseModel):
+    """Typed outcome evidence without a prewritten reviewer answer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    execution_blocked: bool | None
+    evidence_preserved: bool | None
+    detection_timing: Literal["unknown", "before_execution", "after_execution"]
+    strength: EvidenceStrength
+
+
+class IntegrityEvidence(BaseModel):
+    """Evidence-integrity properties present under every study condition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    structured: bool | None
+    tamper_evident: bool | None
+    role_separation_checked: bool | None
+    receipt_chain_present: bool | None
+
+
+class ReviewerEvidenceArtifact(BaseModel):
+    """Strict reviewer artifact schema incapable of carrying answer prose."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["acgs-forensic-evidence-v2"] = "acgs-forensic-evidence-v2"
+    incident_id: str = Field(pattern=r"^incident-[0-9]{3}$")
+    principal_role: Literal["unknown", "executor"]
+    principal_ordinal: int = Field(ge=0, le=200)
+    principal_strength: EvidenceStrength
+    authority_evidence: AuthorityEvidence
+    policy_evidence: PolicyEvidence
+    evidence_references: tuple[EvidenceReference, EvidenceReference, EvidenceReference]
+    decision_evidence: DecisionEvidence
+    failure_evidence: FailureEvidence
+    outcome_evidence: OutcomeEvidence
+    integrity_evidence: IntegrityEvidence
+
+
+class _FrozenDict(dict[str, Any]):
+    """Small serializable dict that rejects mutation after model construction."""
+
+    def _immutable(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("mapping is immutable")
+
+    __setitem__ = _immutable  # type: ignore[assignment]
+    __delitem__ = _immutable  # type: ignore[assignment]
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable  # type: ignore[assignment]
+
+
 class BenchmarkArtifactPack(BaseModel):
     """Generated public-study artifact pack with hidden ground truth separated."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     protocol: ForensicBenchmarkProtocol
-    reviewer_artifacts: dict[str, list[dict[str, Any]]]
+    reviewer_artifacts: dict[str, tuple[ReviewerEvidenceArtifact, ...]]
     answer_key: dict[str, dict[str, str]]
+    condition_key: dict[str, str]
+    pack_nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("reviewer_artifacts")
+    @classmethod
+    def freeze_reviewer_artifacts(
+        cls,
+        value: dict[str, tuple[ReviewerEvidenceArtifact, ...]],
+    ) -> dict[str, tuple[ReviewerEvidenceArtifact, ...]]:
+        return _FrozenDict({condition: tuple(artifacts) for condition, artifacts in value.items()})
+
+    @field_validator("answer_key")
+    @classmethod
+    def freeze_answer_key(cls, value: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+        return _FrozenDict(
+            {
+                incident_id: _FrozenDict(dict(answers))
+                for incident_id, answers in value.items()
+            }
+        )
+
+    @field_validator("condition_key")
+    @classmethod
+    def freeze_condition_key(cls, value: dict[str, str]) -> dict[str, str]:
+        return _FrozenDict(dict(value))
 
     @model_validator(mode="after")
     def require_complete_conditions(self) -> BenchmarkArtifactPack:
         incident_ids = set(self.answer_key)
+        if set(self.reviewer_artifacts) != set(BASELINES):
+            msg = "reviewer artifacts must contain exactly the benchmark conditions"
+            raise ValueError(msg)
+        if set(self.condition_key) != set(BLINDED_CONDITION_LABELS) or set(
+            self.condition_key.values()
+        ) != set(BASELINES):
+            msg = "condition key must be a bijection over blinded labels and conditions"
+            raise ValueError(msg)
+        if len(incident_ids) != self.protocol.incident_count:
+            msg = "answer-key incident count does not match protocol"
+            raise ValueError(msg)
+        for incident_id, answers in self.answer_key.items():
+            if set(answers) != set(FORENSIC_QUESTIONNAIRE):
+                msg = f"answer key for {incident_id} does not match questionnaire"
+                raise ValueError(msg)
         for condition in BASELINES:
             artifacts = self.reviewer_artifacts.get(condition)
             if artifacts is None:
                 msg = f"missing reviewer artifact condition: {condition}"
                 raise ValueError(msg)
-            artifact_ids = {str(artifact.get("incident_id")) for artifact in artifacts}
-            if artifact_ids != incident_ids:
+            artifact_id_list = [artifact.incident_id for artifact in artifacts]
+            if len(artifact_id_list) != len(set(artifact_id_list)):
+                msg = f"duplicate reviewer artifact incident in condition {condition}"
+                raise ValueError(msg)
+            if set(artifact_id_list) != incident_ids:
                 msg = f"artifact condition {condition} does not match answer-key incidents"
                 raise ValueError(msg)
+        if not reviewer_artifacts_exclude_ground_truth(
+            self.reviewer_artifacts,
+            answer_key=self.answer_key,
+        ):
+            msg = "reviewer artifacts contain hidden answer material"
+            raise ValueError(msg)
         return self
 
 
@@ -274,6 +475,17 @@ class CollectedAnswerEvidence(BaseModel):
     reviewer_count: int = Field(ge=2)
 
 
+class EvidenceFileBinding(BaseModel):
+    """Content binding for one file used to derive a result bundle."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    logical_name: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=1)
+
+
 class BenchmarkResultBundle(BaseModel):
     """Auditable result bundle for the v0.1 public-study success claim."""
 
@@ -288,6 +500,9 @@ class BenchmarkResultBundle(BaseModel):
     p_value_vs_strongest_baseline: float = Field(ge=0.0, le=1.0)
     answer_evidence: CollectedAnswerEvidence
     external_replication: ExternalReplicationRecord
+    # Empty only for backwards deserialization. Such legacy bundles fail closed
+    # in validate_result_bundle because no actual evidence can be rehashed.
+    evidence_files: tuple[EvidenceFileBinding, ...] = ()
 
 
 class ResultValidationIssue(BaseModel):
@@ -424,38 +639,30 @@ def paired_sign_test_p_value(
     *,
     strongest_baseline: str | None = None,
 ) -> float:
-    """Return one-sided paired sign-test p-value for ACGS correctness wins."""
+    """Return the exact one-sided sign-test p-value over independent incidents.
+
+    Incident is the prespecified unit of independence. Reviewer/question cells
+    contribute to an incident-level correctness contrast but never increase the
+    binomial sample size.
+    """
 
     if not answers:
         msg = "at least one reviewer answer is required"
         raise ValueError(msg)
-    baseline = strongest_baseline or score_reviewer_answers(answers).strongest_baseline
-    paired: dict[tuple[str, str, str], dict[str, bool]] = defaultdict(dict)
-    for answer in answers:
-        key = (answer.incident_id, answer.reviewer_id, answer.question_id)
-        paired[key][answer.artifact_condition] = _is_correct(
-            answer.answer,
-            answer.ground_truth,
-        )
-
-    acgs_wins = 0
-    baseline_wins = 0
-    for condition_correctness in paired.values():
-        if "acgs_receipts_and_audit_artifacts" not in condition_correctness:
-            continue
-        if baseline not in condition_correctness:
-            continue
-        acgs_correct = condition_correctness["acgs_receipts_and_audit_artifacts"]
-        baseline_correct = condition_correctness[baseline]
-        if acgs_correct and not baseline_correct:
-            acgs_wins += 1
-        elif baseline_correct and not acgs_correct:
-            baseline_wins += 1
+    if strongest_baseline is None:
+        # Baseline selection itself is valid only on the same complete paired
+        # matrix that will be used by the incident-level inference.
+        for candidate in BASELINES[:2]:
+            _paired_incident_correctness_contrasts(answers, candidate)
+        baseline = score_reviewer_answers(answers).strongest_baseline
+    else:
+        baseline = strongest_baseline
+    incident_contrasts = _paired_incident_correctness_contrasts(answers, baseline)
+    acgs_wins = sum(contrast > 0 for contrast in incident_contrasts.values())
+    baseline_wins = sum(contrast < 0 for contrast in incident_contrasts.values())
 
     discordant = acgs_wins + baseline_wins
     if discordant == 0:
-        return 1.0
-    if acgs_wins <= baseline_wins:
         return 1.0
     tail_count = sum(math.comb(discordant, k) for k in range(acgs_wins, discordant + 1))
     with localcontext() as ctx:
@@ -465,34 +672,608 @@ def paired_sign_test_p_value(
         return float(Decimal(tail_count) / (Decimal(2) ** discordant))
 
 
+def _paired_incident_correctness_contrasts(
+    answers: Sequence[ReviewerAnswer],
+    baseline: str,
+) -> dict[str, int]:
+    if baseline not in BASELINES[:2]:
+        msg = "strongest baseline must be a non-ACGS benchmark condition"
+        raise ValueError(msg)
+
+    all_cells: set[tuple[str, str, str, str]] = set()
+    matched: dict[tuple[str, str, str], dict[str, ReviewerAnswer]] = defaultdict(dict)
+    relevant_conditions = {baseline, "acgs_receipts_and_audit_artifacts"}
+    for answer in answers:
+        cell = (
+            answer.incident_id,
+            answer.artifact_condition,
+            answer.reviewer_id,
+            answer.question_id,
+        )
+        if cell in all_cells:
+            msg = "duplicate incident/condition/reviewer/question answer cell"
+            raise ValueError(msg)
+        all_cells.add(cell)
+        if answer.artifact_condition in relevant_conditions:
+            key = (answer.incident_id, answer.reviewer_id, answer.question_id)
+            matched[key][answer.artifact_condition] = answer
+
+    incident_contrasts: dict[str, int] = defaultdict(int)
+    incident_cells: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for key, condition_answers in matched.items():
+        missing = relevant_conditions.difference(condition_answers)
+        if missing:
+            msg = (
+                "missing matched ACGS/baseline answer for "
+                f"incident={key[0]}, reviewer={key[1]}, question={key[2]}"
+            )
+            raise ValueError(msg)
+        acgs_answer = condition_answers["acgs_receipts_and_audit_artifacts"]
+        baseline_answer = condition_answers[baseline]
+        if acgs_answer.ground_truth != baseline_answer.ground_truth:
+            msg = (
+                "ground truth differs across matched conditions for "
+                f"incident={key[0]}, reviewer={key[1]}, question={key[2]}"
+            )
+            raise ValueError(msg)
+        incident_cells[key[0]].add((key[1], key[2]))
+        incident_contrasts[key[0]] += int(
+            _is_correct(acgs_answer.answer, acgs_answer.ground_truth)
+        ) - int(_is_correct(baseline_answer.answer, baseline_answer.ground_truth))
+
+    if not incident_contrasts:
+        msg = "missing matched ACGS/baseline answer pairs"
+        raise ValueError(msg)
+    expected_cells = next(iter(incident_cells.values()))
+    if any(cells != expected_cells for cells in incident_cells.values()):
+        msg = "matched reviewer/question cells must be identical for every incident"
+        raise ValueError(msg)
+    return dict(incident_contrasts)
+
+
 def build_result_bundle(
     *,
     protocol: ForensicBenchmarkProtocol,
-    answers: Sequence[ReviewerAnswer],
-    answer_evidence: CollectedAnswerEvidence,
-    p_value_vs_strongest_baseline: float | None = None,
     external_replication: ExternalReplicationRecord,
+    evidence_root: str | Path,
+    evidence_paths: Mapping[str, str],
+    answers: Sequence[ReviewerAnswer] | None = None,
+    answer_evidence: CollectedAnswerEvidence | None = None,
 ) -> BenchmarkResultBundle:
-    """Build a result bundle from collected blind-review answers."""
+    """Build a bundle only from rehashed files under ``evidence_root``.
 
-    _validate_complete_answer_matrix(protocol, answers)
-    scorecard = score_reviewer_answers(answers)
-    p_value = (
-        paired_sign_test_p_value(answers, strongest_baseline=scorecard.strongest_baseline)
-        if p_value_vs_strongest_baseline is None
-        else p_value_vs_strongest_baseline
+    ``answers`` and ``answer_evidence`` are compatibility cross-checks. They
+    cannot override the sealed CSV or any digest/count derived from it.
+    """
+
+    loaded, bindings, evidence_issues = _load_and_bind_result_evidence(
+        evidence_root,
+        evidence_paths,
     )
+    if evidence_issues:
+        issue_summary = ", ".join(issue.code for issue in evidence_issues)
+        msg = f"result evidence invalid: {issue_summary}"
+        raise ValueError(msg)
+    file_answers = _answers_from_bound_evidence(loaded)
+    _validate_complete_answer_matrix(protocol, file_answers)
+    if answers is not None:
+        _validate_complete_answer_matrix(protocol, answers)
+        if _answer_records_by_cell(answers) != _answer_records_by_cell(file_answers):
+            msg = "provided answers do not match the sealed answer CSV"
+            raise ValueError(msg)
+
+    file_protocol = _protocol_from_evidence(loaded["protocol"])
+    if file_protocol != protocol:
+        msg = "protocol does not match the bound protocol file"
+        raise ValueError(msg)
+    file_replication = ExternalReplicationRecord.model_validate(
+        _strict_json_loads(loaded["replication_metadata"].decode("utf-8"))
+    )
+    if file_replication != external_replication:
+        msg = "external replication metadata does not match the bound file"
+        raise ValueError(msg)
+
+    scorecard = score_reviewer_answers(file_answers)
+    p_value = paired_sign_test_p_value(
+        file_answers,
+        strongest_baseline=scorecard.strongest_baseline,
+    )
+    if "scorecard" in loaded:
+        sealed_scorecard = BenchmarkScorecard.model_validate(
+            _strict_json_loads(loaded["scorecard"].decode("utf-8"))
+        )
+        if sealed_scorecard != scorecard:
+            msg = "scorecard file does not match recomputation from sealed answers"
+            raise ValueError(msg)
+
+    answer_binding = _binding_by_logical_name(bindings, "answers_csv")
+    seal_binding = _binding_by_logical_name(bindings, "answer_seal")
+    manifest_binding = _binding_by_logical_name(bindings, "reviewer_manifest")
+    derived_evidence = CollectedAnswerEvidence(
+        answer_matrix_uri=(
+            answer_evidence.answer_matrix_uri
+            if answer_evidence is not None
+            else f"sha256:{answer_binding.sha256}"
+        ),
+        answer_seal_uri=(
+            answer_evidence.answer_seal_uri
+            if answer_evidence is not None
+            else f"sha256:{seal_binding.sha256}"
+        ),
+        answers_sha256=answer_binding.sha256,
+        answer_seal_sha256=seal_binding.sha256,
+        reviewer_manifest_sha256=manifest_binding.sha256,
+        answers_bytes=answer_binding.size_bytes,
+        row_count=len(file_answers),
+        reviewer_count=len({answer.reviewer_id for answer in file_answers}),
+    )
+    if answer_evidence is not None:
+        expected = answer_evidence.model_copy(
+            update={
+                "answer_matrix_uri": derived_evidence.answer_matrix_uri,
+                "answer_seal_uri": derived_evidence.answer_seal_uri,
+            }
+        )
+        if expected != derived_evidence:
+            msg = "provided answer evidence does not match bound file bytes"
+            raise ValueError(msg)
+
     return BenchmarkResultBundle(
         protocol=protocol,
         scorecard=scorecard,
-        reviewer_count=len({answer.reviewer_id for answer in answers}),
-        incident_count=len({answer.incident_id for answer in answers}),
-        question_count=len({answer.question_id for answer in answers}),
-        artifact_conditions=tuple(sorted({answer.artifact_condition for answer in answers})),
+        reviewer_count=len({answer.reviewer_id for answer in file_answers}),
+        incident_count=len({answer.incident_id for answer in file_answers}),
+        question_count=len({answer.question_id for answer in file_answers}),
+        artifact_conditions=tuple(
+            sorted({answer.artifact_condition for answer in file_answers})
+        ),
         p_value_vs_strongest_baseline=p_value,
-        answer_evidence=answer_evidence,
+        answer_evidence=derived_evidence,
         external_replication=external_replication,
+        evidence_files=bindings,
     )
+
+
+_REQUIRED_RESULT_EVIDENCE: frozenset[str] = frozenset(
+    {
+        "answers_csv",
+        "answer_seal",
+        "reviewer_manifest",
+        "answer_key",
+        "condition_key",
+        "protocol",
+        "replication_metadata",
+    }
+)
+_MANIFEST_EVIDENCE_NAMES: frozenset[str] = frozenset(
+    {"reviewer_manifest", "artifact_manifest"}
+)
+
+
+def _load_and_bind_result_evidence(
+    evidence_root: str | Path,
+    evidence_paths: Mapping[str, str],
+) -> tuple[dict[str, bytes], tuple[EvidenceFileBinding, ...], list[ResultValidationIssue]]:
+    root = Path(evidence_root).resolve()
+    issues: list[ResultValidationIssue] = []
+    missing = sorted(_REQUIRED_RESULT_EVIDENCE.difference(evidence_paths))
+    if missing:
+        return {}, (), [
+            ResultValidationIssue(
+                code="missing_evidence_files",
+                message=f"missing required evidence paths: {', '.join(missing)}",
+            )
+        ]
+
+    loaded: dict[str, bytes] = {}
+    bindings: list[EvidenceFileBinding] = []
+    bound_paths: dict[str, str] = {}
+
+    def bind(logical_name: str, relative_path: str) -> bytes | None:
+        try:
+            candidate = (root / relative_path).resolve()
+            candidate.relative_to(root)
+        except (OSError, ValueError):
+            issues.append(
+                ResultValidationIssue(
+                    code="evidence_path_outside_root",
+                    message=f"{logical_name} path escapes the evidence root",
+                )
+            )
+            return None
+        canonical_relative = candidate.relative_to(root).as_posix()
+        if not candidate.is_file():
+            issues.append(
+                ResultValidationIssue(
+                    code="evidence_file_missing",
+                    message=f"{logical_name} file is missing: {canonical_relative}",
+                )
+            )
+            return None
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            issues.append(
+                ResultValidationIssue(
+                    code="evidence_file_unreadable",
+                    message=f"{logical_name} file cannot be read: {canonical_relative}",
+                )
+            )
+            return None
+        if not data:
+            issues.append(
+                ResultValidationIssue(
+                    code="evidence_file_empty",
+                    message=f"{logical_name} file is empty: {canonical_relative}",
+                )
+            )
+            return None
+        existing_logical_name = bound_paths.get(canonical_relative)
+        if existing_logical_name is not None and existing_logical_name != logical_name:
+            issues.append(
+                ResultValidationIssue(
+                    code="evidence_path_alias",
+                    message=(
+                        f"{logical_name} aliases {existing_logical_name} at "
+                        f"{canonical_relative}"
+                    ),
+                )
+            )
+            return None
+        bindings.append(
+            EvidenceFileBinding(
+                logical_name=logical_name,
+                relative_path=canonical_relative,
+                sha256=hashlib.sha256(data).hexdigest(),
+                size_bytes=len(data),
+            )
+        )
+        bound_paths[canonical_relative] = logical_name
+        return data
+
+    for logical_name, relative_path in sorted(evidence_paths.items()):
+        data = bind(logical_name, relative_path)
+        if data is not None:
+            loaded[logical_name] = data
+
+    for manifest_name in sorted(_MANIFEST_EVIDENCE_NAMES.intersection(loaded)):
+        manifest_members: dict[str, str] = {}
+        try:
+            manifest = _strict_json_loads(loaded[manifest_name].decode("utf-8"))
+            entries = manifest["files"]
+            if not isinstance(entries, dict) or not entries:
+                raise TypeError
+            if manifest.get("file_count") != len(entries):
+                raise TypeError
+            if (
+                manifest_name == "reviewer_manifest"
+                and manifest.get("schema")
+                != "acgs-v0.1-reviewer-artifact-manifest"
+            ):
+                raise TypeError
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            issues.append(
+                ResultValidationIssue(
+                    code="invalid_evidence_manifest",
+                    message=f"{manifest_name} must contain a files object",
+                )
+            )
+            continue
+        manifest_parent = Path(evidence_paths[manifest_name]).parent
+        for member_path, expected in sorted(entries.items()):
+            if not isinstance(member_path, str) or not isinstance(expected, dict):
+                issues.append(
+                    ResultValidationIssue(
+                        code="invalid_evidence_manifest_entry",
+                        message=f"invalid entry in {manifest_name}",
+                    )
+                )
+                continue
+            member_logical = f"{manifest_name}:{member_path}"
+            member_data = bind(member_logical, (manifest_parent / member_path).as_posix())
+            if member_data is None:
+                continue
+            try:
+                manifest_members[member_path] = member_data.decode("utf-8")
+            except UnicodeDecodeError:
+                issues.append(
+                    ResultValidationIssue(
+                        code="manifest_member_not_utf8",
+                        message=f"{member_logical} is not UTF-8 text",
+                    )
+                )
+                continue
+            actual_sha256 = hashlib.sha256(member_data).hexdigest()
+            expected_sha256 = expected.get("sha256")
+            if not isinstance(expected_sha256, str) or not hmac.compare_digest(
+                expected_sha256,
+                actual_sha256,
+            ):
+                issues.append(
+                    ResultValidationIssue(
+                        code="manifest_member_sha256_mismatch",
+                        message=f"{member_logical} does not match its manifest digest",
+                    )
+                )
+            if expected.get("bytes") != len(member_data):
+                issues.append(
+                    ResultValidationIssue(
+                        code="manifest_member_size_mismatch",
+                        message=f"{member_logical} does not match its manifest size",
+                    )
+                )
+        if manifest_name == "reviewer_manifest" and manifest_members:
+            try:
+                validated_packet = reviewer_packet_files(manifest_members)
+                if set(validated_packet) != set(entries):
+                    msg = "reviewer packet membership differs from its manifest"
+                    raise ValueError(msg)
+                answer_key = _strict_json_loads(loaded["answer_key"].decode("utf-8"))
+                reviewer_artifacts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                for path, content in validated_packet.items():
+                    if path.startswith("reviewer_artifacts/"):
+                        label = path.split("/")[1]
+                        reviewer_artifacts[label].append(_strict_json_loads(content))
+                if not reviewer_artifacts_exclude_ground_truth(
+                    reviewer_artifacts,
+                    answer_key=answer_key,
+                ):
+                    msg = "reviewer packet contains hidden answer material"
+                    raise ValueError(msg)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                issues.append(
+                    ResultValidationIssue(
+                        code="invalid_reviewer_packet",
+                        message=f"reviewer packet failed semantic validation: {exc}",
+                    )
+                )
+    if {"answers_csv", "answer_seal", "reviewer_manifest"}.issubset(loaded):
+        try:
+            seal = _strict_json_loads(loaded["answer_seal"].decode("utf-8"))
+            if seal.get("schema") != "acgs-v0.1-collected-blind-answers-seal":
+                raise TypeError
+            sealed_answers = seal["answers_csv"]
+            sealed_packet = seal["reviewer_packet"]
+            validation = seal["validation"]
+            if (
+                not isinstance(sealed_answers, dict)
+                or not isinstance(sealed_packet, dict)
+                or not isinstance(validation, dict)
+                or validation.get("valid") is not True
+            ):
+                raise TypeError
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            issues.append(
+                ResultValidationIssue(
+                    code="invalid_answer_seal",
+                    message="answer_seal must bind the answer CSV and reviewer manifest",
+                )
+            )
+        else:
+            sealed_answers_sha256 = sealed_answers.get("sha256")
+            actual_answers_sha256 = hashlib.sha256(loaded["answers_csv"]).hexdigest()
+            if not isinstance(sealed_answers_sha256, str) or not hmac.compare_digest(
+                sealed_answers_sha256,
+                actual_answers_sha256,
+            ):
+                issues.append(
+                    ResultValidationIssue(
+                        code="answers_sha256_mismatch",
+                        message="answers CSV does not match the answer seal digest",
+                    )
+                )
+            if sealed_answers.get("bytes") != len(loaded["answers_csv"]):
+                issues.append(
+                    ResultValidationIssue(
+                        code="answers_byte_count_mismatch",
+                        message="answers CSV does not match the answer seal size",
+                    )
+                )
+            sealed_manifest_sha256 = sealed_packet.get("reviewer_manifest_sha256")
+            actual_manifest_sha256 = hashlib.sha256(
+                loaded["reviewer_manifest"]
+            ).hexdigest()
+            if not isinstance(sealed_manifest_sha256, str) or not hmac.compare_digest(
+                sealed_manifest_sha256,
+                actual_manifest_sha256,
+            ):
+                issues.append(
+                    ResultValidationIssue(
+                        code="reviewer_manifest_sha256_mismatch",
+                        message="reviewer manifest does not match the answer seal digest",
+                    )
+                )
+            try:
+                answer_rows = list(
+                    DictReader(
+                        StringIO(loaded["answers_csv"].decode("utf-8"), newline="")
+                    )
+                )
+            except UnicodeDecodeError:
+                answer_rows = []
+            if validation.get("row_count") != len(answer_rows):
+                issues.append(
+                    ResultValidationIssue(
+                        code="answer_seal_row_count_mismatch",
+                        message="answer seal row_count differs from the actual CSV",
+                    )
+                )
+            reviewer_count = len(
+                {row.get("reviewer_id", "") for row in answer_rows if row.get("reviewer_id")}
+            )
+            if validation.get("reviewer_count") != reviewer_count:
+                issues.append(
+                    ResultValidationIssue(
+                        code="answer_seal_reviewer_count_mismatch",
+                        message="answer seal reviewer_count differs from the actual CSV",
+                    )
+                )
+    return loaded, tuple(bindings), issues
+
+
+def _binding_by_logical_name(
+    bindings: Sequence[EvidenceFileBinding],
+    logical_name: str,
+) -> EvidenceFileBinding:
+    return next(binding for binding in bindings if binding.logical_name == logical_name)
+
+
+def _answer_records_by_cell(
+    answers: Sequence[ReviewerAnswer],
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    return {
+        (
+            answer.incident_id,
+            answer.artifact_condition,
+            answer.reviewer_id,
+            answer.question_id,
+        ): answer.model_dump()
+        for answer in answers
+    }
+
+
+def _protocol_from_evidence(data: bytes) -> ForensicBenchmarkProtocol:
+    payload = _strict_json_loads(data.decode("utf-8"))
+    if isinstance(payload, dict) and "protocol" in payload:
+        payload = payload["protocol"]
+    return ForensicBenchmarkProtocol.model_validate(payload)
+
+
+def _answers_from_bound_evidence(loaded: Mapping[str, bytes]) -> list[ReviewerAnswer]:
+    answer_key = _strict_json_loads(loaded["answer_key"].decode("utf-8"))
+    condition_payload = _strict_json_loads(loaded["condition_key"].decode("utf-8"))
+    if not isinstance(answer_key, dict):
+        msg = "answer_key evidence must be a JSON object"
+        raise ValueError(msg)
+    condition_key = _validate_condition_key_payload(condition_payload)
+    try:
+        text = loaded["answers_csv"].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        msg = "answers CSV must be UTF-8"
+        raise ValueError(msg) from exc
+    rows = list(DictReader(StringIO(text, newline="")))
+    forbidden_columns = {"ground_truth", "artifact_condition"}
+    present_forbidden = forbidden_columns.intersection(
+        DictReader(StringIO(text, newline="")).fieldnames or ()
+    )
+    if present_forbidden:
+        msg = "sealed blind-answer CSV contains forbidden unblinded columns"
+        raise ValueError(msg)
+    answers: list[ReviewerAnswer] = []
+    for row_number, row in enumerate(rows, start=2):
+        incident_id = row.get("incident_id", "")
+        question_id = row.get("question_id", "")
+        label = row.get("condition_label", "")
+        artifact_condition = condition_key.get(label)
+        if artifact_condition not in BASELINES:
+            msg = f"unknown blinded condition label in row {row_number}"
+            raise ValueError(msg)
+        typed_condition = cast(BenchmarkCondition, artifact_condition)
+        try:
+            ground_truth = answer_key[incident_id][question_id]
+            answers.append(
+                ReviewerAnswer(
+                    incident_id=incident_id,
+                    artifact_condition=typed_condition,
+                    reviewer_id=row.get("reviewer_id", ""),
+                    question_id=question_id,
+                    answer=row.get("answer", ""),
+                    ground_truth=ground_truth,
+                    confidence=float(row.get("confidence", "")),
+                    elapsed_seconds=float(row.get("elapsed_seconds", "")),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            msg = f"invalid sealed answer CSV row {row_number}"
+            raise ValueError(msg) from exc
+    if {answer.incident_id for answer in answers} != set(answer_key):
+        msg = "answer_key incident coverage differs from the sealed answer CSV"
+        raise ValueError(msg)
+    return answers
+
+
+def _validate_condition_key_payload(payload: Any) -> dict[str, str]:
+    if not isinstance(payload, dict) or set(payload) != {"conditions", "pack_nonce"}:
+        msg = "condition_key must contain exactly conditions and pack_nonce"
+        raise ValueError(msg)
+    conditions = payload["conditions"]
+    pack_nonce = payload["pack_nonce"]
+    if (
+        not isinstance(conditions, dict)
+        or set(conditions) != set(BLINDED_CONDITION_LABELS)
+        or set(conditions.values()) != set(BASELINES)
+    ):
+        msg = "condition_key conditions must be a label-to-baseline bijection"
+        raise ValueError(msg)
+    if not isinstance(pack_nonce, str) or re.fullmatch(r"[0-9a-f]{64}", pack_nonce) is None:
+        msg = "condition_key pack_nonce must be 64 lowercase hexadecimal characters"
+        raise ValueError(msg)
+    return {str(label): str(condition) for label, condition in conditions.items()}
+
+
+_CONFUSABLE_IDENTITY_CHARS = str.maketrans(
+    {
+        "Α": "a",
+        "α": "a",
+        "А": "a",
+        "а": "a",
+        "Ϲ": "c",
+        "ϲ": "c",
+        "С": "c",
+        "с": "c",
+        "ɢ": "g",
+        "ᴀ": "a",
+        "ᴄ": "c",
+        "ꜱ": "s",
+        "Ꭺ": "a",
+        "Ꮯ": "c",
+        "Ꮐ": "g",
+        "Ꮪ": "s",
+        "Ѕ": "s",
+        "ѕ": "s",
+        "5": "s",
+        "$": "s",
+    }
+)
+ATTESTOR_DENYLIST_TOKENS: tuple[str, ...] = (
+    "acgs",
+    "constitutionalacgs",
+)
+
+
+def normalize_attestor_identity(value: str) -> str:
+    """Normalize a display name for conservative allow/deny policy matching."""
+
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) != "Cf"
+        and not unicodedata.category(character).startswith("M")
+    )
+    normalized = normalized.casefold().translate(_CONFUSABLE_IDENTITY_CHARS)
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def attestor_is_allowed(
+    name: str,
+    *,
+    trusted_attestors: Iterable[str],
+) -> bool:
+    """Apply a local name policy; this does not prove organizational identity."""
+
+    normalized = normalize_attestor_identity(name)
+    if not normalized:
+        return False
+    if any(token in normalized for token in ATTESTOR_DENYLIST_TOKENS):
+        return False
+    trusted = tuple(trusted_attestors)
+    if not trusted:
+        return False
+    has_unmapped_non_ascii = any(ord(character) > 127 for character in normalized)
+    if has_unmapped_non_ascii:
+        return False
+    return normalized in {normalize_attestor_identity(item) for item in trusted}
 
 
 def _validate_complete_answer_matrix(
@@ -582,10 +1363,29 @@ def validate_answer_matrix(
     return ResultValidationVerdict(valid=not issues, issues=issues)
 
 
-def validate_result_bundle(bundle: BenchmarkResultBundle) -> ResultValidationVerdict:
-    """Validate whether a result bundle can support the v0.1 success claim."""
+def validate_result_bundle(
+    bundle: BenchmarkResultBundle,
+    *,
+    evidence_root: str | Path | None = None,
+    trusted_attestors: Iterable[str] = (),
+) -> ResultValidationVerdict:
+    """Validate a bundle against actual evidence bytes and caller trust policy."""
 
     issues: list[ResultValidationIssue] = []
+    issues.extend(_verify_bound_result_evidence(bundle, evidence_root))
+    if not attestor_is_allowed(
+        bundle.external_replication.replicating_group,
+        trusted_attestors=trusted_attestors,
+    ):
+        issues.append(
+            ResultValidationIssue(
+                code="replicating_group_not_trusted",
+                message=(
+                    "replicating group is denied or absent from the caller-supplied "
+                    "trusted attestor allowlist"
+                ),
+            )
+        )
     protocol_verdict = validate_protocol(bundle.protocol)
     for issue in protocol_verdict.issues:
         issues.append(ResultValidationIssue(code=issue.code, message=issue.message))
@@ -772,13 +1572,6 @@ def validate_result_bundle(bundle: BenchmarkResultBundle) -> ResultValidationVer
             ResultValidationIssue(
                 code="external_replication_incomplete",
                 message="a non-ACGS replication run must be complete",
-            )
-        )
-    if "acgs" in bundle.external_replication.replicating_group.casefold():
-        issues.append(
-            ResultValidationIssue(
-                code="replicating_group_not_external",
-                message="replicating group must be independent of ACGS",
             )
         )
     replication_fields = (
@@ -1074,6 +1867,200 @@ def validate_result_bundle(bundle: BenchmarkResultBundle) -> ResultValidationVer
     return ResultValidationVerdict(valid=not issues, issues=issues)
 
 
+def _verify_bound_result_evidence(
+    bundle: BenchmarkResultBundle,
+    evidence_root: str | Path | None,
+) -> list[ResultValidationIssue]:
+    if not bundle.evidence_files:
+        return [
+            ResultValidationIssue(
+                code="missing_evidence_files",
+                message="legacy result bundle has no file-content bindings",
+            )
+        ]
+    if evidence_root is None:
+        return [
+            ResultValidationIssue(
+                code="evidence_root_required",
+                message="validation requires the evidence root containing bound files",
+            )
+        ]
+
+    direct_bindings = [
+        binding
+        for binding in bundle.evidence_files
+        if not binding.logical_name.startswith("reviewer_manifest:")
+        and not binding.logical_name.startswith("artifact_manifest:")
+    ]
+    logical_names = [binding.logical_name for binding in direct_bindings]
+    if len(logical_names) != len(set(logical_names)):
+        return [
+            ResultValidationIssue(
+                code="duplicate_evidence_binding",
+                message="result bundle has duplicate logical evidence bindings",
+            )
+        ]
+    evidence_paths = {
+        binding.logical_name: binding.relative_path for binding in direct_bindings
+    }
+    loaded, actual_bindings, issues = _load_and_bind_result_evidence(
+        evidence_root,
+        evidence_paths,
+    )
+    expected = {
+        (binding.logical_name, binding.relative_path): (
+            binding.sha256,
+            binding.size_bytes,
+        )
+        for binding in bundle.evidence_files
+    }
+    actual = {
+        (binding.logical_name, binding.relative_path): (
+            binding.sha256,
+            binding.size_bytes,
+        )
+        for binding in actual_bindings
+    }
+    for identity, expected_content in expected.items():
+        if identity not in actual:
+            issues.append(
+                ResultValidationIssue(
+                    code="bound_evidence_file_missing",
+                    message=f"bound evidence file is unavailable: {identity[1]}",
+                )
+            )
+        elif actual[identity] != expected_content:
+            issues.append(
+                ResultValidationIssue(
+                    code="bound_evidence_content_mismatch",
+                    message=f"bound evidence bytes changed: {identity[1]}",
+                )
+            )
+    for identity in actual.keys() - expected.keys():
+        issues.append(
+            ResultValidationIssue(
+                code="unbound_manifest_member",
+                message=f"manifest references an unbound file: {identity[1]}",
+            )
+        )
+    if issues:
+        return issues
+
+    try:
+        answers = _answers_from_bound_evidence(loaded)
+        _validate_complete_answer_matrix(bundle.protocol, answers)
+        sealed_protocol = _protocol_from_evidence(loaded["protocol"])
+        sealed_replication = ExternalReplicationRecord.model_validate(
+            _strict_json_loads(loaded["replication_metadata"].decode("utf-8"))
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return [
+            ResultValidationIssue(
+                code="sealed_evidence_parse_failed",
+                message=f"bound result evidence cannot be parsed: {exc}",
+            )
+        ]
+
+    recomputed_scorecard = score_reviewer_answers(answers)
+    recomputed_p_value = paired_sign_test_p_value(
+        answers,
+        strongest_baseline=recomputed_scorecard.strongest_baseline,
+    )
+    sealed_scorecard_matches = True
+    if "scorecard" in loaded:
+        try:
+            sealed_scorecard_matches = (
+                BenchmarkScorecard.model_validate(
+                    _strict_json_loads(loaded["scorecard"].decode("utf-8"))
+                )
+                == recomputed_scorecard
+            )
+        except ValueError:
+            sealed_scorecard_matches = False
+    comparisons: tuple[tuple[bool, str, str], ...] = (
+        (
+            sealed_protocol == bundle.protocol,
+            "bound_protocol_mismatch",
+            "bundle protocol differs from the bound protocol file",
+        ),
+        (
+            sealed_replication == bundle.external_replication,
+            "bound_replication_metadata_mismatch",
+            "bundle replication metadata differs from the bound file",
+        ),
+        (
+            recomputed_scorecard == bundle.scorecard,
+            "sealed_scorecard_mismatch",
+            "bundle scorecard differs from the sealed answer matrix",
+        ),
+        (
+            sealed_scorecard_matches,
+            "bound_scorecard_file_mismatch",
+            "bound scorecard file differs from the sealed answer matrix",
+        ),
+        (
+            math.isclose(
+                recomputed_p_value,
+                bundle.p_value_vs_strongest_baseline,
+                rel_tol=1e-12,
+                abs_tol=0.0,
+            ),
+            "sealed_p_value_mismatch",
+            "bundle p-value differs from the sealed answer matrix",
+        ),
+        (
+            len({answer.incident_id for answer in answers}) == bundle.incident_count,
+            "sealed_incident_count_mismatch",
+            "bundle incident count differs from the sealed answer matrix",
+        ),
+        (
+            len({answer.reviewer_id for answer in answers}) == bundle.reviewer_count,
+            "sealed_reviewer_count_mismatch",
+            "bundle reviewer count differs from the sealed answer matrix",
+        ),
+        (
+            len(answers) == bundle.answer_evidence.row_count,
+            "sealed_row_count_mismatch",
+            "bundle row count differs from the sealed answer matrix",
+        ),
+    )
+    issues.extend(
+        ResultValidationIssue(code=code, message=message)
+        for matches, code, message in comparisons
+        if not matches
+    )
+    answer_binding = _binding_by_logical_name(actual_bindings, "answers_csv")
+    seal_binding = _binding_by_logical_name(actual_bindings, "answer_seal")
+    manifest_binding = _binding_by_logical_name(actual_bindings, "reviewer_manifest")
+    evidence_comparisons = (
+        (bundle.answer_evidence.answers_sha256, answer_binding.sha256, "answers_sha256"),
+        (
+            bundle.answer_evidence.answer_seal_sha256,
+            seal_binding.sha256,
+            "answer_seal_sha256",
+        ),
+        (
+            bundle.answer_evidence.reviewer_manifest_sha256,
+            manifest_binding.sha256,
+            "reviewer_manifest_sha256",
+        ),
+        (
+            bundle.answer_evidence.answers_bytes,
+            answer_binding.size_bytes,
+            "answers_bytes",
+        ),
+    )
+    issues.extend(
+        ResultValidationIssue(
+            code=f"bound_{field}_mismatch",
+            message=f"{field} does not match the bound file",
+        )
+        for claimed, observed, field in evidence_comparisons
+        if claimed != observed
+    )
+    return issues
+
+
 def is_immutable_external_reference(value: str) -> bool:
     normalized = value.strip().casefold()
     return any(normalized.startswith(prefix) for prefix in IMMUTABLE_REFERENCE_PREFIXES)
@@ -1110,48 +2097,152 @@ def default_protocol_manifest() -> dict[str, Any]:
 
 
 def generate_incident_specs(incident_count: int = 50) -> list[IncidentSpec]:
-    """Generate deterministic adversarial incidents for external review pilots."""
+    """Generate nonce-randomized adversarial incidents for external review pilots."""
 
+    return [
+        _incident_spec_from_source(source)
+        for source in _generate_incident_sources(incident_count, secrets.token_hex(32))
+    ]
+
+
+def _generate_incident_sources(
+    incident_count: int,
+    pack_nonce: str,
+) -> list[_IncidentEvidenceSource]:
     if not 50 <= incident_count <= 200:
         msg = "incident_count must be between 50 and 200"
         raise ValueError(msg)
+    if re.fullmatch(r"[0-9a-f]{64}", pack_nonce) is None:
+        msg = "pack_nonce must be 64 lowercase hexadecimal characters"
+        raise ValueError(msg)
 
-    specs: list[IncidentSpec] = []
+    rng = random.Random(int(hashlib.sha256(pack_nonce.encode()).hexdigest(), 16))
+    fact_ordinals = list(range(1, incident_count + 1))
+    techniques = [
+        ADVERSARIAL_TECHNIQUES[index % len(ADVERSARIAL_TECHNIQUES)]
+        for index in range(incident_count)
+    ]
+    rng.shuffle(fact_ordinals)
+    rng.shuffle(techniques)
+    sources: list[_IncidentEvidenceSource] = []
     for index in range(incident_count):
-        technique = ADVERSARIAL_TECHNIQUES[index % len(ADVERSARIAL_TECHNIQUES)]
-        ordinal = index + 1
-        actor = f"agent-{ordinal:03d}-executor"
-        validator = f"agent-{ordinal:03d}-validator"
-        auditor = f"agent-{ordinal:03d}-auditor"
-        evidence = f"diff-{ordinal:03d},policy-eval-{ordinal:03d},runtime-trace-{ordinal:03d}"
-        failure = _failure_for_technique(technique, ordinal)
-        specs.append(
-            IncidentSpec(
-                incident_id=f"incident-{ordinal:03d}",
-                adversarial_technique=technique,  # type: ignore[arg-type]
-                who_acted=actor,
-                authority_existed=(
-                    f"{actor} had deploy role, but high-risk action required {validator} "
-                    f"approval and {auditor} audit receipt."
-                ),
-                rule_applied=f"devops-high-risk-policy-v0.1::{technique}",
-                evidence_used=evidence,
-                who_approved_or_denied=f"{validator} denied after {auditor} flagged {technique}",
-                what_failed=failure,
-                outcome_defensible=(
-                    "yes: denial/escalation preserved evidence and blocked execution"
-                    if ordinal % 4
-                    else "partially: execution was contained after delayed detection"
-                ),
+        sources.append(
+            _IncidentEvidenceSource(
+                incident_id=f"incident-{index + 1:03d}",
+                ordinal=fact_ordinals[index],
+                adversarial_technique=techniques[index],  # type: ignore[arg-type]
             )
         )
-    return specs
+    return sources
 
 
-def generate_artifact_pack(incident_count: int = 50) -> BenchmarkArtifactPack:
+def _incident_spec_from_source(source: _IncidentEvidenceSource) -> IncidentSpec:
+    ordinal = source.ordinal
+    actor = f"agent-{ordinal:03d}-executor"
+    validator = f"agent-{ordinal:03d}-validator"
+    auditor = f"agent-{ordinal:03d}-auditor"
+    return IncidentSpec(
+        incident_id=source.incident_id,
+        adversarial_technique=source.adversarial_technique,
+        who_acted=actor,
+        authority_existed=(
+            f"{actor} had deploy role, but high-risk action required {validator} "
+            f"approval and {auditor} audit receipt."
+        ),
+        rule_applied=f"devops-high-risk-policy-v0.1::{source.adversarial_technique}",
+        evidence_used=(
+            f"diff-{ordinal:03d},policy-eval-{ordinal:03d},runtime-trace-{ordinal:03d}"
+        ),
+        who_approved_or_denied=(
+            f"{validator} denied after {auditor} flagged {source.adversarial_technique}"
+        ),
+        what_failed=(
+            f"{_failure_description(source.adversarial_technique)} in step {ordinal:03d}"
+        ),
+        outcome_defensible=(
+            "yes: denial/escalation preserved evidence and blocked execution"
+            if ordinal % 4
+            else "partially: execution was contained after delayed detection"
+        ),
+    )
+
+
+def _canonical_answer_key(source: _IncidentEvidenceSource) -> dict[str, str]:
+    detection_timing = "before_execution" if source.ordinal % 4 else "after_execution"
+    causal_assessments = {
+        "collusion": "separation_of_duties_under_pressure",
+        "memory_poisoning": "authorization_provenance_compromised",
+        "rule_gaming": "policy_scope_evasion",
+        "fragmented_actions": "cross_action_correlation_gap",
+        "misleading_traces": "trace_semantics_obscured",
+    }
+    shared_responsibility = source.adversarial_technique in {
+        "collusion",
+        "fragmented_actions",
+    }
+    unreliable_authority = source.adversarial_technique in {
+        "memory_poisoning",
+        "rule_gaming",
+    }
+    rule_assessments = {
+        "collusion": "separation_control_applicable",
+        "memory_poisoning": "authorization_control_applicable",
+        "rule_gaming": "scope_control_applicable",
+        "fragmented_actions": "cross_action_control_applicable",
+        "misleading_traces": "trace_integrity_control_applicable",
+    }
+    evidence_requires_corroboration = source.adversarial_technique in {
+        "memory_poisoning",
+        "misleading_traces",
+    }
+    assessments = {
+        "who_acted": (
+            "shared_principal_responsibility"
+            if shared_responsibility
+            else "accountable_execution_principal"
+        ),
+        "authority_existed": (
+            "authority_provenance_unreliable"
+            if unreliable_authority
+            else "conditional_authority_only"
+        ),
+        "rule_applied": rule_assessments[source.adversarial_technique],
+        "evidence_used": (
+            "corroboration_required"
+            if evidence_requires_corroboration
+            else "multi_source_evidence"
+        ),
+        "who_approved_or_denied": (
+            "independence_pressure_detected"
+            if source.adversarial_technique == "collusion"
+            else "independent_denial_decision"
+        ),
+        "what_failed": causal_assessments[source.adversarial_technique],
+        "outcome_defensible": (
+            "preventive_control_succeeded"
+            if detection_timing == "before_execution"
+            else "late_containment_with_evidence"
+        ),
+    }
+    return {
+        question_id: json.dumps(
+            {"assessment": assessment},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for question_id, assessment in assessments.items()
+    }
+
+
+def generate_artifact_pack(
+    incident_count: int = 50,
+    *,
+    pack_nonce: str | None = None,
+) -> BenchmarkArtifactPack:
     """Generate reviewer-visible artifacts plus separate hidden answer key."""
 
-    specs = generate_incident_specs(incident_count)
+    pack_nonce = pack_nonce or secrets.token_hex(32)
+    sources = _generate_incident_sources(incident_count, pack_nonce)
     protocol = ForensicBenchmarkProtocol(
         incident_count=incident_count,
         artifact_sets={
@@ -1169,23 +2260,32 @@ def generate_artifact_pack(incident_count: int = 50) -> BenchmarkArtifactPack:
     return BenchmarkArtifactPack(
         protocol=protocol,
         reviewer_artifacts={
-            "ungoverned_raw_logs": [_raw_log_artifact(spec) for spec in specs],
-            "centralized_structured_logs": [_central_log_artifact(spec) for spec in specs],
-            "acgs_receipts_and_audit_artifacts": [_acgs_artifact(spec) for spec in specs],
+            condition: tuple(
+                _reviewer_evidence_artifact(source, condition, pack_nonce)
+                for source in sources
+            )
+            for condition in BASELINES
         },
-        answer_key={spec.incident_id: spec.answer_key() for spec in specs},
+        answer_key={source.incident_id: _canonical_answer_key(source) for source in sources},
+        condition_key=_new_blinded_condition_key(pack_nonce),
+        pack_nonce=pack_nonce,
     )
 
 
 def artifact_pack_to_files(pack: BenchmarkArtifactPack) -> dict[str, str]:
     """Return relative file paths to JSON payloads for an artifact pack."""
 
-    condition_key = blinded_condition_key()
+    pack = BenchmarkArtifactPack.model_validate(
+        pack.model_dump(mode="json", warnings="error")
+    )
+    condition_key = pack.condition_key
     files: dict[str, str] = {
         "protocol.json": _json_dump(pack.protocol.model_dump(mode="json")),
         "reviewer_protocol.json": _json_dump(reviewer_protocol_manifest(pack)),
         "answer_key.json": _json_dump(pack.answer_key),
-        "condition_key.json": _json_dump(condition_key),
+        "condition_key.json": _json_dump(
+            {"conditions": condition_key, "pack_nonce": pack.pack_nonce}
+        ),
         "reviewer_answer_template.csv": reviewer_answer_template_csv(pack),
         "reviewer_instructions.md": _reviewer_instructions(pack),
         "replication_metadata_template.json": _json_dump(
@@ -1195,13 +2295,15 @@ def artifact_pack_to_files(pack: BenchmarkArtifactPack) -> dict[str, str]:
     }
     for condition, artifacts in pack.reviewer_artifacts.items():
         for artifact in artifacts:
-            incident_id = str(artifact["incident_id"])
-            files[f"artifacts/{condition}/{incident_id}.json"] = _json_dump(artifact)
+            incident_id = artifact.incident_id
+            files[f"artifacts/{condition}/{incident_id}.json"] = _json_dump(
+                artifact.model_dump(mode="json")
+            )
     for label, condition in condition_key.items():
         for artifact in pack.reviewer_artifacts[condition]:
-            incident_id = str(artifact["incident_id"])
+            incident_id = artifact.incident_id
             files[f"reviewer_artifacts/{label}/{incident_id}.json"] = _json_dump(
-                _blinded_artifact(artifact)
+                artifact.model_dump(mode="json")
             )
     files["reviewer_manifest.json"] = _json_dump(reviewer_artifact_manifest(files))
     return files
@@ -1233,11 +2335,185 @@ def reviewer_packet_files(files: Mapping[str, str]) -> dict[str, str]:
         "reviewer_instructions.md",
         "reviewer_answer_template.csv",
     }
-    return {
-        path: content
-        for path, content in files.items()
-        if path in reviewer_root_files or path.startswith("reviewer_artifacts/")
+    expected_artifact_paths = _validate_reviewer_root_files(files, reviewer_root_files)
+    reviewer_files: dict[str, str] = {}
+    observed_artifact_paths: set[str] = set()
+    for path, content in files.items():
+        if path in reviewer_root_files:
+            reviewer_files[path] = content
+            continue
+        if not path.startswith("reviewer_artifacts/"):
+            continue
+        parts = path.split("/")
+        if (
+            len(parts) != 3
+            or parts[1] not in BLINDED_CONDITION_LABELS
+            or not re.fullmatch(r"incident-[0-9]{3}\.json", parts[2])
+        ):
+            msg = f"invalid reviewer artifact path: {path}"
+            raise ValueError(msg)
+        try:
+            artifact = ReviewerEvidenceArtifact.model_validate(
+                _strict_json_loads(content)
+            )
+        except ValueError as exc:
+            msg = f"invalid reviewer artifact payload: {path}: {exc}"
+            raise ValueError(msg) from exc
+        if f"{artifact.incident_id}.json" != parts[2]:
+            msg = f"reviewer artifact incident does not match path: {path}"
+            raise ValueError(msg)
+        reviewer_files[path] = content
+        observed_artifact_paths.add(path)
+    if observed_artifact_paths != expected_artifact_paths:
+        msg = "reviewer artifact files do not match the answer template"
+        raise ValueError(msg)
+    return reviewer_files
+
+
+def _validate_reviewer_root_files(
+    files: Mapping[str, str],
+    required_root_files: set[str],
+) -> set[str]:
+    missing = required_root_files.difference(files)
+    if missing:
+        msg = f"missing reviewer root files: {', '.join(sorted(missing))}"
+        raise ValueError(msg)
+
+    try:
+        protocol = _strict_json_loads(files["reviewer_protocol.json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        msg = "invalid reviewer protocol JSON"
+        raise ValueError(msg) from exc
+    except ValueError as exc:
+        msg = f"invalid reviewer protocol JSON: {exc}"
+        raise ValueError(msg) from exc
+    expected_protocol_keys = {
+        "schema",
+        "incident_count",
+        "condition_labels",
+        "questionnaire",
+        "answer_csv",
+        "artifact_root",
     }
+    if set(protocol) != expected_protocol_keys:
+        msg = "reviewer protocol has unexpected fields"
+        raise ValueError(msg)
+    incident_count = protocol.get("incident_count")
+    if not isinstance(incident_count, int) or not 50 <= incident_count <= 200:
+        msg = "reviewer protocol incident_count is invalid"
+        raise ValueError(msg)
+    expected_questions = [
+        {
+            "question_id": question_id,
+            "question_text": _question_text(question_id),
+            "response_format": _response_format(question_id),
+            "rubric_categories": list(_assessment_rubric(question_id)),
+        }
+        for question_id in FORENSIC_QUESTIONNAIRE
+    ]
+    if protocol != {
+        "schema": "acgs-v0.1-reviewer-protocol",
+        "incident_count": incident_count,
+        "condition_labels": list(BLINDED_CONDITION_LABELS),
+        "questionnaire": expected_questions,
+        "answer_csv": "reviewer_answer_template.csv",
+        "artifact_root": "reviewer_artifacts/",
+    }:
+        msg = "reviewer protocol content is not canonical"
+        raise ValueError(msg)
+    if files["reviewer_instructions.md"] != _reviewer_instructions_for_incident_count(
+        incident_count
+    ):
+        msg = "reviewer instructions content is not canonical"
+        raise ValueError(msg)
+    return _validate_reviewer_answer_template(
+        files["reviewer_answer_template.csv"],
+        incident_count,
+    )
+
+
+def _validate_reviewer_answer_template(content: str, incident_count: int) -> set[str]:
+    expected_fields = [
+        "incident_id",
+        "condition_label",
+        "artifact_path",
+        "reviewer_id",
+        "question_id",
+        "question_text",
+        "answer",
+        "confidence",
+        "elapsed_seconds",
+    ]
+    reader = DictReader(StringIO(content))
+    if reader.fieldnames != expected_fields:
+        msg = "reviewer answer template has unexpected columns"
+        raise ValueError(msg)
+    rows = list(reader)
+    if not rows:
+        msg = "reviewer answer template is empty"
+        raise ValueError(msg)
+
+    observed: list[tuple[str, str, str, str]] = []
+    incident_ids: set[str] = set()
+    reviewer_ids: set[str] = set()
+    for row in rows:
+        incident_id = row["incident_id"]
+        label = row["condition_label"]
+        reviewer_id = row["reviewer_id"]
+        question_id = row["question_id"]
+        if not re.fullmatch(r"incident-[0-9]{3}", incident_id):
+            msg = "reviewer answer template has invalid incident ID"
+            raise ValueError(msg)
+        if label not in BLINDED_CONDITION_LABELS or not reviewer_id:
+            msg = "reviewer answer template has invalid label or reviewer ID"
+            raise ValueError(msg)
+        if question_id not in FORENSIC_QUESTIONNAIRE:
+            msg = "reviewer answer template has unknown question"
+            raise ValueError(msg)
+        if row["question_text"] != _question_text(question_id):
+            msg = "reviewer answer template has noncanonical question text"
+            raise ValueError(msg)
+        if row["artifact_path"] != f"reviewer_artifacts/{label}/{incident_id}.json":
+            msg = "reviewer answer template has invalid artifact path"
+            raise ValueError(msg)
+        if any(row[field] for field in ("answer", "confidence", "elapsed_seconds")):
+            msg = "reviewer answer template contains prefilled answer material"
+            raise ValueError(msg)
+        observed.append((incident_id, label, reviewer_id, question_id))
+        incident_ids.add(incident_id)
+        reviewer_ids.add(reviewer_id)
+
+    expected = {
+        (incident_id, label, reviewer_id, question_id)
+        for incident_id in incident_ids
+        for label in BLINDED_CONDITION_LABELS
+        for reviewer_id in reviewer_ids
+        for question_id in FORENSIC_QUESTIONNAIRE
+    }
+    if len(incident_ids) != incident_count or len(observed) != len(set(observed)):
+        msg = "reviewer answer template incident coverage or uniqueness is invalid"
+        raise ValueError(msg)
+    if set(observed) != expected:
+        msg = "reviewer answer template coverage is incomplete"
+        raise ValueError(msg)
+    return {
+        f"reviewer_artifacts/{label}/{incident_id}.json"
+        for incident_id in incident_ids
+        for label in BLINDED_CONDITION_LABELS
+    }
+
+
+def _strict_json_loads(content: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                msg = f"duplicate JSON key: {key}"
+                raise ValueError(msg)
+            parsed[key] = value
+        return parsed
+
+    return json.loads(content, object_pairs_hook=reject_duplicate_keys)
 
 
 def reviewer_protocol_manifest(pack: BenchmarkArtifactPack) -> dict[str, Any]:
@@ -1251,6 +2527,8 @@ def reviewer_protocol_manifest(pack: BenchmarkArtifactPack) -> dict[str, Any]:
             {
                 "question_id": question_id,
                 "question_text": _question_text(question_id),
+                "response_format": _response_format(question_id),
+                "rubric_categories": list(_assessment_rubric(question_id)),
             }
             for question_id in FORENSIC_QUESTIONNAIRE
         ],
@@ -1335,9 +2613,21 @@ def replication_metadata_template(pack: BenchmarkArtifactPack) -> dict[str, Any]
 
 
 def blinded_condition_key() -> dict[str, str]:
-    """Return the hidden mapping from reviewer-facing labels to study conditions."""
+    """Return the legacy canonical mapping for standalone compatibility helpers."""
 
+    warnings.warn(
+        "blinded_condition_key() is predictable and deprecated; use pack.condition_key",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return dict(zip(BLINDED_CONDITION_LABELS, BASELINES, strict=True))
+
+
+def _new_blinded_condition_key(pack_nonce: str) -> dict[str, str]:
+    conditions = list(BASELINES)
+    seed = hashlib.sha256(f"condition-key\x00{pack_nonce}".encode()).digest()
+    random.Random(int.from_bytes(seed, "big")).shuffle(conditions)
+    return dict(zip(BLINDED_CONDITION_LABELS, conditions, strict=True))
 
 
 def reviewer_answer_template_csv(
@@ -1362,12 +2652,12 @@ def reviewer_answer_template_csv(
     buffer = StringIO()
     writer = DictWriter(buffer, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
-    condition_key = blinded_condition_key()
+    condition_key = pack.condition_key
     rows: list[dict[str, str]] = []
     for reviewer_id in reviewer_ids:
         for label, condition in condition_key.items():
             for artifact in pack.reviewer_artifacts[condition]:
-                incident_id = str(artifact["incident_id"])
+                incident_id = artifact.incident_id
                 artifact_path = f"reviewer_artifacts/{label}/{incident_id}.json"
                 for question_id in FORENSIC_QUESTIONNAIRE:
                     rows.append(
@@ -1390,15 +2680,40 @@ def reviewer_answer_template_csv(
 
 
 def reviewer_artifacts_exclude_ground_truth(
-    reviewer_artifacts: Mapping[str, Sequence[Mapping[str, Any]]],
+    reviewer_artifacts: Mapping[
+        str,
+        Sequence[ReviewerEvidenceArtifact | Mapping[str, Any]],
+    ],
+    *,
+    answer_key: Mapping[str, Mapping[str, str]] | None = None,
 ) -> bool:
-    """Return true when reviewer-visible artifacts omit answer-key containers."""
+    """Return true when artifacts satisfy the schema and omit copyable answers."""
 
-    forbidden = {"answer_key", "ground_truth", "correct_answer"}
     for artifacts in reviewer_artifacts.values():
         for artifact in artifacts:
-            if _contains_forbidden_key(artifact, forbidden):
+            try:
+                validated = (
+                    artifact
+                    if isinstance(artifact, ReviewerEvidenceArtifact)
+                    else ReviewerEvidenceArtifact.model_validate(artifact)
+                )
+            except ValueError:
                 return False
+            if answer_key is None:
+                continue
+            hidden_answers = answer_key.get(validated.incident_id)
+            if hidden_answers is None:
+                return False
+            serialized = validated.model_dump(mode="json")
+            artifact_fields = _normalized_scalar_fields(serialized)
+            for hidden_answer in hidden_answers.values():
+                try:
+                    parsed_answer = _strict_json_loads(hidden_answer)
+                except (TypeError, ValueError):
+                    return False
+                answer_fields = _normalized_scalar_fields(parsed_answer)
+                if answer_fields & artifact_fields:
+                    return False
     return True
 
 
@@ -1443,104 +2758,246 @@ def _mean_pairwise_agreement(answers: Iterable[ReviewerAnswer]) -> float:
     return sum(agreements) / len(agreements) if agreements else 1.0
 
 
-def _failure_for_technique(technique: str, ordinal: int) -> str:
-    failures = {
+def _failure_description(technique: str) -> str:
+    return {
         "collusion": "executor and validator attempted coordinated approval",
         "memory_poisoning": "agent memory included poisoned prior authorization",
         "rule_gaming": "action was split to evade a high-risk threshold",
         "fragmented_actions": "harm emerged only after stitching fragmented tool calls",
         "misleading_traces": "trace labels understated the protected resource touched",
+    }[technique]
+
+
+def _reviewer_evidence_artifact(
+    source: _IncidentEvidenceSource,
+    condition: str,
+    pack_nonce: str,
+) -> ReviewerEvidenceArtifact:
+    failure_modes = {
+        "collusion": "coordinated_approval",
+        "memory_poisoning": "poisoned_authorization",
+        "rule_gaming": "threshold_evasion",
+        "fragmented_actions": "fragmented_tool_calls",
+        "misleading_traces": "misleading_trace_labels",
     }
-    return f"{failures[technique]} in step {ordinal:03d}"
+    evidence_kinds: tuple[EvidenceClass, EvidenceClass, EvidenceClass] = (
+        "diff",
+        "policy_evaluation",
+        "runtime_trace",
+    )
+    detection_timing = "before_execution" if source.ordinal % 4 else "after_execution"
+
+    if condition == "ungoverned_raw_logs":
+        return ReviewerEvidenceArtifact(
+            incident_id=source.incident_id,
+            principal_role="executor",
+            principal_ordinal=0,
+            principal_strength="observed",
+            authority_evidence=AuthorityEvidence(
+                deploy_role_visible=None,
+                validator_approval_required=None,
+                auditor_receipt_required=None,
+                strength="unavailable",
+            ),
+            policy_evidence=PolicyEvidence(
+                family="unknown",
+                version="unknown",
+                adversarial_signal="unknown",
+                strength="observed",
+            ),
+            evidence_references=tuple(
+                _evidence_reference(
+                    source,
+                    kind,
+                    "observed" if index == 2 else "unavailable",
+                    pack_nonce,
+                )
+                for index, kind in enumerate(evidence_kinds)
+            ),  # type: ignore[arg-type]
+            decision_evidence=DecisionEvidence(
+                reviewing_role="unknown",
+                reviewer_ordinal=0,
+                audit_role_present=None,
+                disposition="unknown",
+                strength="unavailable",
+            ),
+            failure_evidence=FailureEvidence(
+                mode="unknown",
+                step_ordinal=0,
+                strength="unavailable",
+            ),
+            outcome_evidence=OutcomeEvidence(
+                execution_blocked=None,
+                evidence_preserved=None,
+                detection_timing="unknown",
+                strength="unavailable",
+            ),
+            integrity_evidence=IntegrityEvidence(
+                structured=None,
+                tamper_evident=None,
+                role_separation_checked=None,
+                receipt_chain_present=None,
+            ),
+        )
+
+    if condition not in BASELINES:
+        msg = f"unknown reviewer artifact condition: {condition}"
+        raise ValueError(msg)
+    is_acgs = condition == "acgs_receipts_and_audit_artifacts"
+    strength: EvidenceStrength = "observed"
+    return ReviewerEvidenceArtifact(
+        incident_id=source.incident_id,
+        principal_role="executor",
+        principal_ordinal=source.ordinal if is_acgs else 0,
+        principal_strength=strength,
+        authority_evidence=AuthorityEvidence(
+            deploy_role_visible=True,
+            validator_approval_required=True,
+            auditor_receipt_required=True if is_acgs else None,
+            strength=strength,
+        ),
+        policy_evidence=PolicyEvidence(
+            family="devops_high_risk",
+            version="v0.1",
+            adversarial_signal=(source.adversarial_technique if is_acgs else "unknown"),
+            strength=strength,
+        ),
+        evidence_references=tuple(
+            _evidence_reference(source, kind, strength, pack_nonce)
+            for kind in evidence_kinds
+        ),  # type: ignore[arg-type]
+        decision_evidence=DecisionEvidence(
+            reviewing_role="validator",
+            reviewer_ordinal=source.ordinal if is_acgs else 0,
+            audit_role_present=True,
+            disposition="denied",
+            strength=strength,
+        ),
+        failure_evidence=FailureEvidence(
+            mode=(
+                failure_modes[source.adversarial_technique]  # type: ignore[arg-type]
+                if is_acgs
+                else "unknown"
+            ),
+            step_ordinal=source.ordinal if is_acgs else 0,
+            strength=strength if is_acgs else "unavailable",
+        ),
+        outcome_evidence=OutcomeEvidence(
+            execution_blocked=True,
+            evidence_preserved=True if is_acgs else None,
+            detection_timing=(detection_timing if is_acgs else "unknown"),  # type: ignore[arg-type]
+            strength=strength if is_acgs else "unavailable",
+        ),
+        integrity_evidence=IntegrityEvidence(
+            structured=None,
+            tamper_evident=None,
+            role_separation_checked=None,
+            receipt_chain_present=None,
+        ),
+    )
 
 
-def _raw_log_artifact(spec: IncidentSpec) -> dict[str, Any]:
-    return {
-        "incident_id": spec.incident_id,
-        "artifact_condition": "ungoverned_raw_logs",
-        "events": [
-            f"{spec.who_acted}: requested operation",
-            f"trace: {spec.adversarial_technique} signal present but not classified",
-            "result: action interrupted after operator review",
-        ],
-        "omitted_fields": ["policy_hash", "validator_vote", "receipt_chain"],
-    }
-
-
-def _central_log_artifact(spec: IncidentSpec) -> dict[str, Any]:
-    return {
-        "incident_id": spec.incident_id,
-        "artifact_condition": "centralized_structured_logs",
-        "events": [
-            {
-                "actor": spec.who_acted,
-                "action": "high_risk_devops_operation",
-                "policy": spec.rule_applied,
-            },
-            {
-                "validator": spec.who_approved_or_denied,
-                "evidence_refs": spec.evidence_used.split(","),
-            },
-        ],
-        "central_orchestrator": {
-            "structured_logging": True,
-            "human_escalation_hook": True,
-            "receipt_chain": False,
+def _evidence_reference(
+    source: _IncidentEvidenceSource,
+    evidence_class: EvidenceClass,
+    strength: EvidenceStrength,
+    pack_nonce: str,
+) -> EvidenceReference:
+    reference_payload = json.dumps(
+        {
+            "evidence_class": evidence_class,
+            "incident_id": source.incident_id,
+            "ordinal": source.ordinal,
         },
-    }
-
-
-def _acgs_artifact(spec: IncidentSpec) -> dict[str, Any]:
-    return {
-        "incident_id": spec.incident_id,
-        "artifact_condition": "acgs_receipts_and_audit_artifacts",
-        "receipt": {
-            "actor": spec.who_acted,
-            "authority": spec.authority_existed,
-            "rule": spec.rule_applied,
-            "evidence_hashes": {
-                evidence_name: f"sha256:{spec.incident_id}-{evidence_name}"
-                for evidence_name in spec.evidence_used.split(",")
-            },
-            "decision": spec.who_approved_or_denied,
-            "failure_boundary": spec.what_failed,
-            "defensibility": spec.outcome_defensible,
-            "previous_receipt_hash": f"sha256:{spec.incident_id}-previous",
-            "receipt_hash": f"sha256:{spec.incident_id}-receipt",
-        },
-        "audit": {
-            "tamper_evident": True,
-            "role_separation_checked": True,
-            "scoring_answers_withheld": True,
-        },
-    }
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    nonce = bytes.fromhex(pack_nonce)
+    canonical_reference = (
+        len(nonce).to_bytes(4, "big")
+        + nonce
+        + len(reference_payload).to_bytes(4, "big")
+        + reference_payload
+    )
+    digest = hashlib.sha256(canonical_reference).hexdigest()
+    return EvidenceReference(
+        evidence_class=(evidence_class if strength != "unavailable" else "unknown"),
+        digest=digest,
+        strength=strength,
+    )
 
 
 def _json_dump(value: Any) -> str:
-    import json
-
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
 
 def _question_text(question_id: str) -> str:
     questions = {
-        "who_acted": "Who acted?",
-        "authority_existed": "What authority existed?",
-        "rule_applied": "What rule applied?",
-        "evidence_used": "What evidence was used?",
-        "who_approved_or_denied": "Who approved or denied?",
-        "what_failed": "What failed?",
-        "outcome_defensible": "Was the outcome defensible?",
+        "who_acted": "Assess responsibility for the action.",
+        "authority_existed": "Assess whether the visible authority was sufficient.",
+        "rule_applied": "Assess whether an adversarial control was triggered.",
+        "evidence_used": "Assess the breadth of the evidence basis.",
+        "who_approved_or_denied": "Assess the independence of the decision.",
+        "what_failed": "Assess the underlying causal control failure.",
+        "outcome_defensible": "Assess the defensibility of the outcome.",
     }
     return questions[question_id]
 
 
-def _blinded_artifact(artifact: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        str(key): value
-        for key, value in artifact.items()
-        if str(key) != "artifact_condition"
+def _response_format(question_id: str) -> str:
+    formats = {
+        question: '{"assessment":"<rubric category>"}'
+        for question in FORENSIC_QUESTIONNAIRE
     }
+    return formats[question_id]
+
+
+def _assessment_rubric(question_id: str) -> tuple[str, ...]:
+    rubrics = {
+        "who_acted": (
+            "accountable_execution_principal",
+            "shared_principal_responsibility",
+            "indeterminate_principal",
+        ),
+        "authority_existed": (
+            "conditional_authority_only",
+            "authority_provenance_unreliable",
+            "indeterminate_authority",
+        ),
+        "rule_applied": (
+            "separation_control_applicable",
+            "authorization_control_applicable",
+            "scope_control_applicable",
+            "cross_action_control_applicable",
+            "trace_integrity_control_applicable",
+            "indeterminate_control",
+        ),
+        "evidence_used": (
+            "multi_source_evidence",
+            "corroboration_required",
+            "insufficient_evidence",
+        ),
+        "who_approved_or_denied": (
+            "independent_denial_decision",
+            "independence_pressure_detected",
+            "indeterminate_decision",
+        ),
+        "what_failed": (
+            "separation_of_duties_under_pressure",
+            "authorization_provenance_compromised",
+            "policy_scope_evasion",
+            "cross_action_correlation_gap",
+            "trace_semantics_obscured",
+            "indeterminate_failure",
+        ),
+        "outcome_defensible": (
+            "preventive_control_succeeded",
+            "late_containment_with_evidence",
+            "indefensible_outcome",
+            "indeterminate_outcome",
+        ),
+    }
+    return rubrics[question_id]
 
 
 def _replication_readme(pack: BenchmarkArtifactPack) -> str:
@@ -1590,6 +3047,10 @@ def _replication_readme(pack: BenchmarkArtifactPack) -> str:
 
 
 def _reviewer_instructions(pack: BenchmarkArtifactPack) -> str:
+    return _reviewer_instructions_for_incident_count(pack.protocol.incident_count)
+
+
+def _reviewer_instructions_for_incident_count(incident_count: int) -> str:
     return "\n".join(
         [
             "# ACGS v0.1 Reviewer Instructions",
@@ -1599,9 +3060,14 @@ def _reviewer_instructions(pack: BenchmarkArtifactPack) -> str:
             "Condition labels are intentionally blinded. Do not infer or relabel them.",
             "For every assigned row, inspect the artifact path, answer the fixed "
             "question, and fill `answer`, `confidence`, and `elapsed_seconds`.",
+            "Use the canonical `response_format` for that question from "
+            "`reviewer_protocol.json`; choose one listed `rubric_categories` value "
+            "after assessing the visible evidence.",
+            "Encode each answer as compact JSON with keys sorted lexicographically and "
+            "no spaces (UTF-8, separators `,` and `:`).",
             "Confidence must be a number from 0.0 to 1.0.",
             "",
-            f"Incident count: {pack.protocol.incident_count}",
+            f"Incident count: {incident_count}",
             "Condition labels: " + ", ".join(BLINDED_CONDITION_LABELS),
             "Questions: " + ", ".join(FORENSIC_QUESTIONNAIRE),
             "",
@@ -1609,12 +3075,25 @@ def _reviewer_instructions(pack: BenchmarkArtifactPack) -> str:
     )
 
 
-def _contains_forbidden_key(value: Any, forbidden: set[str]) -> bool:
+def _normalized_scalar_fields(value: Any) -> set[str]:
+    """Return typed, Unicode-normalized scalar values from a parsed structure."""
+
     if isinstance(value, Mapping):
-        return any(
-            str(key) in forbidden or _contains_forbidden_key(child, forbidden)
-            for key, child in value.items()
-        )
+        fields: set[str] = set()
+        for child in value.values():
+            fields.update(_normalized_scalar_fields(child))
+        return fields
     if isinstance(value, (list, tuple)):
-        return any(_contains_forbidden_key(child, forbidden) for child in value)
-    return False
+        fields = set()
+        for child in value:
+            fields.update(_normalized_scalar_fields(child))
+        return fields
+    if isinstance(value, str):
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        normalized = "".join(character for character in normalized if character.isalnum())
+        return {f"string:{normalized}"} if normalized else set()
+    if isinstance(value, bool):
+        return {f"bool:{str(value).lower()}"}
+    if isinstance(value, int | float):
+        return {f"number:{value}"}
+    return set()

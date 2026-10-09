@@ -5,6 +5,8 @@ import hashlib
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from constitutional_swarm.forensic_benchmark import (
     ADVERSARIAL_TECHNIQUES,
     BASELINES,
     FORENSIC_QUESTIONNAIRE,
+    BenchmarkArtifactPack,
     BenchmarkResultBundle,
     CollectedAnswerEvidence,
     ConditionScore,
@@ -20,11 +23,11 @@ from constitutional_swarm.forensic_benchmark import (
     ReviewerAnswer,
     ReviewerCohortManifest,
     artifact_pack_to_files,
-    blinded_condition_key,
     build_result_bundle,
     generate_artifact_pack,
     paired_sign_test_p_value,
     replication_metadata_template,
+    reviewer_artifact_manifest,
     reviewer_answer_template_csv,
     reviewer_artifacts_exclude_ground_truth,
     reviewer_packet_files,
@@ -52,6 +55,7 @@ from constitutional_swarm.governance_receipts import (
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from scripts.run_governance_benchmark import (
+    _seal_collected_blind_answers,
     required_public_artifact_verification_commands,
 )
 
@@ -519,9 +523,10 @@ def test_governance_benchmark_runner_scores_condition_blinded_csv(tmp_path) -> N
     answer_key_path = tmp_path / "answer-key.json"
     condition_key_path = tmp_path / "condition-key.json"
     answer_key_path.write_text(json.dumps(pack.answer_key))
-    condition_key_path.write_text(json.dumps(blinded_condition_key()))
+    condition_key_path.write_text(artifact_pack_to_files(pack)["condition_key.json"])
     _write_condition_blinded_answers_csv(
         answers_path,
+        pack.condition_key,
         [
             ReviewerAnswer(
                 incident_id="incident-001",
@@ -566,8 +571,6 @@ def test_governance_benchmark_runner_scores_condition_blinded_csv(tmp_path) -> N
             str(answer_key_path),
             "--condition-key-json",
             str(condition_key_path),
-            "--p-value",
-            "0.01",
         ],
         check=False,
         capture_output=True,
@@ -589,7 +592,7 @@ def test_generated_artifact_pack_has_50_incidents_and_hidden_answer_key() -> Non
     for condition in BASELINES:
         assert len(pack.reviewer_artifacts[condition]) == 50
         assert {
-            artifact["incident_id"] for artifact in pack.reviewer_artifacts[condition]
+            artifact.incident_id for artifact in pack.reviewer_artifacts[condition]
         } == set(pack.answer_key)
 
     files = artifact_pack_to_files(pack)
@@ -661,19 +664,22 @@ def test_reviewer_packet_files_exclude_coordinator_only_material() -> None:
     assert "replication_metadata_template.json" not in reviewer_files
 
 
-def test_replication_template_is_not_success_evidence() -> None:
+def test_replication_template_is_not_success_evidence(tmp_path: Path) -> None:
     pack = generate_artifact_pack()
     replication_template = ExternalReplicationRecord.model_validate(
         replication_metadata_template(pack)
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
+    fixture = _build_result_bundle_fixture(
+        tmp_path,
+        pack,
         external_replication=replication_template,
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        fixture.bundle,
+        evidence_root=fixture.evidence_root,
+        trusted_attestors=("Independent Systems Lab",),
+    )
 
     assert verdict.valid is False
     assert "external_replication_incomplete" in {
@@ -692,14 +698,14 @@ def test_reviewer_answer_template_is_blind_and_complete() -> None:
     assert "answer_key" not in rows[0]
     assert "correct_answer" not in rows[0]
     assert "artifact_condition" not in rows[0]
-    assert rows[0]["condition_label"] in blinded_condition_key()
+    assert rows[0]["condition_label"] in pack.condition_key
     assert rows[0]["artifact_path"].startswith("reviewer_artifacts/condition_")
     assert rows[0]["answer"] == ""
     assert rows[0]["confidence"] == ""
     assert rows[0]["elapsed_seconds"] == ""
     assert {
         row["condition_label"] for row in rows
-    } == set(blinded_condition_key())
+    } == set(pack.condition_key)
     assert {row["question_id"] for row in rows} == set(FORENSIC_QUESTIONNAIRE)
     assert template == reviewer_answer_template_csv(pack)
     assert [row["condition_label"] for row in rows[:3]] != [
@@ -1148,13 +1154,8 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
     tmp_path,
 ) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.01,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = fixture.bundle
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
@@ -1173,13 +1174,17 @@ def test_governance_benchmark_runner_writes_external_replication_submission_pack
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/replication_metadata.json",
             "--submission-commands-transcript-url",
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/commands-transcript.txt",
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload["valid"] is True
     assert payload["missing_fields"] == []
@@ -1230,13 +1235,8 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
     tmp_path,
 ) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.01,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = fixture.bundle
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
@@ -1255,6 +1255,10 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/replication_metadata.json",
             "--submission-commands-transcript-url",
             f"{REPLICATION_RELEASE_DOWNLOAD_BASE}/commands-transcript.txt",
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
@@ -1270,6 +1274,10 @@ def test_governance_benchmark_runner_validates_external_replication_submission_p
             str(output_dir),
             "--submission-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
@@ -1290,13 +1298,8 @@ def test_governance_benchmark_runner_rejects_placeholder_submission_urls(
     tmp_path,
 ) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.01,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = fixture.bundle
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
@@ -1315,6 +1318,10 @@ def test_governance_benchmark_runner_rejects_placeholder_submission_urls(
             "https://example.org/replication_metadata.json",
             "--submission-commands-transcript-url",
             "https://example.org/commands-transcript.txt",
+            "--evidence-root",
+            str(fixture.evidence_root),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
@@ -1369,7 +1376,13 @@ def test_governance_benchmark_runner_rejects_tampered_replication_kit(
         / "condition_a"
         / "incident-001.json"
     )
-    target.write_text(target.read_text().replace("requested operation", "altered operation"))
+    target.write_text(
+        target.read_text().replace(
+            '"principal_role": "executor"',
+            '"principal_role": "unknown"',
+            1,
+        )
+    )
 
     verify = subprocess.run(
         [
@@ -2078,25 +2091,8 @@ def test_governance_benchmark_runner_rejects_answer_seal_bundle_hash_mismatch(
     )
     assert seal.returncode == 0
     pack = generate_artifact_pack()
-    answers = _full_blind_review_answers(pack.answer_key)
-    bundle_path.write_text(
-        build_result_bundle(
-            protocol=pack.protocol,
-            answers=answers,
-            answer_evidence=_complete_answer_evidence().model_copy(
-                update={
-                    "answers_sha256": json.loads(seal.stdout)["answers_sha256"],
-                    "answers_bytes": answers_path.stat().st_size,
-                    "reviewer_manifest_sha256": json.loads(seal.stdout)[
-                        "reviewer_manifest_sha256"
-                    ],
-                    "row_count": len(answers),
-                    "reviewer_count": len({answer.reviewer_id for answer in answers}),
-                }
-            ),
-            external_replication=_complete_external_replication_record(),
-        ).model_dump_json()
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle_path.write_text(fixture.bundle.model_dump_json())
 
     result = subprocess.run(
         [
@@ -2250,6 +2246,8 @@ def test_governance_benchmark_runner_validates_reviewer_cohort_manifest(
             "scripts/run_governance_benchmark.py",
             "--validate-reviewer-cohort-manifest",
             str(manifest_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
@@ -2281,14 +2279,8 @@ def test_governance_benchmark_runner_rejects_reviewer_cohort_count_mismatch(
             reviewer_roster_sha256="a" * 64,
         ).model_dump_json()
     )
-    bundle_path.write_text(
-        build_result_bundle(
-            protocol=pack.protocol,
-            answers=_full_blind_review_answers(pack.answer_key),
-            answer_evidence=_complete_answer_evidence(),
-            external_replication=_complete_external_replication_record(),
-        ).model_dump_json()
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle_path.write_text(fixture.bundle.model_dump_json())
 
     result = subprocess.run(
         [
@@ -2319,12 +2311,8 @@ def test_governance_benchmark_runner_rejects_scorecard_result_bundle_mismatch(
     pack = generate_artifact_pack()
     scorecard_path = tmp_path / "scorecard.json"
     bundle_path = tmp_path / "result-bundle.json"
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    fixture = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = fixture.bundle
     tampered_scorecard = bundle.scorecard.model_copy(
         update={"strongest_baseline": "ungoverned_raw_logs"}
     )
@@ -2395,6 +2383,12 @@ def test_governance_benchmark_runner_rejects_placeholder_reviewer_cohort_manifes
 def test_governance_benchmark_runner_validates_replication_attestation(
     tmp_path,
 ) -> None:
+    pack = generate_artifact_pack()
+    built = _build_result_bundle_fixture(
+        tmp_path,
+        pack,
+        directory_name="attestation-evidence",
+    )
     attestation_path = tmp_path / "replication_attestation.json"
     metadata_path = tmp_path / "replication_metadata.json"
     result_bundle_path = tmp_path / "result-bundle.json"
@@ -2402,9 +2396,9 @@ def test_governance_benchmark_runner_validates_replication_attestation(
     scorecard_path = tmp_path / "scorecard.json"
     artifact_pack_path = tmp_path / "artifact-pack.tar.gz"
     commands_transcript_path = tmp_path / "commands-transcript.txt"
-    result_bundle_path.write_text('{"schema":"acgs-v0.1-result-bundle"}')
+    result_bundle_path.write_text(built.bundle.model_dump_json())
     cohort_manifest_path.write_text('{"schema":"reviewer-cohort-manifest"}')
-    scorecard_path.write_text('{"schema":"scorecard"}')
+    scorecard_path.write_text(built.bundle.scorecard.model_dump_json())
     artifact_pack_path.write_text("artifact pack bytes")
     commands_transcript_path.write_text(_complete_replication_command())
     result_bundle_sha256 = hashlib.sha256(result_bundle_path.read_bytes()).hexdigest()
@@ -2433,7 +2427,7 @@ def test_governance_benchmark_runner_validates_replication_attestation(
             }
         )
     )
-    metadata_path.write_text(_complete_external_replication_record().model_dump_json())
+    metadata_path.write_text(built.bundle.external_replication.model_dump_json())
 
     result = subprocess.run(
         [
@@ -2453,13 +2447,19 @@ def test_governance_benchmark_runner_validates_replication_attestation(
             str(artifact_pack_path),
             "--attested-commands-transcript",
             str(commands_transcript_path),
+            "--trusted-attestor",
+            "Dr. Ada Reviewer",
+            "--trusted-attestor",
+            "Independent Systems Lab",
+            "--evidence-root",
+            str(built.evidence_root),
         ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload["valid_shape"] is True
     assert payload["success_evidence"] is True
@@ -2506,6 +2506,10 @@ def test_governance_benchmark_runner_rejects_attestation_transcript_missing_comm
             str(metadata_path),
             "--attested-commands-transcript",
             str(commands_transcript_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
+            "--trusted-attestor",
+            "Dr. Ada Reviewer",
         ],
         check=False,
         capture_output=True,
@@ -2771,6 +2775,10 @@ def test_governance_benchmark_runner_rejects_attestation_pack_and_transcript_has
             str(artifact_pack_path),
             "--attested-commands-transcript",
             str(commands_transcript_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
+            "--trusted-attestor",
+            "Dr. Ada Reviewer",
         ],
         check=False,
         capture_output=True,
@@ -3053,7 +3061,13 @@ def test_governance_benchmark_runner_rejects_tampered_reviewer_manifest_file(
         text=True,
     )
     target = output_dir / "reviewer_artifacts" / "condition_a" / "incident-001.json"
-    target.write_text(target.read_text().replace("requested operation", "altered operation"))
+    target.write_text(
+        target.read_text().replace(
+            '"principal_role": "executor"',
+            '"principal_role": "unknown"',
+            1,
+        )
+    )
 
     verify = subprocess.run(
         [
@@ -3073,17 +3087,16 @@ def test_governance_benchmark_runner_rejects_tampered_reviewer_manifest_file(
     assert "sha256_mismatch" in {issue["code"] for issue in payload["issues"]}
 
 
-def test_result_bundle_validates_only_complete_public_study_evidence() -> None:
+def test_result_bundle_validates_only_complete_public_study_evidence(tmp_path) -> None:
     pack = generate_artifact_pack()
-    answers = _full_blind_review_answers(pack.answer_key)
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=answers,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(bundle.external_replication.replicating_group,),
+    )
 
     assert verdict.valid is True
     assert verdict.issues == []
@@ -3094,23 +3107,25 @@ def test_result_bundle_validates_only_complete_public_study_evidence() -> None:
     assert bundle.p_value_vs_strongest_baseline <= 0.05
 
 
-def test_result_bundle_requires_external_completion_audit_command() -> None:
+def test_result_bundle_requires_external_completion_audit_command(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_completion_audit = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
         "--completion-audit-result-bundle result-bundle.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_completion_audit}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_completion_audit}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3118,22 +3133,24 @@ def test_result_bundle_requires_external_completion_audit_command() -> None:
     }
 
 
-def test_result_bundle_requires_external_replication_kit_verification() -> None:
+def test_result_bundle_requires_external_replication_kit_verification(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_kit_verification = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py --verify-replication-kit .",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_kit_verification}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_kit_verification}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3141,23 +3158,25 @@ def test_result_bundle_requires_external_replication_kit_verification() -> None:
     }
 
 
-def test_result_bundle_requires_external_public_artifact_validation() -> None:
+def test_result_bundle_requires_external_public_artifact_validation(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_public_artifact_validation = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
         "--validate-required-public-artifacts required_public_artifacts.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_public_artifact_validation}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_public_artifact_validation}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3165,7 +3184,7 @@ def test_result_bundle_requires_external_public_artifact_validation() -> None:
     }
 
 
-def test_result_bundle_requires_external_reviewer_cohort_bundle_binding() -> None:
+def test_result_bundle_requires_external_reviewer_cohort_bundle_binding(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_cohort_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3173,16 +3192,18 @@ def test_result_bundle_requires_external_reviewer_cohort_bundle_binding() -> Non
         "--cohort-result-bundle result-bundle.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_cohort_binding}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_cohort_binding}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3190,7 +3211,7 @@ def test_result_bundle_requires_external_reviewer_cohort_bundle_binding() -> Non
     }
 
 
-def test_result_bundle_requires_external_answer_matrix_bundle_binding() -> None:
+def test_result_bundle_requires_external_answer_matrix_bundle_binding(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_answer_matrix_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3201,16 +3222,18 @@ def test_result_bundle_requires_external_answer_matrix_bundle_binding() -> None:
         "--answer-matrix-result-bundle result-bundle.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_answer_matrix_binding}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_answer_matrix_binding}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3218,7 +3241,7 @@ def test_result_bundle_requires_external_answer_matrix_bundle_binding() -> None:
     }
 
 
-def test_result_bundle_requires_external_answer_seal_bundle_binding() -> None:
+def test_result_bundle_requires_external_answer_seal_bundle_binding(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_answer_seal_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3227,16 +3250,18 @@ def test_result_bundle_requires_external_answer_seal_bundle_binding() -> None:
         "--answer-seal-result-bundle result-bundle.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_answer_seal_binding}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_answer_seal_binding}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3244,7 +3269,7 @@ def test_result_bundle_requires_external_answer_seal_bundle_binding() -> None:
     }
 
 
-def test_result_bundle_requires_external_scorecard_bundle_binding() -> None:
+def test_result_bundle_requires_external_scorecard_bundle_binding(tmp_path) -> None:
     pack = generate_artifact_pack()
     command_without_scorecard_binding = _complete_replication_command().replace(
         " && python scripts/run_governance_benchmark.py "
@@ -3252,16 +3277,18 @@ def test_result_bundle_requires_external_scorecard_bundle_binding() -> None:
         "--scorecard-result-bundle result-bundle.json",
         "",
     )
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record().model_copy(
-            update={"command_line": command_without_scorecard_binding}
-        ),
+    replication = _complete_external_replication_record().model_copy(
+        update={"command_line": command_without_scorecard_binding}
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3316,32 +3343,34 @@ def test_paired_sign_test_p_value_handles_large_discordant_sets() -> None:
     assert 0.0 < p_value < 1e-300
 
 
-def test_result_bundle_rejects_toy_or_non_external_success_claim() -> None:
+def test_result_bundle_rejects_toy_or_non_external_success_claim(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.20,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=ExternalReplicationRecord(
-            replicating_group="ACGS internal team",
-            artifact_pack_uri="local",
-            reviewer_cohort_uri="local",
-            command_line="python scripts/run_governance_benchmark.py",
-            scorecard_uri="local",
-            attestation_uri="local",
-            completed=False,
-            reproduction_notes="Demo-only run.",
-        ),
+    replication = ExternalReplicationRecord(
+        replicating_group="ACGS internal team",
+        artifact_pack_uri="local",
+        reviewer_cohort_uri="local",
+        command_line="python scripts/run_governance_benchmark.py",
+        scorecard_uri="local",
+        attestation_uri="local",
+        completed=False,
+        reproduction_notes="Demo-only run.",
     )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
+    )
+    bundle = built.bundle.model_copy(update={"p_value_vs_strongest_baseline": 0.20})
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
         "not_statistically_significant",
         "external_replication_incomplete",
-        "replicating_group_not_external",
+        "replicating_group_not_trusted",
         "external_artifact_pack_not_immutable",
         "external_reviewer_cohort_not_immutable",
         "external_scorecard_not_immutable",
@@ -3368,28 +3397,30 @@ def test_result_bundle_rejects_toy_or_non_external_success_claim() -> None:
     }
 
 
-def test_result_bundle_rejects_placeholder_external_replication_metadata() -> None:
+def test_result_bundle_rejects_placeholder_external_replication_metadata(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=ExternalReplicationRecord(
-            replicating_group="TODO-independent-group-name",
-            artifact_pack_uri="TODO-immutable-uri-or-checksum-for-reviewed-pack",
-            reviewer_cohort_uri="TODO-immutable-uri-or-checksum-for-reviewer-cohort",
-            command_line=(
-                "python scripts/run_governance_benchmark.py "
-                "--score-reviewer-answers answers.csv"
-            ),
-            scorecard_uri="TODO-uri-or-path-to-reproduced-scorecard",
-            attestation_uri="TODO-uri-or-path-to-independent-replication-attestation",
-            completed=True,
-            reproduction_notes="TODO: attach reproduced scorecard.",
+    replication = ExternalReplicationRecord(
+        replicating_group="TODO-independent-group-name",
+        artifact_pack_uri="TODO-immutable-uri-or-checksum-for-reviewed-pack",
+        reviewer_cohort_uri="TODO-immutable-uri-or-checksum-for-reviewer-cohort",
+        command_line=(
+            "python scripts/run_governance_benchmark.py "
+            "--score-reviewer-answers answers.csv"
         ),
+        scorecard_uri="TODO-uri-or-path-to-reproduced-scorecard",
+        attestation_uri="TODO-uri-or-path-to-independent-replication-attestation",
+        completed=True,
+        reproduction_notes="TODO: attach reproduced scorecard.",
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3415,21 +3446,23 @@ def test_result_bundle_rejects_placeholder_external_replication_metadata() -> No
     }
 
 
-def test_result_bundle_rejects_non_immutable_external_references() -> None:
+def test_result_bundle_rejects_non_immutable_external_references(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(
-            artifact_pack_uri="reviewed-pack.tar.gz",
-            reviewer_cohort_uri="reviewer-cohort.json",
-            scorecard_uri="scorecard.json",
-            attestation_uri="attestation.json",
-        ),
+    replication = _complete_external_replication_record(
+        artifact_pack_uri="reviewed-pack.tar.gz",
+        reviewer_cohort_uri="reviewer-cohort.json",
+        scorecard_uri="scorecard.json",
+        attestation_uri="attestation.json",
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3440,21 +3473,23 @@ def test_result_bundle_rejects_non_immutable_external_references() -> None:
     }
 
 
-def test_result_bundle_rejects_placeholder_external_reference_hosts() -> None:
+def test_result_bundle_rejects_placeholder_external_reference_hosts(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(
-            artifact_pack_uri="https://example.org/acgs-v0-1-pack.tar.gz",
-            reviewer_cohort_uri="https://localhost/acgs-v0-1-reviewer-cohort.json",
-            scorecard_uri="https://127.0.0.1/acgs-v0-1-scorecard.json",
-            attestation_uri="https://0.0.0.0/acgs-v0-1-attestation.json",
-        ),
+    replication = _complete_external_replication_record(
+        artifact_pack_uri="https://example.org/acgs-v0-1-pack.tar.gz",
+        reviewer_cohort_uri="https://localhost/acgs-v0-1-reviewer-cohort.json",
+        scorecard_uri="https://127.0.0.1/acgs-v0-1-scorecard.json",
+        attestation_uri="https://0.0.0.0/acgs-v0-1-attestation.json",
+    )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3465,26 +3500,28 @@ def test_result_bundle_rejects_placeholder_external_reference_hosts() -> None:
     }
 
 
-def test_result_bundle_rejects_dummy_public_record_references() -> None:
+def test_result_bundle_rejects_dummy_public_record_references(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(
-            artifact_pack_uri="https://zenodo.org/records/123456/files/acgs-v0-1-pack.tar.gz",
-            reviewer_cohort_uri=(
-                "https://zenodo.org/records/123456/files/"
-                "acgs-v0-1-reviewer-cohort.json"
-            ),
-            scorecard_uri="https://zenodo.org/records/123456/files/acgs-v0-1-scorecard.json",
-            attestation_uri=(
-                "https://zenodo.org/records/123456/files/acgs-v0-1-attestation.json"
-            ),
+    replication = _complete_external_replication_record(
+        artifact_pack_uri="https://zenodo.org/records/123456/files/acgs-v0-1-pack.tar.gz",
+        reviewer_cohort_uri=(
+            "https://zenodo.org/records/123456/files/"
+            "acgs-v0-1-reviewer-cohort.json"
+        ),
+        scorecard_uri="https://zenodo.org/records/123456/files/acgs-v0-1-scorecard.json",
+        attestation_uri=(
+            "https://zenodo.org/records/123456/files/acgs-v0-1-attestation.json"
         ),
     )
+    built = _build_result_bundle_fixture(
+        tmp_path, pack, external_replication=replication
+    )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        built.bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3495,12 +3532,12 @@ def test_result_bundle_rejects_dummy_public_record_references() -> None:
     }
 
 
-def test_result_bundle_rejects_dummy_answer_evidence_references() -> None:
+def test_result_bundle_rejects_dummy_answer_evidence_references(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence().model_copy(
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle.model_copy(
+        update={
+            "answer_evidence": built.bundle.answer_evidence.model_copy(
             update={
                 "answer_matrix_uri": (
                     "https://zenodo.org/records/123456/files/acgs-v0-1-answers.csv"
@@ -3510,11 +3547,15 @@ def test_result_bundle_rejects_dummy_answer_evidence_references() -> None:
                     "acgs-v0-1-answer-seal.json"
                 ),
             }
-        ),
-        external_replication=_complete_external_replication_record(),
+            )
+        }
     )
 
-    verdict = validate_result_bundle(bundle)
+    verdict = validate_result_bundle(
+        bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(bundle.external_replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3523,14 +3564,10 @@ def test_result_bundle_rejects_dummy_answer_evidence_references() -> None:
     }
 
 
-def test_result_bundle_rejects_scorecard_answer_count_mismatch() -> None:
+def test_result_bundle_rejects_scorecard_answer_count_mismatch(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle
     acgs_score = bundle.scorecard.condition_scores["acgs_receipts_and_audit_artifacts"]
     tampered_scorecard = bundle.scorecard.model_copy(
         update={
@@ -3544,20 +3581,20 @@ def test_result_bundle_rejects_scorecard_answer_count_mismatch() -> None:
     )
     tampered_bundle = bundle.model_copy(update={"scorecard": tampered_scorecard})
 
-    verdict = validate_result_bundle(tampered_bundle)
+    verdict = validate_result_bundle(
+        tampered_bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(bundle.external_replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert "score_answer_count_mismatch" in {issue.code for issue in verdict.issues}
 
 
-def test_result_bundle_rejects_inconsistent_scorecard_claims() -> None:
+def test_result_bundle_rejects_inconsistent_scorecard_claims(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle
     tampered_scorecard = bundle.scorecard.model_copy(
         update={
             "strongest_baseline": "ungoverned_raw_logs",
@@ -3567,7 +3604,11 @@ def test_result_bundle_rejects_inconsistent_scorecard_claims() -> None:
     )
     tampered_bundle = bundle.model_copy(update={"scorecard": tampered_scorecard})
 
-    verdict = validate_result_bundle(tampered_bundle)
+    verdict = validate_result_bundle(
+        tampered_bundle,
+        evidence_root=built.evidence_root,
+        trusted_attestors=(bundle.external_replication.replicating_group,),
+    )
 
     assert verdict.valid is False
     assert {issue.code for issue in verdict.issues} >= {
@@ -3589,16 +3630,18 @@ def test_condition_score_rejects_impossible_metric_values() -> None:
         )
 
 
-def test_result_bundle_builder_rejects_incomplete_answer_matrix() -> None:
+def test_result_bundle_builder_rejects_incomplete_answer_matrix(tmp_path) -> None:
     pack = generate_artifact_pack()
     answers = _full_blind_review_answers(pack.answer_key)
+    built = _build_result_bundle_fixture(tmp_path, pack, answers=answers)
 
     with pytest.raises(ValueError, match="incomplete answer matrix"):
         build_result_bundle(
             protocol=pack.protocol,
+            external_replication=built.bundle.external_replication,
+            evidence_root=built.evidence_root,
+            evidence_paths=built.evidence_paths,
             answers=answers[:-1],
-            answer_evidence=_complete_answer_evidence(),
-            external_replication=_complete_external_replication_record(),
         )
 
 
@@ -3616,13 +3659,8 @@ def test_answer_matrix_verdict_reports_missing_cells() -> None:
 
 def test_governance_benchmark_runner_validates_result_bundle_json(tmp_path) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.01,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
@@ -3632,6 +3670,10 @@ def test_governance_benchmark_runner_validates_result_bundle_json(tmp_path) -> N
             "scripts/run_governance_benchmark.py",
             "--validate-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(built.evidence_root),
+            "--trusted-attestor",
+            bundle.external_replication.replicating_group,
         ],
         check=False,
         capture_output=True,
@@ -3647,11 +3689,8 @@ def test_governance_benchmark_runner_validates_result_bundle_json(tmp_path) -> N
     assert payload["summary"]["question_count"] == len(FORENSIC_QUESTIONNAIRE)
     assert payload["summary"]["acgs_wins"] is True
     assert payload["summary"]["external_replication_completed"] is True
-    assert (
-        payload["summary"]["answer_matrix_uri"]
-        == "https://zenodo.org/records/987654321/files/acgs-v0-1-answers.csv"
-    )
-    assert payload["summary"]["answers_sha256"] == "a" * 64
+    assert payload["summary"]["answer_matrix_uri"] == bundle.answer_evidence.answer_matrix_uri
+    assert payload["summary"]["answers_sha256"] == bundle.answer_evidence.answers_sha256
     assert payload["summary"]["replicating_group"] == "Independent Systems Lab"
     assert (
         payload["summary"]["reviewer_cohort_uri"]
@@ -3663,13 +3702,8 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
     tmp_path,
 ) -> None:
     pack = generate_artifact_pack()
-    bundle = build_result_bundle(
-        protocol=pack.protocol,
-        answers=_full_blind_review_answers(pack.answer_key),
-        p_value_vs_strongest_baseline=0.01,
-        answer_evidence=_complete_answer_evidence(),
-        external_replication=_complete_external_replication_record(),
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack)
+    bundle = built.bundle
     bundle_path = tmp_path / "result-bundle.json"
     bundle_path.write_text(bundle.model_dump_json())
 
@@ -3679,6 +3713,10 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
             "scripts/run_governance_benchmark.py",
             "--completion-audit-result-bundle",
             str(bundle_path),
+            "--evidence-root",
+            str(built.evidence_root),
+            "--trusted-attestor",
+            bundle.external_replication.replicating_group,
         ],
         check=False,
         capture_output=True,
@@ -3753,7 +3791,7 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
     ] is True
     assert checklist["acgs_significantly_beats_strongest_baseline"]["evidence"][
         "p_value_vs_strongest_baseline"
-    ] == 0.01
+    ] == bundle.p_value_vs_strongest_baseline
     assert checklist["inter_reviewer_agreement_reported"]["satisfied"] is True
     assert (
         checklist["inter_reviewer_agreement_reported"]["evidence"][
@@ -3770,8 +3808,8 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
     assert checklist["public_blind_review_data_verified"]["evidence"] == {
         "incident_count": 50,
         "reviewer_count": 2,
-        "answer_matrix_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-answers.csv",
-        "answer_seal_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-answer-seal.json",
+        "answer_matrix_uri": bundle.answer_evidence.answer_matrix_uri,
+        "answer_seal_uri": bundle.answer_evidence.answer_seal_uri,
         "reviewer_cohort_uri": "https://zenodo.org/records/987654321/files/acgs-v0-1-reviewer-cohort.json",
     }
     assert checklist["non_acgs_external_replication_verified"]["satisfied"] is False
@@ -3803,8 +3841,8 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
         "external_replication_attestation": "attestation_uri",
     }
     expected_bundle_references = {
-        "public_blind_answer_matrix": "https://zenodo.org/records/987654321/files/acgs-v0-1-answers.csv",
-        "pre_unblinding_answer_seal": "https://zenodo.org/records/987654321/files/acgs-v0-1-answer-seal.json",
+        "public_blind_answer_matrix": bundle.answer_evidence.answer_matrix_uri,
+        "pre_unblinding_answer_seal": bundle.answer_evidence.answer_seal_uri,
         "external_reviewer_cohort_manifest": "https://zenodo.org/records/987654321/files/acgs-v0-1-reviewer-cohort.json",
         "public_scorecard": "https://zenodo.org/records/987654321/files/acgs-v0-1-scorecard.json",
         "external_replication_attestation": "https://zenodo.org/records/987654321/files/acgs-v0-1-attestation.json",
@@ -3813,8 +3851,8 @@ def test_governance_benchmark_completion_audit_remains_blocked_for_local_bundle(
         "external_replication_attestation": "https://zenodo.org/records/987654321/files/acgs-v0-1-pack.tar.gz",
     }
     expected_bundle_sha256 = {
-        "public_blind_answer_matrix": "a" * 64,
-        "pre_unblinding_answer_seal": "b" * 64,
+        "public_blind_answer_matrix": bundle.answer_evidence.answers_sha256,
+        "pre_unblinding_answer_seal": bundle.answer_evidence.answer_seal_sha256,
     }
     expected_proves = {
         "public_blind_answer_matrix": {
@@ -4001,20 +4039,8 @@ def test_governance_benchmark_runner_rejects_answer_matrix_bundle_hash_mismatch(
     protocol_path.write_text(pack.protocol.model_dump_json())
     answer_key_path.write_text(json.dumps(pack.answer_key))
     _write_blind_answers_csv(answers_path, answers)
-    bundle_path.write_text(
-        build_result_bundle(
-            protocol=pack.protocol,
-            answers=answers,
-            answer_evidence=_complete_answer_evidence().model_copy(
-                update={
-                    "answers_bytes": answers_path.stat().st_size,
-                    "row_count": len(answers),
-                    "reviewer_count": len({answer.reviewer_id for answer in answers}),
-                }
-            ),
-            external_replication=_complete_external_replication_record(),
-        ).model_dump_json()
-    )
+    built = _build_result_bundle_fixture(tmp_path, pack, answers=answers)
+    bundle_path.write_text(built.bundle.model_dump_json())
 
     result = subprocess.run(
         [
@@ -4051,10 +4077,11 @@ def test_governance_benchmark_runner_reports_blank_answer_template_as_invalid(
     answer_key_path = tmp_path / "answer-key.json"
     condition_key_path = tmp_path / "condition-key.json"
 
-    protocol_path.write_text(pack.protocol.model_dump_json())
+    full_files = artifact_pack_to_files(pack)
+    protocol_path.write_text(full_files["protocol.json"])
     answers_path.write_text(reviewer_answer_template_csv(pack))
-    answer_key_path.write_text(json.dumps(pack.answer_key))
-    condition_key_path.write_text(json.dumps(blinded_condition_key()))
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
 
     result = subprocess.run(
         [
@@ -4068,8 +4095,6 @@ def test_governance_benchmark_runner_reports_blank_answer_template_as_invalid(
             str(answer_key_path),
             "--condition-key-json",
             str(condition_key_path),
-            "--p-value",
-            "0.01",
         ],
         check=False,
         capture_output=True,
@@ -4097,17 +4122,29 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
     artifact_pack_path = tmp_path / "artifact-pack.tar.gz"
     commands_transcript_path = tmp_path / "commands-transcript.txt"
 
-    protocol_path.write_text(pack.protocol.model_dump_json())
-    answer_key_path.write_text(json.dumps(pack.answer_key))
-    condition_key_path.write_text(json.dumps(blinded_condition_key()))
     full_files = artifact_pack_to_files(pack)
+    protocol_path.write_text(full_files["protocol.json"])
+    answer_key_path.write_text(full_files["answer_key.json"])
+    condition_key_path.write_text(full_files["condition_key.json"])
     reviewer_files = reviewer_packet_files(full_files)
     reviewer_files["reviewer_manifest.json"] = full_files["reviewer_manifest.json"]
     _write_text_tree(reviewer_packet_dir, reviewer_files)
-    _write_successful_reviewer_template_csv(
+    selected_answers = [
+        answer.model_copy(
+            update={
+                "reviewer_id": {"r1": "reviewer-1", "r2": "reviewer-2"}.get(
+                    answer.reviewer_id,
+                    answer.reviewer_id,
+                )
+            }
+        )
+        for answer in _full_blind_review_answers(pack.answer_key)
+    ]
+    _write_collected_answers_from_models(
         answers_path,
         reviewer_packet_dir / "reviewer_answer_template.csv",
-        pack.answer_key,
+        pack.condition_key,
+        selected_answers,
     )
     seal = subprocess.run(
         [
@@ -4153,8 +4190,8 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
             str(answer_key_path),
             "--condition-key-json",
             str(condition_key_path),
-            "--p-value",
-            "0.01",
+            "--trusted-attestor",
+            "Independent Systems Lab",
         ],
         check=False,
         capture_output=True,
@@ -4219,6 +4256,10 @@ def test_governance_benchmark_runner_builds_result_bundle_from_files(tmp_path) -
             str(artifact_pack_path),
             "--attested-commands-transcript",
             str(commands_transcript_path),
+            "--trusted-attestor",
+            "Independent Systems Lab",
+            "--trusted-attestor",
+            "Dr. Ada Reviewer",
         ],
         check=False,
         capture_output=True,
@@ -4312,9 +4353,13 @@ def _write_blind_answers_csv(path: Path, answers: list[ReviewerAnswer]) -> None:
             writer.writerow(row)
 
 
-def _write_condition_blinded_answers_csv(path: Path, answers: list[ReviewerAnswer]) -> None:
+def _write_condition_blinded_answers_csv(
+    path: Path,
+    condition_key: Mapping[str, str],
+    answers: list[ReviewerAnswer],
+) -> None:
     inverse_condition_key = {
-        condition: label for label, condition in blinded_condition_key().items()
+        condition: label for label, condition in condition_key.items()
     }
     fieldnames = [
         "incident_id",
@@ -4428,6 +4473,85 @@ def _complete_external_replication_record(
     )
 
 
+@dataclass(frozen=True)
+class _BuiltResultBundle:
+    bundle: BenchmarkResultBundle
+    evidence_root: Path
+    evidence_paths: dict[str, str]
+
+
+def _build_result_bundle_fixture(
+    tmp_path: Path,
+    pack: BenchmarkArtifactPack,
+    *,
+    external_replication: ExternalReplicationRecord | None = None,
+    answers: list[ReviewerAnswer] | None = None,
+    directory_name: str = "result-evidence",
+) -> _BuiltResultBundle:
+    evidence_root = tmp_path / directory_name
+    reviewer_packet_dir = evidence_root / "reviewer_packet"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    selected_answers = (
+        answers if answers is not None else _full_blind_review_answers(pack.answer_key)
+    )
+    full_files = artifact_pack_to_files(pack)
+    reviewer_ids = tuple(sorted({answer.reviewer_id for answer in selected_answers}))
+    full_files["reviewer_answer_template.csv"] = reviewer_answer_template_csv(
+        pack,
+        reviewer_ids=reviewer_ids,
+    )
+    full_files["reviewer_manifest.json"] = (
+        json.dumps(reviewer_artifact_manifest(full_files), indent=2, sort_keys=True) + "\n"
+    )
+    reviewer_files = reviewer_packet_files(full_files)
+    reviewer_files["reviewer_manifest.json"] = full_files["reviewer_manifest.json"]
+    _write_text_tree(reviewer_packet_dir, reviewer_files)
+
+    answers_path = evidence_root / "answers.csv"
+    _write_collected_answers_from_models(
+        answers_path,
+        reviewer_packet_dir / "reviewer_answer_template.csv",
+        pack.condition_key,
+        selected_answers,
+    )
+    seal_path = evidence_root / "collected-answers-seal.json"
+    seal_result = _seal_collected_blind_answers(
+        seal_path,
+        answers_path,
+        reviewer_packet_dir,
+    )
+    assert seal_result["valid"] is True
+
+    (evidence_root / "answer_key.json").write_text(full_files["answer_key.json"])
+    (evidence_root / "condition_key.json").write_text(full_files["condition_key.json"])
+    (evidence_root / "protocol.json").write_text(full_files["protocol.json"])
+    replication = external_replication or _complete_external_replication_record()
+    (evidence_root / "replication_metadata.json").write_text(
+        replication.model_dump_json()
+    )
+    evidence_paths = {
+        "answers_csv": "answers.csv",
+        "answer_seal": "collected-answers-seal.json",
+        "reviewer_manifest": "reviewer_packet/reviewer_manifest.json",
+        "answer_key": "answer_key.json",
+        "condition_key": "condition_key.json",
+        "protocol": "protocol.json",
+        "replication_metadata": "replication_metadata.json",
+    }
+    bundle = build_result_bundle(
+        protocol=pack.protocol,
+        external_replication=replication,
+        evidence_root=evidence_root,
+        evidence_paths=evidence_paths,
+        answers=selected_answers,
+    )
+    return _BuiltResultBundle(
+        bundle=bundle,
+        evidence_root=evidence_root,
+        evidence_paths=evidence_paths,
+    )
+
+
 def _complete_answer_evidence() -> CollectedAnswerEvidence:
     return CollectedAnswerEvidence(
         answer_matrix_uri="https://zenodo.org/records/987654321/files/acgs-v0-1-answers.csv",
@@ -4439,6 +4563,50 @@ def _complete_answer_evidence() -> CollectedAnswerEvidence:
         row_count=50 * 2 * len(FORENSIC_QUESTIONNAIRE) * len(BASELINES),
         reviewer_count=2,
     )
+
+
+def _write_collected_answers_from_models(
+    path: Path,
+    template_path: Path,
+    condition_key: Mapping[str, str],
+    answers: list[ReviewerAnswer],
+) -> None:
+    inverse_condition_key = {
+        condition: label for label, condition in condition_key.items()
+    }
+    by_cell = {
+        (
+            answer.incident_id,
+            inverse_condition_key[answer.artifact_condition],
+            answer.reviewer_id,
+            answer.question_id,
+        ): answer
+        for answer in answers
+    }
+    with template_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+        fieldnames = list(rows[0])
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            key = (
+                row["incident_id"],
+                row["condition_label"],
+                row["reviewer_id"],
+                row["question_id"],
+            )
+            answer = by_cell.get(key)
+            if answer is None:
+                continue
+            row.update(
+                {
+                    "answer": answer.answer,
+                    "confidence": str(answer.confidence),
+                    "elapsed_seconds": str(answer.elapsed_seconds),
+                }
+            )
+            writer.writerow(row)
 
 
 def _write_filled_reviewer_template_csv(
@@ -4471,8 +4639,8 @@ def _write_successful_reviewer_template_csv(
     path: Path,
     template_path: Path,
     answer_key: dict[str, dict[str, str]],
+    condition_key: Mapping[str, str],
 ) -> None:
-    condition_key = blinded_condition_key()
     with template_path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
         fieldnames = list(rows[0])
