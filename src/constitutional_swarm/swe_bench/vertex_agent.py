@@ -111,6 +111,8 @@ class VertexClaudeSWEBenchAgent(SWEBenchAgent):
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
+        if extra_kwargs and "timeout" in extra_kwargs:
+            raise ValueError("extra_kwargs cannot override the configured timeout")
         try:
             from anthropic import AnthropicVertex
         except ImportError as exc:
@@ -121,6 +123,8 @@ class VertexClaudeSWEBenchAgent(SWEBenchAgent):
         self._client = AnthropicVertex(
             project_id=self._project_id,
             region=self._region,
+            timeout=self.timeout_s,
+            max_retries=0,
         )
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_kwargs: dict[str, Any] = dict(extra_kwargs or {})
@@ -163,14 +167,14 @@ class VertexClaudeSWEBenchAgent(SWEBenchAgent):
             stats["error"] = f"api_status_{exc.status_code}"
             stats["stderr_tail"] = str(exc.message)[:500]
             return "", stats
+        except anthropic.APITimeoutError:
+            _log.warning("Vertex request timed out after %.0fs", self.timeout_s)
+            stats["error"] = "timeout"
+            return "", stats
         except anthropic.APIConnectionError as exc:
             _log.warning("Vertex connection error: %s", exc)
             stats["error"] = "connection_error"
             stats["stderr_tail"] = str(exc)[:500]
-            return "", stats
-        except anthropic.APITimeoutError:
-            _log.warning("Vertex request timed out after %.0fs", self.timeout_s)
-            stats["error"] = "timeout"
             return "", stats
 
         raw = ""

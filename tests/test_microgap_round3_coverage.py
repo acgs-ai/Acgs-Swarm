@@ -4,7 +4,7 @@ Targets:
 - privacy_accountant.py lines 125-126  (ValueError in RDP→epsilon math)
 - swarm_coordinator.py lines 154-155  (ImportError for gossip transport)
 - swe_bench/codex_agent.py lines 163-164  (OSError on last_path.read_text)
-- swe_bench/local_harness.py line 327  (patch(1) fallback out concatenation)
+- swe_bench/local_harness.py  (no patch(1) fallback: apply fails closed)
 - settlement_store.py line 91  (empty-line skip in load_all)
 - execution.py lines 70-71  (KeyError→ValueError in contract_status_from_execution)
 """
@@ -107,7 +107,8 @@ class TestCodexAgentOSErrorOnRead:
 
         with (
             patch(
-                "constitutional_swarm.swe_bench.codex_agent.subprocess.run", return_value=mock_proc
+                "constitutional_swarm.swe_bench.codex_agent._run_process",
+                return_value=mock_proc,
             ),
             patch("pathlib.Path.read_text", side_effect=OSError("permission denied")),
             patch("pathlib.Path.unlink"),
@@ -120,29 +121,22 @@ class TestCodexAgentOSErrorOnRead:
 
 
 # ---------------------------------------------------------------------------
-# swe_bench/local_harness.py line 327
+# swe_bench/local_harness.py — no patch(1) fallback (fail closed)
 # ---------------------------------------------------------------------------
-class TestLocalHarnessPatchFallbackConcat:
-    """Trigger line 327: out += '---patch(1)---' when patch command fails."""
+class TestLocalHarnessNoPatchFallback:
+    """All git-apply strategies failing must fail closed without invoking patch(1)."""
 
-    def test_apply_patch_patch_command_fails_concatenates_output(self):
-        """All git apply variants fail → patch(1) found → patch fails → out concatenated."""
+    def test_apply_patch_never_invokes_patch1(self):
         from constitutional_swarm.swe_bench.local_harness import HarnessResult, LocalSWEBenchHarness
 
         harness = LocalSWEBenchHarness()
         result = HarnessResult(instance_id="test-1")
         worktree = Path("/tmp/fake_worktree")
-
-        call_count = 0
+        commands: list[list[str]] = []
 
         def mock_run(cmd, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if "patch" in cmd and cmd[0] == "patch":
-                # patch(1) command itself — return failure
-                return 1, "patch command failed output"
-            # All git apply variants fail
-            return 1, f"git apply failed {call_count}"
+            commands.append(list(cmd))
+            return 1, f"git apply failed {len(commands)}"
 
         with (
             patch("constitutional_swarm.swe_bench.local_harness._run", side_effect=mock_run),
@@ -150,12 +144,11 @@ class TestLocalHarnessPatchFallbackConcat:
         ):
             harness._apply_patch(worktree, "diff --git a/f.py b/f.py\n", result)
 
-        # Line 327 was hit: out was concatenated with patch(1) output
         assert result.applied is False
-        assert "---patch(1)---" in (result.log_tail or "")
+        assert result.error == "patch did not apply"
+        assert commands and all(cmd[0] == "git" for cmd in commands)
 
-    def test_apply_patch_patch_command_fails_log_tail_has_both_outputs(self):
-        """Verify the combined log tail includes both git apply and patch(1) output."""
+    def test_apply_patch_failure_log_tail_has_git_apply_output(self):
         from constitutional_swarm.swe_bench.local_harness import HarnessResult, LocalSWEBenchHarness
 
         harness = LocalSWEBenchHarness()
@@ -163,8 +156,6 @@ class TestLocalHarnessPatchFallbackConcat:
         worktree = Path("/tmp/fake_worktree")
 
         def mock_run(cmd, **kwargs):
-            if "patch" in cmd and cmd[0] == "patch":
-                return 1, "patch1_fail_output"
             return 1, "git_apply_fail"
 
         with (
@@ -174,7 +165,8 @@ class TestLocalHarnessPatchFallbackConcat:
             harness._apply_patch(worktree, "--- a/f.py\n+++ b/f.py\n", result)
 
         assert result.log_tail is not None
-        assert "patch1_fail_output" in result.log_tail
+        assert "git_apply_fail" in result.log_tail
+        assert "---patch(1)---" not in result.log_tail
 
 
 # ---------------------------------------------------------------------------

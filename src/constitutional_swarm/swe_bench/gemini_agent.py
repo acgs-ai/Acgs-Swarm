@@ -26,6 +26,7 @@ Requirements
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -81,8 +82,11 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
+        if extra_config and "http_options" in extra_config:
+            raise ValueError("extra_config cannot override http_options")
         try:
             from google import genai
+            from google.genai import types as genai_types
         except ImportError as exc:
             raise ImportError(
                 "google-genai is required. Install with "
@@ -92,6 +96,10 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
             vertexai=True,
             project=self._project_id,
             location=self._region,
+            http_options=genai_types.HttpOptions(
+                timeout=max(1, math.ceil(self.timeout_s * 1000)),
+                retry_options=genai_types.HttpRetryOptions(attempts=1),
+            ),
         )
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_config: dict[str, Any] = dict(extra_config or {})

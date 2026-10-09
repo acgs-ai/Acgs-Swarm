@@ -15,14 +15,18 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from constitutional_swarm.swe_bench.agent import SWEBenchAgent
+from constitutional_swarm.swe_bench._subprocess import (
+    _run_process,
+    _subprocess_env as _minimal_subprocess_env,
+    _terminate_process_tree as _terminate_shared_process_tree,
+)
+from constitutional_swarm.swe_bench.agent import SWEBenchAgent, _validate_timeout_seconds
 
 BACKEND_MINI_EXTERNAL_BASELINE = "mini_external_baseline"
 SCORE_SOURCE_NOT_EVALUATED = "not_evaluated"
@@ -92,7 +96,7 @@ class MiniSweBenchRunner:
     ) -> None:
         self.mini_binary = mini_binary
         self.model = model
-        self.timeout_s = timeout_s
+        self.timeout_s = _validate_timeout_seconds(timeout_s)
         self.extra_args = list(extra_args or [])
         self.work_dir = Path(work_dir).expanduser().resolve() if work_dir is not None else None
         self.env = dict(env or {})
@@ -370,46 +374,20 @@ def _run_command(
     cwd: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.Popen(
+    return _run_process(
         cmd,
+        timeout_s=timeout_s,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
         env=_subprocess_env(env),
-        start_new_session=True,
     )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
-        raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout, stderr=stderr)
 
 
 def _subprocess_env(env: dict[str, str]) -> dict[str, str]:
-    safe_env = {"PATH": os.environ.get("PATH", "")}
-    if os.name == "nt" and "SYSTEMROOT" in os.environ:
-        safe_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
-    safe_env.update(env)
-    return safe_env
+    return _minimal_subprocess_env(env)
 
 
 def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except OSError:
-        proc.kill()
-        return
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            proc.kill()
+    _terminate_shared_process_tree(proc)
 
 
 def _as_list(value: Any) -> list[str]:

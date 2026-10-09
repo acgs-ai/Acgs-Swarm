@@ -47,6 +47,8 @@ and indexable layers — no hard transformers dependency at import time.
 from __future__ import annotations
 
 import importlib.util
+import threading
+import warnings
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 try:
@@ -123,7 +125,25 @@ class _BODESHook:
 
         # Diagnostic counters — reset per forward pass by LatentDNAWrapper
         self.interventions: int = 0
+        self.steer_failures: int = 0
         self.total_tokens: int = 0
+        self._stats_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._tensor_cache: dict[tuple[torch.device, torch.dtype], Tensor] = {}
+
+    def _vector_for(self, hidden: Tensor) -> Tensor:
+        """Return the immutable steering vector cached for this placement."""
+        key = (hidden.device, hidden.dtype)
+        with self._cache_lock:
+            cached = self._tensor_cache.get(key)
+            if cached is not None:
+                return cached
+            vector = self.v_viol.to(hidden.device, hidden.dtype)
+            vector_norm = vector.norm()
+            if (vector_norm - 1.0).abs() > 1e-5:
+                vector = vector / vector_norm
+            self._tensor_cache[key] = vector
+            return vector
 
     def __call__(
         self,
@@ -146,13 +166,10 @@ class _BODESHook:
 
         # hidden: [batch, seq_len, hidden_dim]
         batch, seq_len, _hidden_dim = hidden.shape
-        self.total_tokens += batch * seq_len
+        with self._stats_lock:
+            self.total_tokens += batch * seq_len
 
-        v = self.v_viol.to(hidden.device, hidden.dtype)  # [hidden_dim]
-        # Re-normalize after dtype/device transfer to prevent precision drift
-        v_norm = v.norm()
-        if (v_norm - 1.0).abs() > 1e-5:
-            v = v / v_norm
+        v = self._vector_for(hidden)
 
         # Projection: [batch, seq_len]
         # proj[b, s] = hidden[b, s] · v_viol
@@ -161,8 +178,7 @@ class _BODESHook:
         # CBF condition: steer where proj > threshold
         mask = proj > self.threshold  # [batch, seq_len], bool
 
-        n_interventions = mask.sum().item()
-        self.interventions += int(n_interventions)
+        n_interventions = int(mask.sum().item())
 
         if n_interventions > 0:
             # Orthogonal steering: h_safe = h - gamma * (h·v) * v
@@ -180,11 +196,20 @@ class _BODESHook:
                 # Only subtract where mask is True — preserves safe tokens exactly
                 mask_expanded = mask.unsqueeze(-1).expand_as(hidden)  # [batch, seq_len, hidden_dim]
                 hidden = torch.where(mask_expanded, hidden - steering_delta, hidden)
-            except (RuntimeError, torch.cuda.OutOfMemoryError):
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
                 # Steering failed (OOM or numerical) — fail open to preserve
                 # model functionality. The downstream AgentDNA.validate layer
                 # will catch any violations that survive.
-                pass
+                with self._stats_lock:
+                    self.steer_failures += n_interventions
+                warnings.warn(
+                    f"BODES steering failed for {n_interventions} token(s): {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                with self._stats_lock:
+                    self.interventions += n_interventions
 
         if rest is None:
             return hidden
@@ -252,7 +277,40 @@ class _BODESSubspaceHook:
         self.gamma = gamma
 
         self.interventions: int = 0
+        self.steer_failures: int = 0
         self.total_tokens: int = 0
+        self._stats_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._tensor_cache: dict[
+            tuple[torch.device, torch.dtype],
+            tuple[Tensor, Tensor, Tensor | None, Tensor | None],
+        ] = {}
+
+    def _tensors_for(
+        self,
+        hidden: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+        """Return immutable subspace tensors cached for this placement."""
+        key = (hidden.device, hidden.dtype)
+        with self._cache_lock:
+            cached = self._tensor_cache.get(key)
+            if cached is not None:
+                return cached
+            basis = self.basis.to(hidden.device, hidden.dtype)
+            mean = self.mean.to(hidden.device, hidden.dtype)
+            whitener = (
+                self.whitener.to(hidden.device, hidden.dtype)
+                if self.whitener is not None
+                else None
+            )
+            dewhitener = (
+                self.dewhitener.to(hidden.device, hidden.dtype)
+                if self.dewhitener is not None
+                else None
+            )
+            cached = (basis, mean, whitener, dewhitener)
+            self._tensor_cache[key] = cached
+            return cached
 
     def __call__(
         self,
@@ -268,22 +326,27 @@ class _BODESSubspaceHook:
             rest = None
 
         batch, seq_len, hidden_dim = hidden.shape
-        self.total_tokens += batch * seq_len
+        with self._stats_lock:
+            self.total_tokens += batch * seq_len
 
         if hidden_dim != self.dim:
-            # Fail-open: shape mismatch means the hook was misconfigured for
-            # this layer. Preserve model functionality — downstream string
-            # validation still catches violations.
+            affected_tokens = batch * seq_len
+            with self._stats_lock:
+                self.steer_failures += affected_tokens
+            warnings.warn(
+                "BODES subspace dimension mismatch: "
+                f"expected {self.dim}, got {hidden_dim}; "
+                f"steering skipped for {affected_tokens} token(s)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return output
 
-        B = self.basis.to(hidden.device, hidden.dtype)  # (k, d)
-        mu = self.mean.to(hidden.device, hidden.dtype)  # (d,)
+        B, mu, W, Winv = self._tensors_for(hidden)
 
         centered = hidden - mu  # [B, S, d]
         if self.is_leace:
-            assert self.whitener is not None and self.dewhitener is not None
-            W = self.whitener.to(hidden.device, hidden.dtype)  # (d, d)
-            Winv = self.dewhitener.to(hidden.device, hidden.dtype)  # (d, d)
+            assert W is not None and Winv is not None
             # Whiten before projecting: centered_w = centered @ W.T
             centered_w = centered @ W.T  # [B, S, d]
             coords = centered_w @ B.T  # [B, S, k]
@@ -294,13 +357,13 @@ class _BODESSubspaceHook:
         per_comp_mask = coords > self.threshold  # [B, S, k], bool
         any_mask = per_comp_mask.any(dim=-1)  # [B, S]
         n_interventions = int(any_mask.sum().item())
-        self.interventions += n_interventions
 
         if n_interventions > 0:
             try:
                 zero = torch.zeros_like(coords)
                 masked_coords = torch.where(per_comp_mask, coords, zero)  # [B, S, k]
                 if self.is_leace:
+                    assert Winv is not None
                     # bad = (masked_coords @ B) @ Winv.T  — match numpy steer()
                     bad = (masked_coords @ B) @ Winv.T  # [B, S, d]
                 else:
@@ -308,9 +371,18 @@ class _BODESSubspaceHook:
                     bad = masked_coords @ B  # [B, S, d]
                 steering_delta = self.gamma * bad
                 hidden = hidden - steering_delta
-            except (RuntimeError, torch.cuda.OutOfMemoryError):
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
                 # Fail-open on OOM / numerical failure — string validator backstops.
-                pass
+                with self._stats_lock:
+                    self.steer_failures += n_interventions
+                warnings.warn(
+                    f"BODES steering failed for {n_interventions} token(s): {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                with self._stats_lock:
+                    self.interventions += n_interventions
 
         if rest is None:
             return hidden
@@ -435,8 +507,10 @@ class LatentDNAWrapper:
         """Register the BODES hook. Idempotent."""
         if self._handle is not None:
             return
-        self._hook_impl.interventions = 0
-        self._hook_impl.total_tokens = 0
+        with self._hook_impl._stats_lock:
+            self._hook_impl.interventions = 0
+            self._hook_impl.steer_failures = 0
+            self._hook_impl.total_tokens = 0
         self._handle = self._target_layer.register_forward_hook(self._hook_impl)
 
     def disable(self) -> None:
@@ -455,11 +529,14 @@ class LatentDNAWrapper:
 
     def intervention_stats(self) -> dict[str, Any]:
         """Return hook diagnostic statistics from the last enabled session."""
-        total = self._hook_impl.total_tokens
-        steered = self._hook_impl.interventions
+        with self._hook_impl._stats_lock:
+            total = self._hook_impl.total_tokens
+            steered = self._hook_impl.interventions
+            steer_failures = self._hook_impl.steer_failures
         return {
             "total_tokens": total,
             "steered_tokens": steered,
+            "steer_failures": steer_failures,
             "intervention_rate": steered / total if total > 0 else 0.0,
             "layer_idx": self.layer_idx,
             "threshold": self._hook_impl.threshold,

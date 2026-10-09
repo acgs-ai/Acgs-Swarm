@@ -69,15 +69,22 @@ def test_run_langgraph_returns_expected_shape() -> None:
     assert set(result.keys()) == {
         "patches",
         "total",
+        "patch_generated",
+        "patch_rate",
         "resolved",
         "resolve_rate",
+        "evaluation_mode",
         "crdt_size",
         "governed_count",
         "mean_intervention",
+        "mean_duration_s",
     }
     assert result["total"] == 3
+    assert result["patch_generated"] == 3
+    assert result["patch_rate"] == pytest.approx(1.0)
     assert result["resolved"] == 3
     assert result["resolve_rate"] == pytest.approx(1.0)
+    assert result["evaluation_mode"] == "patch_generation_only"
     assert result["crdt_size"] == 3
     # Stub _SuccessAgent has wrapper=None, so governed=False on every patch.
     assert result["governed_count"] == 0

@@ -8,19 +8,14 @@ not bypass those checks.
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
-
-
-def _serialize_state(state: Any) -> str:
-    """Canonical JSON for CRDT payload. Strips ``messages`` (BaseMessage objects)."""
-    if not isinstance(state, dict):
-        return json.dumps({"value": str(state)}, sort_keys=True, separators=(",", ":"))
-    safe = {k: v for k, v in state.items() if k != "messages"}
-    return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
+from constitutional_swarm.langgraph_runtime.state import (
+    SwarmGraphState,
+    serialize_for_crdt,
+)
 
 
 async def stream_to_crdt(
@@ -41,23 +36,47 @@ async def stream_to_crdt(
 
     Yields each chunk so callers can do their own observation.
     """
+    constitutional_hash = inputs.get("constitutional_hash", "")
+    if constitutional_hash != CONSTITUTIONAL_HASH:
+        raise ValueError(
+            "constitutional hash mismatch: "
+            f"expected {CONSTITUTIONAL_HASH!r}, got {constitutional_hash!r}"
+        )
+
     cfg = config or {"configurable": {"thread_id": inputs.get("task_id", "stream")}}
 
+    snapshot = dict(inputs)
     async for chunk in graph.astream(inputs, config=cfg, stream_mode="updates"):
         # chunk shape under stream_mode="updates": {node_name: state_update_dict}
-        if isinstance(chunk, dict) and settle_node_name in chunk:
-            settled_update = chunk[settle_node_name]
-            payload_state = {**inputs, **(settled_update or {})}
-            payload_state.setdefault("constitutional_hash", CONSTITUTIONAL_HASH)
-            payload = _serialize_state(payload_state)
-            governed = bool(payload_state.get("governed", False))
-            crdt.append(
-                payload=payload,
-                bodes_passed=governed,
-                constitutional_hash=CONSTITUTIONAL_HASH,
-            )
-            if gossip_node is not None:
-                await gossip_node.gossip_round(n_peers=gossip_peers)
+        if isinstance(chunk, dict):
+            for update in chunk.values():
+                if not isinstance(update, dict):
+                    continue
+                if (
+                    "constitutional_hash" in update
+                    and update["constitutional_hash"] != constitutional_hash
+                ):
+                    raise ValueError(
+                        "streamed constitutional hash does not match validated input: "
+                        f"{update['constitutional_hash']!r}"
+                    )
+                snapshot.update(update)
+            snapshot["constitutional_hash"] = constitutional_hash
+
+            if (
+                settle_node_name in chunk
+                and snapshot.get("governance_status") == "accepted"
+                and snapshot.get("settled") is True
+                and snapshot.get("governed") is True
+            ):
+                payload = serialize_for_crdt(cast("SwarmGraphState", snapshot))
+                crdt.append(
+                    payload=payload,
+                    bodes_passed=True,
+                    constitutional_hash=constitutional_hash,
+                )
+                if gossip_node is not None:
+                    await gossip_node.gossip_round(n_peers=gossip_peers)
         yield chunk
 
 

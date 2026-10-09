@@ -48,6 +48,9 @@ def validate_node(state: Mapping[str, Any], *, dna: Any) -> dict[str, Any]:
     Empty patch short-circuits with empty violations + zero risk (matches the
     'no_patch_to_govern' branch in swe_bench/governed_agent.py:109).
     """
+    if dna is None:
+        raise ValueError("dna is required for constitutional patch validation")
+
     patch = state.get("patch", "")
     if not patch:
         return {"violations": [], "risk_score": 0.0, "governed": True}
@@ -77,19 +80,30 @@ def generate_node(
     return {
         "patch": patch,
         "intervention_rate": float(stats.get("intervention_rate", 0.0)),
-        "constitutional_hash": CONSTITUTIONAL_HASH,
     }
 
 
 def append_crdt_node(state: Mapping[str, Any], *, crdt: Any) -> dict[str, Any]:
     """Append the current state to a MerkleCRDT.  Returns the new CID in state."""
+    constitutional_hash = state.get("constitutional_hash", "")
+    if constitutional_hash != CONSTITUTIONAL_HASH:
+        raise ValueError(
+            "constitutional hash mismatch: "
+            f"expected {CONSTITUTIONAL_HASH!r}, got {constitutional_hash!r}"
+        )
+    if crdt is None:
+        return {"cid": ""}
     # ``dict(state)`` matches the eventual Unit 2 ``serialize_for_crdt`` signature
     # (operates on a concrete dict, not the ``Mapping`` protocol). The cast bridges
     # the read-only ``Mapping`` parameter to the ``SwarmGraphState`` TypedDict the
     # serializer declares; keys are a superset by construction.
     payload = _serialize_for_crdt(cast("SwarmGraphState", dict(state)))
     governed = bool(state.get("governed", False))
-    node = crdt.append(payload=payload, bodes_passed=governed)
+    node = crdt.append(
+        payload=payload,
+        bodes_passed=governed,
+        constitutional_hash=constitutional_hash,
+    )
     # MerkleCRDT.append returns a DAGNode whose CID lives on .cid; stubs may
     # return a plain string -- coerce uniformly via str().
     cid = getattr(node, "cid", node)
