@@ -23,10 +23,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from ._staging import _StagedBatch
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Chain submitter interface (pluggable — stub or real Bittensor extrinsic)
@@ -258,11 +264,20 @@ class ChainAnchor:
         submitter: ChainSubmitter | None = None,
         batch_size: int = 100,
     ) -> None:
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+        ):
+            raise ValueError("batch_size must be a positive integer")
         self._constitutional_hash = constitutional_hash
         self._submitter: ChainSubmitter = submitter or InMemorySubmitter()
         self._batch_size = batch_size
-        self._pending: list[ProofEvidence] = []
+        self._pending: _StagedBatch[ProofEvidence] = _StagedBatch()
         self._history: list[AnchorRecord] = []
+        self._state_lock = threading.RLock()
+        self._flush_guard = threading.Lock()
+        self._last_flush_error: Exception | None = None
 
     @property
     def constitutional_hash(self) -> str:
@@ -270,21 +285,35 @@ class ChainAnchor:
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return self._pending.pending_count
 
     @property
     def anchor_history(self) -> list[AnchorRecord]:
-        return list(self._history)
+        with self._state_lock:
+            return list(self._history)
+
+    @property
+    def last_flush_error(self) -> Exception | None:
+        """Most recent external auto/explicit flush error, cleared on success."""
+        with self._state_lock:
+            return self._last_flush_error
 
     @property
     def total_proofs_anchored(self) -> int:
-        return sum(r.proof_count for r in self._history)
+        with self._state_lock:
+            return sum(r.proof_count for r in self._history)
 
     def add_proof(self, proof: ProofEvidence) -> AnchorRecord | None:
         """Add a proof to the pending batch.
 
         Auto-flushes when the batch is full.
         Returns the AnchorRecord if a flush occurred, else None.
+
+        The proof is accepted once appended. If the automatic external submit
+        fails, this method logs the failure, leaves the stable batch pending,
+        records it in ``last_flush_error``, and returns None. A later explicit
+        ``flush()`` retries and propagates any submit failure.
 
         Raises ValueError if the proof's constitutional hash does not
         match the anchor's expected hash.
@@ -295,67 +324,95 @@ class ChainAnchor:
                 f"expected={self._constitutional_hash} "
                 f"got={proof.constitutional_hash}"
             )
-        self._pending.append(proof)
-        if len(self._pending) >= self._batch_size:
-            return self.flush()
+        with self._state_lock:
+            self._pending.append(proof)
+            should_flush = self._pending.pending_count >= self._batch_size
+        if should_flush:
+            return self._flush(auto=True)
         return None
 
     def flush(self) -> AnchorRecord | None:
         """Flush the pending batch to chain.
 
         Returns the AnchorRecord if there were pending proofs, else None.
-        Pending proofs are cleared on success.
+        Pending proofs are cleared on success. One call processes exactly the
+        stable prefix staged at its start. Proofs appended during external I/O
+        remain queued, even if that suffix reaches ``batch_size``; call
+        ``flush()`` again (or add another proof) to process the suffix.
         """
-        if not self._pending:
-            return None
+        return self._flush(auto=False)
 
-        batch = list(self._pending)
-        self._pending = []
+    def _flush(self, *, auto: bool) -> AnchorRecord | None:
+        if not self._flush_guard.acquire(blocking=False):
+            if auto:
+                return None
+            raise RuntimeError("flush already in progress")
+        try:
+            with self._state_lock:
+                batch = self._pending.stage()
+            if not batch:
+                return None
 
-        # Compute leaf hashes and Merkle root
-        leaves = [p.membership_leaf() for p in batch]
-        batch_root = _compute_merkle_root(leaves)
-
-        # Submit to chain
-        block_height = self._submitter.submit(
-            batch_root=batch_root,
-            constitutional_hash=self._constitutional_hash,
-            proof_count=len(batch),
-        )
-
-        # Create immutable record
-        record = AnchorRecord(
-            anchor_id=uuid.uuid4().hex[:8],
-            batch_root=batch_root,
-            constitutional_hash=self._constitutional_hash,
-            proof_count=len(batch),
-            block_height=block_height,
-            submitted_at=time.time(),
-            proof_ids=tuple(p.proof_id for p in batch),
-            leaf_hashes=tuple(leaves),
-        )
-        self._history.append(record)
-        return record
+            leaves = [p.membership_leaf() for p in batch]
+            batch_root = _compute_merkle_root(leaves)
+            try:
+                block_height = self._submitter.submit(
+                    batch_root=batch_root,
+                    constitutional_hash=self._constitutional_hash,
+                    proof_count=len(batch),
+                )
+            except Exception as exc:
+                with self._state_lock:
+                    self._last_flush_error = exc
+                if auto:
+                    logger.exception(
+                        "automatic chain-anchor flush failed; proof remains pending"
+                    )
+                    return None
+                raise
+            record = AnchorRecord(
+                anchor_id=uuid.uuid4().hex[:8],
+                batch_root=batch_root,
+                constitutional_hash=self._constitutional_hash,
+                proof_count=len(batch),
+                block_height=block_height,
+                submitted_at=time.time(),
+                proof_ids=tuple(p.proof_id for p in batch),
+                leaf_hashes=tuple(leaves),
+            )
+            with self._state_lock:
+                self._history.append(record)
+                self._pending.commit()
+                self._last_flush_error = None
+            return record
+        finally:
+            self._flush_guard.release()
 
     def verify_proof_in_history(self, proof: ProofEvidence) -> AnchorRecord | None:
         """Find and return the AnchorRecord that contains this proof.
 
         Returns None if the proof is not found in any anchor batch.
         """
-        for record in self._history:
+        with self._state_lock:
+            history = tuple(self._history)
+        for record in history:
             if record.verify_membership(proof):
                 return record
         return None
 
     def summary(self) -> dict[str, Any]:
-        return {
-            "constitutional_hash": self._constitutional_hash,
-            "batch_size": self._batch_size,
-            "pending": self._pending_count_safe(),
-            "total_anchored": self.total_proofs_anchored,
-            "batches_submitted": len(self._history),
-            "latest_block": self._history[-1].block_height if self._history else None,
-        }
+        with self._state_lock:
+            return {
+                "constitutional_hash": self._constitutional_hash,
+                "batch_size": self._batch_size,
+                "pending": self._pending.pending_count,
+                "total_anchored": sum(r.proof_count for r in self._history),
+                "batches_submitted": len(self._history),
+                "latest_block": self._history[-1].block_height
+                if self._history
+                else None,
+            }
 
     def _pending_count_safe(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return self._pending.pending_count

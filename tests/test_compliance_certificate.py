@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import constitutional_swarm.bittensor.compliance_certificate as certificate_module
 from constitutional_swarm.bittensor.compliance_certificate import (
     AuditPeriod,
     CertificateIssuer,
@@ -78,9 +79,8 @@ class TestComplianceSnapshot:
         assert s.escalation_rate == pytest.approx(0.03)
 
     def test_zero_decisions(self):
-        s = ComplianceSnapshot(0, 0, 0, 0, CONST_HASH)
-        assert s.compliance_rate == 1.0
-        assert s.escalation_rate == 0.0
+        with pytest.raises(ValueError, match="total_decisions must be greater than zero"):
+            ComplianceSnapshot(0, 0, 0, 0, CONST_HASH)
 
     def test_to_dict(self):
         s = _good_snapshot()
@@ -205,10 +205,16 @@ class TestCertificateIssuer:
         issuer.revoke(cert.cert_id, reason="hash changed")
         assert issuer.verify(cert) is False
 
-    def test_expired_cert_invalid(self):
+    def test_zero_lifetime_rejected(self):
         issuer = self._issuer()
-        cert = issuer.issue("e1", _period(), _good_snapshot(), valid_for_days=0)
-        # Expires immediately (0 days)
+        with pytest.raises(ValueError, match="valid_for_days must be greater than zero"):
+            issuer.issue("e1", _period(), _good_snapshot(), valid_for_days=0)
+
+    def test_expired_cert_invalid(self, monkeypatch):
+        issuer = self._issuer()
+        cert = issuer.issue("e1", _period(), _good_snapshot(), valid_for_days=1)
+        monkeypatch.setattr(certificate_module.time, "time", lambda: cert.expires_at + 1)
+
         assert cert.is_expired is True
         assert issuer.verify(cert) is False
 
