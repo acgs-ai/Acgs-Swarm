@@ -7,13 +7,13 @@ on the trust matrix H(t) ∈ ℝⁿˣⁿ, integrated via a custom Projected RK4 
 State variable: S(t) = H(t), the nxn trust/routing matrix (Candidate A).
 
 At each RK4 step, the derivative dH/dt = f_θ(H, t) is evaluated in Euclidean
-space, then the result is projected back onto the spectral sphere and injected
-with the residual alpha * I. This guarantees BIBO stability without computing tangent
+space, then blended with the residual alpha * I before a final projection onto
+the spectral sphere. This guarantees BIBO stability without computing tangent
 spaces of the spectral norm ball (which requires differentiating through SVD).
 
 The approach directly extends Phase 2:
     Discrete:   H_{k+1} = spectral_project(alpha * I + (1 - alpha) * (H_k @ H_0))
-    Continuous: H(t+dt) = spectral_project(alpha * I + (1 - alpha) * RK4_step(f, H, t, dt))
+    Continuous: H(t+dt) = spectral_project((1 - alpha) * RK4_step(f, H, t, dt) + alpha * I)
 
 Dependencies: torch (optional, same isolation as latent_dna.py).
 """
@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -36,8 +38,10 @@ except ImportError as exc:
     raise ImportError("swarm_ode requires torch. Install with: pip install torch>=2.0") from exc
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
+from constitutional_swarm.privacy_accountant import PrivacyAccountant, matrix_l2_sensitivity
 
 _DRAND_CHAIN_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_DISCRETE_GAUSSIAN_SUPPORT_SIZE = 1_000_001
 
 
 class SwarmVectorField(Protocol):
@@ -118,19 +122,86 @@ def spectral_project_torch(
     r: float = 1.0,
     max_power_iter: int = 20,
 ) -> Tensor:
-    """Project H onto the spectral sphere ‖H‖₂ ≤ r. Differentiable-safe."""
+    """Approximately project ``H`` toward the spectral sphere ``‖H‖₂ ≤ r``.
+
+    The stochastic power iterations used here estimate the spectral norm; they
+    do not certify an upper bound. Callers calibrating differential privacy
+    must supply an independently certified spectral bound rather than treating
+    this estimate or the returned matrix as a DP sensitivity certificate.
+    """
     sigma = _spectral_norm_torch(H, max_iter=max_power_iter)
     if sigma <= r + 1e-10:
         return H
     H_proj = H * (r / sigma)
-    # Verification pass: power iteration is a lower bound; re-check and rescale
-    # until the projected matrix is actually within the sphere (≤ 3 passes).
+    # Refinement passes reduce estimator error, but stochastic power iteration
+    # cannot certify that the true spectral norm is within the requested ball.
     for _ in range(3):
         sigma_check = _spectral_norm_torch(H_proj, max_iter=max_power_iter)
         if sigma_check <= r + 1e-10:
             break
         H_proj = H_proj * (r / sigma_check)
     return H_proj
+
+
+def exact_spectral_project_torch(H: Tensor, r: float = 1.0) -> Tensor:
+    """Project a square matrix into ``||H||_2 <= r`` using an exact SVD.
+
+    Unlike :func:`spectral_project_torch`, this helper does not use stochastic
+    power iteration. It computes and rechecks the largest singular value with
+    :func:`torch.linalg.svdvals`, adding a dtype-aware rounding guard when a
+    rescale is required. Inputs must be non-empty, square, finite, real
+    floating-point tensors and ``r`` must be finite and positive.
+
+    The input tensor is returned unchanged when its SVD already certifies the
+    bound. A projected result is returned only after a second SVD verifies
+    ``||H||_2 <= r``; failure to obtain that finite-precision postcondition is
+    reported loudly.
+    """
+    if not isinstance(H, Tensor):
+        raise TypeError(f"H must be a torch.Tensor, got {type(H).__name__}")
+    if H.ndim != 2 or H.shape[0] != H.shape[1] or H.shape[0] == 0:
+        raise ValueError(f"H must be a non-empty square matrix, got shape {tuple(H.shape)}")
+    if not H.is_floating_point():
+        raise TypeError(f"H must use a real floating-point dtype, got {H.dtype}")
+    if not bool(torch.isfinite(H).all().item()):
+        raise ValueError("H must contain only finite values")
+    if (
+        isinstance(r, bool)
+        or not isinstance(r, (int, float))
+        or not math.isfinite(r)
+        or r <= 0
+    ):
+        raise ValueError(f"r must be a finite positive radius, got {r}")
+
+    radius = float(r)
+    certificate_dtype = (
+        torch.float32 if H.dtype in (torch.float16, torch.bfloat16) else H.dtype
+    )
+
+    def certified_norm(matrix: Tensor) -> float:
+        singular_values = torch.linalg.svdvals(matrix.to(dtype=certificate_dtype))
+        norm = float(singular_values.amax().item())
+        if not math.isfinite(norm):
+            raise RuntimeError("SVD did not produce a finite spectral norm")
+        return norm
+
+    norm = certified_norm(H)
+    if norm <= radius:
+        return H
+
+    dtype_epsilon = torch.finfo(certificate_dtype).eps
+    guarded_radius = radius * (1.0 - 8.0 * dtype_epsilon)
+    if guarded_radius <= 0.0 or guarded_radius >= radius:
+        guarded_radius = math.nextafter(radius, 0.0)
+
+    projected = H * (guarded_radius / norm)
+    for _ in range(4):
+        projected_norm = certified_norm(projected)
+        if projected_norm <= radius:
+            return projected
+        projected = projected * (guarded_radius / projected_norm)
+
+    raise RuntimeError("unable to certify the projected spectral norm within radius r")
 
 
 def projected_rk4_step(
@@ -151,8 +222,8 @@ def projected_rk4_step(
         k3 = f(H + dt/2 · k2, t + dt/2)
         k4 = f(H + dt · k3, t + dt)
         H_unprojected = H + dt/6 · (k1 + 2k2 + 2k3 + k4)
-        H_projected = spectral_project(H_unprojected, r)
-        H_next = (1 - alpha) * H_projected + alpha * I
+        H_residual = (1 - alpha) * H_unprojected + alpha * I
+        H_next = spectral_project(H_residual, r)
 
     Args:
         f: Vector field dH/dt = f(H, t).
@@ -164,7 +235,8 @@ def projected_rk4_step(
         max_power_iter: Power iterations for spectral norm estimation.
 
     Returns:
-        H at time t + dt, projected onto the spectral sphere with residual.
+        H at time t + dt after residual injection and final projection onto
+        the spectral sphere.
     """
     k1 = f(H, t)
     k2 = f(H + 0.5 * dt * k1, t + 0.5 * dt)
@@ -286,20 +358,26 @@ def _trust_variance_torch(H: Tensor) -> float:
 
 
 def calibrate_sigma(
-    r: float,
-    residual_alpha: float,
+    *,
+    certified_spectral_bound: float,
+    matrix_dimension: int,
     epsilon: float,
     delta: float,
 ) -> float:
-    """Compute Gaussian noise std-dev for (ε,δ)-DP gossip (NDSS Lemma 4.3).
+    """Calibrate Gaussian noise for an entrywise ``n × n`` matrix release.
 
-    Global sensitivity Δg = 2·(1-α)·r, derived from the fact that the
-    residual injection reduces the Lipschitz constant of the update map
-    from 2r (plain projection) to 2(1-α)r.
+    The flattened L2 sensitivity is the Frobenius diameter of the certified
+    spectral-norm ball: ``Δ2 = 2 * r * sqrt(n)``. The residual coefficient is
+    deliberately absent because the update path does not establish a smaller
+    neighboring-dataset sensitivity. Calibration inverts the accountant's RDP
+    conversion, which is valid across positive epsilon values supported by the
+    configured finite order grid.
 
     Args:
-        r: Spectral radius bound (SpectralSphere parameter).
-        residual_alpha: Identity injection coefficient α ∈ (0,1).
+        certified_spectral_bound: Caller-certified spectral-norm bound ``r``.
+            A stochastic power-iteration estimate is not sufficient.
+        matrix_dimension: Positive matrix dimension ``n`` for the ``n × n``
+            trust matrix.
         epsilon: Privacy budget ε > 0.
         delta: Privacy failure probability δ ∈ (0,1).
 
@@ -307,13 +385,17 @@ def calibrate_sigma(
         σ such that the Gaussian mechanism H̃ = H_proj + N(0,σ²I) satisfies
         (ε,δ)-DP per round.
     """
-    if not (0 < residual_alpha < 1):
-        raise ValueError(f"residual_alpha must be in (0,1), got {residual_alpha}")
-    if epsilon <= 0 or delta <= 0 or delta >= 1:
-        raise ValueError(f"Invalid DP parameters: ε={epsilon}, δ={delta}")
-
-    sensitivity = 2.0 * (1.0 - residual_alpha) * r
-    return sensitivity * math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon
+    sensitivity = matrix_l2_sensitivity(
+        certified_spectral_bound=certified_spectral_bound,
+        matrix_dimension=matrix_dimension,
+    )
+    if not math.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError(f"epsilon must be finite and positive, got {epsilon}")
+    if not math.isfinite(delta) or not (0 < delta < 1):
+        raise ValueError(f"delta must be finite and in (0,1), got {delta}")
+    return PrivacyAccountant(epsilon=epsilon, delta=delta).required_sigma(
+        sensitivity=sensitivity
+    )
 
 
 def add_dp_noise(H_proj: Tensor, sigma: float) -> Tensor:
@@ -321,7 +403,10 @@ def add_dp_noise(H_proj: Tensor, sigma: float) -> Tensor:
 
     Step 4 of Algorithm 1: Z ~ N(0, σ²·I_{n×n}), H̃ = H_proj + Z.
 
-    This must be called AFTER spectral projection and BEFORE broadcast.
+    This must be called AFTER spectral projection and BEFORE broadcast. The
+    sigma must have been calibrated from a caller-certified spectral bound and
+    the released matrix dimension; the projection's stochastic norm estimate
+    is not itself a DP sensitivity certificate.
     The noise is additive; the receiver re-projects to maintain the
     spectral-sphere constraint (post-processing does not hurt DP).
 
@@ -332,7 +417,7 @@ def add_dp_noise(H_proj: Tensor, sigma: float) -> Tensor:
     Returns:
         Noisy matrix H̃ with the same shape as H_proj.
     """
-    if sigma <= 0:
+    if not math.isfinite(sigma) or sigma <= 0:
         raise ValueError(f"sigma must be positive, got {sigma}")
     noise = torch.randn_like(H_proj) * sigma
     return H_proj + noise
@@ -341,8 +426,8 @@ def add_dp_noise(H_proj: Tensor, sigma: float) -> Tensor:
 # ---------------------------------------------------------------------------
 # Discrete Gaussian Sampler (Canonne, Kamath & Steinke 2020)
 # ---------------------------------------------------------------------------
-# Circuit-friendly DP noise: exact integer output verifiable via PMF table.
-# Replaces continuous Gaussian for zk-SNARK compatibility (Noir circuits).
+# Circuit-oriented integer noise from a truncated float64 PMF/CDF approximation.
+# Supports reproducible circuit witnesses; callers retain the full DP analysis.
 # Reference: arXiv:2004.00010 — "The Discrete Gaussian for Differential Privacy"
 # ---------------------------------------------------------------------------
 
@@ -350,19 +435,26 @@ def add_dp_noise(H_proj: Tensor, sigma: float) -> Tensor:
 class DiscreteGaussianSampler:
     """Discrete Gaussian distribution N_Z(0, sigma^2) over the integers.
 
-    Samples from the truncated discrete Gaussian using the alias method
-    with a CDT (Cumulative Distribution Table) lookup — exact integer
-    output with no floating-point rounding artifacts.
+    Samples from a truncated discrete Gaussian approximation using
+    inverse-transform sampling over a float64 CDF (Cumulative Distribution
+    Function). Each integer-valued output is selected by a linear scan of the
+    precomputed CDF. The caller must include truncation error in its privacy
+    analysis; this sampler alone is not an exact DP certificate. The local
+    torch generator receives OS entropy when no seed is supplied, but torch's
+    pseudorandom generator is not a cryptographic RNG.
 
     Properties:
     - Output is an integer in [-tail_bound, +tail_bound]
     - PMF: Pr[X=k] ∝ exp(-k²/(2σ²))
     - The PMF table is pre-computed at construction time; each sample
       is O(tail_bound) for the CDT scan (acceptable for small sigma).
-    - Verifiable: any prover can reconstruct the CDT and check the sample.
+    - Support tables are capped at 1,000,001 entries as a resource-safety
+      contract. This operational cap is not a differential-privacy theorem;
+      callers needing wider support must use a streaming sampler.
+    - Reproducible: a verifier given the seed can reconstruct the CDF stream.
 
     Args:
-        sigma: Standard deviation (sensitivity / noise_multiplier).
+        sigma: Distribution standard deviation.
         tail_bound: Truncation at ±tail_bound (default = ceil(6σ)).
         seed: Optional integer seed for reproducibility.
 
@@ -379,20 +471,36 @@ class DiscreteGaussianSampler:
         tail_bound: int | None = None,
         seed: int | None = None,
     ) -> None:
-        if sigma <= 0:
+        if not math.isfinite(sigma) or sigma <= 0:
             raise ValueError(f"sigma must be positive, got {sigma}")
+        if tail_bound is not None and (
+            isinstance(tail_bound, bool) or not isinstance(tail_bound, int) or tail_bound <= 0
+        ):
+            raise ValueError(f"tail_bound must be a positive integer, got {tail_bound}")
         self._sigma = sigma
         self._seed = seed
         self._noise_call_counter = 0
-        self._tail = tail_bound if tail_bound is not None else max(6, math.ceil(6 * sigma))
-        self._rng = torch.Generator()
-        if seed is not None:
-            self._rng.manual_seed(seed)
+        if tail_bound is None:
+            six_sigma = 6.0 * sigma
+            if not math.isfinite(six_sigma):
+                raise ValueError("sigma implies an unrepresentable default support")
+            tail_bound = max(6, math.ceil(six_sigma))
+        support_size = 2 * tail_bound + 1
+        if support_size > sys.maxsize:
+            raise ValueError("tail_bound implies an unrepresentable support")
+        if support_size > _MAX_DISCRETE_GAUSSIAN_SUPPORT_SIZE:
+            raise ValueError(
+                "discrete Gaussian support table exceeds the resource limit of "
+                f"{_MAX_DISCRETE_GAUSSIAN_SUPPORT_SIZE} entries"
+            )
+        self._tail = tail_bound
+        effective_seed = seed if seed is not None else secrets.randbits(64)
+        self._rng = torch.Generator().manual_seed(effective_seed)
 
         # Build CDT (Cumulative Distribution Table)
         self._support = list(range(-self._tail, self._tail + 1))
         log_unnorm = torch.tensor(
-            [-k * k / (2.0 * sigma * sigma) for k in self._support],
+            [-0.5 * (float(k) / sigma) * (float(k) / sigma) for k in self._support],
             dtype=torch.float64,
         )
         # numerically stable softmax-style normalization
@@ -442,8 +550,8 @@ class DiscreteGaussianSampler:
     ) -> Tensor:
         """Add sensitivity-scaled discrete Gaussian noise to a zero tensor.
 
-        Equivalent to continuous Gaussian but with integer-valued output.
-        Used as drop-in for add_dp_noise() when zk-SNARK verifiability matters.
+        Approximates sensitivity-scaled Gaussian noise with integer-valued,
+        truncated output for circuit-oriented workflows.
 
         Args:
             shape: Output shape.
@@ -452,6 +560,8 @@ class DiscreteGaussianSampler:
         Returns:
             Float tensor of shape ``shape`` containing integer noise values.
         """
+        if not math.isfinite(sensitivity) or sensitivity <= 0:
+            raise ValueError(f"sensitivity must be positive, got {sensitivity}")
         scaled_sigma = self._sigma * sensitivity
         # Derive a unique seed per call to avoid identical noise vectors.
         self._noise_call_counter += 1
@@ -465,7 +575,6 @@ class DiscreteGaussianSampler:
             if sensitivity == 1.0
             else DiscreteGaussianSampler(
                 sigma=scaled_sigma,
-                tail_bound=self._tail,
                 seed=derived_seed,
             )
         )

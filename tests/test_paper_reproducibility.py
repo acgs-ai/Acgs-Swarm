@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import math
 import subprocess
@@ -14,13 +13,13 @@ import pytest
 pytest.importorskip("torch")
 
 from scripts.reproduce_paper_claims import (
+    DP_MATRIX_DIMENSION,
     ICLR_UNMAPPED_IDS,
     NDSS_UNMAPPED_IDS,
     collect_evidence,
     summary,
 )
-
-calibrate_sigma = importlib.import_module("constitutional_swarm.swarm_ode").calibrate_sigma
+from constitutional_swarm.privacy_accountant import PrivacyAccountant, matrix_l2_sensitivity
 
 
 DELTA = 1e-5
@@ -32,22 +31,19 @@ def _read(rel_path: str) -> str:
     return (ROOT / rel_path).read_text(encoding="utf-8")
 
 
-def _gaussian_sigma(*, residual_alpha: float, epsilon: float) -> float:
-    """Paper Eq. sigma with alpha=0 allowed for the baseline column."""
-    if residual_alpha > 0.0:
-        return calibrate_sigma(
-            r=RADIUS,
-            residual_alpha=residual_alpha,
-            epsilon=epsilon,
-            delta=DELTA,
-        )
-
-    sensitivity = 2.0 * (1.0 - residual_alpha) * RADIUS
-    return sensitivity * math.sqrt(2.0 * math.log(1.25 / DELTA)) / epsilon
+def _gaussian_sigma(*, epsilon: float, matrix_dimension: int = DP_MATRIX_DIMENSION) -> float:
+    """Production matrix-Gaussian calibration for a certified spectral bound."""
+    sensitivity = matrix_l2_sensitivity(
+        certified_spectral_bound=RADIUS,
+        matrix_dimension=matrix_dimension,
+    )
+    return PrivacyAccountant(epsilon=epsilon, delta=DELTA).required_sigma(
+        sensitivity=sensitivity
+    )
 
 
-def test_ndss_09_standard_composition_matches_protocol_formula() -> None:
-    """NDSS-09: k-round standard composition follows the protocol text."""
+def test_ndss_09_historical_composition_is_not_the_live_certificate() -> None:
+    """NDSS-09: preserve paper parity while the protocol uses the accountant."""
     per_round_epsilon = 0.25
     per_round_delta = 1e-6
     k_rounds = 16
@@ -57,76 +53,115 @@ def test_ndss_09_standard_composition_matches_protocol_formula() -> None:
 
     assert epsilon_total == pytest.approx(5.256521769756932)
     assert delta_total == pytest.approx(1.6e-5)
+    paper_text = _read("papers/ndss2027/sections/protocol.tex")
+    protocol_text = _read("docs/maci_dp_protocol.md")
+
+    assert "standard composition is approximately" in paper_text
+    assert "Use one session-scoped `PrivacyAccountant`" in protocol_text
+    assert "call `spend`" in protocol_text
+    assert "`assert_budget`" in protocol_text
 
 
-def test_iclr_15_dp_noise_reductions_are_exact_percentages() -> None:
-    """ICLR-15: residual alpha gives exact percentage sigma reductions."""
-    for epsilon in (1.0, 2.0, 4.0, 8.0):
-        baseline = _gaussian_sigma(residual_alpha=0.0, epsilon=epsilon)
+def test_iclr_15_corrected_calibration_uses_matrix_l2_sensitivity() -> None:
+    """ICLR-15 errata: matrix dimension is part of the sensitivity contract."""
+    sensitivity = matrix_l2_sensitivity(
+        certified_spectral_bound=RADIUS,
+        matrix_dimension=DP_MATRIX_DIMENSION,
+    )
 
-        for alpha, expected_reduction in ((0.1, 0.10), (0.2, 0.20), (0.5, 0.50)):
-            sigma = _gaussian_sigma(residual_alpha=alpha, epsilon=epsilon)
-            reduction = 1.0 - (sigma / baseline)
-
-            assert reduction == pytest.approx(expected_reduction)
-
-
-def test_ndss_18_residual_reduces_sigma_by_ten_percent_at_epsilon_2() -> None:
-    """NDSS-18: the epsilon=2 residual-vs-baseline ratio is reproducible."""
-    baseline = _gaussian_sigma(residual_alpha=0.0, epsilon=2.0)
-    residual = _gaussian_sigma(residual_alpha=0.1, epsilon=2.0)
-
-    assert 1.0 - (residual / baseline) == pytest.approx(0.10)
+    assert sensitivity == pytest.approx(2.0 * RADIUS * math.sqrt(DP_MATRIX_DIMENSION))
+    assert _gaussian_sigma(epsilon=1.0) == pytest.approx(57.2103885, rel=1e-8)
 
 
-def test_iclr_15_paper_dp_noise_table_absolute_values_match_calibration() -> None:
-    """ICLR-15: the ICLR DP table uses the same formula as calibrate_sigma()."""
+def test_ndss_18_corrected_calibration_has_no_residual_discount() -> None:
+    """NDSS-18 errata: alpha is absent without a certified Frobenius clip."""
+    evidence = {item.claim_id: item for item in collect_evidence()}["NDSS-18"]
+
+    assert _gaussian_sigma(epsilon=2.0) == pytest.approx(30.3930097, rel=1e-8)
+    assert evidence.measurements["published_epsilon2_baseline_sigma"] == 4.84
+    assert evidence.measurements["published_epsilon2_residual_sigma"] == 4.36
+    assert evidence.measurements["legacy_harness_constants_unverified"] == [1.92, 1.73]
+
+
+def test_iclr_15_paper_dp_noise_table_matches_errata_proposal() -> None:
+    """ICLR-15: immutable old values and corrected proposal stay paired."""
+    old_rows = (
+        "1.0 & 9.69 & 8.72 ($-10\\%$) & 7.75 ($-20\\%$) & 4.84 ($-50\\%$)",
+        "2.0 & 4.84 & 4.36 ($-10\\%$) & 3.88 ($-20\\%$) & 2.42 ($-50\\%$)",
+        "4.0 & 2.42 & 2.18 ($-10\\%$) & 1.94 ($-20\\%$) & 1.21 ($-50\\%$)",
+        "8.0 & 1.21 & 1.09 ($-10\\%$) & 0.97 ($-20\\%$) & 0.61 ($-50\\%$)",
+    )
     expected = {
-        1.0: {0.0: 9.69, 0.1: 8.72, 0.2: 7.75, 0.5: 4.84},
-        2.0: {0.0: 4.84, 0.1: 4.36, 0.2: 3.88, 0.5: 2.42},
-        4.0: {0.0: 2.42, 0.1: 2.18, 0.2: 1.94, 0.5: 1.21},
-        8.0: {0.0: 1.21, 0.1: 1.09, 0.2: 0.97, 0.5: 0.61},
+        1.0: 57.21038854,
+        2.0: 30.3930097,
+        4.0: 16.37049377,
+        8.0: 9.01801824,
     }
     paper_text = _read("papers/iclr2027/sections/experiments.tex")
+    errata_text = _read("papers/DP_SENSITIVITY_ERRATA.md")
 
-    for epsilon, alpha_values in expected.items():
-        for alpha, paper_sigma in alpha_values.items():
-            calibrated = _gaussian_sigma(residual_alpha=alpha, epsilon=epsilon)
+    for old_row in old_rows:
+        assert old_row in paper_text
+        assert old_row in errata_text
+    assert "residual-discount columns" in errata_text
+    for epsilon, corrected_sigma in expected.items():
+        calibrated = _gaussian_sigma(epsilon=epsilon)
 
-            assert calibrated == pytest.approx(paper_sigma, abs=0.005)
-            assert f"{paper_sigma:.2f}" in paper_text
+        assert calibrated == pytest.approx(corrected_sigma, rel=1e-8)
+        assert f"{corrected_sigma:.8f}" in errata_text
 
 
-def test_ndss_17_paper_dp_accuracy_table_matches_calibration() -> None:
-    """NDSS-17: the NDSS DP table uses the same formula as calibrate_sigma()."""
-    expected_theory = {1.0: 8.721, 2.0: 4.360, 4.0: 2.180, 8.0: 1.090}
+def test_ndss_17_paper_dp_accuracy_table_matches_errata_proposal() -> None:
+    """NDSS-17: historical table values map to corrected proposed values."""
+    old_rows = (
+        "1.0 & 8.721 & formula check & exact & Yes",
+        "2.0 & 4.360 & formula check & exact & Yes",
+        "4.0 & 2.180 & formula check & exact & Yes",
+        "8.0 & 1.090 & formula check & exact & Yes",
+    )
+    expected_theory = {
+        1.0: 57.21038854,
+        2.0: 30.3930097,
+        4.0: 16.37049377,
+        8.0: 9.01801824,
+    }
     paper_text = _read("papers/ndss2027/sections/evaluation.tex")
+    errata_text = _read("papers/DP_SENSITIVITY_ERRATA.md")
 
-    for epsilon, paper_sigma in expected_theory.items():
-        calibrated = _gaussian_sigma(residual_alpha=0.1, epsilon=epsilon)
+    for old_row in old_rows:
+        assert old_row in paper_text
+        assert old_row in errata_text
+    assert "no empirical samples" in errata_text
+    for epsilon, corrected_sigma in expected_theory.items():
+        calibrated = _gaussian_sigma(epsilon=epsilon)
 
-        assert calibrated == pytest.approx(paper_sigma, abs=0.0005)
-        assert f"{paper_sigma:.3f}" in paper_text
+        assert calibrated == pytest.approx(corrected_sigma, rel=1e-8)
+        assert f"{corrected_sigma:.8f}" in errata_text
 
 
-def test_ndss_18_paper_absolute_sigma_values_match_calibration() -> None:
-    """NDSS-18: absolute epsilon=2 values match implementation calibration."""
-    baseline = _gaussian_sigma(residual_alpha=0.0, epsilon=2.0)
-    residual = _gaussian_sigma(residual_alpha=0.1, epsilon=2.0)
+def test_ndss_18_paper_absolute_sigma_values_match_errata_proposal() -> None:
+    """NDSS-18: old comparison is retained only as an errata target."""
+    corrected = _gaussian_sigma(epsilon=2.0)
     paper_text = _read("papers/ndss2027/sections/evaluation.tex")
+    errata_text = _read("papers/DP_SENSITIVITY_ERRATA.md")
 
-    assert baseline == pytest.approx(4.84, abs=0.005)
-    assert residual == pytest.approx(4.36, abs=0.005)
+    assert corrected == pytest.approx(30.3930097, rel=1e-8)
     assert "baseline\n$\\sigma = 4.84$" in paper_text
     assert "residual-injection\n$\\sigma = 4.36$" in paper_text
+    assert "No residual-based reduction is certified" in errata_text
 
 
 def test_ndss_10_matrix_noise_bound_uses_conservative_spectral_scale() -> None:
     """NDSS-10: matrix Gaussian noise uses the 2*sqrt(n) spectral-norm scale."""
     n_agents = 50
     sigma = RADIUS / (2.0 * math.sqrt(n_agents))
+    evidence = {item.claim_id: item for item in collect_evidence()}["NDSS-10"]
 
     assert 2.0 * sigma * math.sqrt(n_agents) == pytest.approx(RADIUS)
+    assert evidence.measurements["leading_spectral_scale"] == "2*sigma*sqrt(n)"
+    assert evidence.measurements["heuristic_threshold"] == "sigma <= r/(2*sqrt(n))"
+    assert evidence.measurements["heuristic_only"] is True
+    assert evidence.measurements["privacy_or_tail_certificate"] is False
     assert "$\\sigma \\leq r/(2\\sqrt{n})$" in _read("papers/ndss2027/sections/protocol.tex")
 
 
@@ -202,10 +237,20 @@ def test_remaining_claim_reproducers_all_pass() -> None:
     assert report["failed_claim_ids"] == []
     assert "ICLR-03" in report["withdrawn_claim_ids"]
     assert "ICLR-14" in report["withdrawn_claim_ids"]
-    scored = [item for item in evidence if item.status in {"measured", "formula"}]
+    assert set(report["errata_proposed_ids"]) == {"ICLR-15", "NDSS-17", "NDSS-18"}
+    scored = [
+        item
+        for item in evidence
+        if item.status in {"measured", "formula"}
+        and item.measurements.get("errata_proposed") is not True
+    ]
     assert scored
     assert all(item.passed for item in scored)
     assert all(item.status != "withdrawn" or not item.passed for item in evidence)
+    errata = [item for item in evidence if item.measurements.get("errata_proposed") is True]
+    assert all(not item.passed for item in errata)
+    assert all(item.status == "formula" for item in errata)
+    assert all(item.measurements["corrected_calibration_verified"] for item in errata)
     assert all("2656" not in json.dumps(item.measurements) or item.status == "withdrawn" for item in evidence)
 
 
@@ -247,6 +292,11 @@ def test_reproduce_paper_claims_cli_json() -> None:
     assert payload["summary"]["failed_claim_ids"] == []
     assert payload["summary"]["total"] == 24
     assert "ICLR-03" in payload["summary"]["withdrawn_claim_ids"]
+    assert set(payload["summary"]["errata_proposed_ids"]) == {
+        "ICLR-15",
+        "NDSS-17",
+        "NDSS-18",
+    }
 
 
 def test_claim_map_reproducer_row_matches_live_registry() -> None:
