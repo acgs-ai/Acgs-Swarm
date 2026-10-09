@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import OrderedDict
 
 from acgs_lite import Constitution
@@ -12,6 +13,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
 from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
+
+
+def _constitution_fingerprint(constitution: Constitution) -> str:
+    payload = json.dumps(
+        constitution.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class LocalRemotePeer:
@@ -29,10 +39,12 @@ class LocalRemotePeer:
         replay_window_seconds: float = 300.0,
     ) -> None:
         self.agent_id = agent_id
-        self.constitution = constitution
         self.strict = strict
+        self._constitution = constitution.model_copy(deep=True)
+        self._constitutional_hash = self._constitution.hash
+        self._constitution_fingerprint = _constitution_fingerprint(self._constitution)
         self._dna = AgentDNA(
-            constitution=constitution,
+            constitution=self._constitution,
             agent_id=agent_id,
             strict=strict,
         )
@@ -50,6 +62,18 @@ class LocalRemotePeer:
             format=serialization.PublicFormat.Raw,
         ).hex()
 
+    @property
+    def constitution(self) -> Constitution:
+        """Return a detached view of the constitution evaluated by this peer."""
+        return self._constitution.model_copy(deep=True)
+
+    def _assert_constitution_unchanged(self) -> None:
+        if (
+            self._dna.constitution is not self._constitution
+            or _constitution_fingerprint(self._constitution) != self._constitution_fingerprint
+        ):
+            raise RuntimeError("Remote peer constitution changed after initialization")
+
     def handle_vote_request(self, request: RemoteVoteRequest) -> RemoteVoteResponse:
         if request.voter_id != self.agent_id:
             raise ValueError(
@@ -57,20 +81,27 @@ class LocalRemotePeer:
             )
         if request.voter_public_key != self.public_key_hex:
             raise ValueError("Vote request public key does not match remote peer identity")
-        ConstitutionalMesh.verify_remote_vote_request(
-            request,
-            replay_window_seconds=self._replay_window_seconds,
-            nonce_cache=self._request_nonce_cache,
-        )
+        self._assert_constitution_unchanged()
+        local_constitutional_hash = self._constitutional_hash
+        if request.constitutional_hash != local_constitutional_hash:
+            raise ValueError("Remote vote request constitutional hash does not match local constitution")
         if (
             not self._allow_untrusted_request_signers
             and request.request_signer_public_key not in self._trusted_request_signers
         ):
             raise ValueError("Remote vote request signer is not trusted")
+        ConstitutionalMesh.verify_remote_vote_request(
+            request,
+            replay_window_seconds=self._replay_window_seconds,
+            nonce_cache=self._request_nonce_cache,
+        )
         if hashlib.sha256(request.content.encode("utf-8")).hexdigest()[:32] != request.content_hash:
             raise ValueError("Remote vote request content does not match content hash")
 
         result = self._dna.validate(request.content)
+        self._assert_constitution_unchanged()
+        if result.constitutional_hash != local_constitutional_hash:
+            raise RuntimeError("Remote peer validator used an unexpected constitution")
         approved = result.valid
         reason = "constitutional check passed" if result.valid else "; ".join(result.violations)
         signature = self._private_key.sign(
@@ -79,7 +110,7 @@ class LocalRemotePeer:
                 voter_id=request.voter_id,
                 approved=approved,
                 reason=reason,
-                constitutional_hash=request.constitutional_hash,
+                constitutional_hash=local_constitutional_hash,
                 content_hash=request.content_hash,
             )
         ).hex()
@@ -88,7 +119,7 @@ class LocalRemotePeer:
             voter_id=request.voter_id,
             approved=approved,
             reason=reason,
-            constitutional_hash=request.constitutional_hash,
+            constitutional_hash=local_constitutional_hash,
             content_hash=request.content_hash,
             signature=signature,
         )

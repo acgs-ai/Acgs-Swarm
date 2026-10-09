@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--report-mode",
         action="store_true",
-        help="Report unverifiable signatures without failing solely for that status.",
+        help="Emit report-mode diagnostics; verification remains fail-closed.",
     )
     parser.add_argument(
         "--trusted-signers",

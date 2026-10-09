@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm import ConstitutionalMesh, JSONLSettlementStore, SQLiteSettlementStore
 from constitutional_swarm.governance_receipts import (
     SignatureRecord,
+    ValidatorVote,
     bundle_from_json,
     build_receipt,
     payload_canonical_bytes,
@@ -208,7 +209,13 @@ def test_signed_semantic_contradiction_fails(tmp_path) -> None:
             "content": str(record.assignment.get("content_hash", "none")),
         },
         decision="approved" if not bool(record.result.get("accepted")) else "denied",
-        validator_votes=[ValidatorVote(validator_id="v", decision="approve", rationale="ok")],
+        validator_votes=[
+            ValidatorVote(
+                validator_id="v",
+                decision="approve" if not bool(record.result.get("accepted")) else "deny",
+                rationale="ok",
+            )
+        ],
         rejected_alternative="skip",
         metadata={"assignment_id": assignment.assignment_id, "claim": "local-dsse-shaped-receipt"},
     )
@@ -266,6 +273,9 @@ def test_extra_signed_receipt_in_bundle_fails(tmp_path) -> None:
             "receipt_id": first.payload.receipt_id + "-followup",
             "action": "wrong-action",
             "decision": "denied",
+            "validator_votes": [
+                ValidatorVote(validator_id="v", decision="deny", rationale="denied")
+            ],
             "previous_receipt_hash": receipt_hash(first),
             "evidence_hashes": {
                 "settlement": settlement_canonical_digest(record),

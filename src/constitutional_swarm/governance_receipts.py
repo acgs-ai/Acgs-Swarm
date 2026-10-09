@@ -14,7 +14,7 @@ from typing import Any, Final, Literal
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Final so mypy infers the literal type, matching the Literal[...] model fields.
 PROFILE_VERSION: Final = "acgs.local.intoto-dsse-shaped.v0.1"
@@ -109,6 +109,11 @@ class ReceiptPayload(BaseModel):
             raise ValueError(msg)
         return value
 
+    @model_validator(mode="after")
+    def require_semantic_consistency(self) -> ReceiptPayload:
+        _validate_receipt_payload(self)
+        return self
+
 
 class GovernanceReceipt(BaseModel):
     """Local ACGS v0.1 receipt envelope."""
@@ -166,6 +171,59 @@ class VerificationVerdict(BaseModel):
     signature_status: Literal["valid", "invalid", "unverifiable", "not_checked"]
     issues: list[ReceiptIssue] = Field(default_factory=list)
     receipt_hashes: list[str] = Field(default_factory=list)
+
+
+def _receipt_payload_semantic_issues(payload: ReceiptPayload) -> list[tuple[str, str]]:
+    """Return semantic receipt issues shared by constructors and verifiers."""
+
+    issues: list[tuple[str, str]] = []
+    normalized_validator_ids = [
+        vote.validator_id.strip().casefold() for vote in payload.validator_votes
+    ]
+    if any(not validator_id for validator_id in normalized_validator_ids):
+        issues.append(
+            (
+                "blank_validator_id",
+                "validator IDs must be non-blank",
+            )
+        )
+    if len(set(normalized_validator_ids)) != len(normalized_validator_ids):
+        issues.append(
+            (
+                "duplicate_validator_id",
+                "validator IDs must be unique within a receipt after normalization",
+            )
+        )
+
+    approve_count = sum(vote.decision == "approve" for vote in payload.validator_votes)
+    deny_count = sum(vote.decision == "deny" for vote in payload.validator_votes)
+    abstain_count = sum(vote.decision == "abstain" for vote in payload.validator_votes)
+    decision_supported = (
+        (payload.decision == "approved" and approve_count > deny_count)
+        or (
+            payload.decision == "denied"
+            and deny_count > 0
+            and deny_count >= approve_count
+        )
+        or (
+            payload.decision == "escalated"
+            and (deny_count > 0 or abstain_count > 0)
+        )
+    )
+    if not decision_supported:
+        issues.append(
+            (
+                "decision_vote_mismatch",
+                f"receipt decision {payload.decision!r} is not supported by validator votes",
+            )
+        )
+    return issues
+
+
+def _validate_receipt_payload(payload: ReceiptPayload) -> None:
+    issues = _receipt_payload_semantic_issues(payload)
+    if issues:
+        raise ValueError("; ".join(message for _, message in issues))
 
 
 def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -302,6 +360,7 @@ def build_receipt(
 ) -> GovernanceReceipt:
     """Construct a receipt with the correct digest for the supplied payload."""
 
+    _validate_receipt_payload(payload)
     return GovernanceReceipt(
         payload=payload,
         payload_digest=payload_digest(payload),
@@ -317,8 +376,8 @@ def verify_bundle(
 ) -> VerificationVerdict:
     """Verify a receipt bundle.
 
-    Default mode is fail-closed. Report mode allows unverifiable signatures to be
-    reported without failing the whole bundle, but other integrity failures still fail.
+    Both modes fail closed. Report mode changes the output mode label while preserving
+    signature diagnostics for callers that need a complete report.
     """
 
     issues: list[ReceiptIssue] = []
@@ -367,6 +426,15 @@ def verify_bundle(
                 )
             )
 
+        for code, message in _receipt_payload_semantic_issues(receipt.payload):
+            issues.append(
+                ReceiptIssue(
+                    code=code,
+                    message=message,
+                    receipt_id=receipt_id,
+                )
+            )
+
         payload_bytes = payload_canonical_bytes(receipt.payload)
         signature_statuses.append(
             _verify_receipt_signatures(
@@ -382,14 +450,7 @@ def verify_bundle(
         previous_hash = current_hash
 
     aggregate_signature_status = _aggregate_signature_status(signature_statuses)
-    fatal_issues = [
-        issue
-        for issue in issues
-        if not (report_mode and issue.code == "signature_unverifiable")
-    ]
-    valid = not fatal_issues and (
-        report_mode or aggregate_signature_status not in {"invalid", "unverifiable"}
-    )
+    valid = not issues and aggregate_signature_status == "valid"
 
     return VerificationVerdict(
         valid=valid,

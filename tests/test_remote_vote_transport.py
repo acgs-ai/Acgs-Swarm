@@ -672,7 +672,7 @@ async def test_remote_vote_client_missing_websockets_dependency_raises_import_er
 
 
 def test_transport_security_plaintext_rejects_explicit_ssl_context() -> None:
-    with pytest.raises(ValueError, match="cannot specify both transport_security and ssl_context"):
+    with pytest.raises(ValueError, match="plaintext transport cannot use TLS material"):
         RemoteVoteServer(
             lambda request: RemoteVoteResponse(
                 assignment_id=request.assignment_id,
@@ -688,7 +688,8 @@ def test_transport_security_plaintext_rejects_explicit_ssl_context() -> None:
         )
 
 
-def test_transport_security_tls_forces_ssl_context_creation() -> None:
+def test_transport_security_tls_accepts_supplied_server_context() -> None:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server = RemoteVoteServer(
         lambda request: RemoteVoteResponse(
             assignment_id=request.assignment_id,
@@ -700,9 +701,10 @@ def test_transport_security_tls_forces_ssl_context_creation() -> None:
             signature="00" * 64,
         ),
         transport_security="tls",
+        ssl_context=context,
     )
 
-    assert isinstance(server.ssl_context, ssl.SSLContext)
+    assert server.ssl_context is context
 
 
 @pytest.mark.asyncio
@@ -747,6 +749,7 @@ async def test_transport_security_auto_derives_from_endpoint_scheme(
 
 
 def test_remote_vote_server_auto_derives_ssl_context_from_host_scheme() -> None:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls_server = RemoteVoteServer(
         lambda request: RemoteVoteResponse(
             assignment_id=request.assignment_id,
@@ -759,6 +762,7 @@ def test_remote_vote_server_auto_derives_ssl_context_from_host_scheme() -> None:
         ),
         host="wss://localhost",
         transport_security="auto",
+        ssl_context=context,
     )
     plaintext_server = RemoteVoteServer(
         lambda request: RemoteVoteResponse(
@@ -774,5 +778,5 @@ def test_remote_vote_server_auto_derives_ssl_context_from_host_scheme() -> None:
         transport_security="auto",
     )
 
-    assert isinstance(tls_server.ssl_context, ssl.SSLContext)
+    assert tls_server.ssl_context is context
     assert plaintext_server.ssl_context is None

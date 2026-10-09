@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import ssl
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -57,12 +58,36 @@ def _build_ssl_context(
     mode: Literal["plaintext", "tls"],
     *,
     server_side: bool = False,
+    ssl_context: ssl.SSLContext | None = None,
+    certfile: str | os.PathLike[str] | None = None,
+    keyfile: str | os.PathLike[str] | None = None,
 ) -> ssl.SSLContext | None:
+    """Validate TLS configuration and return the context used by the transport."""
+    if ssl_context is not None and (certfile is not None or keyfile is not None):
+        raise ValueError("cannot combine ssl_context with certfile or keyfile")
+    if keyfile is not None and certfile is None:
+        raise ValueError("keyfile requires certfile")
     if mode == "plaintext":
+        if ssl_context is not None or certfile is not None or keyfile is not None:
+            raise ValueError("plaintext transport cannot use TLS material")
         return None
-    if server_side:
-        return ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    return ssl.create_default_context()
+    if ssl_context is not None:
+        expected_protocol = (
+            ssl.PROTOCOL_TLS_SERVER if server_side else ssl.PROTOCOL_TLS_CLIENT
+        )
+        if ssl_context.protocol != expected_protocol:
+            expected_name = (
+                "PROTOCOL_TLS_SERVER" if server_side else "PROTOCOL_TLS_CLIENT"
+            )
+            raise ValueError(f"TLS context must use {expected_name}")
+        return ssl_context
+    if not server_side:
+        return ssl.create_default_context()
+    if certfile is None:
+        raise ValueError("TLS server requires ssl_context or certfile")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return context
 
 
 @dataclass(frozen=True, slots=True)

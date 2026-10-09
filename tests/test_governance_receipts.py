@@ -75,7 +75,7 @@ def test_golden_payload_canonical_bytes_are_deterministic() -> None:
     assert first == second
     assert (
         payload_digest(payload)
-        == "18bda95d0abc073b2125f6caedcad7701927e030f8ed952453a760a7aa8d3939"
+        == "724b725aa3c483b88bbe37aff7e8756e5b9fd97a7fddc5c480b2539e3a1c6517"
     )
 
 
@@ -135,7 +135,7 @@ def test_role_separation_violation_is_rejected() -> None:
     assert "role_separation_violation" in {issue.code for issue in verdict.issues}
 
 
-def test_signature_unverifiable_fails_closed_but_report_mode_passes() -> None:
+def test_signature_unverifiable_fails_closed_in_report_mode() -> None:
     bundle = valid_provenance_bundle()
     unsigned = bundle.receipts[0].model_copy(
         update={"signatures": [SignatureRecord(key_id="unsigned", algorithm="none")]}
@@ -151,7 +151,7 @@ def test_signature_unverifiable_fails_closed_but_report_mode_passes() -> None:
 
     assert fail_closed.valid is False
     assert fail_closed.signature_status == "unverifiable"
-    assert report.valid is True
+    assert report.valid is False
     assert report.signature_status == "unverifiable"
 
 
@@ -173,7 +173,7 @@ def test_devops_fixtures_are_offline_and_verifiable() -> None:
 
 def test_resigned_tampering_with_unknown_key_fails_closed() -> None:
     bundle = valid_provenance_bundle()
-    forged_payload = bundle.receipts[1].payload.model_copy(update={"decision": "approved"})
+    forged_payload = bundle.receipts[1].payload.model_copy(update={"action": "tampered action"})
     attacker_key = Ed25519PrivateKey.from_private_bytes(bytes([99]) * 32)
     attacker_public = attacker_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -256,7 +256,7 @@ def test_verifier_cli_rejects_forged_bundle(tmp_path) -> None:
         text=True,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 2
     assert json.loads(result.stdout)["valid"] is False
 
 
