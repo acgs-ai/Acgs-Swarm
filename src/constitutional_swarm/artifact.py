@@ -8,7 +8,9 @@ agents coordinate through published artifacts.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -19,24 +21,72 @@ from typing import Any
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
 
 
+_CANONICAL_VALUE_ERROR = (
+    "Artifact metadata and canonical fields must be finite JSON values"
+)
+
+
+def _validate_json_value(value: Any, active_containers: set[int] | None = None) -> None:
+    """Reject values that cannot be represented by lossless canonical JSON."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ValueError(_CANONICAL_VALUE_ERROR)
+
+    active = set() if active_containers is None else active_containers
+    if isinstance(value, Mapping):
+        container_id = id(value)
+        if container_id in active:
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        active.add(container_id)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(_CANONICAL_VALUE_ERROR)
+                _validate_json_value(item, active)
+        finally:
+            active.remove(container_id)
+        return
+    if isinstance(value, (list, tuple)):
+        container_id = id(value)
+        if container_id in active:
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        active.add(container_id)
+        try:
+            for item in value:
+                _validate_json_value(item, active)
+        finally:
+            active.remove(container_id)
+        return
+    raise ValueError(_CANONICAL_VALUE_ERROR)
+
+
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze(item) for key, item in value.items()}
-        )
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    if isinstance(value, set):
-        return tuple(sorted((_freeze(item) for item in value), key=repr))
     return value
 
 
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
+        return {key: _thaw(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
     return value
+
+
+def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    """Encode a mapping deterministically for content-addressed integrity."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +111,9 @@ class Artifact:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        _validate_json_value(self.metadata)
         object.__setattr__(self, "tags", tuple(self.tags))
         object.__setattr__(self, "parent_artifacts", tuple(self.parent_artifacts))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
@@ -83,11 +136,7 @@ class Artifact:
     @property
     def content_hash(self) -> str:
         """SHA-256 hash of the content for integrity verification."""
-        return hashlib.sha256(
-            json.dumps(
-                self.canonical_dict(), sort_keys=True, separators=(",", ":")
-            ).encode()
-        ).hexdigest()[:32]
+        return hashlib.sha256(_canonical_bytes(self.canonical_dict())).hexdigest()[:32]
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary."""
@@ -125,6 +174,7 @@ class ArtifactStore:
 
     def __init__(self) -> None:
         self._artifacts: dict[tuple[str, str], Artifact] = {}
+        self._sealed_digests: dict[tuple[str, str], str] = {}
         self._revoked: set[tuple[str, str]] = set()
         self._by_task: dict[tuple[str, str], list[tuple[str, str]]] = {}
         self._by_domain: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -218,7 +268,12 @@ class ArtifactStore:
             if key in self._artifacts:
                 raise ValueError(f"Artifact {artifact.artifact_id} already exists")
             immutable = Artifact(**artifact.canonical_dict())
+            try:
+                sealed_digest = immutable.content_hash
+            except (TypeError, ValueError) as exc:
+                raise ValueError(_CANONICAL_VALUE_ERROR) from exc
             self._artifacts[key] = immutable
+            self._sealed_digests[key] = sealed_digest
             self._by_task.setdefault((workflow_id, immutable.task_id), []).append(key)
             self._by_domain.setdefault((workflow_id, immutable.domain), []).append(key)
             self._by_agent.setdefault((workflow_id, immutable.agent_id), []).append(key)
@@ -344,14 +399,18 @@ class ArtifactStore:
         )
 
     def verify_integrity(self, artifact_id: str, *, workflow_id: str = "") -> bool:
-        """Verify an artifact's content hash hasn't been tampered with."""
+        """Compare current artifact bytes with the digest sealed at publication."""
         with self._lock:
             key = (workflow_id, artifact_id)
             artifact = self._artifacts.get(key)
-        if artifact is None or not self._is_visible(key):
+            sealed_digest = self._sealed_digests.get(key)
+        if artifact is None or sealed_digest is None or not self._is_visible(key):
             return False
-        expected = Artifact(**artifact.canonical_dict()).content_hash
-        return artifact.content_hash == expected
+        try:
+            current_digest = artifact.content_hash
+        except (TypeError, ValueError):
+            return False
+        return hmac.compare_digest(current_digest, sealed_digest)
 
     @property
     def count(self) -> int:

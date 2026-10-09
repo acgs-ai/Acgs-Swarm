@@ -5,6 +5,7 @@ All tests use :memory: SQLite databases so they are fast and isolated.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 
 import pytest
@@ -12,6 +13,7 @@ from constitutional_swarm.evolution_log import (
     DecelerationBlockedError,
     DuplicateRecordError,
     EvolutionLog,
+    EvolutionViolationError,
     MissingPriorEpochError,
     NonIncreasingValueError,
 )
@@ -64,12 +66,12 @@ class TestSchemaAndBasicInsert:
 
     def test_epoch_zero_rejected_by_check_constraint(self) -> None:
         with EvolutionLog(":memory:") as log:
-            with pytest.raises(sqlite3.IntegrityError):
+            with pytest.raises(EvolutionViolationError, match="positive integer"):
                 log.record(0, "x", 1.0)
 
     def test_negative_epoch_rejected(self) -> None:
         with EvolutionLog(":memory:") as log:
-            with pytest.raises(sqlite3.IntegrityError):
+            with pytest.raises(EvolutionViolationError, match="positive integer"):
                 log.record(-1, "x", 1.0)
 
 
@@ -305,13 +307,17 @@ class TestAdmit:
 
 class TestAdmissibleMin:
     def test_capability_epoch_6(self, seeded_log: EvolutionLog) -> None:
-        """Guide §2.7: PriorValue=30, PriorDelta=8, min=30+8+1=39."""
-        assert seeded_log.admissible_min("capability", 6) == 39.0
+        candidate = seeded_log.admissible_min("capability", 6)
+        assert candidate == math.nextafter(38.0, math.inf)
+        assert seeded_log.admit("capability", 6, candidate)
+        assert not seeded_log.admit(
+            "capability", 6, math.nextafter(candidate, -math.inf)
+        )
 
-    def test_epoch_2_is_prior_plus_1(self) -> None:
+    def test_epoch_2_is_least_representable_successor(self) -> None:
         with EvolutionLog(":memory:") as log:
             log.record(1, "x", 100.0)
-            assert log.admissible_min("x", 2) == 101.0
+            assert log.admissible_min("x", 2) == math.nextafter(100.0, math.inf)
 
     def test_epoch_1_raises(self) -> None:
         with EvolutionLog(":memory:") as log:

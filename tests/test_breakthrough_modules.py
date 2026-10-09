@@ -71,7 +71,7 @@ def _make_credential(
     org_id: str = "test-org",
     constitutional_hash: str = _CONST_HASH,
     expires_at: float = 0.0,
-    domains: tuple[str, ...] = (),
+    domains: tuple[str, ...] = ("*",),
 ) -> AgentCredential:
     return AgentCredential(
         agent_id=agent_id,
@@ -101,7 +101,7 @@ class TestFederatedConstitutionBridge:
 
     def test_gate_rejects_unknown_credential(self) -> None:
         bridge = _make_bridge()
-        decision = bridge.gate("non-existent-agent", domain="privacy")
+        decision = bridge.gate("non-existent-agent", org_id="test-org", domain="privacy")
         assert not decision.allowed
         assert decision.reason == "UNKNOWN_CREDENTIAL"
 
@@ -109,8 +109,8 @@ class TestFederatedConstitutionBridge:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-rev")
         bridge.register_credential(cred)
-        bridge.revoke("agent-rev")
-        decision = bridge.gate("agent-rev", domain="safety")
+        bridge.revoke("agent-rev", org_id=cred.org_id)
+        decision = bridge.gate("agent-rev", org_id=cred.org_id, domain="safety")
         assert not decision.allowed
         assert decision.reason == "REVOKED"
 
@@ -121,7 +121,7 @@ class TestFederatedConstitutionBridge:
             expires_at=_NOW - 100,  # already expired
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-exp", domain="")
+        decision = bridge.gate("agent-exp", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "EXPIRED"
 
@@ -132,7 +132,7 @@ class TestFederatedConstitutionBridge:
             constitutional_hash="WRONG_HASH_1234",
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-hash", domain="")
+        decision = bridge.gate("agent-hash", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "HASH_MISMATCH"
 
@@ -143,7 +143,7 @@ class TestFederatedConstitutionBridge:
             domains=("safety",),  # only safety, not privacy
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-dom", domain="privacy")
+        decision = bridge.gate("agent-dom", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "DOMAIN_DENIED"
 
@@ -154,26 +154,27 @@ class TestFederatedConstitutionBridge:
             domains=("privacy",),
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-ok", domain="privacy")
+        decision = bridge.gate("agent-ok", org_id=cred.org_id, domain="privacy")
         assert decision.allowed
         assert decision.reason == "ALLOWED"
 
-    def test_gate_allows_valid_credential_no_domain_restriction(self) -> None:
+    def test_gate_rejects_empty_domain_allowlist(self) -> None:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-open", domains=())
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-open", domain="anything")
-        assert decision.allowed
+        decision = bridge.gate("agent-open", org_id=cred.org_id, domain="anything")
+        assert not decision.allowed
+        assert decision.reason == "DOMAIN_DENIED"
 
     def test_revoke_returns_true_for_known_agent(self) -> None:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-known")
         bridge.register_credential(cred)
-        assert bridge.revoke("agent-known") is True
+        assert bridge.revoke("agent-known", org_id=cred.org_id) is True
 
     def test_revoke_returns_false_for_unknown_agent(self) -> None:
         bridge = _make_bridge()
-        assert bridge.revoke("ghost-agent") is False
+        assert bridge.revoke("ghost-agent", org_id="test-org") is False
 
     def test_summary_returns_correct_counts(self) -> None:
         bridge = _make_bridge()
@@ -182,9 +183,9 @@ class TestFederatedConstitutionBridge:
         bridge.register_credential(cred_ok)
         bridge.register_credential(cred_bad)
 
-        bridge.gate("agent-a", domain="")  # should ALLOW
-        bridge.gate("agent-b", domain="")  # should DENY (hash mismatch)
-        bridge.gate("nobody", domain="")  # should DENY (unknown)
+        bridge.gate("agent-a", org_id=cred_ok.org_id, domain="privacy")  # should ALLOW
+        bridge.gate("agent-b", org_id=cred_bad.org_id, domain="privacy")  # hash mismatch
+        bridge.gate("nobody", org_id="test-org", domain="privacy")  # unknown
 
         s = bridge.summary()
         assert s["registered_credentials"] == 2
@@ -197,8 +198,8 @@ class TestFederatedConstitutionBridge:
         cred = _make_credential(agent_id="agent-log")
         bridge.register_credential(cred)
 
-        bridge.gate("agent-log", domain="privacy")
-        bridge.gate("ghost", domain="safety")
+        bridge.gate("agent-log", org_id=cred.org_id, domain="privacy")
+        bridge.gate("ghost", org_id="test-org", domain="safety")
 
         log = bridge.audit_log()
         assert len(log) == 2
@@ -213,8 +214,8 @@ class TestFederatedConstitutionBridge:
 
         t1 = _NOW + 1
         t2 = _NOW + 2
-        bridge.gate("agent-ts", domain="", now=t1)
-        bridge.gate("agent-ts", domain="", now=t2)
+        bridge.gate("agent-ts", org_id=cred.org_id, domain="privacy", now=t1)
+        bridge.gate("agent-ts", org_id=cred.org_id, domain="privacy", now=t2)
 
         log = bridge.audit_log()
         assert log[0]["timestamp"] <= log[1]["timestamp"]
@@ -862,7 +863,7 @@ class TestFederatedBridgePendingEnforcement:
             status=CredentialStatus.PENDING,
         )
         bridge.register_credential(cred)
-        decision = bridge.gate(cred.agent_id)
+        decision = bridge.gate(cred.agent_id, org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert "PENDING" in decision.reason
 
@@ -916,15 +917,14 @@ class TestConstitutionalHashConsolidation:
 
 
 class TestDefenseFloodingMitigation:
-    """Verify defense credit scales inversely with max challenge severity."""
+    """Verify one fixed defense-response credit scales with challenge severity."""
 
     def test_high_severity_limits_defense_value(self) -> None:
         """Many defenses should NOT override a high-severity challenge."""
         resolver = DebateResolver(approval_threshold=0.6)
         resolver.propose("p1", "proposer", "domain", "content")
         resolver.challenge("p1", "c1", "critical flaw", severity=0.8)
-        # Use different defender IDs to avoid per-defender cap.
-        # score = 0.5 - 0.24 + 5*0.15*(1-0.8) = 0.5 - 0.24 + 0.15 = 0.41
+        # Asserted defender IDs carry no weight: score = 0.5 - 0.24 + 0.15*0.2 = 0.29.
         for i in range(5):
             resolver.defend("p1", f"def-{i}", f"rebuttal {i}")
         verdict = resolver.resolve("p1")
