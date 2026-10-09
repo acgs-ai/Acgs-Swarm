@@ -168,14 +168,22 @@ The productized, hardened flow (`governed_handoff.py`).
 
 ## Flow 8 — Constitutional amendment (joint consensus)
 
-1. Propose: `AmendmentProposal(prior, proposed, to_epoch)`; `drift = .drift` is the
+1. Propose: `AmendmentProposal(prior, proposed, binding_digest=...)`; `proposed`
+   carries the next epoch and parent digest, while `.drift` is the
    symmetric-difference rule count (`evaluate_drift`).
-2. Gate drift: must fit the declared `DriftBudget` else `DriftBudgetExceeded`.
-3. Ratify under **joint consensus**: a `TransitionCertificate` needs *both* the
-   old and new validator sets to ratify; `verify_transition(...)` enforces epoch
-   match (`EpochMismatchError`) and joint quorum (`JointQuorumNotMetError`).
-4. On success, the new `ConstitutionVersion` (`.digest`) becomes active; the
-   bittensor layer distributes it via `constitution_sync.py`.
+2. Gate drift with the verifier-owned
+   `TransitionVerificationPolicy.max_rule_delta`; proposal-carried
+   `DriftBudget` is compatibility metadata and cannot authorize a larger change.
+3. Ratify under **joint consensus**: `TransitionCertificate` carries signed
+   `QuorumCertificate`s from both the old and new validator sets over the same
+   canonical, length-prefixed v2 transition subject.
+4. `verify_transition(...)` checks the proposal against the verifier's trusted
+   current `ConstitutionVersion`, validator registries, and certificate policy,
+   then enforces the drift limit and both quorums. A predecessor mismatch raises
+   `EpochMismatchError`; an invalid side raises `JointQuorumNotMetError`.
+5. Governed bittensor sync (`constitution_sync.py`) additionally requires the
+   proposal's `binding_digest` to match the complete canonical sync-message
+   commitment before activating and pinning the new version.
 - **Formal model:** `specs/constitution_reconfig.tla` (checked by `tla-check` CI).
 
 ---

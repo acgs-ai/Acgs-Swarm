@@ -123,22 +123,27 @@ def _select_with_exclusions(
     threshold_fraction: float,
     max_retries: int,
 ) -> CommitteeSelection:
-    """Select a committee with the decision's rejected ids unioned into ``exclude``.
-
-    A flagged node can never be sampled into the committee. With
-    ``require_independent`` the fault-domain-aware
-    :meth:`CommitteeSelector.select_until_independent` is used.
-    """
-    full_exclude = tuple(frozenset(exclude) | decision.rejected_set)
+    """Select exclusively from validators explicitly admitted by screening."""
+    all_validator_ids = frozenset(identity.agent_id for identity in selector._set)
+    admitted = frozenset(decision.admitted)
+    full_exclude = tuple(
+        frozenset(exclude) | (all_validator_ids - admitted) | decision.rejected_set
+    )
     if require_independent:
-        return selector.select_until_independent(
+        selection = selector.select_until_independent(
             seed,
             committee_size,
             exclude=full_exclude,
             threshold_fraction=threshold_fraction,
             max_retries=max_retries,
         )
-    return selector.select(seed, committee_size, exclude=full_exclude)
+    else:
+        selection = selector.select(seed, committee_size, exclude=full_exclude)
+    if not set(selection.members) <= admitted:
+        raise RuntimeError(
+            "committee selector returned a validator not explicitly admitted"
+        )
+    return selection
 
 
 class AbliterationAdmissionGate:
