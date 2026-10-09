@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import pytest
@@ -55,6 +55,8 @@ def test_c16_registry_frozen_snapshot_has_no_mutation_capability() -> None:
     # __setattr__ for non-field names; 3.14 raises FrozenInstanceError. Both refuse.
     with pytest.raises((AttributeError, TypeError)):
         frozen._frozen = False
+    with pytest.raises(FrozenInstanceError):
+        frozen._grants = ()
 
     assert type(frozen).__name__ == "FrozenVoteSignerRegistry"
     assert frozen.frozen is True
