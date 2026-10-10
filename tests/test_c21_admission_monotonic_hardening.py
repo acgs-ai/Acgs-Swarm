@@ -18,6 +18,7 @@ import contextlib
 import io
 import json
 import sys
+import sysconfig
 from pathlib import Path
 
 import numpy as np
@@ -397,8 +398,16 @@ def test_generator_stdout_noise_does_not_break_clean_audit(tmp_path: Path) -> No
 # globals, forge its report, extend sys.path and import the package.
 _R4_FRAME_PROBES = {
     'gen_frame': 'import json\nfrom pathlib import Path\n\nholder = []\ndef g():\n    yield holder[0].gi_frame.f_back\ngen = g()\nholder.append(gen)\ntop = next(gen)\nchild = top.f_back.f_globals\nsysm = child["sys"]\nosm = sysm.modules["os"]\nPath(child["meta"]["path"] + ".PWNED").write_text(str(osm.getppid()) + " nonce=" + child["meta"]["nonce"])\n',
-    'gen_hide': 'from pathlib import Path\nholder = []\ndef g():\n    yield holder[0].gi_frame.f_back\ngen = g()\nholder.append(gen)\nfr = next(gen); child = fr.f_back.f_globals\ngen0 = iter([fr])\nsysm = child["sys"]\nsysm.path.append("/home/martin/Acgs-Swarm/.worktrees/integration/.venv/lib/python3.13/site-packages")\nsysm.path.insert(0, "/home/martin/Acgs-Swarm/.worktrees/fix-C21-admission-monotonic/src")\nil = next(gen0).f_builtins["__import__"]("importlib")\ncs = il.import_module("constitutional_swarm.evolution_log")\nPath(child["meta"]["path"] + ".LOADED").write_text("loaded " + str(cs.EvolutionLog))\nfor k in list(sysm.modules):\n    if k.split(".")[0] == "constitutional_swarm":\n        del sysm.modules[k]\n',
-    'gen_noclean': 'holder = []\ndef g():\n    yield holder[0].gi_frame.f_back\ngen = g()\nholder.append(gen)\nfr = next(gen); child = fr.f_back.f_globals\ngen0 = iter([fr])\nsysm = child["sys"]\nsysm.path.append("/home/martin/Acgs-Swarm/.worktrees/integration/.venv/lib/python3.13/site-packages")\nsysm.path.insert(0, "/home/martin/Acgs-Swarm/.worktrees/fix-C21-admission-monotonic/src")\nnext(gen0).f_builtins["__import__"]("constitutional_swarm.evolution_log")\n',
+    'gen_hide': 'from pathlib import Path\nholder = []\ndef g():\n    yield holder[0].gi_frame.f_back\ngen = g()\nholder.append(gen)\nfr = next(gen); child = fr.f_back.f_globals\ngen0 = iter([fr])\nsysm = child["sys"]\nsysm.path.append("@SITE@")\nsysm.path.insert(0, "@SRC@")\nil = next(gen0).f_builtins["__import__"]("importlib")\ncs = il.import_module("constitutional_swarm.evolution_log")\nPath(child["meta"]["path"] + ".LOADED").write_text("loaded " + str(cs.EvolutionLog))\nfor k in list(sysm.modules):\n    if k.split(".")[0] == "constitutional_swarm":\n        del sysm.modules[k]\n',
+    'gen_noclean': 'holder = []\ndef g():\n    yield holder[0].gi_frame.f_back\ngen = g()\nholder.append(gen)\nfr = next(gen); child = fr.f_back.f_globals\ngen0 = iter([fr])\nsysm = child["sys"]\nsysm.path.append("@SITE@")\nsysm.path.insert(0, "@SRC@")\nnext(gen0).f_builtins["__import__"]("constitutional_swarm.evolution_log")\n',
+}
+# Resolve the import roots at runtime so the probes target this checkout and
+# interpreter (CI included) rather than one developer machine.
+_R4_PROBE_SRC = str(Path(evaluator.__file__).resolve().parents[3])
+_R4_PROBE_SITE = sysconfig.get_paths()["purelib"]
+_R4_FRAME_PROBES = {
+    name: body.replace("@SRC@", _R4_PROBE_SRC).replace("@SITE@", _R4_PROBE_SITE)
+    for name, body in _R4_FRAME_PROBES.items()
 }
 
 
