@@ -1924,7 +1924,13 @@ def test_post_start_attestation_failure_kills_stubborn_observer(
         child.close()
         observer_pid.append(parent.recv())
         parent.close()
-        return process, SimpleNamespace(close=lambda: None), {"malformed": "proof"}
+        # C22: _start_observer also returns supervisor-held launch expectations.
+        return (
+            process,
+            SimpleNamespace(close=lambda: None),
+            {"malformed": "proof"},
+            None,
+        )
 
     monkeypatch.setattr(service_module, "_start_observer", fake_start_observer)
     monkeypatch.setattr(
