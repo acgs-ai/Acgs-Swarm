@@ -22,6 +22,14 @@ The per-module map of *what the code does and how*. Organized by maturity tier
 - **Logic:** `validate(text)` runs the constitution's rule matchers and returns
   valid + violations + risk; built to sit inline on the local hot path.
   `constitutional_dna` wraps any callable to validate its output.
+- **Governed path:** `govern(fn=None, *, action_type=None, block_on_violation=True,
+  block_on_warnings=False)` (and `constitutional_dna` with the same keywords)
+  raises `ConstitutionalViolationError` on an invalid result or a verified Z3
+  counterexample; pass `block_on_violation=False` to opt out. WARN-tier matches
+  are logged and counted in `stats["warnings"]` and raise only with
+  `block_on_warnings=True`. `govern(action_type=...)` runs `check_maci` before
+  input validation; a DNA with a `maci_role` and no `action_type` raises
+  `ValueError` at decoration.
 - **⚠** A disabled DNA **raises** `DNADisabledError` on `validate()` — it never
   silently passes. Greek-symbol-heavy sibling `latent_dna.py` is *not* this.
 
@@ -69,9 +77,14 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `sign_vote_envelope` / `submit_vote_envelope`,
   `request_validation` (→ `PeerAssignment`), `submit_vote`, `get_result`
   (→ `MeshResult` + `MeshProof`), `halt`/`resume`/`is_halted`,
-  `rotate_constitution`, `get_reputation`, read-only `vote_registry`,
-  `receipt_trust_registry()`, `_select_peers` (trust-weighted sampling + one
-  exploration slot). Pass an out-of-band `VoteSignerRegistry` with the
+  `rotate_constitution`, `get_reputation`, read-only `vote_registry` (the live,
+  mutable voter registry), read-only `assigner_trust_root` (a
+  `FrozenVoteSignerRegistry` holding only the pinned assigner grant, never a
+  snapshot of the live registry; recovery, `ConstitutionalValidator` and
+  `PrecedentCascade` verify assignments against it plus `assigner_id` /
+  `assigner_key_id`), `quarantined_settlements`, `receipt_trust_registry()`, and the
+  private `_select_peers_unlocked` (trust-weighted sampling + one exploration
+  slot, called from `_request_validation_once`). Pass an out-of-band `VoteSignerRegistry` with the
   `vote_registry=` constructor argument when recovery or external consumers
   must share voter and assigner authority. An external registry also requires
   explicit `assigner_id` and matching `assigner_private_key`; the grant must
@@ -126,8 +139,9 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   assignment before releasing any request, and each peer signs a protocol-v3
   envelope bound to its digest. Consumers preserve and reverify both objects.
   `request_validation(..., task_id=...)` binds the task explicitly and defaults
-  it to the artifact ID. V2 settlement waits for every assigned peer, including
-  when the compatibility `complete_evidence` option is false. Persistent
+  it to the artifact ID. V2 settlement waits for every assigned peer. The
+  `ConstitutionalMesh(complete_evidence=...)` argument is deprecated and has no
+  effect (passing it emits `DeprecationWarning`). Persistent
   settlements additionally require quorum at least three. Multi-identity local signing requires the explicit mesh
   `evidence_mode="single_operator_dev"`; those envelopes cannot become
   independent precedent evidence.
@@ -279,9 +293,20 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   - `ok` requires a valid signature under an out-of-band trust anchor. An
     unsigned bundle or a call without trusted public keys is diagnostic-only and
     returns `ok: false`; the bundle-embedded key is never a trust anchor.
-  - The `tool_call` gate is **default-DENY allowlist**
-    (`DEFAULT_COMMAND_ALLOWLIST = true, echo`); the constitution may
-    extend but never weaken it.
+  - The `tool_call` gate is **default-DENY** against the closed, code-owned
+    `SAFE_COMMANDS` table: `true` (no arguments) and `echo` (plain-word
+    arguments only). Each entry carries its own argument policy
+    (`SafeCommandSpec`). `command_allowlist` may only select from that table.
+    A list, tuple or set narrows it: unknown names are ignored, and an empty
+    one enables nothing. A non-sequence value (for example a string) enables
+    nothing. An absent or null value enables the whole table. Configuration
+    can never add an executable, flag, or argument shape.
+  - `ExternalAgentAdapter` (the operator-configured agent CLI) is outside
+    `SAFE_COMMANDS`. Its `argv[0]` is resolved on `FIXED_SUBPROCESS_PATH`
+    (`/usr/bin:/bin:/usr/local/bin`) or must be absolute. A relative
+    (`./agent`), blank, unparseable or unresolvable command raises
+    `RuntimeError` before any child starts. Every child gets the scrubbed
+    environment and the non-dumpable supervisor hardening.
   - Code-owned protected paths include root and nested dotenv and direnv files,
     including dotted suffixes and backup names (`.env.*`, `.env~`, `.envrc.*`,
     `.envrc~`, and their `**/` variants), under normalized, case-insensitive
@@ -385,11 +410,17 @@ frozen files.
 - **Formal model:** `specs/constitution_reconfig.tla`.
 
 ### `debate_resolver.py` — adversarial debate
-- **Surface:** `DebateResolver` (`.propose`, `.challenge`, `.defend`, `.resolve`,
-  `.summary`), `DebateRecord` (`.compute_merkle_root`), `FinalVerdict`
-  (`.is_approved`), `VerdictOutcome`.
+- **Surface:** `DebateResolver(participants={agent_id: roles})` (`.propose`,
+  `.challenge`, `.defend`, `.resolve`, `.register_participant`,
+  `.verify_transcript`, `.summary`), `DebateRecord` (`.compute_merkle_root`),
+  `FinalVerdict` (`.is_approved`), `VerdictOutcome`, `AUTO_CHALLENGER_ID`.
 - **Logic:** CourtGuard pattern — Proposer/Challenger/Defense produce a
   Merkle-rooted transcript resolved to a verdict.
+- **⚠** Roles come from the registry pinned on the resolver. A self-challenge or
+  an unregistered challenger/defender raises `PermissionError`, and only
+  registered challengers count at resolve. With no registry, every debate
+  deadlocks. Synthetic challenges use the reserved `AUTO_CHALLENGER_ID` and are
+  never counted.
 
 ### `node_admission.py` — abliteration-aware admission
 - **Surface:** `AbliterationAdmissionGate`, `ActivationAdmissionGate`,
@@ -427,7 +458,7 @@ The largest subpackage; a full incentive subnet. By role:
 |---|---|
 | Runtimes | `subnet_owner.py`, `miner.py`, `validator.py`, `axon_server.py`, `dendrite_client.py` |
 | Coordination | `governance_coordinator.py`, `came_coordinator.py`, `nmc_protocol.py` (anti-collusion commit-reveal) |
-| Quality / evolution | `map_elites.py`, `island_evolution.py`, `emission_calculator.py`, `threshold_updater.py`, `tier_manager.py`, `authenticity_detector.py` |
+| Quality / evolution | `map_elites.py`, `island_evolution.py` (EXPERIMENTAL, no runtime caller), `emission_calculator.py`, `threshold_updater.py`, `tier_manager.py`, `authenticity_detector.py` |
 | Precedent / rules | `precedent_store.py`, `rule_codifier.py`, `cascade.py` |
 | Audit / anchoring | `arweave_audit_log.py`, `chain_anchor.py`, `compliance_certificate.py`, `constitution_sync.py` |
 | Protocol / wire | `protocol.py`, `synapses.py`, `synapse_adapter.py` |
@@ -472,9 +503,19 @@ The largest subpackage; a full incentive subnet. By role:
   request content hash, requester hotkey, selected axon identity, and judgment
   body. The testnet validator verifies both the SDK axon routing tuple and the
   request-bound body signature before converting or admitting a judgment;
-  unsigned or mismatched miner responses fail closed.
+  unsigned or mismatched miner responses fail closed. The response protocol is
+  v2 (`constitutional-swarm.bittensor-judgment-response.v2`); v1 responses are
+  rejected. `synapse_adapter.authenticate_response` is the single verifier that
+  both `ValidatorDendriteClient` and the testnet script call.
+  `MinerAxonServer` requires `response_signing_key=` (or the dev-only
+  `allow_unsigned_responses=True`) and must be attached with
+  `server.attach_to(axon)`; a direct `axon.attach(verify_fn=server.verify)`
+  replaces bittensor's `default_verify` and skips transport authentication.
 - **Codifier trust boundary:** `RuleCodifier(precedent_store=...)` and
-  `PrecedentBackedCodifier(precedent_store=...)` accept only exact canonical
+  `PrecedentBackedCodifier(precedent_store=...)` take `governors=` and
+  `proposer_id=`. Approve, activate, reject and revoke require a rostered
+  governor who is not the proposer (`PermissionError` otherwise), and
+  activation applies only to the pinned constitution hash. Both accept only exact canonical
   records already admitted by that explicitly provisioned store. There is no
   registry-less fallback store. Empty read-only cluster/proposal queries may
   return `[]` without a store, but observing records or any populated
@@ -535,8 +576,9 @@ The largest subpackage; a full incentive subnet. By role:
 
 ### `private_vote.py` — commit-reveal private voting
 - **Surface:** construct `PrivateBallotBox` with `epoch`, `subject`,
-  `eligible_voters=frozenset(raw Ed25519 public keys)`, optional `provers`, and
-  `strict_v2`; then use `.submit_commit`, `.close_commit_phase`,
+  `eligible_voters=frozenset(raw Ed25519 public keys)`, optional `provers`,
+  `strict_v2` (default `True`) and `allow_insecure_hash_prover` (default
+  `False`); then use `.submit_commit`, `.close_commit_phase`,
   `.submit_reveal`, and `.tally(require_all_revealed=...)`. The box policy
   cannot be overridden at tally time. The pure `tally(...)` function likewise
   requires `eligible_voters`; `build_commit` and `build_reveal` construct the
@@ -554,16 +596,25 @@ The largest subpackage; a full incentive subnet. By role:
   relayer can still withhold or strip fields, but any alteration invalidates
   the signature and the receiver rejects the record. Strict mode requires a
   registered verifier that advertises validity assurance and therefore rejects
-  the `HashCommitmentProver` wire-format scaffold. Construct the box with
-  `provers=None` when no verifier is needed. Regenerate ballots created with
-  the older nullifier, commitment, or commit-signature formats.
+  the `HashCommitmentProver` wire-format scaffold. Both `tally()` and
+  `PrivateBallotBox` default to strict mode, and no in-repo verifier advertises
+  validity assurance, so by default only ballots checked by a real SNARK
+  verifier count. Legacy proofless ballots need an explicit `strict_v2=False`;
+  hash-scaffold proofs additionally need `allow_insecure_hash_prover=True`,
+  which never overrides strict mode. Regenerate ballots created with the older
+  nullifier, commitment, or commit-signature formats.
 
 ### `federated_bridge.py` — cross-org credential gate
-- **Surface:** `FederatedConstitutionBridge` (`.register_credential`,
-  `.renew_credential`, `.gate(agent_id, *, org_id, domain)`,
-  `.revoke(agent_id, *, org_id)`, `.audit_log`, `.summary`), `AgentCredential`
-  (`.fingerprint`, `.is_expired`, `.is_not_yet_valid`, `.authorised_for`),
+- **Surface:** `FederatedConstitutionBridge(issuer_keys={org_id: [raw 32-byte
+  Ed25519 public keys]})` (`.register_credential`, `.renew_credential`,
+  `.gate(agent_id, *, org_id, domain)`, `.revoke(agent_id, *, org_id)`,
+  `.audit_log`, `.summary`), `AgentCredential` (`.fingerprint`,
+  `.signing_digest`, `.is_expired`, `.is_not_yet_valid`, `.authorised_for`),
   `FederationDecision`, `CredentialStatus`, `ALL_DOMAINS`.
+- **Issuer trust:** registration verifies `issuer_signature` against the issuer
+  keys pinned at bridge construction; unsigned or foreign-signed credentials
+  raise `PermissionError`. `expires_at` is required and must exceed
+  `issued_at` (there is no "never expires" value).
 - **Credential semantics:** credentials are scoped by `(org_id, agent_id)`;
   revocation remains sticky across same-key renewal and is cleared only when a
   newer credential changes `pubkey_fingerprint` to a key that was never revoked
@@ -580,17 +631,26 @@ The largest subpackage; a full incentive subnet. By role:
 ### `mac_acgs_loop.py` — auto-constitution pipeline
 - **Surface:** `MacAcgsLoop` (`.run_cycle`, `.add_external_challenger`,
   `.audit_log`, `.constitution_updates`, `.coverage_history`, `.summary`),
-  `MacAcgsConfig`, `MacAcgsCycleResult`, `PipelineEvent`/`PipelineEventType`.
-- **⚠** Known **import-boundary leak**: line ~43 imports
-  `bittensor.came_coordinator` unconditionally (~458ms on every package import).
-  Fix is to move it inside the constructing method (see
-  `src/constitutional_swarm/AGENTS.md` MANUAL section + RUNTIME_OPTIMIZATION_REPORT B1).
+  `MacAcgsConfig`, `MacAcgsCycleResult`, `PipelineEvent`/`PipelineEventType`,
+  `ChallengeProvider`.
+- **⚠** No self-approval: `MacAcgsConfig.auto_challenge` and `auto_defend`
+  default to `False`, and a rule is approved only through a challenge from a
+  registered external reviewer (`challenge_provider=` or
+  `add_external_challenger`). Synthetic challenges use the reserved
+  `AUTO_CHALLENGER_ID` and are never counted. An injected `debate` whose
+  constitutional hash differs from the config raises `ValueError`.
+- The former `bittensor.came_coordinator` import-boundary leak is fixed: the
+  bittensor symbols load lazily at construction, guarded by
+  `tests/test_core_import_isolation.py` (see the `src/constitutional_swarm/AGENTS.md`
+  MANUAL section).
 
 ### `forensic_benchmark.py` — blind-review benchmark protocol
 - **Surface:** Pydantic models (`ForensicBenchmarkProtocol`, `BenchmarkScorecard`,
-  `IncidentSpec`, `BenchmarkArtifactPack`, `BenchmarkResultBundle`, …) +
+  `BenchmarkArtifactPack`, `BenchmarkResultBundle`, …) +
   `validate_protocol`, `score_reviewer_answers`, `paired_sign_test_p_value`,
-  `build_result_bundle`, `generate_incident_specs`, `generate_artifact_pack`.
+  `build_result_bundle`, `generate_artifact_pack`. The dead
+  `IncidentSpec`/`generate_incident_specs` chain was removed;
+  `generate_artifact_pack()` is the incident generator.
 - **Logic:** the reproducible v0.1 public-study contract — generate adversarial
   incidents with hidden ground truth, collect blind-reviewer answers, score by
   matched condition, gate the success claim with a paired sign test.
