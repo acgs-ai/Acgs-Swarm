@@ -651,6 +651,11 @@ class ConstitutionalValidator:
             content_hash=content_hash,
             constitutional_hash=result.constitutional_hash,
             require_independent=not self._config.single_operator_dev,
+            # The assigner is pinned by the mesh's construction-time trust root,
+            # never by grants later added to the live voter registry.
+            assigner_trust_root=mesh.assigner_trust_root,
+            expected_assigner_id=mesh.assigner_id,
+            expected_assigner_key_id=mesh.assigner_key_id,
         )
         if verified_envelopes != authoritative_result.vote_envelopes:
             raise ValueError("vote envelopes differ from authoritative mesh evidence")

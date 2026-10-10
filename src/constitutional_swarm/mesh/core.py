@@ -22,7 +22,6 @@ sub-microsecond product latency claim.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import os
@@ -79,7 +78,11 @@ from constitutional_swarm.mesh.vote_envelope import (
     VoteEnvelope,
     VoteSignerRegistry,
     canonical_assigned_peers_hash,
+    content_hash,
+    key_id_for_public_key,
     normalize_voter_id,
+    private_key_from,
+    public_key_from,
     sign_assignment,
     sign_vote_envelope as create_vote_envelope,
     signed_assignment_digest,
@@ -87,7 +90,6 @@ from constitutional_swarm.mesh.vote_envelope import (
     signed_assignment_to_dict,
     compute_vote_envelope_root,
     verify_assignment_vote_envelopes,
-    verify_signed_assignment,
     verify_vote_envelope,
     vote_envelope_from_dict,
     vote_envelope_hash,
@@ -100,6 +102,8 @@ from constitutional_swarm.settlement_store import (
     SettlementRecord,
     SettlementStore,
     SQLiteSettlementStore,
+    lookup_settlement,
+    normalize_receipt_digest,
 )
 
 if TYPE_CHECKING:
@@ -114,6 +118,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_QUARANTINED_SETTLEMENT_IDS = 1_000
+# Per-signer bound on remembered remote vote request nonces.
+_MAX_REMOTE_VOTE_NONCES_PER_SIGNER = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +253,9 @@ class ConstitutionalMesh:
         )
         self._assigner_id = normalize_voter_id(assigner_id or "mesh-assigner")
         if registry_was_supplied:
-            self._assigner_key_id = hashlib.sha256(
-                self._assigner_private_key.public_key().public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
-            ).hexdigest()
+            self._assigner_key_id = key_id_for_public_key(
+                self._assigner_private_key.public_key()
+            )
             self._vote_registry.authorize(
                 self._assigner_id, self._assigner_key_id, role="assigner"
             )
@@ -262,7 +265,16 @@ class ConstitutionalMesh:
                 self._assigner_private_key.public_key(),
                 roles={"assigner"},
             )
-        self._assigner_trust_root = self._vote_registry.frozen_copy()
+        # The trust root holds exactly the pinned assigner grant. A snapshot of the
+        # whole (possibly shared, already mutated) live registry would also trust
+        # any other assigner grant present at construction, e.g. on rotation.
+        pinned_root = VoteSignerRegistry()
+        pinned_root.register(
+            self._assigner_id,
+            self._assigner_private_key.public_key(),
+            roles={"assigner"},
+        )
+        self._assigner_trust_root = pinned_root.frozen_copy()
         self._request_signing_private_key = (
             Ed25519PrivateKey.generate()
             if request_signing_private_key is None
@@ -282,7 +294,12 @@ class ConstitutionalMesh:
         self._receipt_signing_public_key = (
             self._receipt_signing_private_key.public_key()
         )
+        # Mutate only through _put_assignment_locked/_pop_assignment_locked so the
+        # pending counter stays exact without scanning every assignment.
         self._assignments: dict[str, PeerAssignment] = {}
+        self._pending_assignments = 0
+        # Set by rotate_constitution: only a rotation can strand pending work.
+        self._stale_assignments_possible = False
         self._votes: dict[str, list[ValidationVote]] = {}
         self._vote_envelopes: dict[str, list[VoteEnvelope]] = {}
         self._signed_envelopes_by_signature: OrderedDict[str, VoteEnvelope] = (
@@ -402,6 +419,11 @@ class ConstitutionalMesh:
     def assigner_id(self) -> str:
         """Return the identity whose pinned key authorizes mesh assignments."""
         return self._assigner_id
+
+    @property
+    def assigner_key_id(self) -> str:
+        """Return the key id of the pinned assignment-authority key."""
+        return self._assigner_key_id
 
     def get_assigner_public_key(self) -> str:
         """Return the pinned assignment-authority public key as lowercase hex."""
@@ -528,6 +550,7 @@ class ConstitutionalMesh:
             )
             self._constitution_generation += 1
             self._state_generation += 1
+            self._stale_assignments_possible = True
             self._voter_dna.clear()
             if self._use_manifold:
                 if not preserve_trust:
@@ -670,7 +693,7 @@ class ConstitutionalMesh:
             custom_policy=self._custom_trust_policy is not None,
         )
 
-        content_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
+        payload_hash = content_hash(content)
         assignment_id = uuid.uuid4().hex[:12]
         issued_at = time.time()
         effective_quorum = max(self._quorum, len(peers) // 2 + 1)
@@ -681,7 +704,7 @@ class ConstitutionalMesh:
             assigner_id=self._assigner_id,
             producer_id=producer_id,
             artifact_id=artifact_id,
-            content_hash=content_hash,
+            content_hash=payload_hash,
             constitutional_hash=snapshot_hash,
             assigned_peers=peers,
             quorum=effective_quorum,
@@ -693,7 +716,7 @@ class ConstitutionalMesh:
             producer_id=producer_id,
             artifact_id=artifact_id,
             content=content,
-            content_hash=content_hash,
+            content_hash=payload_hash,
             peers=signed_assignment.assigned_peers,
             constitutional_hash=snapshot_hash,
             timestamp=issued_at,
@@ -731,7 +754,7 @@ class ConstitutionalMesh:
                 raise MeshCapacityError(
                     f"mesh pending assignment capacity {self._max_pending_assignments} reached"
                 )
-            self._assignments[assignment.assignment_id] = assignment
+            self._put_assignment_locked(assignment)
             self._votes[assignment.assignment_id] = []
             self._total_validations += 1
             self._agents[producer_id].validations_received += 1
@@ -855,27 +878,7 @@ class ConstitutionalMesh:
             MeshHaltedError: Mesh is halted.
         """
         with self._lock:
-            self._check_halted()
-            if assignment_id in self._final_results:
-                raise AssignmentSettledError(
-                    f"Assignment {assignment_id} is already settled"
-                )
-            assignment = self._assignments.get(assignment_id)
-            if assignment is None:
-                raise KeyError(f"Assignment {assignment_id} not found")
-            self._require_current_assignment_constitution(assignment)
-            if assignment.is_recovered:
-                raise RecoveredAssignmentError(
-                    f"Assignment {assignment_id} is already durably settled"
-                )
-            if voter_id not in assignment.peers:
-                raise UnauthorizedVoterError(
-                    f"{voter_id} is not assigned to validation {assignment_id}"
-                )
-            if voter_id not in self._agents:
-                raise UnauthorizedVoterError(
-                    f"{voter_id} is not a registered mesh agent"
-                )
+            assignment = self._vote_target_locked(assignment_id, voter_id)
             try:
                 envelope = self._signed_envelopes_by_signature[signature]
                 verified = verify_vote_envelope(
@@ -899,38 +902,64 @@ class ConstitutionalMesh:
                 raise InvalidVoteSignatureError(
                     f"Invalid or unsigned vote envelope for {voter_id} on {assignment_id}"
                 ) from exc
-
-            existing = self._votes.get(assignment_id, [])
-            if any(v.voter_id == voter_id for v in existing):
-                raise DuplicateVoteError(f"{voter_id} already voted on {assignment_id}")
-            self._signed_envelopes_by_signature.pop(signature, None)
-
-            vote = ValidationVote(
-                assignment_id=assignment_id,
-                voter_id=voter_id,
-                approved=approved,
-                reason=reason,
-                signature=signature,
-                constitutional_hash=assignment.constitutional_hash,
-                content_hash=assignment.content_hash,
-                timestamp=time.time(),
-            )
-            self._votes[assignment_id] = [*existing, vote]
-            self._vote_envelopes[assignment_id] = [
-                *self._vote_envelopes.get(assignment_id, []),
-                verified,
-            ]
-            self._total_votes += 1
-
-            if voter_id in self._agents:
-                self._agents[voter_id].validations_performed += 1
-
-            # Update reputations if quorum reached
-            self._maybe_settle_reputations(assignment_id)
+            vote = self._record_verified_vote_locked(assignment, voter_id, verified)
 
         if self._maybe_finalize_result(assignment_id):
             self.settle(assignment_id)
 
+        return vote
+
+    def _vote_target_locked(self, assignment_id: str, voter_id: str) -> PeerAssignment:
+        """Return the open assignment a vote targets, or raise the admission error."""
+        self._check_halted()
+        if assignment_id in self._final_results:
+            raise AssignmentSettledError(f"Assignment {assignment_id} is already settled")
+        assignment = self._assignments.get(assignment_id)
+        if assignment is None:
+            raise KeyError(f"Assignment {assignment_id} not found")
+        self._require_current_assignment_constitution(assignment)
+        if assignment.is_recovered:
+            raise RecoveredAssignmentError(
+                f"Assignment {assignment_id} is already durably settled"
+            )
+        if voter_id not in assignment.peers:
+            raise UnauthorizedVoterError(
+                f"{voter_id} is not assigned to validation {assignment_id}"
+            )
+        if voter_id not in self._agents:
+            raise UnauthorizedVoterError(f"{voter_id} is not a registered mesh agent")
+        return assignment
+
+    def _record_verified_vote_locked(
+        self, assignment: PeerAssignment, voter_id: str, verified: VoteEnvelope
+    ) -> ValidationVote:
+        """Install one already-verified envelope; callers verify exactly once."""
+        assignment_id = assignment.assignment_id
+        existing = self._votes.get(assignment_id, [])
+        if any(v.voter_id == voter_id for v in existing):
+            raise DuplicateVoteError(f"{voter_id} already voted on {assignment_id}")
+        self._signed_envelopes_by_signature.pop(verified.signature, None)
+
+        vote = ValidationVote(
+            assignment_id=assignment_id,
+            voter_id=voter_id,
+            approved=verified.approved,
+            reason=verified.reason,
+            signature=verified.signature,
+            constitutional_hash=assignment.constitutional_hash,
+            content_hash=assignment.content_hash,
+            timestamp=time.time(),
+        )
+        self._votes[assignment_id] = [*existing, vote]
+        self._vote_envelopes[assignment_id] = [
+            *self._vote_envelopes.get(assignment_id, []),
+            verified,
+        ]
+        self._total_votes += 1
+        self._agents[voter_id].validations_performed += 1
+
+        # Update reputations if quorum reached
+        self._maybe_settle_reputations(assignment_id)
         return vote
 
     def get_result(self, assignment_id: str) -> MeshResult:
@@ -1033,10 +1062,7 @@ class ConstitutionalMesh:
             if self._settlement_store is not None:
                 self._settlement_store.clear_pending(assignment_id)
             with self._lock:
-                self._assignments[assignment_id] = replace(
-                    recovered_assignment,
-                    content="",
-                )
+                self._put_assignment_locked(replace(recovered_assignment, content=""))
                 self._votes.pop(assignment_id, None)
                 self._purge_signed_envelopes_locked(assignment_id)
                 self._settled_assignments.discard(assignment_id)
@@ -1393,18 +1419,47 @@ class ConstitutionalMesh:
         ).encode("utf-8")
 
     @staticmethod
-    def _evict_remote_vote_nonce_cache_entries(
+    def _reject_unadmissible_remote_vote_nonce(
+        nonce_cache: OrderedDict[str, float], nonce: str
+    ) -> None:
+        if nonce in nonce_cache:
+            raise RemoteVoteReplayError(
+                f"Remote vote request nonce {nonce!r} was already used inside the replay window"
+            )
+        if len(nonce_cache) >= _MAX_REMOTE_VOTE_NONCES_PER_SIGNER:
+            raise RemoteVoteReplayError("Remote vote request nonce capacity reached for signer")
+
+    @staticmethod
+    def _check_remote_vote_nonce(
+        nonce_cache: OrderedDict[str, float], nonce: str, *, now: float
+    ) -> None:
+        """Sweep expired nonces and reject a replay without recording anything.
+
+        Cache values are expiry times. They are not insertion-ordered (a later
+        request may carry an earlier timestamp), so the whole bounded cache is
+        scanned rather than its head. A request is still accepted at exactly
+        ``timestamp + W``, so a nonce is kept through its expiry instant.
+        """
+        for expired in [key for key, expires_at in nonce_cache.items() if expires_at < now]:
+            del nonce_cache[expired]
+        ConstitutionalMesh._reject_unadmissible_remote_vote_nonce(nonce_cache, nonce)
+
+    @staticmethod
+    def _record_remote_vote_nonce(
         nonce_cache: OrderedDict[str, float],
+        request: RemoteVoteRequest,
         *,
         now: float,
         replay_window_seconds: float,
     ) -> None:
-        expiry_cutoff = now - replay_window_seconds
-        while nonce_cache:
-            oldest_nonce, last_seen = next(iter(nonce_cache.items()))
-            if last_seen > expiry_cutoff:
-                break
-            nonce_cache.pop(oldest_nonce)
+        """Record a fully verified nonce until its acceptance window closes.
+
+        Requests are accepted while ``abs(now - timestamp) <= W``, so the nonce is
+        held until ``max(now, timestamp) + W``; expiring it at receipt time + W
+        would let a future-dated request be replayed after eviction.
+        """
+        ConstitutionalMesh._reject_unadmissible_remote_vote_nonce(nonce_cache, request.nonce)
+        nonce_cache[request.nonce] = max(now, request.timestamp) + replay_window_seconds
 
     @staticmethod
     def verify_remote_vote_request(
@@ -1470,27 +1525,22 @@ class ConstitutionalMesh:
         except (ValueError, InvalidSignature) as exc:
             raise ValueError("Remote vote request signature is invalid") from exc
         if nonce_cache is not None:
-            ConstitutionalMesh._evict_remote_vote_nonce_cache_entries(
+            # Only authenticated requests reach the cache: an unsigned caller can
+            # neither probe nonce presence nor make us pay for the sweep.
+            ConstitutionalMesh._check_remote_vote_nonce(
+                nonce_cache, request.nonce, now=current_time
+            )
+            ConstitutionalMesh._record_remote_vote_nonce(
                 nonce_cache,
+                request,
                 now=current_time,
                 replay_window_seconds=replay_window_seconds,
             )
-            if request.nonce in nonce_cache:
-                raise RemoteVoteReplayError(
-                    f"Remote vote request nonce {request.nonce!r}"
-                    " was already used inside the replay window"
-                )
-            if len(nonce_cache) >= 10_000:
-                raise RemoteVoteReplayError(
-                    "Remote vote request nonce capacity reached for signer"
-                )
-            nonce_cache[request.nonce] = current_time
-            nonce_cache.move_to_end(request.nonce)
         return True
 
     @staticmethod
-    def _content_matches_hash(content: str, content_hash: str) -> bool:
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32] == content_hash
+    def _content_matches_hash(content: str, expected_hash: str) -> bool:
+        return content_hash(content) == expected_hash
 
     @classmethod
     def _assert_assignment_payload_complete(cls, assignment: PeerAssignment) -> None:
@@ -1504,6 +1554,8 @@ class ConstitutionalMesh:
         self, assignment: PeerAssignment
     ) -> None:
         if assignment.constitutional_hash != self.constitutional_hash:
+            # Self-heal the rotation-gated discard if a mismatch ever arises otherwise.
+            self._stale_assignments_possible = True
             raise MeshSnapshotStaleError(
                 f"Assignment {assignment.assignment_id} belongs to a stale constitution"
             )
@@ -1523,12 +1575,31 @@ class ConstitutionalMesh:
     # -- Stats -------------------------------------------------------------
 
     def _pending_assignment_count_locked(self) -> int:
-        return sum(
-            1 for assignment in self._assignments.values() if not assignment.is_recovered
-        )
+        return self._pending_assignments
+
+    def _put_assignment_locked(self, assignment: PeerAssignment) -> None:
+        """Install or replace one assignment, keeping the pending counter exact."""
+        previous = self._assignments.get(assignment.assignment_id)
+        if previous is not None and not previous.is_recovered:
+            self._pending_assignments -= 1
+        if not assignment.is_recovered:
+            self._pending_assignments += 1
+        self._assignments[assignment.assignment_id] = assignment
+
+    def _pop_assignment_locked(self, assignment_id: str) -> None:
+        previous = self._assignments.pop(assignment_id, None)
+        if previous is not None and not previous.is_recovered:
+            self._pending_assignments -= 1
 
     def _discard_stale_assignments_locked(self) -> None:
-        """Reclaim bounded pending capacity from invalidated constitutions."""
+        """Reclaim bounded pending capacity from invalidated constitutions.
+
+        Only ``rotate_constitution`` can strand pending assignments (every insert
+        checks the current hash), so the scan runs once per rotation.
+        """
+        if not self._stale_assignments_possible:
+            return
+        self._stale_assignments_possible = False
         stale_ids = [
             assignment_id
             for assignment_id, assignment in self._assignments.items()
@@ -1536,7 +1607,7 @@ class ConstitutionalMesh:
             and assignment.constitutional_hash != self.constitutional_hash
         ]
         for assignment_id in stale_ids:
-            self._assignments.pop(assignment_id, None)
+            self._pop_assignment_locked(assignment_id)
             self._votes.pop(assignment_id, None)
             self._purge_signed_envelopes_locked(assignment_id)
             self._settled_assignments.discard(assignment_id)
@@ -1551,7 +1622,7 @@ class ConstitutionalMesh:
         self._final_results.move_to_end(assignment_id)
         while len(self._final_results) > self._max_settled_results:
             evicted_id, _ = self._final_results.popitem(last=False)
-            self._assignments.pop(evicted_id, None)
+            self._pop_assignment_locked(evicted_id)
             self._votes.pop(evicted_id, None)
             self._purge_signed_envelopes_locked(evicted_id)
             self._settled_assignments.discard(evicted_id)
@@ -1974,10 +2045,8 @@ class ConstitutionalMesh:
             raise ValueError("signed assignment evidence is required")
         if (
             envelope.protocol_version != 3
-            or envelope.assignment_digest
-            != signed_assignment_digest(assignment.signed_assignment)
-            or
-            envelope.assigned_peer_count != len(assignment.peers)
+            or envelope.assignment_digest != assignment.signed_assignment_digest
+            or envelope.assigned_peer_count != len(assignment.peers)
             or envelope.assigned_peers_hash
             != canonical_assigned_peers_hash(assignment.peers)
             or envelope.quorum != self._effective_quorum(assignment)
@@ -2045,7 +2114,6 @@ class ConstitutionalMesh:
         )
         from constitutional_swarm.settlement_evidence import (
             RECEIPT_SIGNER_KEY_ID,
-            committed_receipt_index,
             evidence_lock,
             receipt_path_for,
             store_filesystem_path,
@@ -2091,8 +2159,7 @@ class ConstitutionalMesh:
             return
         receipt_path = receipt_path_for(self._settlement_store, assignment_id)
         with evidence_lock(self._settlement_store):
-            referenced = committed_receipt_index(self._settlement_store)
-            if assignment_id in referenced:
+            if self._has_committed_receipt(assignment_id):
                 # A committed pointer already exists. Do not replace the file.
                 self._settlement_store.append(bound)
                 return
@@ -2109,10 +2176,14 @@ class ConstitutionalMesh:
             try:
                 self._settlement_store.append(bound)
             except Exception:
-                still_referenced = committed_receipt_index(self._settlement_store)
-                if assignment_id not in still_referenced:
+                if not self._has_committed_receipt(assignment_id):
                     receipt_path.unlink(missing_ok=True)
                 raise
+
+    def _has_committed_receipt(self, assignment_id: str) -> bool:
+        """Whether one committed settlement already points at a receipt (indexed get)."""
+        record = lookup_settlement(self._settlement_store, assignment_id)
+        return record is not None and bool(normalize_receipt_digest(record.receipt_digest))
 
     def _receipt_bundle_path(self, assignment_id: str) -> Path:
         from constitutional_swarm.settlement_evidence import receipt_path_for
@@ -2161,7 +2232,7 @@ class ConstitutionalMesh:
                     exc,
                 )
                 continue
-            self._assignments[assignment.assignment_id] = assignment
+            self._put_assignment_locked(assignment)
             self._vote_envelopes[assignment.assignment_id] = list(envelopes)
             self._votes.setdefault(assignment.assignment_id, [])
             self._remember_final_result_locked(assignment.assignment_id, result)
@@ -2222,16 +2293,8 @@ class ConstitutionalMesh:
             or assignment.signed_assignment.key_id != self._assigner_key_id
         ):
             raise ValueError("signed assignment does not match mesh assignment authority")
-        verify_signed_assignment(
-            assignment.signed_assignment,
-            self._assigner_trust_root,
-            task_id=assignment.task_id,
-            assignment_id=assignment.assignment_id,
-            producer_id=assignment.producer_id,
-            artifact_id=assignment.artifact_id,
-            content_hash=assignment.content_hash,
-            constitutional_hash=assignment.constitutional_hash,
-        )
+        # The assignment authority comes only from the trust root and pins fixed at
+        # construction; the live registry authorizes voters, never the assigner.
         envelopes = verify_assignment_vote_envelopes(
             assignment.signed_assignment,
             record.votes,
@@ -2245,6 +2308,9 @@ class ConstitutionalMesh:
             expected_assigned_peers=assignment.peers,
             expected_quorum=self._effective_quorum(assignment),
             require_independent=self._evidence_mode != "single_operator_dev",
+            assigner_trust_root=self._assigner_trust_root,
+            expected_assigner_id=self._assigner_id,
+            expected_assigner_key_id=self._assigner_key_id,
         )
         # verify_assignment_vote_envelopes binds the envelope count and voter
         # set to the signed roster, so unassigned or missing voters cannot pass.
@@ -2313,6 +2379,8 @@ class ConstitutionalMesh:
             },
         )
         report = ReconciliationReport()
+        # Durable history is read once per pass (lazily); later lookups are by id.
+        durable_index: tuple[dict[str, SettlementRecord], frozenset[str]] | None = None
 
         for record in pending_records:
             assignment_id = str(record.assignment.get("assignment_id", "<unknown>"))
@@ -2361,7 +2429,14 @@ class ConstitutionalMesh:
                     durable_record,
                     votes=recovered_votes,
                 )
-                existing_durable = self._durable_settlement(assignment.assignment_id)
+                if durable_index is None:
+                    durable_index = self._load_durable_index()
+                durable_records, duplicate_ids = durable_index
+                if assignment.assignment_id in duplicate_ids:
+                    raise ValueError(
+                        f"Durable settlement {assignment.assignment_id} appears more than once"
+                    )
+                existing_durable = durable_records.get(assignment.assignment_id)
                 if existing_durable is None:
                     try:
                         self._persist_settlement_record(
@@ -2370,8 +2445,8 @@ class ConstitutionalMesh:
                         )
                     except DuplicateSettlementError:
                         pass
-                    existing_durable = self._durable_settlement(
-                        assignment.assignment_id
+                    existing_durable = lookup_settlement(
+                        self._settlement_store, assignment.assignment_id
                     )
                 self._require_matching_durable_settlement(
                     expected_durable,
@@ -2390,17 +2465,13 @@ class ConstitutionalMesh:
                         continue
                     current_assignment = self._assignments.get(assignment.assignment_id)
                     if current_assignment is None:
-                        self._assignments[assignment.assignment_id] = replace(
-                            assignment,
-                            is_recovered=True,
-                            content="",
+                        self._put_assignment_locked(
+                            replace(assignment, is_recovered=True, content="")
                         )
                         self._total_validations += 1
                     elif not current_assignment.is_recovered:
-                        self._assignments[assignment.assignment_id] = replace(
-                            current_assignment,
-                            is_recovered=True,
-                            content="",
+                        self._put_assignment_locked(
+                            replace(current_assignment, is_recovered=True, content="")
                         )
                     if assignment.assignment_id not in self._final_results:
                         self._remember_final_result_locked(assignment.assignment_id, result)
@@ -2457,20 +2528,18 @@ class ConstitutionalMesh:
         """Install the exact authenticated vote evidence used by receipts."""
         return replace(record, votes=self._vote_dicts(votes))
 
-    def _durable_settlement(self, assignment_id: str) -> SettlementRecord | None:
-        """Load one durable settlement by identity and reject duplicate history."""
-        if self._settlement_store is None:
-            return None
-        matches = [
-            record
-            for record in self._settlement_store.load_all()
-            if str(record.assignment.get("assignment_id", "")) == assignment_id
-        ]
-        if len(matches) > 1:
-            raise ValueError(
-                f"Durable settlement {assignment_id} appears more than once"
-            )
-        return matches[0] if matches else None
+    def _load_durable_index(self) -> tuple[dict[str, SettlementRecord], frozenset[str]]:
+        """Index durable settlements by id, separating ids that appear more than once."""
+        assert self._settlement_store is not None
+        records: dict[str, SettlementRecord] = {}
+        duplicates: set[str] = set()
+        for record in self._settlement_store.load_all():
+            assignment_id = str(record.assignment.get("assignment_id", ""))
+            if assignment_id in records:
+                duplicates.add(assignment_id)
+            else:
+                records[assignment_id] = record
+        return records, frozenset(duplicates)
 
     @staticmethod
     def _require_matching_durable_settlement(
@@ -2774,9 +2843,7 @@ class ConstitutionalMesh:
                 assigned_peers=assignment.peers,
                 quorum=self._effective_quorum(assignment),
                 evidence_mode=self._assignment_evidence_mode(assignment),
-                assignment_digest=signed_assignment_digest(
-                    assignment.signed_assignment
-                ) if assignment.signed_assignment is not None else "",
+                assignment_digest=assignment.signed_assignment_digest,
             )
             if len(self._signed_envelopes_by_signature) >= 10_000:
                 raise MeshCapacityError("pending locally signed vote capacity reached")
@@ -2818,16 +2885,10 @@ class ConstitutionalMesh:
             return self._signed_envelopes_by_signature[signature]
 
     def submit_vote_envelope(self, envelope: VoteEnvelope) -> ValidationVote:
+        """Verify one signed envelope once and record it as the voter's vote."""
         with self._lock:
-            assignment = self._assignments.get(envelope.assignment_id)
-            if assignment is None:
-                raise KeyError(f"Assignment {envelope.assignment_id} not found")
-            if envelope.voter_id not in assignment.peers:
-                raise UnauthorizedVoterError(
-                    f"{envelope.voter_id} is not assigned to validation "
-                    f"{envelope.assignment_id}"
-                )
-            verify_vote_envelope(
+            assignment = self._vote_target_locked(envelope.assignment_id, envelope.voter_id)
+            verified = verify_vote_envelope(
                 envelope,
                 self._vote_registry,
                 task_id=assignment.task_id,
@@ -2836,25 +2897,15 @@ class ConstitutionalMesh:
                 artifact_id=assignment.artifact_id,
                 content_hash=assignment.content_hash,
                 constitutional_hash=assignment.constitutional_hash,
-                expected_assignment_digest=(
-                    signed_assignment_digest(assignment.signed_assignment)
-                    if assignment.signed_assignment is not None
-                    else None
-                ),
+                expected_assignment_digest=assignment.signed_assignment_digest or None,
             )
-            self._verify_envelope_assignment_metadata(envelope, assignment)
-            self._signed_envelopes_by_signature[envelope.signature] = envelope
-        try:
-            return self.submit_vote(
-                envelope.assignment_id,
-                envelope.voter_id,
-                approved=envelope.approved,
-                reason=envelope.reason,
-                signature=envelope.signature,
+            self._verify_envelope_assignment_metadata(verified, assignment)
+            vote = self._record_verified_vote_locked(
+                assignment, envelope.voter_id, verified
             )
-        finally:
-            with self._lock:
-                self._signed_envelopes_by_signature.pop(envelope.signature, None)
+        if self._maybe_finalize_result(envelope.assignment_id):
+            self.settle(envelope.assignment_id)
+        return vote
 
     def get_vote_public_key(self, agent_id: str) -> str:
         """Return the registered Ed25519 public key as a hex string."""
@@ -2933,29 +2984,15 @@ class ConstitutionalMesh:
 
     @staticmethod
     def _coerce_public_key(value: Ed25519PublicKey | bytes | str) -> Ed25519PublicKey:
-        if isinstance(value, Ed25519PublicKey):
-            raw = value.public_bytes(
-                serialization.Encoding.Raw,
-                serialization.PublicFormat.Raw,
-            )
-        else:
-            raw = (
-                bytes.fromhex(str.__str__(value))
-                if isinstance(value, str)
-                else value
-            )
-        if not isinstance(raw, bytes):
-            raise TypeError("invalid public key type")
-        return Ed25519PublicKey.from_public_bytes(bytes(raw))
+        """Canonical key coercion: hex input must be exact lowercase hex."""
+        return public_key_from(value)
 
     @staticmethod
     def _coerce_private_key(
         value: Ed25519PrivateKey | bytes | str,
     ) -> Ed25519PrivateKey:
-        if isinstance(value, Ed25519PrivateKey):
-            return value
-        raw = bytes.fromhex(value) if isinstance(value, str) else value
-        return Ed25519PrivateKey.from_private_bytes(raw)
+        """Canonical key coercion: hex input must be exact lowercase hex."""
+        return private_key_from(value)
 
     @staticmethod
     def _vote_payload_bytes(

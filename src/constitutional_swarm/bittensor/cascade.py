@@ -553,6 +553,17 @@ class PrecedentCascade:
         ):
             return False
         expected_content_hash = judgment_content_hash(candidate.judgment_text)
+        # With a mesh, the assigner is pinned by its construction-time trust root,
+        # never by grants that reached the caller-supplied voter registry.
+        assigner_pins: dict[str, Any] = (
+            {}
+            if self._mesh is None
+            else {
+                "assigner_trust_root": self._mesh.assigner_trust_root,
+                "expected_assigner_id": self._mesh.assigner_id,
+                "expected_assigner_key_id": self._mesh.assigner_key_id,
+            }
+        )
         try:
             envelopes = verify_assignment_vote_envelopes(
                 result.signed_assignment,
@@ -565,6 +576,7 @@ class PrecedentCascade:
                 content_hash=expected_content_hash,
                 constitutional_hash=self._constitution.hash,
                 require_independent=True,
+                **assigner_pins,
             )
         except (IndexError, TypeError, ValueError):
             return False
