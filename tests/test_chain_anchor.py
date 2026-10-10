@@ -202,7 +202,7 @@ class TestChainAnchor:
 
         record = anchor.anchor_history[0]
         for p in proofs:
-            assert record.verify_membership(p) is True
+            assert record.verify_membership(p, expected_root=record.batch_root) is True
 
     def test_non_member_proof_not_verified(self):
         anchor = ChainAnchor(CONST_HASH, batch_size=5)
@@ -211,7 +211,7 @@ class TestChainAnchor:
 
         record = anchor.anchor_history[0]
         outsider = _make_proof(root_hash="not_in_batch")
-        assert record.verify_membership(outsider) is False
+        assert record.verify_membership(outsider, expected_root=record.batch_root) is False
 
     def test_verify_proof_in_history(self):
         anchor = ChainAnchor(CONST_HASH, batch_size=3)
