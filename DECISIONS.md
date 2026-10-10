@@ -267,7 +267,7 @@ security claims hold:
 | Change | Before | After |
 |---|---|---|
 | Evidence bundle integrity | `verify_bundle` only re-checked chain self-consistency → a coherent chain fabricated from scratch verified green (verifier == forger) | `build_bundle` optionally Ed25519-signs a domain-separated attestation pre-image (`BUNDLE_SIG_DOMAIN`, binds chain_hash + constitution_hash + version pin + final_state + task identity). `verify_bundle(..., trusted_public_keys=...)` REQUIRES a valid signature for `ok` when a trust anchor is supplied. Trust derives only from out-of-band keys, never the bundle-embedded key. |
-| `tool_call` gate | default-ALLOW (denylist only) → `curl http://x/` ran | code-owned default-DENY allowlist `DEFAULT_COMMAND_ALLOWLIST = (true, echo)`; a constitution may EXTEND it but never weaken the default. Interpreter/test-runner/shell commands (`python*`, `pypy*`, `pytest`, `bash`, `env`, `uv`, `node`, …) are in `DENIED_INTERPRETER_COMMANDS` and are denied UNCONDITIONALLY — an allowlist cannot re-enable them, since `python -c <code>` / a `pytest` conftest / `bash -c` would bypass every other gate. `ACGS_TEST` therefore runs only pre-vetted non-interpreter commands; running the real test suite is a supervisor responsibility outside the governed directive stream. |
+| `tool_call` gate | default-ALLOW (denylist only) → `curl http://x/` ran | default-DENY against a closed, code-owned safe-command table `SAFE_COMMANDS` (current form, C25b): `true` (no arguments) and `echo` (plain-word arguments, no flags or path separators, ≤64 arguments of ≤256 characters). Every entry carries its own argument policy (`SafeCommandSpec`). `command_allowlist` may only SELECT from the table. A list, tuple or set narrows it: unknown names are ignored, and an empty one enables nothing. A non-sequence value (for example a string) enables nothing. An absent or null value enables the whole table. Configuration can never add an executable, flag, or argument shape, so interpreters, shells, launchers and test runners cannot be enabled. `ACGS_TEST` therefore runs only these commands; running the real test suite is a supervisor responsibility outside the governed directive stream. |
 | Constitution version pin | `608508a9bd224290` computed + emitted but never compared | `_intake` fails closed if the constitution **declares** a `constitutional_version` / `constitutional_hash` that ≠ the pinned constant (enforce-if-declared; silent when undeclared, preserving existing configs) |
 
 **New public surface:** `BundleSigner`, `verify_bundle(trusted_public_keys=...)`,
@@ -279,6 +279,18 @@ chain-consistency and runs stay unsigned (honestly reported as `signed: false`).
 return `ok: false`; every summary field (`tests_run`, `policy_decisions`,
 `file_changes`, `tool_events`, `role_assignments`) is bound into the v2 signed
 pre-image and re-derived from replayed events.
+**Superseded 2026-10-10 (C25, C25b):** the original `tool_call` row let a
+constitution EXTEND `DEFAULT_COMMAND_ALLOWLIST` and relied on a
+`DENIED_INTERPRETER_COMMANDS` denylist plus an argv-wide name scan. That design
+was open-world: any unlisted launcher (`split --filter`, `capsh`, `prlimit`,
+`setpriv`, `bwrap`) or `--opt=value` form re-opened code execution. The denylist
+was deleted and replaced by the closed `SAFE_COMMANDS` table above; adding a
+command now requires a code change with a reviewed argument policy. Signing
+material moved to `ACGS_SIGNING_KEY_FILE` (an owner-only, single-link regular
+file read through `secure_files.private_file`); `ACGS_SIGNING_KEY` is deprecated
+and every `ACGS_SIGNING_*` variable is withheld from child processes. Every
+governed child launch makes the supervisor non-dumpable on Linux (signed or
+unsigned) and reads `PR_GET_DUMPABLE` back, failing closed if it is not 0.
 The constitutional hash constant itself is **unchanged** — this only adds
 enforcement that references it. Signing uses the core `cryptography` dep (no new
 optional extra). Deferred: REVIEW-halts-loop and full executor loop-ification
@@ -527,3 +539,171 @@ The authority-key loader also requires the opened descriptor's `st_uid` to
 equal `os.geteuid()`. `O_NOFOLLOW` protects only the final path component; it
 does not establish a recursive no-symlink policy for parent components, so
 operators must control every parent directory in the authority-file path.
+
+### 2026-10-10 — Systemic sweep C18–C51: trust anchors come from the verifier
+
+One rule runs through every batch: a verifier takes its trust anchors (keys,
+roots, rosters, thresholds, expected request) from its own configuration, never
+from the object it is judging, and an insecure mode needs an explicit, greppable
+opt-in. Per-batch decisions follow. Batch labels (C18, C48, …) match the
+`fix/C<N>-…` branch names in the integration merge commits, for example
+`git log --merges --grep 'fix/C48'`. C14, C16 and C17 have their own entries
+above.
+
+- **Shared helpers (C18).** `strict_json` (duplicate keys, NaN, lone surrogates,
+  depth and size limits), `framing.framed_digest` / `require_plain_id` (typed,
+  length-framed digests; a finite ASCII identifier grammar) and
+  `secure_files.private_file` (descriptor-based owner, mode and link checks)
+  are stdlib-only. New digests use `canonical_dumps`; the byte-stable encoders
+  already in use (codec, protocol v1, governance receipts, contract) are not
+  merged into it, because their digests are persisted or signed.
+- **Transitions and sync (C19).** Thresholds, drift budget and trust root come
+  from verifier-owned policy; a certificate must agree with them. Transition
+  votes sign `constitutional-transition-v3`, sync messages are wire v2 and must
+  be signed by a trusted issuer, and replay state is per issuer. A governed
+  certificate waives neither issuer authentication nor replay checks.
+- **QC votes (C20).** `SignedVote` signatures bind `voter_id` through
+  `build_vote_message_v2` (`acgs-swarm/qc-vote/v2`). Only the verifier's
+  `CertificateVerificationPolicy(allow_legacy_v1=True)` can accept v1; a
+  per-vote version field was rejected because the verified object would pick
+  its own weaker format. Fault-domain caps keep cap-vs-raw semantics with an
+  opt-in `enforce_domain_share`; water-filling was rejected because it changes
+  every quorum decision.
+- **Admission and R4 audit (C21).** Gates snapshot trusted inputs at
+  construction, weight candidates must present exactly the reference matrix
+  names, and a gate whose precondition cannot be checked fails rather than
+  reporting "skipped". The R4 audit runs the generator in a `python -I -S`
+  child; it is not a sandbox.
+- **Authority plane (C22, C23).** Observer launch is pinned to
+  `ObserverLaunchExpectationsV1` built from supervisor-held state, never read
+  back from the attestation. All authority-plane JSON uses the shared strict
+  parser. The privileged child sends only stable codes from
+  `_PROTOCOL_ERROR_CODES` over IPC, requires pairwise-distinct role keys, and
+  takes the policy version explicitly. Collapsing all denials to one code was
+  rejected because callers depend on reasons such as `untrusted_policy_binding`.
+- **Governed commit (C24).** Seal anchors are pinned to the bootstrap config
+  (`authority_anchor_mismatch` otherwise) and `_transaction` is the single
+  commit owner. Recorded limit: the agent signature in
+  `GovernedReceiptPayload.canonical_bytes` covers only the APCC
+  producer-statement projection. Policy context (`policy_version`,
+  `policy_digest`, epochs, `authority_root`, `workflow_generation`,
+  `state_version`, `profile`, `intent`, `verifier_policy_id`) is bound by the
+  policy-signed `AuthoritativeVerdict`, not by the agent. Changing that would
+  bump the APCC producer-statement protocol. It is left to a deferred design
+  decision on request authority.
+- **Governed handoff (C25, C25b, C51a).** Signer material and executable
+  authorization share one subprocess boundary. See the 2026-06-03 entry's
+  2026-10-10 supersession note for the closed `SAFE_COMMANDS` table. The
+  operator-configured `ExternalAgentAdapter` command is not routed through
+  `SAFE_COMMANDS`, because it must launch real agent CLIs. It is resolved on
+  `FIXED_SUBPROCESS_PATH` (`/usr/bin:/bin:/usr/local/bin`, with system
+  directories first) or must be absolute. A relative, blank, unparseable or
+  unresolvable command fails before spawn.
+- **Receipts and settlement (C26, C27).** Settlement signers must be distinct
+  from voters, the assigner and the producer, checked at the grant and again at
+  verification. Evidence verified against a root containing a `fixture-`
+  identity or a publicly derivable key is labelled `development`, never
+  `proof_grade`. Settlement persistence uses one OS lock helper
+  (`exclusive_file_lock`, `flock`); running without a lock raises
+  `SettlementLockUnavailableError` rather than warning.
+- **Mesh core and vote envelopes (C28, C29, C48).** Persisted-settlement loading
+  has one quarantine boundary: an unparsable, hash-inconsistent or
+  evidence-failing record is logged with its cause and never becomes
+  authoritative, and construction never aborts on stored history. Assignment
+  authority is a caller-pinned trust root: `verify_assignment_vote_envelopes`
+  takes `assigner_trust_root`, `expected_assigner_id` and
+  `expected_assigner_key_id`. `ConstitutionalMesh.vote_registry` deliberately
+  stays the live, mutable voter registry (C28), and `assigner_trust_root` is a
+  separate frozen registry holding only the pinned assigner grant (assigner id
+  and key). It is deliberately not a snapshot of the live registry, so a mesh
+  built by `rotate_constitution` cannot inherit a late-registered assigner and
+  `receipt_trust_registry()` exports only the pinned assigner as its assigner
+  grant. C48 kept that split by design
+  and declined to make `vote_registry` return `frozen_copy()`, because
+  `ConstitutionalValidator.rotate_constitution` passes the live registry into a
+  new mesh that mutates it. Instead every in-repo verifier path (mesh recovery,
+  `ConstitutionalValidator`, `PrecedentCascade` when it holds a mesh) pins
+  `assigner_trust_root` plus the pinned assigner id and key. A third-party
+  verifier that reads `vote_registry` without passing `assigner_trust_root`
+  still trusts live assigner grants. Remote-vote nonces (mesh core and
+  `LocalRemotePeer`) are checked and recorded only after the signature
+  verifies, expire at `max(now, timestamp) + W`, and are evicted only when
+  `expires_at < now`, so a replay at exactly `timestamp + W` is still rejected.
+- **Gossip (C30).** Gossip reuses the remote-vote TLS policy: plaintext is the
+  default only on loopback, and the shared token is refused on any plaintext
+  non-loopback link. There is no override for a TLS-terminating proxy.
+- **Private voting and DP (C31).** Private voting is fail-closed by default:
+  `strict_v2=True`, and the hash-scaffold prover counts only with
+  `allow_insecure_hash_prover=True` in non-strict mode. `DrandClient` stays
+  unauthenticated (no BLS dependency) and says so; ODE snapshots never claim
+  BODES passage.
+- **APCC stores (C32).** Non-decision audit ids use
+  `framed_digest(b"apcc.audit-id.v2", ...)`; the decision family (`commit`,
+  `DENIED`, `CONFLICTED`, `conflict`) keeps the v1 NUL-join because
+  `observation.py` recomputes it independently. Migration is fail-closed
+  (rewriting would re-hash the trust-log chain). The PostgreSQL store imports
+  the same id function and semantic validator, so both backends are affected.
+  The schema v4 bump is deferred because it needs the PG17 GCB catalog
+  fingerprint regenerated. Until then, pre-C32 SQLite and PostgreSQL stores
+  fail to reopen with a generic error ("APCC SQLite store semantic validation
+  failed" or "APCC authority store semantic validation failed"). The store runs
+  the same per-row validator when writing as when reopening, so it cannot seal
+  a state it would reject.
+- **APCC observation and empirical (C33, C34).** The request an observation
+  answers comes from the caller (`expected_request`) and is compared before any
+  cryptographic work; the verified result records `request_digest`. B4 pins its
+  proof trust root at adapter construction; B5's journal MAC comes from a
+  dedicated supervisor-only secret via HKDF, and B5 bumped `ADAPTER_VERSION` to
+  `gcb1-subprocess-v2` with no migration.
+- **Audit log and anchors (C35, C35b).** One count-committed RFC 6962-style
+  Merkle tree serves audit batches and chain anchors. Verifier trust facts come
+  from the caller (`expected_root`, `expected_batch_id`); there is no unpinned
+  fallback. Decoders accept exactly the key set `to_dict()` emits, because
+  silent defaults changed the hashed leaf content.
+- **Bittensor (C36–C39).** Response authentication is one library function
+  (`synapse_adapter.authenticate_response`) that both the client and the
+  testnet script call; scripts may add allow-lists but never re-implement
+  verification. A miner axon attaches only through `attach_to`. NMC commitments
+  bind `(session_id, case_id, miner_uid)` with a v2 framed digest and rosters
+  are mandatory. Rule codification separates duties (pinned governor roster,
+  proposer excluded, pinned constitution hash). Precedent metadata shape is a
+  `PrecedentRecord` constructor invariant; cryptographic `task_id` binding is a
+  follow-up. Economics and attestation need explicit opt-ins:
+  `allow_insecure_stub`, `allow_unregistered`, `admin_override`.
+- **SWE-bench (C40, C41).** Governance and evaluation share one detector entry
+  point (`evaluate_payload`), so the enforced robustness floor is the one that
+  is measured. The CRDT `bodes_passed` flag carries the governance verdict.
+  Library code never derives a write location from the cwd. Patch adapters
+  share one diff extractor and one Messages-API base; oracle-selected
+  best-of-k results are labelled pass@k. C51b allowlists instance ids
+  (`[A-Za-z0-9][A-Za-z0-9._-]*`) before they reach paths or harness argv. It
+  extends normalization with accent folding (NFKD, drop marks, NFC) and maps
+  blank fillers to spaces, while zero-width characters are still deleted.
+  ROLE-004 matches `rm` recursive and force flags in any order using bounded
+  patterns only, so matching stays linear. That changed the MCFS rule-set hash
+  (`4b9636ce4710779f` → `ebcb7caa26e6abfb`), which nothing pins; the project
+  constitutional hash is unchanged.
+- **LangGraph runtime (C42, C42b, C51a).** The actual DNA hash is pinned and
+  rechecked; acceptance is a terminal verdict owned by the settle node, and
+  streaming trusts only that node's own update. Error labels are a closed set.
+  `stream_to_crdt` appends at most once, after the stream ends, and only when
+  the final patch equals the patch the validator checked and the settle node
+  read. Each update is bound to the input state its task read, and an
+  unobserved write (a replayed chunk, a task without a result event, or early
+  close) appends nothing. This is an in-process evidence protocol, not
+  cryptographic attestation.
+- **Core governance gates (C43).** `govern` raises by default on an invalid
+  result or a verified Z3 counterexample; WARN-tier matches are logged and
+  counted, not raised, because blocking them would override the constitution
+  author's intent. Credentials verify against issuer keys pinned at bridge
+  construction, debate roles come from a registry pinned on the resolver, and
+  the MAC-ACGS loop approves only through a registered external challenger.
+- **Numerics (C44).** Spectral-sphere projection is a verifier: non-finite input,
+  an overflowed estimate or an unverified bound raises rather than reporting
+  `r`, because `trust_matrix` readers do not consult `is_stable`.
+- **Core misc and tooling (C45, C47).** Duplicate agent names are rejected at
+  discovery (report schema unchanged); ArtifactStore visibility guards run
+  outside the non-reentrant store lock. Benchmark CLI verifiers parse
+  security-relevant JSON with the shared strict loader, and packet JSON that
+  only a lenient parser accepts is reported as `ambiguous_packet_json`. TLC
+  runners hash and run a private copy of the jar.
