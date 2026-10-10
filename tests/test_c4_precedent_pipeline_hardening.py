@@ -11,7 +11,11 @@ import pytest
 from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
 from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
-from constitutional_swarm.bittensor.rule_codifier import PrecedentCluster, RuleCodifier
+from constitutional_swarm.bittensor.rule_codifier import (
+    PrecedentCluster,
+    RuleCodifier,
+    constitution_hash,
+)
 from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
 from constitutional_swarm.bittensor.synapses import JudgmentSynapse, ValidationSynapse
 from constitutional_swarm.mesh.settlement import MeshProof
@@ -38,6 +42,13 @@ from tests.test_c14_protocol_hardening import (
     c14_precedent_test_registry,
     c14_precedent_test_store,
 )
+
+
+# C38: approval/activation need a rostered governor, and activation only
+# extends the YAML whose hash is the codifier's pinned constitutional hash.
+_C38_GOVERNOR = "c38-governor"
+_C38_BASE_YAML = "name: test\nrules: []\n"
+_C38_BASE_HASH = constitution_hash(_C38_BASE_YAML)
 
 
 class _GuardTrackingStore(PrecedentStore):
@@ -222,6 +233,7 @@ def _admission_codifier_with_one_record() -> tuple[PrecedentStore, RuleCodifier,
         precedent_store=store,
         min_cluster_size=1,
         min_validator_agreement=0.5,
+        governors={_C38_GOVERNOR},
     )
     return store, codifier, record
 
@@ -239,7 +251,7 @@ def test_admission_revocation_between_proposal_and_approval_fails_closed() -> No
     [candidate] = codifier.propose_rules(codifier.find_clusters(store.active_records()))
     store.revoke(record.precedent_id)
     with pytest.raises(ValueError, match="active|revoked"):
-        codifier.approve(candidate.candidate_id)
+        codifier.approve(candidate.candidate_id, governor=_C38_GOVERNOR)
 
 
 def test_admission_proposal_uses_one_detached_cluster_snapshot() -> None:
@@ -299,16 +311,16 @@ def test_admission_proposal_uses_one_detached_cluster_snapshot() -> None:
 
     store.revoke(source_a.precedent_id)
     with pytest.raises(ValueError, match="active|revoked"):
-        codifier.approve(candidate.candidate_id)
+        codifier.approve(candidate.candidate_id, governor=_C38_GOVERNOR)
 
 
 def test_admission_revocation_between_approval_and_activation_fails_closed() -> None:
     store, codifier, record = _admission_codifier_with_one_record()
     [candidate] = codifier.propose_rules(codifier.find_clusters(store.active_records()))
-    codifier.approve(candidate.candidate_id)
+    codifier.approve(candidate.candidate_id, governor=_C38_GOVERNOR)
     store.revoke(record.precedent_id)
     with pytest.raises(ValueError, match="active|revoked"):
-        codifier.activate(candidate.candidate_id, "name: test\nrules: []\n")
+        codifier.activate(candidate.candidate_id, _C38_BASE_YAML, governor=_C38_GOVERNOR)
 
 
 def test_admission_spoofed_cluster_payload_cannot_propose_rule() -> None:
@@ -404,7 +416,13 @@ def _nmc_complete_session(
     for miner_uid, judgment in ordered_judgments:
         session.accept_commitment(
             miner_uid,
-            nmc_mod.compute_commitment_hash(judgment, nonces[miner_uid]),
+            nmc_mod.compute_commitment_hash(
+                judgment,
+                nonces[miner_uid],
+                session_id=session.session_id,
+                case_id=session.case_id,
+                miner_uid=miner_uid,
+            ),
         )
     for miner_uid, judgment in ordered_judgments:
         session.accept_reveal(miner_uid, judgment, nonces[miner_uid])
@@ -447,16 +465,21 @@ def test_nmc_duplicate_content_flags_but_cannot_flip_identity_majority(
 def test_nmc_commitment_encoding_is_unambiguous_and_reveal_cannot_equivocate() -> None:
     first = ("approve:a", "b")
     second = ("approve", "a:b")
-
-    first_hash = nmc_mod.compute_commitment_hash(*first)
-    second_hash = nmc_mod.compute_commitment_hash(*second)
-
-    assert first_hash != second_hash
     session = NMCSession(
         case_id="C4-commitment",
         required_miners={"miner-1"},
         min_reveals=1,
     )
+    context = {
+        "session_id": session.session_id,
+        "case_id": session.case_id,
+        "miner_uid": "miner-1",
+    }
+
+    first_hash = nmc_mod.compute_commitment_hash(*first, **context)
+    second_hash = nmc_mod.compute_commitment_hash(*second, **context)
+
+    assert first_hash != second_hash
     session.accept_commitment("miner-1", first_hash)
     with pytest.raises(ValueError, match="does not match commitment"):
         session.accept_reveal("miner-1", *second)
@@ -764,20 +787,23 @@ def test_precedent_source_guard_serializes_revocation() -> None:
 
 
 def test_codifier_guards_sources_during_each_state_transition() -> None:
-    store = _GuardTrackingStore(CONSTITUTIONAL_HASH)
-    record = _admission_record(case_id="transitions", task_id="transitions")
+    store = _GuardTrackingStore(_C38_BASE_HASH)
+    record = _admission_record(
+        case_id="transitions", task_id="transitions", constitutional_hash=_C38_BASE_HASH
+    )
     store.add(record)
     [canonical] = store.active_records()
     codifier = RuleCodifier(
-        CONSTITUTIONAL_HASH,
+        _C38_BASE_HASH,
         precedent_store=store,
         min_cluster_size=1,
         min_validator_agreement=0.5,
+        governors={_C38_GOVERNOR},
     )
     [cluster] = codifier.find_clusters([canonical])
     [candidate] = codifier.propose_rules([cluster])
-    codifier.approve(candidate.candidate_id)
-    codifier.activate(candidate.candidate_id, "name: test\nrules: []\n")
+    codifier.approve(candidate.candidate_id, governor=_C38_GOVERNOR)
+    codifier.activate(candidate.candidate_id, _C38_BASE_YAML, governor=_C38_GOVERNOR)
     expected = (record.precedent_id,)
     assert store.guarded_source_sets == [expected, expected, expected]
 
@@ -1072,38 +1098,41 @@ class TestC4ReviewAdmission:
     def test_rule_codifier_supports_successive_activations_from_one_admission_epoch(
         self,
     ) -> None:
-        store = PrecedentStore(CONSTITUTIONAL_HASH)
+        store = PrecedentStore(_C38_BASE_HASH)
         records = [
             _admission_record(
                 case_id="successive-safety",
                 task_id="successive-safety",
                 vector={"safety": 1.0},
+                constitutional_hash=_C38_BASE_HASH,
             ),
             _admission_record(
                 case_id="successive-privacy",
                 task_id="successive-privacy",
                 vector={"privacy": 1.0},
+                constitutional_hash=_C38_BASE_HASH,
             ),
         ]
         for record in records:
             store.add(record)
         codifier = RuleCodifier(
-            CONSTITUTIONAL_HASH,
+            _C38_BASE_HASH,
             precedent_store=store,
             min_cluster_size=1,
             min_validator_agreement=0.5,
+            governors={_C38_GOVERNOR},
         )
         clusters = codifier.find_clusters(list(store.active_records()))
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) == 2
 
-        codifier.approve(candidates[0].candidate_id)
+        codifier.approve(candidates[0].candidate_id, governor=_C38_GOVERNOR)
         _, yaml_after_first = codifier.activate(
-            candidates[0].candidate_id, "name: test\nrules: []\n"
+            candidates[0].candidate_id, _C38_BASE_YAML, governor=_C38_GOVERNOR
         )
         hash_after_first = codifier.constitutional_hash
-        codifier.approve(candidates[1].candidate_id)
-        codifier.activate(candidates[1].candidate_id, yaml_after_first)
+        codifier.approve(candidates[1].candidate_id, governor=_C38_GOVERNOR)
+        codifier.activate(candidates[1].candidate_id, yaml_after_first, governor=_C38_GOVERNOR)
 
         assert codifier.constitutional_hash != hash_after_first
         assert len(codifier.active_rules) == 2
@@ -1117,6 +1146,7 @@ class TestC4ReviewProtocol:
         with pytest.warns(DeprecationWarning, match="exclude_sybils"):
             NMCSession(
                 case_id="deprecated-exclusion",
+                required_miners={"miner-1"},
                 exclude_sybils=exclude_sybils,
             )
 
@@ -1126,9 +1156,11 @@ class TestC4ReviewProtocol:
     def test_omitted_exclude_sybils_argument_does_not_warn(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            NMCSession(case_id="default-exclusion")
+            NMCSession(case_id="default-exclusion", required_miners={"miner-1"})
             coordinator = nmc_mod.NMCCoordinator()
-            coordinator.create_session("default-coordinator-exclusion")
+            coordinator.create_session(
+                "default-coordinator-exclusion", required_miners={"miner-1"}
+            )
 
         assert not [item for item in caught if item.category is DeprecationWarning]
 

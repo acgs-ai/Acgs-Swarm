@@ -9,6 +9,11 @@ Formula (per dimension d, per domain):
     shift = (2 x observation_rate - 1) x max_shift_per_cycle
     posterior = bounded_simplex_projection(prior + shift)
 
+Evidence admission:
+    Precedents are resolved through an injected PrecedentStore
+    (``require_canonical_records``): unknown, altered, revoked or repeated
+    records are rejected, so only canonical admitted grades count.
+
 Evidence classification (from PrecedentRecord):
     dimension d is "ambiguous" if d ∈ precedent.ambiguous_dimensions
     "confirmed"  if impact_vector[d] ≥ 0.5  (the elevated score was justified)
@@ -26,7 +31,8 @@ Design invariants:
     • Reversible — rollback returns to any prior snapshot
     • Transparent — every update logged with human-readable explanation
     • Bounded — max_shift_per_cycle caps per-cycle movement
-    • Domain-scoped — domains get independent weight tables
+    • Domain-scoped — domains get independent weight tables, and an update
+      for a domain only accepts evidence collected for exactly that domain
 
 Roadmap: 08-subnet-implementation-roadmap.md § Phase 3.2
 Q&A:     07-subnet-concept-qa-responses.md § 5 Mechanism 2
@@ -37,25 +43,15 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from constitutional_swarm.bittensor._validation import _validate_count, _validate_finite
-
-if TYPE_CHECKING:
-    from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
-
-_DIMENSIONS = (
-    "safety",
-    "security",
-    "privacy",
-    "fairness",
-    "reliability",
-    "transparency",
-    "efficiency",
-)
+from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
+from constitutional_swarm.bittensor.rule_codifier import _DIMENSIONS
 
 # Default weights matching the Q&A doc and impact_scorer.py
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -206,16 +202,16 @@ class BayesianThresholdUpdater:
 
     Usage::
 
-        updater = BayesianThresholdUpdater()
+        updater = BayesianThresholdUpdater(precedent_store=trusted_store)
 
-        # Collect evidence from PrecedentStore
+        # Collect evidence from records admitted to that PrecedentStore
         evidence = updater.collect_evidence(
             precedents,
             domain="healthcare",
             case_domains=authoritative_case_domains,
         )
 
-        # Run one update cycle
+        # Run one update cycle (evidence domain must equal the update domain)
         cycle = updater.update(evidence, domain="healthcare")
 
         # Inspect what changed
@@ -230,13 +226,20 @@ class BayesianThresholdUpdater:
         updater.rollback("healthcare")
     """
 
+    #: Upper bound on retained UpdateCycle audit records (oldest dropped first).
+    _MAX_CYCLE_HISTORY = 1000
+
     def __init__(
         self,
         base_weights: dict[str, float] | None = None,
         max_shift_per_cycle: float = 0.08,
         min_evidence_count: int = 5,
         confirmation_threshold: float = 0.5,
+        precedent_store: PrecedentStore | None = None,
     ) -> None:
+        if precedent_store is not None and not isinstance(precedent_store, PrecedentStore):
+            raise TypeError("precedent_store must be a PrecedentStore")
+        self._precedent_store = precedent_store
         supplied = base_weights or {}
         unknown = set(supplied) - set(_DIMENSIONS)
         if unknown:
@@ -273,13 +276,23 @@ class BayesianThresholdUpdater:
         self._domain_weights: dict[str, dict[str, float]] = {}
         # domain → stack of (weights, cycle_id) for rollback
         self._history: dict[str, list[tuple[dict[str, float], str]]] = {}
-        # all cycles ever run
-        self._cycles: list[UpdateCycle] = []
+        # most recent cycles (bounded audit trail)
+        self._cycles: deque[UpdateCycle] = deque(maxlen=self._MAX_CYCLE_HISTORY)
+        self._cycle_count = 0
         self._lock = RLock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def precedent_store(self) -> PrecedentStore:
+        """Return the injected admission store or fail before evidence use."""
+        if self._precedent_store is None:
+            raise ValueError(
+                "precedent evidence requires an injected trusted PrecedentStore"
+            )
+        return self._precedent_store
 
     def weights(self, domain: str = "") -> dict[str, float]:
         """Current weights for a domain (falls back to global base)."""
@@ -305,7 +318,8 @@ class BayesianThresholdUpdater:
           overblown  if impact_vector[d] < confirmation_threshold
 
         Args:
-            precedents: list of active PrecedentRecord objects
+            precedents: exact active records admitted to the injected store;
+                    unknown, altered, revoked or duplicated records raise
             domain: filter to only precedents matching this domain
                     (empty string = all active precedents)
             case_domains: authoritative case-id to domain mapping, required
@@ -323,9 +337,12 @@ class BayesianThresholdUpdater:
                 if not isinstance(case_id, str) or not isinstance(mapped_domain, str):
                     raise TypeError("case_domains must map strings to strings")
 
+        canonical = (
+            self.precedent_store.require_canonical_records(list(precedents)) if precedents else ()
+        )
         filtered = [
             precedent
-            for precedent in precedents
+            for precedent in canonical
             if precedent.is_active
             and (
                 not domain
@@ -399,7 +416,7 @@ class BayesianThresholdUpdater:
                 raise TypeError("evidence domain must be a string")
             if item.dimension in evidence_map:
                 raise ValueError(f"duplicate evidence for dimension {item.dimension!r}")
-            if item.domain and item.domain != domain:
+            if item.domain != domain:
                 raise ValueError(
                     f"evidence domain {item.domain!r} does not match update domain {domain!r}"
                 )
@@ -477,8 +494,9 @@ class BayesianThresholdUpdater:
                 )
 
             self._history.setdefault(domain, []).append(
-                (dict(prior), "pre-" + str(len(self._cycles)))
+                (dict(prior), "pre-" + str(self._cycle_count))
             )
+            self._cycle_count += 1
             self._domain_weights[domain] = dict(posterior)
             cycle = UpdateCycle(
                 cycle_id=uuid.uuid4().hex[:8],
@@ -519,15 +537,16 @@ class BayesianThresholdUpdater:
             return True
 
     def all_cycles(self) -> list[UpdateCycle]:
+        """Return the retained (most recent) update cycles, oldest first."""
         with self._lock:
-            return deepcopy(self._cycles)
+            return deepcopy(list(self._cycles))
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
             domains = list(self._domain_weights)
             return {
                 "domains_tracked": domains,
-                "cycles_run": len(self._cycles),
+                "cycles_run": self._cycle_count,
                 "max_shift_per_cycle": self._max_shift,
                 "min_evidence_count": self._min_evidence,
                 "current_weights": {

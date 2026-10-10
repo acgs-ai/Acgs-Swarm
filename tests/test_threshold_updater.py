@@ -7,14 +7,27 @@ from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
 from constitutional_swarm.bittensor.protocol import EscalationType
 from constitutional_swarm.bittensor.threshold_updater import (
     DEFAULT_WEIGHTS,
-    BayesianThresholdUpdater,
+    BayesianThresholdUpdater as _BayesianThresholdUpdater,
     DimensionEvidence,
     _fill_defaults,
     _normalize,
 )
-from tests.test_c14_protocol_hardening import c14_precedent_signed_record
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store,
+)
 
 CONST_HASH = "608508a9bd224290"
+
+
+def BayesianThresholdUpdater(*args, **kwargs):  # type: ignore[no-untyped-def]
+    # C38: precedent evidence is admitted through an injected PrecedentStore.
+    kwargs.setdefault("precedent_store", c14_precedent_test_store(CONST_HASH))
+    return _BayesianThresholdUpdater(*args, **kwargs)
+
+
+def _admit(updater, records):  # type: ignore[no-untyped-def]
+    return [updater.precedent_store.admit(record) for record in records]
 
 
 # ---------------------------------------------------------------------------
@@ -31,11 +44,11 @@ def _make_record(
 ) -> PrecedentRecord:
     return c14_precedent_signed_record(
         case_id=case_id,
-        task_id="t1",
+        task_id=f"t-{case_id}",
         miner_uid="miner-01",
         judgment=judgment,
         reasoning="Rationale",
-        votes_for=3,
+        votes_for=5,
         votes_against=0,
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=impact_vector
@@ -140,11 +153,11 @@ class TestEvidenceCollection:
             ambiguous=("security",),
             grade=0.9,
         )
-        evidence = updater.collect_evidence([rec])
+        evidence = updater.collect_evidence(_admit(updater, [rec]))
         sec = next(e for e in evidence if e.dimension == "security")
         assert sec.total_cases == 1
         # impact_vector["security"] = 0.8 >= 0.5 → confirmed
-        # grade = votes_for/total = 3/3 = 1.0 (votes_for=3, votes_against=0)
+        # grade = votes_for/total = 5/5 = 1.0 (votes_for=5, votes_against=0)
         assert sec.confirmed_count == pytest.approx(1.0)
         assert sec.overblown_count == pytest.approx(0.0)
 
@@ -180,7 +193,7 @@ class TestEvidenceCollection:
             ambiguous=("security",),
             grade=1.0,
         )
-        evidence = updater.collect_evidence([r1, r2])
+        evidence = updater.collect_evidence(_admit(updater, [r1, r2]))
         sec = next(e for e in evidence if e.dimension == "security")
         assert sec.total_cases == 2
         assert sec.confirmed_count == pytest.approx(1.0)
@@ -202,7 +215,7 @@ class TestEvidenceCollection:
             },
             ambiguous=("security",),  # safety NOT in ambiguous
         )
-        evidence = updater.collect_evidence([rec])
+        evidence = updater.collect_evidence(_admit(updater, [rec]))
         safety = next(e for e in evidence if e.dimension == "safety")
         assert safety.total_cases == 0  # not counted even though score is high
 
@@ -216,7 +229,7 @@ class TestUpdateCycle:
     def test_update_no_evidence_unchanged(self):
         updater = BayesianThresholdUpdater(min_evidence_count=5)
         evidence = [
-            DimensionEvidence(d, "", 0, 0.0, 0.0)
+            DimensionEvidence(d, "test", 0, 0.0, 0.0)
             for d in (
                 "safety",
                 "security",
@@ -250,9 +263,9 @@ class TestUpdateCycle:
             "efficiency",
         ):
             if dim == "security":
-                evidence.append(DimensionEvidence(dim, "", 47, 41.0, 6.0))
+                evidence.append(DimensionEvidence(dim, "healthcare", 47, 41.0, 6.0))
             else:
-                evidence.append(DimensionEvidence(dim, "", 0, 0.0, 0.0))
+                evidence.append(DimensionEvidence(dim, "healthcare", 0, 0.0, 0.0))
 
         cycle = updater.update(evidence, domain="healthcare")
         sec = next(u for u in cycle.updates if u.dimension == "security")
@@ -331,16 +344,16 @@ class TestUpdateCycle:
 
     def test_domain_isolated_weights(self):
         updater = BayesianThresholdUpdater(min_evidence_count=1)
-        ev_high = [DimensionEvidence("security", "", 20, 18.0, 2.0)]
+        ev_high = [DimensionEvidence("security", "healthcare", 20, 18.0, 2.0)]
         ev_high += [
-            DimensionEvidence(d, "", 0, 0.0, 0.0)
+            DimensionEvidence(d, "healthcare", 0, 0.0, 0.0)
             for d in ("safety", "privacy", "fairness", "reliability", "transparency", "efficiency")
         ]
 
         updater.update(ev_high, domain="healthcare")
         updater.update(
             [
-                DimensionEvidence(d, "", 0, 0.0, 0.0)
+                DimensionEvidence(d, "finance", 0, 0.0, 0.0)
                 for d in (
                     "safety",
                     "security",
@@ -377,7 +390,7 @@ class TestUpdateCycle:
     def test_update_from_precedents_convenience(self):
         updater = BayesianThresholdUpdater(min_evidence_count=1)
         recs = [_make_record(case_id=f"c{i}") for i in range(5)]
-        cycle = updater.update_from_precedents(recs)
+        cycle = updater.update_from_precedents(_admit(updater, recs))
         assert cycle is not None
         assert cycle.total_precedents_used >= 0
 

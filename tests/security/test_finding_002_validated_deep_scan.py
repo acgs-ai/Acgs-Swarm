@@ -180,20 +180,26 @@ def test_governed_handoff_denies_interpreter_aliases_even_if_allowlisted(
     assert "interpreter" in decision.reason
 
 
-def _commitment(judgment: str, nonce: str) -> str:
-    return compute_commitment_hash(judgment, nonce)
+def _commitment(session: NMCSession, miner_uid: str, judgment: str, nonce: str) -> str:
+    return compute_commitment_hash(
+        judgment,
+        nonce,
+        session_id=session.session_id,
+        case_id=session.case_id,
+        miner_uid=miner_uid,
+    )
 
 
 def test_nmc_rejects_commitments_from_miners_outside_required_set() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"})
     with pytest.raises(ValueError, match="not required"):
-        session.accept_commitment("outsider", _commitment("deny", "n"))
+        session.accept_commitment("outsider", _commitment(session, "outsider", "deny", "n"))
 
 
 def test_nmc_rejects_untrusted_reveal_weight() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"}, miner_weights={"m1": 1.0, "m2": 2.0})
-    session.accept_commitment("m1", _commitment("allow", "n1"))
-    session.accept_commitment("m2", _commitment("deny", "n2"))
+    session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
+    session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
     session.accept_reveal("m1", "allow", "n1", weight=999.0)
     session.accept_reveal("m2", "deny", "n2", weight=1.0)
 
@@ -204,8 +210,8 @@ def test_nmc_rejects_untrusted_reveal_weight() -> None:
 
 def test_nmc_defaults_to_equal_weights_when_no_trusted_weight_map() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"})
-    session.accept_commitment("m1", _commitment("allow", "n1"))
-    session.accept_commitment("m2", _commitment("deny", "n2"))
+    session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
+    session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
     session.accept_reveal("m1", "allow", "n1", weight=999.0)
     session.accept_reveal("m2", "deny", "n2", weight=1.0)
 
