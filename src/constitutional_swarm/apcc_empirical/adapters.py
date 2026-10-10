@@ -10,7 +10,8 @@ import threading
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Protocol, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -46,6 +47,7 @@ class BaselineBlocked(RuntimeError):
 
 _TEST_SIGNING_SEED = b"\x11" * 32
 _UNKNOWN_SIGNING_SEED = b"\x22" * 32
+_TEST_SIGNER_KEY_ID = "baseline-test-key"
 _MAX_CERTIFICATE_BYTES = 4096
 
 
@@ -118,7 +120,7 @@ class BaselineEvidence:
         public_key = private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
-        evidence = cls(trusted_keys=(TrustedKey("baseline-test-key", public_key),))
+        evidence = cls(trusted_keys=(TrustedKey(_TEST_SIGNER_KEY_ID, public_key),))
         encoded = evidence.canonical_statement_bytes()
         return replace(
             evidence, encoded_statement=encoded, signature=private_key.sign(encoded)
@@ -224,6 +226,14 @@ _EVIDENCE_MUTATIONS: dict[str, dict[str, object]] = {
 }
 
 
+def _raw_public_key(seed: bytes) -> bytes:
+    return (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+
+
 def native_evidence_for_variant(variant_id: str) -> BaselineEvidence:
     evidence = BaselineEvidence.valid()
     if variant_id == "invalid-signature:default":
@@ -231,6 +241,17 @@ def native_evidence_for_variant(variant_id: str) -> BaselineEvidence:
     if variant_id == "unknown-key:default":
         return _seal(
             replace(evidence, signer_key_id="attacker-key"),
+            seed=_UNKNOWN_SIGNING_SEED,
+        )
+    if variant_id == "unknown-key:trusted-key-injection":
+        # The attacker also appends its own key to the evidence-carried trust
+        # list; a verifier that takes its trust root from the evidence accepts.
+        injected = (
+            *evidence.trusted_keys,
+            TrustedKey("attacker-key", _raw_public_key(_UNKNOWN_SIGNING_SEED)),
+        )
+        return _seal(
+            replace(evidence, signer_key_id="attacker-key", trusted_keys=injected),
             seed=_UNKNOWN_SIGNING_SEED,
         )
     if variant_id == "canonicalization-ambiguity:default":
@@ -253,6 +274,7 @@ def variant_id_for_native_evidence(attack_id: str, evidence: BaselineEvidence) -
     candidates = (
         "invalid-signature:default",
         "unknown-key:default",
+        "unknown-key:trusted-key-injection",
         "canonicalization-ambiguity:default",
         *_EVIDENCE_MUTATIONS,
     )
@@ -382,11 +404,17 @@ _BASELINE_GUARANTEES: dict[str, frozenset[Capability]] = {
 }
 
 
-def _proof_validation_failures(evidence: BaselineEvidence) -> tuple[str, ...]:
+def _proof_validation_failures(
+    evidence: BaselineEvidence, *, trusted: Mapping[str, bytes]
+) -> tuple[str, ...]:
+    """Validate evidence against the verifier-pinned ``trusted`` root only.
+
+    ``evidence.trusted_keys`` travels inside the stimulus being verified and is
+    never consulted here.
+    """
     failures: list[str] = []
     if evidence.proof is None:
         failures.append("missing-proof")
-    trusted = {key.key_id: key.public_key for key in evidence.trusted_keys}
     public_key = trusted.get(evidence.signer_key_id)
     if public_key is None:
         failures.append("unknown-key")
@@ -497,9 +525,20 @@ class ExperimentalSQLiteAdapter:
         *,
         interleaving_barrier: B4InterleavingBarrier | None = None,
         after_commit: Callable[[ExperimentalSQLiteAdapter], None] | None = None,
+        trusted_keys: Mapping[str, bytes] | None = None,
     ) -> None:
         if baseline_id not in _BASELINE_GUARANTEES:
             raise ValueError("experimental SQLite adapter requires B0 through B4")
+        if trusted_keys is None:
+            trusted_keys = {_TEST_SIGNER_KEY_ID: _raw_public_key(_TEST_SIGNING_SEED)}
+        if any(
+            type(key_id) is not str or type(public_key) is not bytes
+            for key_id, public_key in trusted_keys.items()
+        ):
+            raise TypeError("trusted_keys must map str key ids to raw public key bytes")
+        # Pinned at construction: the proof verifier's trust root never comes
+        # from the evidence it verifies.
+        self._trusted_keys: Mapping[str, bytes] = MappingProxyType(dict(trusted_keys))
         self.baseline_id = baseline_id
         self.path = Path(path)
         self.guarantees = _BASELINE_GUARANTEES[baseline_id]
@@ -535,10 +574,10 @@ class ExperimentalSQLiteAdapter:
                 evidence.presented_scheduler_id == evidence.authorized_scheduler_id
                 and evidence.presented_policy_epoch == evidence.current_policy_epoch
             )
-        return not _proof_validation_failures(evidence)
+        return not _proof_validation_failures(evidence, trusted=self._trusted_keys)
 
     def _audit_detected(self, evidence: BaselineEvidence) -> bool:
-        return bool(_proof_validation_failures(evidence))
+        return bool(_proof_validation_failures(evidence, trusted=self._trusted_keys))
 
     def execute(self, stimulus: TrialStimulus) -> AuthorityObservation:
         accepted = self._accepted(stimulus.evidence)

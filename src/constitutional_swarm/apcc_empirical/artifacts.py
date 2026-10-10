@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 import ctypes
 import errno
 from dataclasses import dataclass
@@ -22,8 +21,8 @@ from jsonschema.exceptions import SchemaError
 from constitutional_swarm.apcc_empirical.contract import (
     ExperimentMatrix,
     canonical_json_bytes,
-    load_matrix,
-    load_raw_result,
+    load_matrix_bytes,
+    load_raw_result_bytes,
     planned_ablation_performance_runs,
     planned_ablation_trials,
     planned_attack_trials,
@@ -233,15 +232,12 @@ def _load_schema(raw: bytes) -> tuple[dict[str, object], Draft202012Validator]:
 def _load_matrix_payload(raw: bytes) -> ExperimentMatrix:
     if _sha256(raw) != REVIEWED_MATRIX_SHA256:
         raise ArtifactViolation("artifact does not contain the exact reviewed matrix")
-    with tempfile.TemporaryDirectory(prefix="apcc-matrix-") as temporary:
-        path = Path(temporary) / "matrix.json"
-        path.write_bytes(raw)
-        try:
-            return load_matrix(path)
-        except ValueError as error:
-            raise ArtifactViolation(
-                "artifact matrix violates the reviewed contract"
-            ) from error
+    try:
+        return load_matrix_bytes(raw)
+    except ValueError as error:
+        raise ArtifactViolation(
+            "artifact matrix violates the reviewed contract"
+        ) from error
 
 
 @lru_cache(maxsize=4)
@@ -501,15 +497,10 @@ class RawArtifactWriter:
         )
         if errors:
             raise ArtifactViolation("raw record violates the embedded reviewed schema")
-        with tempfile.TemporaryDirectory(prefix="apcc-record-") as temporary:
-            validation = Path(temporary) / "record.json"
-            validation.write_bytes(raw)
-            try:
-                load_raw_result(validation, matrix=self._matrix)
-            except ValueError as error:
-                raise ArtifactViolation(
-                    "raw record violates the reviewed contract"
-                ) from error
+        try:
+            load_raw_result_bytes(raw, matrix=self._matrix)
+        except ValueError as error:
+            raise ArtifactViolation("raw record violates the reviewed contract") from error
         if self._stream is None:
             self._discard_staging()
             raise ArtifactViolation("artifact writer stream is unavailable")
@@ -658,45 +649,42 @@ def read_artifact_run(path: Path) -> ArtifactRun:
         raise ArtifactViolation("artifact content hash or size mismatch")
     lines = payloads["raw.jsonl"].splitlines(keepends=True)
     trial_ids: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="apcc-artifact-read-") as temporary:
-        validation_path = Path(temporary) / "record.json"
-        for line in lines:
-            try:
-                record = json.loads(line)
-                record_is_canonical = canonical_json_bytes(record) == line
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-                raise ArtifactViolation(
-                    "raw artifact contains invalid JSONL"
-                ) from error
-            if not isinstance(record, dict) or not record_is_canonical:
-                raise ArtifactViolation("raw artifact contains non-canonical JSONL")
-            expected_provenance = {
-                "environment_id": manifest["environment_id"],
-                "git_sha": manifest["git_sha"],
-                "matrix_revision": manifest["matrix_revision"],
-                "matrix_sha256": manifest["matrix_sha256"],
-                "schema_version": manifest["schema_version"],
-                "tool_versions": manifest["tool_versions"],
-            }
-            if any(
-                record.get(key) != value for key, value in expected_provenance.items()
-            ):
-                raise ArtifactViolation(
-                    "raw artifact record provenance does not match manifest"
-                )
-            if tuple(schema_validator.iter_errors(record)):
-                raise ArtifactViolation("raw artifact record violates embedded schema")
-            validation_path.write_bytes(line)
-            try:
-                load_raw_result(validation_path, matrix=matrix)
-            except ValueError as error:
-                raise ArtifactViolation(
-                    "raw artifact record violates reviewed contract"
-                ) from error
-            trial_id = record.get("trial_id")
-            if not isinstance(trial_id, str):
-                raise ArtifactViolation("raw artifact trial_id is invalid")
-            trial_ids.append(trial_id)
+    for line in lines:
+        try:
+            record = json.loads(line)
+            record_is_canonical = canonical_json_bytes(record) == line
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ArtifactViolation(
+                "raw artifact contains invalid JSONL"
+            ) from error
+        if not isinstance(record, dict) or not record_is_canonical:
+            raise ArtifactViolation("raw artifact contains non-canonical JSONL")
+        expected_provenance = {
+            "environment_id": manifest["environment_id"],
+            "git_sha": manifest["git_sha"],
+            "matrix_revision": manifest["matrix_revision"],
+            "matrix_sha256": manifest["matrix_sha256"],
+            "schema_version": manifest["schema_version"],
+            "tool_versions": manifest["tool_versions"],
+        }
+        if any(
+            record.get(key) != value for key, value in expected_provenance.items()
+        ):
+            raise ArtifactViolation(
+                "raw artifact record provenance does not match manifest"
+            )
+        if tuple(schema_validator.iter_errors(record)):
+            raise ArtifactViolation("raw artifact record violates embedded schema")
+        try:
+            load_raw_result_bytes(line, matrix=matrix)
+        except ValueError as error:
+            raise ArtifactViolation(
+                "raw artifact record violates reviewed contract"
+            ) from error
+        trial_id = record.get("trial_id")
+        if not isinstance(trial_id, str):
+            raise ArtifactViolation("raw artifact trial_id is invalid")
+        trial_ids.append(trial_id)
     if manifest.get("raw_record_count") != len(lines):
         raise ArtifactViolation("raw artifact record count mismatch")
     if manifest.get("trial_ids") != trial_ids:
