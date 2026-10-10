@@ -32,6 +32,18 @@ from constitutional_swarm.swe_bench.harness import _patch_generation_metrics
 log = logging.getLogger(__name__)
 
 
+def _bodes_passed(result: SWEPatch) -> bool:
+    """Return True only when governance ran AND explicitly accepted the patch.
+
+    ``SWEPatch.governed`` means "a governance wrapper was present", not
+    "the patch passed": GovernedAgent sets it on rejected and empty patches
+    too. The CRDT ``bodes_passed`` flag is hashed into the node CID and
+    counted as ``bodes_validated``, so it must reflect the verdict.
+    """
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return result.governed is True and metadata.get("governance_action") == "accepted"
+
+
 class SwarmCoordinator:
     """Coordinate multiple SWEBenchAgent instances via MerkleCRDT gossip.
 
@@ -131,7 +143,7 @@ class SwarmCoordinator:
             patches.append(result)
             # Serialize patch result into CRDT as a DAG node
             payload = json.dumps(asdict(result))
-            shared_crdt.append(payload=payload, bodes_passed=result.governed)
+            shared_crdt.append(payload=payload, bodes_passed=_bodes_passed(result))
 
         return self._aggregate(patches, shared_crdt)
 
@@ -179,7 +191,9 @@ class SwarmCoordinator:
             for i, result in enumerate(results):
                 patches.append(result)
                 payload = json.dumps(asdict(result))
-                nodes[i % n_nodes].crdt.append(payload=payload, bodes_passed=result.governed)
+                nodes[i % n_nodes].crdt.append(
+                    payload=payload, bodes_passed=_bodes_passed(result)
+                )
 
             # Gossip rounds to converge
             for _ in range(self.n_gossip_rounds):
