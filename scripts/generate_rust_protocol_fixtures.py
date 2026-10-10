@@ -331,7 +331,7 @@ def build_fixture_corpus() -> dict[str, dict[str, Any]]:
         "mesh_proof.json": {
             "canonical_bytes_hex": encode_mesh_proof_v1(proof).hex(),
             "proof": frozen_proof,
-            "verified": proof.verify(),
+            "verified": proof.verify(allow_legacy_v1=True),
         },
         "settlement_record.json": {
             "canonical_bytes_hex": encode_settlement_record_v1(settlement).hex(),

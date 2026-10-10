@@ -4,25 +4,36 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import OrderedDict
 import threading
+import time
+from collections import OrderedDict
+from collections.abc import Callable
 
 from acgs_lite import Constitution
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from constitutional_swarm.dna import AgentDNA
-from constitutional_swarm.mesh import ConstitutionalMesh, RemoteVoteRequest
+from constitutional_swarm.mesh import (
+    ConstitutionalMesh,
+    RemoteVoteReplayError,
+    RemoteVoteRequest,
+)
 from constitutional_swarm.mesh.vote_envelope import (
     FrozenVoteSignerRegistry,
     VoteSignerRegistryView,
-    _public,
+    content_hash,
     normalize_voter_id,
+    private_key_from,
+    public_key_from,
     sign_vote_envelope,
     signed_assignment_digest,
     verify_signed_assignment,
 )
 from constitutional_swarm.remote_vote_transport.protocol import RemoteVoteResponse
+
+# Matches ConstitutionalMesh.verify_remote_vote_request's per-signer nonce capacity.
+_MAX_NONCES_PER_SIGNER = 10_000
 
 
 def _constitution_fingerprint(constitution: Constitution) -> str:
@@ -48,6 +59,7 @@ class LocalRemotePeer:
         trusted_assigners: VoteSignerRegistryView,
         allow_untrusted_request_signers: bool = False,
         replay_window_seconds: float = 300.0,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if allow_untrusted_request_signers:
             raise ValueError(
@@ -70,7 +82,7 @@ class LocalRemotePeer:
             canonical_input = (
                 str.__str__(public_key) if isinstance(public_key, str) else public_key
             )
-            canonical_key = _public(canonical_input)
+            canonical_key = public_key_from(canonical_input)
             self._trusted_request_signers.add(
                 canonical_key.public_bytes(
                     serialization.Encoding.Raw,
@@ -81,8 +93,11 @@ class LocalRemotePeer:
             raise TypeError("trusted_assigners must be an immutable registry snapshot")
         self._trusted_assigners = trusted_assigners
         self._replay_window_seconds = replay_window_seconds
+        self._clock = clock
+        # One replay cache (nonce -> expiry time) per trusted request signer; the key
+        # set is bounded by ``trusted_request_signers``, each cache by
+        # ``_MAX_NONCES_PER_SIGNER``.
         self._request_nonce_caches: dict[str, OrderedDict[str, float]] = {}
-        self._request_nonce_cache: OrderedDict[str, float] = OrderedDict()
         self._nonce_lock = threading.Lock()
 
     @property
@@ -105,6 +120,8 @@ class LocalRemotePeer:
             raise RuntimeError("Remote peer constitution changed after initialization")
 
     def handle_vote_request(self, request: RemoteVoteRequest) -> RemoteVoteResponse:
+        if type(request) is not RemoteVoteRequest:
+            raise TypeError("handle_vote_request requires an exact RemoteVoteRequest")
         if request.voter_id != self.agent_id:
             raise ValueError(
                 f"Vote request intended for {request.voter_id}, but peer is {self.agent_id}"
@@ -139,21 +156,16 @@ class LocalRemotePeer:
             request.request_signer_public_key not in self._trusted_request_signers
         ):
             raise ValueError("Remote vote request signer is not trusted")
+        # Verify the signature and replay window once, outside the lock, then admit
+        # the nonce under the lock using the same clock reading.
+        now = self._clock()
         ConstitutionalMesh.verify_remote_vote_request(
             request,
             replay_window_seconds=self._replay_window_seconds,
+            now=now,
         )
-        with self._nonce_lock:
-            signer_cache = self._request_nonce_caches.setdefault(
-                request.request_signer_public_key, OrderedDict()
-            )
-            ConstitutionalMesh.verify_remote_vote_request(
-                request,
-                replay_window_seconds=self._replay_window_seconds,
-                nonce_cache=signer_cache,
-            )
-            self._request_nonce_cache = signer_cache
-        if hashlib.sha256(request.content.encode("utf-8")).hexdigest()[:32] != request.content_hash:
+        self._admit_request_nonce(request, now=now)
+        if content_hash(request.content) != request.content_hash:
             raise ValueError("Remote vote request content does not match content hash")
 
         result = self._dna.validate(request.content)
@@ -182,16 +194,47 @@ class LocalRemotePeer:
         )
         return RemoteVoteResponse(envelope)
 
+    def _admit_request_nonce(self, request: RemoteVoteRequest, *, now: float) -> None:
+        """Record a verified request nonce until its acceptance window closes.
+
+        Requests are accepted while ``abs(now - timestamp) <= W``, so a nonce must be
+        remembered until ``max(now, timestamp) + W``. Expiring it at receipt time
+        ``+ W`` would let a future-dated request be replayed after eviction.
+        """
+        expires_at = max(now, request.timestamp) + self._replay_window_seconds
+        with self._nonce_lock:
+            cache = self._request_nonce_caches.setdefault(
+                request.request_signer_public_key, OrderedDict()
+            )
+            self._sweep_expired_nonces(cache, now=now)
+            if request.nonce in cache:
+                raise RemoteVoteReplayError(
+                    f"Remote vote request nonce {request.nonce!r}"
+                    " was already used inside the replay window"
+                )
+            if len(cache) >= _MAX_NONCES_PER_SIGNER:
+                raise RemoteVoteReplayError(
+                    "Remote vote request nonce capacity reached for signer"
+                )
+            cache[request.nonce] = expires_at
+
+    @staticmethod
+    def _sweep_expired_nonces(cache: OrderedDict[str, float], *, now: float) -> None:
+        """Drop every nonce whose expiry has passed.
+
+        Expiries are not insertion-ordered (a later request may carry an earlier
+        timestamp), so the whole bounded cache is scanned rather than its head.
+        """
+        for nonce in [nonce for nonce, expires_at in cache.items() if expires_at <= now]:
+            del cache[nonce]
+
     @staticmethod
     def _coerce_private_key(
         value: Ed25519PrivateKey | bytes | str | None,
     ) -> Ed25519PrivateKey:
         if value is None:
             return Ed25519PrivateKey.generate()
-        if isinstance(value, Ed25519PrivateKey):
-            return value
-        raw = bytes.fromhex(value) if isinstance(value, str) else value
-        return Ed25519PrivateKey.from_private_bytes(raw)
+        return private_key_from(value)
 
 
 __all__ = ["LocalRemotePeer"]
