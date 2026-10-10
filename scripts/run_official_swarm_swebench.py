@@ -25,13 +25,16 @@ if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from constitutional_swarm.swe_bench.run_one_by_one import (  # noqa: E402
+    _safe_instance_id,
     _safe_path_component,
 )
 
 
 def load_instance_ids(predictions_path: Path) -> list[str]:
     rows = [json.loads(line) for line in predictions_path.read_text().splitlines() if line.strip()]
-    instance_ids = [str(row["instance_id"]) for row in rows]
+    # Each id becomes an argv value after the harness "-i" flag: same allowlist
+    # as the run-state paths ([A-Za-z0-9][A-Za-z0-9._-]*).
+    instance_ids = [_safe_instance_id(str(row["instance_id"])) for row in rows]
     if not instance_ids:
         raise ValueError(f"No predictions found in {predictions_path}")
     return instance_ids

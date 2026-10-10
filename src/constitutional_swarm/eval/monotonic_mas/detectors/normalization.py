@@ -8,10 +8,17 @@ ever adds catches for literal patterns that the raw pass already sees
 (e.g. ``rm -rf``).
 
 Pipeline (in order):
-1. Unicode NFKC — folds fullwidth / compatibility forms (``ｄｉｓａｂｌｅ``)
-   and non-breaking spaces to their plain equivalents.
-2. Drop Unicode format characters (category ``Cf``) — zero-width space /
-   joiners, soft hyphen, BOM, bidi controls.
+1. Unicode NFKD — folds fullwidth / compatibility forms (``ｄｉｓａｂｌｅ``)
+   and non-breaking spaces to their plain equivalents, and splits accented
+   letters into base letter + combining mark.
+2. Invisible characters — visibly blank fillers (Hangul fillers, braille
+   blank; ``_INVISIBLE_SEPARATORS``) become spaces, so
+   they cannot glue two words into one token (``disable<U+3164>safety``).
+   Zero-width format characters (category ``Cf``: zero-width space / joiners,
+   soft hyphen, BOM, bidi controls) and combining marks (category ``Mn``:
+   accents, combining grapheme joiner) are dropped, so they cannot split or
+   decorate a word (``dis<U+200B>able``, ``dísáble``). NFC then recomposes
+   what remains (Hangul syllables survive).
 3. Confusables map — a small, bounded table of Cyrillic and Greek letters
    that render identically to Latin letters (``_CONFUSABLES``). Not the full
    Unicode confusables set; covers the common single-letter swaps.
@@ -105,6 +112,21 @@ _CONFUSABLES = str.maketrans(
     }
 )
 
+# Characters that render as blank space but are not whitespace to ``\s``.
+# Mapped to a space (not deleted): a filler between two words must separate
+# them. U+3164 and U+FFA0 fold to U+1160 under NFKD; all are listed anyway.
+_INVISIBLE_SEPARATORS = frozenset(
+    {
+        "\u115f",  # HANGUL CHOSEONG FILLER
+        "\u1160",  # HANGUL JUNGSEONG FILLER
+        "\u3164",  # HANGUL FILLER
+        "\uffa0",  # HALFWIDTH HANGUL FILLER
+        "\u2800",  # BRAILLE PATTERN BLANK
+    }
+)
+# Zero-width format characters and combining (non-spacing) marks are deleted.
+_DROPPED_CATEGORIES = frozenset({"Cf", "Mn"})
+
 # lower/digit -> Upper  (disableSafety -> disable Safety)
 # UPPER -> Upper+lower  (HTTPServer -> HTTP Server)
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -119,9 +141,17 @@ def _delet_token(tok: str) -> str:
     return tok
 
 
+def _fold_char(ch: str) -> str:
+    if ch in _INVISIBLE_SEPARATORS:
+        return " "
+    if unicodedata.category(ch) in _DROPPED_CATEGORIES:
+        return ""
+    return ch
+
+
 def _fold_unicode(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = unicodedata.normalize("NFKD", text)
+    text = unicodedata.normalize("NFC", "".join(_fold_char(ch) for ch in text))
     return text.translate(_CONFUSABLES)
 
 
