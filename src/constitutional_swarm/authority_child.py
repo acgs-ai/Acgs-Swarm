@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import secrets
 import select
@@ -16,7 +17,7 @@ from typing import Any, Literal
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from constitutional_swarm.apcc.model import Signature
+from constitutional_swarm.apcc.model import FailureCode, Signature
 from constitutional_swarm.apcc.ports import (
     APCCAuthorityConfig,
     AuthorityRuntime,
@@ -33,18 +34,146 @@ from constitutional_swarm.authority_ipc import (
     send_frame,
     signed_response,
 )
+from constitutional_swarm.governance_errors import GovernanceBypassDenied
 from constitutional_swarm.governed_commit import TrustedGovernanceBootstrap
+from constitutional_swarm.strict_json import loads as strict_loads
+
+logger = logging.getLogger(__name__)
+
+_MAX_KEY_BUNDLE_BYTES = 1_048_576
+_SUPPORTED_KEY_SOURCE_KINDS = frozenset({"file", "consumed"})
+# Fixed allowlist of the protocol codes handlers raise on purpose (literal codes in
+# authority_service.py, governed_commit.py and apcc/*.py, plus FailureCode values).
+# Any other exception text, however code-shaped, collapses to its category code.
+# tests/test_c23_authority_child_hardening.py re-scans those modules for drift.
+_NODE_STATUSES = (
+    "blocked",
+    "ready",
+    "claimed",
+    "result_produced",
+    "governed_committed",
+    "denied",
+    "revoked",
+    "superseded",
+)
+_ATTEMPT_FIELDS = (
+    "store_id",
+    "workflow_id",
+    "node_id",
+    "attempt_id",
+    "agent_id",
+    "key_id",
+    "expected_node_state_version",
+    "policy_epoch",
+    "authority_epoch",
+    "agent_revocation_epoch",
+    "workflow_revocation_generation",
+    "workflow_generation",
+)
+_PROTOCOL_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "INVALID_DECIMAL_STRING",
+        "ISOLATION_UNAVAILABLE",
+        "agent_revoked",
+        "attempt_authorization_expired_or_invalid",
+        "authority_anchor_integrity_failure",
+        "authority_anchor_mismatch",
+        "authority_foreign_key_check_failed",
+        "authority_integrity_check_failed",
+        "authority_or_capability_denied",
+        "authority_schema_shape_mismatch",
+        "authority_status_batch_length_mismatch",
+        "authority_status_batch_order_mismatch",
+        "authority_status_nonce_collision",
+        "authority_store_already_exists",
+        "authority_store_not_sealed",
+        "authority_unavailable",
+        "bootstrap_store_identity_mismatch",
+        "canonical_certificate_identity_mismatch",
+        "canonical_certificate_missing",
+        "controller_signer_already_used",
+        "empty_node_status_batch",
+        "execution_channel_already_composed",
+        "invalid_admin_request",
+        "invalid_apcc_nonce",
+        "invalid_artifact",
+        "invalid_attempt_authorization_signature",
+        "invalid_capabilities",
+        "invalid_capability",
+        "invalid_field_type",
+        "invalid_node_ids",
+        "invalid_observation_request",
+        "invalid_observation_response",
+        "invalid_predecessor_bindings",
+        "invalid_receipt",
+        "invalid_registry_snapshot",
+        "invalid_request",
+        "invalid_required_capabilities",
+        "invalid_scheduler_request",
+        "invalid_scheduler_sequence",
+        "invalid_status_parameters",
+        "invalid_task_dag",
+        "invalid_task_node",
+        "invalid_work_receipt",
+        "invalid_workflow_definition",
+        "legacy_projection_missing",
+        "metadata_nesting_too_deep",
+        "missing_staged_result",
+        "node_status_batch_length_mismatch",
+        "node_status_batch_too_large",
+        "node_tainted_by_revocation",
+        "nonfinite_number",
+        "observer_already_started",
+        "observer_must_precede_scheduler",
+        "observer_starting",
+        "predecessor_not_governed_committed",
+        "projection_artifact_conflict",
+        "recovery_evidence_binding_mismatch",
+        "recovery_evidence_context_mismatch",
+        "recovery_evidence_missing",
+        "recovery_policy_mismatch",
+        "recovery_predecessor_evidence_mismatch",
+        "recovery_receipt_digest_mismatch",
+        "recovery_signature_invalid",
+        "recovery_topology_mismatch",
+        "recovery_verdict_digest_mismatch",
+        "result_not_produced",
+        "revocation_root_not_governed_committed",
+        "scheduler_rebootstrap_required",
+        "sealed_authority_store_required",
+        "signed_attempt_authorization_required",
+        "staging_context_mismatch",
+        "task_node_identity_mismatch",
+        "unknown_admin_operation",
+        "unknown_control_action",
+        "unknown_node",
+        "unknown_observer_operation",
+        "unknown_operation",
+        "unknown_predecessor",
+        "unknown_scheduler_operation",
+        "unknown_status_signing_operation",
+        "unsealed_verifier_policy",
+        "untrusted_policy_binding",
+        "untrusted_producer_key",
+        "workflow_topology_integrity_failure",
+        *(code.value for code in FailureCode),
+        *(f"node_not_ready:{status}" for status in _NODE_STATUSES),
+        *(f"stale_or_mismatched_attempt_{name}" for name in _ATTEMPT_FIELDS),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
 class KeySourceRef:
     """Public reference and pinned public identity for child-held signing keys."""
 
-    kind: Literal["file", "kms", "pkcs11", "consumed"]
+    kind: Literal["file", "consumed"]
     location: str
     expected_identity_public_key: bytes
 
     def __post_init__(self) -> None:
+        if self.kind not in _SUPPORTED_KEY_SOURCE_KINDS:
+            raise ValueError("unsupported key source kind")
         if not self.location or len(self.expected_identity_public_key) != 32:
             raise ValueError("invalid key source reference")
 
@@ -54,7 +183,6 @@ class OutboxSinkRef:
     """Public reference to an authority-side outbox delivery adapter."""
 
     kind: Literal["discard"] = "discard"
-    location: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +227,10 @@ class _PolicySigner:
         self._keys = keys
 
     def public_key_bytes(self, version: str | None = None) -> bytes:
-        return _public_bytes(self._keys[version or next(iter(self._keys))])
+        # ValueError, not TypeError: governed_commit retries TypeError without a version.
+        if type(version) is not str or version not in self._keys:
+            raise ValueError("explicit configured policy version required")
+        return _public_bytes(self._keys[version])
 
     def sign(self, domain: bytes, canonical_body: bytes) -> bytes:
         body = json.loads(canonical_body)
@@ -153,9 +284,7 @@ class _LoadedKeys:
 
 
 def _load_file_keys_raw(raw: bytes | bytearray, reference: KeySourceRef) -> _LoadedKeys:
-    if len(raw) > 1_048_576:
-        raise ValueError("authority key bundle too large")
-    body = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    body = strict_loads(raw, max_bytes=_MAX_KEY_BUNDLE_BYTES, allow_float=False)
     if not isinstance(body, dict) or set(body) != {
         "policy",
         "registry",
@@ -187,15 +316,6 @@ def _load_file_keys_raw(raw: bytes | bytearray, reference: KeySourceRef) -> _Loa
     return loaded
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate authority key")
-        result[key] = value
-    return result
-
-
 def _validate_keys(config: APCCAuthorityConfig, keys: _LoadedKeys) -> None:
     policy_by_version = {binding.scope[1]: binding for binding in config.policy_trust}
     if set(policy_by_version) != set(keys.policy):
@@ -203,12 +323,54 @@ def _validate_keys(config: APCCAuthorityConfig, keys: _LoadedKeys) -> None:
     for version, binding in policy_by_version.items():
         if binding.public_key != _public_bytes(keys.policy[version]):
             raise PermissionError("policy public key mismatch")
-    if config.registry_trust[0].public_key != _public_bytes(keys.registry):
+    registry_public = _public_bytes(keys.registry)
+    if any(binding.public_key != registry_public for binding in config.registry_trust):
         raise PermissionError("registry public key mismatch")
     if config.commit_trust.public_key != _public_bytes(keys.commit):
         raise PermissionError("commit public key mismatch")
     if config.status_trust.public_key != _public_bytes(keys.status):
         raise PermissionError("status public key mismatch")
+    loaded = [
+        _public_bytes(key)
+        for key in (
+            keys.identity,
+            keys.control,
+            keys.registry,
+            keys.commit,
+            keys.status,
+            *keys.policy.values(),
+        )
+    ]
+    # Producer keys belong to agents; none may double as an authority-held key.
+    producer_keys = {binding.public_key for binding in config.producer_trust}
+    if len(set(loaded)) != len(loaded) or not producer_keys.isdisjoint(loaded):
+        raise PermissionError("authority role keys must be pairwise distinct")
+
+
+def _request_error_code(exc: BaseException, channel: str) -> str:
+    """Map a request failure to a stable wire code; never forward free text."""
+    if isinstance(exc, LookupError):
+        fallback = (
+            "unknown_operation"
+            if channel == "execution"
+            else "unknown_admin_operation"
+            if channel == "admin"
+            else "unknown_status_signing_operation"
+        )
+    elif isinstance(exc, GovernanceBypassDenied):
+        fallback = "governance_denied"
+    elif isinstance(exc, PermissionError):
+        fallback = "permission_denied"
+    elif isinstance(exc, (TypeError, ValueError)):
+        fallback = "invalid_request"
+    else:
+        return "internal_error"
+    if isinstance(exc, KeyError) or not exc.args:
+        return fallback
+    reason = exc.args[0]
+    if type(reason) is str and reason in _PROTOCOL_ERROR_CODES:
+        return reason
+    return fallback
 
 
 def _bootstrap(
@@ -348,18 +510,14 @@ def authority_child_main(
                     else:
                         result = _handle_status_sign_request(request, admin)
                 except Exception as exc:
-                    if isinstance(exc, LookupError):
-                        code = (
-                            "unknown_operation"
-                            if channel == "execution"
-                            else "unknown_admin_operation"
-                            if channel == "admin"
-                            else "unknown_status_signing_operation"
-                        )
-                    elif isinstance(exc, (TypeError, ValueError)):
-                        code = "invalid_request"
-                    else:
-                        code = type(exc).__name__
+                    code = _request_error_code(exc, channel)
+                    logger.warning(
+                        "authority %s request failed with %s: %s: %s",
+                        channel,
+                        code,
+                        type(exc).__name__,
+                        exc,
+                    )
                     response = signed_response(
                         key=ephemeral,
                         session=session,
@@ -367,7 +525,7 @@ def authority_child_main(
                         sequence=sequences[channel],
                         authority_pid=os.getpid(),
                         request_digest=request_digest,
-                        error={"code": code, "message": str(exc)},
+                        error={"code": code, "message": code},
                     )
                 else:
                     response = signed_response(
@@ -409,11 +567,12 @@ def authority_child_main(
                 _recover_outbox(admin)
                 last_recovery = time.monotonic()
     except BaseException as exc:
+        logger.error(
+            "authority child terminated with %s: %s", type(exc).__name__, exc
+        )
         try:
             try:
-                readiness.send(
-                    {"startup_error": type(exc).__name__, "message": str(exc)}
-                )
+                readiness.send({"startup_error": type(exc).__name__})
             except (OSError, BrokenPipeError):
                 pass
         finally:
