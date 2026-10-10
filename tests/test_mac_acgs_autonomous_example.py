@@ -92,6 +92,10 @@ def test_precedent_backed_codifier_commits_constitutional_update() -> None:
     loop, store, codifier = example.run_with_precedents(
         precedents,
         c14_precedent_test_registry(),
+        reviewer_id="human-reviewer-1",
+        challenge_provider=lambda proposal: [
+            ("human-reviewer-1", f"review of {proposal.proposal_id}", 0.10)
+        ],
     )
 
     updates = loop.constitution_updates()

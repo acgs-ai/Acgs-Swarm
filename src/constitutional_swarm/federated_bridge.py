@@ -8,6 +8,10 @@ Architecture:
     - FederatedConstitutionBridge — enforces fail-closed cross-org rule gates
 
 Security contract:
+    - Credentials must carry an Ed25519 issuer signature that verifies against
+      a key pinned for their ``org_id`` at bridge construction; anything else
+      is refused at registration/renewal (no pinned keys ⇒ no trusted issuer)
+    - Every credential carries an explicit expiry after its issuance time
     - Unknown credentials → REJECT (fail-closed, never fail-open)
     - Constitutional hash mismatch → REJECT
     - Revoked credentials → REJECT
@@ -29,14 +33,20 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
+from constitutional_swarm.framing import framed_digest
 
 ALL_DOMAINS = "*"
+
+# Domain separator for the digest an org issuer signs over a credential.
+CREDENTIAL_SIGNATURE_DOMAIN = b"constitutional-swarm.federated-credential.v1"
+_ED25519_PUBLIC_KEY_BYTES = 32
+_ED25519_SIGNATURE_BYTES = 64
 
 
 class CredentialStatus(Enum):
@@ -58,10 +68,13 @@ class AgentCredential:
         pubkey_fingerprint: Hex fingerprint of the agent's public key.
         constitutional_hash: Hash of the constitution this agent operates under.
         issued_at:          Unix timestamp of issuance.
-        expires_at:         Unix timestamp of expiry (0 = never expires).
+        expires_at:         Unix timestamp of expiry; required and > issued_at.
         domains:            Governance domains this agent is authorised for.
-                            Use ``ALL_DOMAINS`` for explicit unrestricted access.
-        metadata:           Arbitrary issuer metadata.
+                            Empty denies all; ``ALL_DOMAINS`` is explicit
+                            unrestricted access.
+        metadata:           Arbitrary issuer metadata (not signed, not trusted).
+        issuer_signature:   Ed25519 signature by the org issuer over
+                            ``signing_digest()``.
 
     Example::
 
@@ -70,7 +83,12 @@ class AgentCredential:
             org_id="acme-corp",
             pubkey_fingerprint="deadbeef1234",
             constitutional_hash="608508a9bd224290",
-            issued_at=int(time.time()),
+            issued_at=now,
+            expires_at=now + 3600,
+            domains=("privacy",),
+        )
+        cred = dataclasses.replace(
+            cred, issuer_signature=org_issuer_key.sign(cred.signing_digest())
         )
     """
 
@@ -79,10 +97,11 @@ class AgentCredential:
     pubkey_fingerprint: str
     constitutional_hash: str
     issued_at: float
-    expires_at: float = 0.0
+    expires_at: float
     domains: tuple[str, ...] = ()
     status: CredentialStatus = CredentialStatus.ACTIVE
     metadata: dict[str, Any] = field(default_factory=dict)
+    issuer_signature: bytes = b""
 
     def __post_init__(self) -> None:
         """Validate and canonicalise security-relevant credential fields."""
@@ -109,6 +128,10 @@ class AgentCredential:
             if not math.isfinite(value):
                 raise ValueError(f"{field_name} must be finite")
             object.__setattr__(self, field_name, float(value))
+        if self.expires_at <= self.issued_at:
+            raise ValueError("expires_at must be later than issued_at (expiry is required)")
+        if not isinstance(self.issuer_signature, bytes):
+            raise ValueError("issuer_signature must be bytes")
         if any(not isinstance(domain, str) or not domain.strip() for domain in self.domains):
             raise ValueError("domains must contain only non-empty strings")
         object.__setattr__(self, "domains", tuple(sorted(set(self.domains))))
@@ -134,10 +157,12 @@ class AgentCredential:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def signing_digest(self) -> bytes:
+        """Domain-separated digest an org issuer signs (binds every auth field)."""
+        return framed_digest(CREDENTIAL_SIGNATURE_DOMAIN, self.fingerprint)
+
     def is_expired(self, now: float | None = None) -> bool:
         """True if the credential has passed its expiry timestamp."""
-        if self.expires_at == 0.0:
-            return False
         _now = time.time() if now is None else now
         if isinstance(_now, bool) or not isinstance(_now, (int, float)) or not math.isfinite(_now):
             raise ValueError("now must be finite")
@@ -199,6 +224,7 @@ class FederatedConstitutionBridge:
 
         bridge = FederatedConstitutionBridge(
             local_constitutional_hash="608508a9bd224290",
+            issuer_keys={"partner-corp": [partner_issuer_public_key_raw32]},
         )
 
         cred = AgentCredential(
@@ -206,7 +232,12 @@ class FederatedConstitutionBridge:
             org_id="partner-corp",
             pubkey_fingerprint="abcdef",
             constitutional_hash="608509bd224290",  # WRONG HASH
-            issued_at=time.time(),
+            issued_at=now,
+            expires_at=now + 3600,
+            domains=("privacy",),
+        )
+        cred = dataclasses.replace(
+            cred, issuer_signature=partner_issuer_key.sign(cred.signing_digest())
         )
         bridge.register_credential(cred)
 
@@ -219,6 +250,9 @@ class FederatedConstitutionBridge:
 
     Args:
         local_constitutional_hash: The constitutional hash this bridge enforces.
+        issuer_keys: Pinned trust root ``{org_id: [raw 32-byte Ed25519 public
+            keys]}``. Credentials are accepted only with a valid signature from
+            a key pinned for their ``org_id``. ``None`` trusts no issuer.
         require_hash_match: If True (default), cross-org agents must present
             the same constitutional hash (strict federation mode).
         audit_log_size: Maximum retained decisions. Defaults to 1000;
@@ -235,9 +269,11 @@ class FederatedConstitutionBridge:
         require_hash_match: bool = True,
         audit_log_size: int | None = 1000,
         audit_overflow_sink: Callable[[FederationDecision], None] | None = None,
+        issuer_keys: Mapping[str, Iterable[bytes]] | None = None,
     ) -> None:
         if not isinstance(local_constitutional_hash, str) or not local_constitutional_hash.strip():
             raise ValueError("local_constitutional_hash must be a non-empty string")
+        self._issuer_keys = _pin_issuer_keys(issuer_keys)
         if audit_log_size is not None and (
             isinstance(audit_log_size, bool)
             or not isinstance(audit_log_size, int)
@@ -273,7 +309,12 @@ class FederatedConstitutionBridge:
 
         Args:
             cred: Agent credential issued by a federated organisation.
+
+        Raises:
+            PermissionError: if the issuer signature does not verify against a
+                key pinned for ``cred.org_id``.
         """
+        self._verify_issuer(cred)
         key = (cred.org_id, cred.agent_id)
         with self._lock:
             if key in self._credentials:
@@ -294,7 +335,12 @@ class FederatedConstitutionBridge:
         Revocation remains sticky for each public-key fingerprint. Rotation to
         never-revoked key material can reinstate an identity, but rotating back
         to any historically revoked fingerprint cannot.
+
+        Raises:
+            PermissionError: if the issuer signature does not verify against a
+                key pinned for ``cred.org_id``.
         """
+        self._verify_issuer(cred)
         key = (cred.org_id, cred.agent_id)
         with self._lock:
             current = self._credentials.get(key)
@@ -471,6 +517,33 @@ class FederatedConstitutionBridge:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
+    def _verify_issuer(self, cred: AgentCredential) -> None:
+        """Fail closed unless a key pinned for the org signed this credential."""
+        if not isinstance(cred, AgentCredential):
+            raise TypeError("cred must be an AgentCredential")
+        pinned = self._issuer_keys.get(cred.org_id, ())
+        if not pinned:
+            raise PermissionError(
+                f"issuer signature rejected: no pinned issuer key for org_id={cred.org_id!r}"
+            )
+        signature = cred.issuer_signature
+        if len(signature) != _ED25519_SIGNATURE_BYTES:
+            raise PermissionError("issuer signature rejected: missing or malformed signature")
+
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        digest = cred.signing_digest()
+        for public_key in pinned:
+            try:
+                Ed25519PublicKey.from_public_bytes(public_key).verify(signature, digest)
+            except (InvalidSignature, ValueError):
+                continue
+            return
+        raise PermissionError(
+            f"issuer signature rejected: no pinned key for org_id={cred.org_id!r} verifies"
+        )
+
     def _allow(
         self, agent_id: str, org_id: str, domain: str, now: float
     ) -> tuple[FederationDecision, tuple[FederationDecision, ...]]:
@@ -541,3 +614,27 @@ class FederatedConstitutionBridge:
                 f"credentials={len(self._credentials)}, "
                 f"decisions={self._total_decisions})"
             )
+
+
+def _pin_issuer_keys(
+    issuer_keys: Mapping[str, Iterable[bytes]] | None,
+) -> dict[str, tuple[bytes, ...]]:
+    """Copy and validate the pinned issuer trust root at construction."""
+    if issuer_keys is None:
+        return {}
+    if not isinstance(issuer_keys, Mapping):
+        raise ValueError("issuer_keys must be a mapping of org_id to public keys")
+    pinned: dict[str, tuple[bytes, ...]] = {}
+    for org_id, keys in issuer_keys.items():
+        if not isinstance(org_id, str) or not org_id.strip():
+            raise ValueError("issuer_keys org_id must be a non-empty string")
+        if isinstance(keys, (str, bytes)) or not isinstance(keys, Iterable):
+            raise ValueError("issuer_keys values must be iterables of raw public keys")
+        org_keys = tuple(keys)
+        if not org_keys or any(
+            not isinstance(key, bytes) or len(key) != _ED25519_PUBLIC_KEY_BYTES
+            for key in org_keys
+        ):
+            raise ValueError("issuer keys must be raw 32-byte Ed25519 public keys")
+        pinned[org_id] = org_keys
+    return pinned
