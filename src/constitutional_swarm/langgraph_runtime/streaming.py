@@ -35,9 +35,10 @@ async def stream_to_crdt(
 ) -> AsyncIterator[dict]:
     """Stream graph events; mirror settled states into the CRDT.
 
-    On every chunk where the ``settle_node_name`` node emits an update, append
-    the state to ``crdt``. If ``gossip_node`` is provided, trigger one gossip
-    round per append.
+    Append the accumulated state to ``crdt`` only when the ``settle_node_name``
+    node's own update declares ``governance_status="accepted"`` and the state
+    still carries clean validation evidence bound to the same patch. If
+    ``gossip_node`` is provided, trigger one gossip round per append.
 
     Yields each chunk so callers can do their own observation.
     """
@@ -90,8 +91,13 @@ async def stream_to_crdt(
                             validated_patch = patch
 
             current_patch = snapshot.get("patch")
+            # Acceptance must be declared by the settle node's own update; a
+            # status accumulated from an intermediate node is not a verdict.
+            settle_update = chunk.get(settle_node_name)
             if (
-                settle_node_name in chunk
+                isinstance(settle_update, dict)
+                and type(settle_update.get("governance_status")) is str
+                and settle_update.get("governance_status") == "accepted"
                 and validated_patch is not None
                 and type(current_patch) is str
                 and current_patch == validated_patch

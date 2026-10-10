@@ -1527,7 +1527,7 @@ def test_c9_runtime_adapter_binds_governed_result_hash(
     assert created[0].calls[0]["constitutional_hash"] == expected_artifact_hash
 
 
-def test_c9_runtime_adapter_stamps_default_hash_on_governed_result(monkeypatch) -> None:
+def test_c9_runtime_adapter_does_not_stamp_default_hash_on_governed_result(monkeypatch) -> None:
     from constitutional_swarm.langgraph_runtime import coordinator_adapter
 
     created = []
@@ -2113,7 +2113,7 @@ class _C9RuntimeConfiguredWrapperAgent(SWEBenchAgent):
         return "patch", {"intervention_rate": 0.25}
 
 
-def test_c9_runtime_coordinator_default_hash_stamps_direct_governed_result() -> None:
+def test_c9_runtime_coordinator_does_not_stamp_default_hash_on_direct_governed_result() -> None:
     result = run_langgraph(
         [_C9RuntimeConfiguredWrapperAgent()], _c9_runtime_make_tasks(1)
     )

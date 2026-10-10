@@ -122,7 +122,7 @@ def run_langgraph(
         patches.append(result)
         try:
             payload = canonical_dumps(asdict(result))
-        except (StrictJSONError, TypeError, ValueError) as exc:
+        except (StrictJSONError, RecursionError, TypeError, ValueError) as exc:
             result, bodes_passed, artifact_hash = _reject_malformed_result(
                 result,
                 configured_hash=configured_hash,
@@ -194,7 +194,7 @@ def _normalize_result(
 
     try:
         canonical_dumps(metadata)
-    except (StrictJSONError, TypeError, ValueError) as exc:
+    except (StrictJSONError, RecursionError, TypeError, ValueError) as exc:
         return _reject_malformed_result(
             result,
             configured_hash=configured_hash,

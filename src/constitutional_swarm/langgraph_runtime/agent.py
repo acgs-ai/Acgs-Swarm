@@ -109,13 +109,20 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         if governance_status is not None:
             stats["governance_status"] = governance_status
         if not has_completed_acceptance(result):
-            if type(governance_status) is str:
+            # Only terminal verdicts keep their own label; anything else
+            # (including "accepted" without complete evidence) is incomplete.
+            if type(governance_status) is str and governance_status in {"rejected", "halted"}:
                 stats["error"] = f"governance_{governance_status}"
             else:
                 stats["error"] = "governance_incomplete"
             return "", stats
+        patch = result.get("patch", "")
+        if type(patch) is not str:
+            stats["governance_status"] = "rejected"
+            stats["error"] = "invalid_patch"
+            return "", stats
         stats["violations"] = list(result["violations"])
-        return result.get("patch", "") or "", stats
+        return patch, stats
 
 
 __all__ = ["LangGraphSWEBenchAgent"]

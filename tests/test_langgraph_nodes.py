@@ -82,7 +82,7 @@ def test_validate_node_handles_string_violations() -> None:
     assert out["governed"] is False
 
 
-def test_validate_node_handles_none_risk_score() -> None:
+def test_validate_node_rejects_none_risk_score() -> None:
     result = SimpleNamespace(valid=True, violations=(), risk_score=None)
     dna = MagicMock()
     dna.hash = CONSTITUTIONAL_HASH
@@ -151,7 +151,7 @@ def test_append_crdt_node_serializes_state_and_returns_cid() -> None:
     assert out == {"cid": "bafy-cid-001"}
 
 
-def test_append_crdt_node_defaults_governed_flag_to_false() -> None:
+def test_append_crdt_node_rejects_state_without_validation_evidence() -> None:
     crdt = MagicMock()
     crdt.append.return_value = SimpleNamespace(cid="bafy-cid-002")
 
