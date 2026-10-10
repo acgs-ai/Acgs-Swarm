@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import array
 import json
 import math
@@ -21,7 +20,6 @@ from enum import Enum
 from typing import Any, TypeVar
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -63,12 +61,15 @@ from constitutional_swarm.capability import Capability, CapabilityRegistry
 from constitutional_swarm.execution import ContractStatus, WorkReceipt
 from constitutional_swarm.authority_ipc import (
     PROTOCOL,
+    StrictJSONError,
     b64u_decode,
     canonical_json,
     digest as ipc_digest,
+    raw_public_bytes,
     recv_frame as recv_authenticated_frame,
     send_frame as send_authenticated_frame,
     signed_response,
+    strict_loads,
     verify_response,
 )
 from constitutional_swarm.governed_commit import (
@@ -881,6 +882,7 @@ class _JSONClient:
         "_session",
         "_authority_pid",
         "_ipc_public_key",
+        "_ipc_verify_key",
         "_sequence",
         "_poisoned",
         "_rpc_lock",
@@ -895,6 +897,7 @@ class _JSONClient:
         self._session = ""
         self._authority_pid = 0
         self._ipc_public_key: bytes | None = None
+        self._ipc_verify_key: Ed25519PublicKey | None = None
         self._sequence = 0
         self._poisoned = False
         self._rpc_lock = threading.RLock()
@@ -912,8 +915,8 @@ class _JSONClient:
             raise GovernanceBypassDenied("invalid_request") from exc
         with self._rpc_lock:
             connection = self._channel_socket
-            public_key_bytes = self._ipc_public_key
-            if self._poisoned or connection is None or public_key_bytes is None:
+            verify_key = self._ipc_verify_key
+            if self._poisoned or connection is None or verify_key is None:
                 raise GovernanceBypassDenied("authority_unavailable")
             self._sequence += 1
             try:
@@ -923,7 +926,7 @@ class _JSONClient:
                 response = recv_authenticated_frame(connection, self._max_frame_bytes)
                 result, error = verify_response(
                     response,
-                    public_key=Ed25519PublicKey.from_public_bytes(public_key_bytes),
+                    public_key=verify_key,
                     session=self._session,
                     channel=self._channel_role,
                     sequence=self._sequence,
@@ -994,9 +997,8 @@ def _bind_verified_child_channel(
     instance._channel_role = channel_role
     instance._session = session
     instance._authority_pid = authority_pid
-    instance._ipc_public_key = ipc_public_key.public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    instance._ipc_public_key = raw_public_bytes(ipc_public_key)
+    instance._ipc_verify_key = ipc_public_key
     return instance
 
 
@@ -1223,36 +1225,34 @@ class AuthorityObserverClient(_JSONClient):
         self, request: AuthorityObservationRequest
     ) -> SignedAuthorityObservation:
         encoded = encode_authority_observation_request(request)
-        result = self._rpc(
-            "observe",
-            {
-                "request_b64u": base64.urlsafe_b64encode(encoded)
-                .rstrip(b"=")
-                .decode("ascii")
-            },
-        )
-        body = _exact_object(result, {"observation_b64u"}, "observation_response")
-        encoded_response = body["observation_b64u"]
-        if type(encoded_response) is not str:
-            raise GovernanceBypassDenied("invalid_observation_response")
-        try:
-            observation = decode_signed_authority_observation(
-                b64u_decode(encoded_response)
+        # The response is bound to the sequence this call consumed; hold the
+        # (reentrant) RPC lock so no concurrent call can advance it first.
+        with self._rpc_lock:
+            result = self._rpc("observe", {"request_b64u": b64u_encode(encoded)})
+            body = _exact_object(
+                result, {"observation_b64u"}, "observation_response"
             )
-            public_key = self._ipc_public_key
-            if public_key is None:
-                raise ValueError("observer readiness key is unavailable")
-            verify_signed_authority_observation(
-                observation,
-                pinned_public_key=public_key,
-                expected_request=request,
-                expected_launch_attestation_digest=self._launch_attestation_digest,
-                expected_session_id=self._session,
-                expected_sequence=str(self._sequence),
-            )
-        except (TypeError, ValueError) as error:
-            self._poison()
-            raise GovernanceBypassDenied("invalid_observation_response") from error
+            encoded_response = body["observation_b64u"]
+            if type(encoded_response) is not str:
+                raise GovernanceBypassDenied("invalid_observation_response")
+            try:
+                observation = decode_signed_authority_observation(
+                    b64u_decode(encoded_response)
+                )
+                public_key = self._ipc_public_key
+                if public_key is None:
+                    raise ValueError("observer readiness key is unavailable")
+                verify_signed_authority_observation(
+                    observation,
+                    pinned_public_key=public_key,
+                    expected_request=request,
+                    expected_launch_attestation_digest=self._launch_attestation_digest,
+                    expected_session_id=self._session,
+                    expected_sequence=str(self._sequence),
+                )
+            except (TypeError, ValueError) as error:
+                self._poison()
+                raise GovernanceBypassDenied("invalid_observation_response") from error
         return observation
 
 
@@ -1333,9 +1333,7 @@ def _observer_child_main(
         os.environ.clear()
         readiness.send({"stage": "HARDENED_READY", "pid": os.getpid(), "dumpable": 0})
         key = Ed25519PrivateKey.generate()
-        public_key = key.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
+        public_key = raw_public_bytes(key.public_key())
         session = f"session-{secrets.token_urlsafe(24)}"
         key_id = sha256_digest(public_key)
         status_signer = _bind_verified_child_channel(
@@ -1390,9 +1388,7 @@ def _observer_child_main(
             "launch_nonce": launch_nonce,
             "session_id": session,
             "observer_key_id": key_id,
-            "observer_public_key": base64.urlsafe_b64encode(public_key)
-            .rstrip(b"=")
-            .decode("ascii"),
+            "observer_public_key": b64u_encode(public_key),
             "initial_trust_sequence": initial_trust_sequence,
             "initial_trust_head": initial_trust_head,
         }
@@ -1466,7 +1462,7 @@ def _observer_child_main(
                 signature = Signature(
                     "Ed25519",
                     key_id,
-                    base64.urlsafe_b64encode(
+                    b64u_encode(
                         key.sign(
                             AUTHORITY_OBSERVATION_DOMAIN
                             + b"\x00"
@@ -1478,9 +1474,7 @@ def _observer_child_main(
                                 request_digest=decoded_request.canonical_digest,
                             )
                         )
-                    )
-                    .rstrip(b"=")
-                    .decode("ascii"),
+                    ),
                 )
                 signed = SignedAuthorityObservation(
                     snapshot,
@@ -1492,11 +1486,7 @@ def _observer_child_main(
                     signature,
                 )
                 encoded = encode_signed_authority_observation(signed)
-                result = {
-                    "observation_b64u": base64.urlsafe_b64encode(encoded)
-                    .rstrip(b"=")
-                    .decode("ascii")
-                }
+                result = {"observation_b64u": b64u_encode(encoded)}
                 response = signed_response(
                     key=key,
                     session=session,
@@ -1707,8 +1697,8 @@ class _ControllerSigner:
         except (EOFError, OSError) as error:
             raise RuntimeError("controller signer failed") from error
         try:
-            value = json.loads(response)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            value = strict_loads(response, max_bytes=16_385)
+        except StrictJSONError as error:
             raise RuntimeError("invalid controller signer response") from error
         if type(value) is not dict:
             raise RuntimeError("invalid controller signer response")
@@ -1783,7 +1773,9 @@ def _start_observer(
     controller_key_id: str,
     controller_public_key: bytes,
     postgres_observer_dsn: str | None = None,
-) -> tuple[Any, AuthorityObserverClient, dict[str, object]]:
+) -> tuple[
+    Any, AuthorityObserverClient, dict[str, object], ObserverLaunchExpectationsV1
+]:
     if backend.kind == "postgresql":
         if type(postgres_observer_dsn) is not str:
             raise ValueError("PostgreSQL observer credential is required")
@@ -1808,9 +1800,7 @@ def _start_observer(
             cleanup.callback(_safe_close, credential_send)
         else:
             credential_recv, credential_send = None, None
-        launch_nonce = (
-            base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
-        )
+        launch_nonce = b64u_encode(os.urandom(32))
         process = context.Process(
             target=_observer_child_main,
             args=(
@@ -1879,11 +1869,7 @@ def _start_observer(
         public_key = Ed25519PublicKey.from_public_bytes(
             b64u_decode(ready["observer_public_key"])
         )
-        if ready["observer_key_id"] != sha256_digest(
-            public_key.public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-        ):
+        if ready["observer_key_id"] != sha256_digest(raw_public_bytes(public_key)):
             raise RuntimeError("observer readiness key mismatch")
         launch_attestation = controller_signer.sign(ready)
         if launch_attestation.get("controller_key_id") != controller_key_id:
@@ -1911,9 +1897,27 @@ def _start_observer(
             max_frame_bytes=max_frame_bytes,
         )
         client._launch_attestation_digest = launch_attestation_digest
+        # P1: pins come from supervisor-computed launch_public, the PID this
+        # supervisor spawned, and the ready body it bound above and the
+        # observer authenticated in OBSERVER_TCB_READY -- never the attestation.
+        expectations = ObserverLaunchExpectationsV1(
+            experiment_id=launch_public["experiment_id"],
+            run_id=launch_public["run_id"],
+            authority_store_id=launch_public["authority_store_id"],
+            backend_kind=launch_public["backend_kind"],
+            backend_instance_digest=launch_public["backend_instance_digest"],
+            schema_version=launch_public["schema_version"],
+            schema_fingerprint=launch_public["schema_fingerprint"],
+            status_key_id=launch_public["status_key_id"],
+            observer_pid=str(observer_pid),
+            session_id=ready["session_id"],
+            observer_key_id=ready["observer_key_id"],
+            initial_trust_sequence=ready["initial_trust_sequence"],
+            initial_trust_head=ready["initial_trust_head"],
+        )
         ready_parent.close()
         cleanup.pop_all()
-        return process, client, launch_attestation
+        return process, client, launch_attestation, expectations
 
 
 class AuthorityAdminClient:
@@ -1965,15 +1969,12 @@ class AuthorityAdminClient:
         public_key: Ed25519PublicKey,
         capabilities: Sequence[str] = (),
     ) -> int | None:
-        encoded = public_key.public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
         result = self._client._rpc(
             "register_agent",
             {
                 "workflow_id": workflow_id,
                 "agent_id": agent_id,
-                "public_key": base64.urlsafe_b64encode(encoded).rstrip(b"=").decode(),
+                "public_key": b64u_encode(raw_public_bytes(public_key)),
                 "capabilities": list(capabilities),
             },
         )
@@ -2353,8 +2354,8 @@ def _receive_scheduler_activation(
             raise ValueError("invalid scheduler activation frame")
         descriptors = _decode_scheduler_ancillary(ancillary, flags)
         try:
-            message = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            message = strict_loads(payload, max_bytes=max_frame_bytes)
+        except StrictJSONError as error:
             raise ValueError("invalid scheduler activation frame") from error
         body = _exact_object(
             message,
@@ -2419,9 +2420,7 @@ def _dormant_scheduler_child(
     os.chdir("/")
     os.environ.clear()
     key = Ed25519PrivateKey.generate()
-    public_key = key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    public_key = raw_public_bytes(key.public_key())
     key_id = sha256_digest(public_key)
     ready_body = {
         "stage": "DORMANT_SCHEDULER_HARDENED_READY",
@@ -2530,8 +2529,8 @@ def _verify_scheduler_signed_message(
     domain: bytes,
 ) -> Ed25519PublicKey:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = strict_loads(raw, max_bytes=16_384)
+    except StrictJSONError as error:
         raise IsolationUnavailable(
             "ISOLATION_UNAVAILABLE: invalid scheduler readiness"
         ) from error
@@ -2718,10 +2717,10 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
                 "ISOLATION_UNAVAILABLE: dormant scheduler readiness missing"
             )
         try:
-            decoded = json.loads(raw)
+            decoded = strict_loads(raw, max_bytes=16_384)
             encoded_public = decoded["scheduler_public_key"]
             key_id = decoded["scheduler_key_id"]
-        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (KeyError, TypeError, StrictJSONError) as error:
             raise IsolationUnavailable(
                 "ISOLATION_UNAVAILABLE: dormant scheduler readiness malformed"
             ) from error
@@ -2745,11 +2744,7 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
             public_key=None,
             domain=_SCHEDULER_READY_DOMAIN,
         )
-        if key_id != sha256_digest(
-            public_key.public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-        ):
+        if key_id != sha256_digest(raw_public_bytes(public_key)):
             raise IsolationUnavailable(
                 "ISOLATION_UNAVAILABLE: dormant scheduler key mismatch"
             )
@@ -3747,7 +3742,7 @@ def _start_authority_observer_locked(
         if authority_pid is None:
             status_socket.close()
             raise RuntimeError("authority child has no process identity")
-        process, client, attestation_object = _start_observer(
+        process, client, attestation_object, expectations = _start_observer(
             backend,
             status_connection=status_socket,
             status_session=authority_handle._session_id,
@@ -3767,12 +3762,7 @@ def _start_authority_observer_locked(
         )
         attestation.verify(
             pinned_controller_public_key=controller_public,
-            expected=ObserverLaunchExpectationsV1(
-                **{
-                    name: getattr(attestation, name)
-                    for name in ObserverLaunchExpectationsV1.__dataclass_fields__
-                }
-            ),
+            expected=expectations,
             now_ms=int(time.time() * 1000),
         )
     except BaseException:
