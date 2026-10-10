@@ -13,7 +13,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -174,6 +174,7 @@ class ArtifactStore:
 
     def __init__(self) -> None:
         self._artifacts: dict[tuple[str, str], Artifact] = {}
+        self._by_id: dict[str, list[tuple[str, str]]] = {}
         self._sealed_digests: dict[tuple[str, str], str] = {}
         self._revoked: set[tuple[str, str]] = set()
         self._by_task: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -207,17 +208,40 @@ class ArtifactStore:
                 capability, _prior_guard = self._governed_guards[workflow_id]
         return _GovernedProjectionPort(self, workflow_id, seal_id, capability)
 
+    def _visibility_snapshot_unlocked(
+        self, keys: Iterable[tuple[str, str]]
+    ) -> list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]]:
+        """Collect stored, unrevoked keys with their guards; caller holds the lock."""
+        snapshot: list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]] = []
+        for key in keys:
+            artifact = self._artifacts.get(key)
+            if artifact is None or key in self._revoked:
+                continue
+            guarded = self._governed_guards.get(key[0])
+            snapshot.append((key, artifact, None if guarded is None else guarded[1]))
+        return snapshot
+
+    @staticmethod
+    def _resolve_visible(
+        snapshot: list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]],
+    ) -> list[tuple[tuple[str, str], Artifact]]:
+        """Evaluate guards outside the store lock; guards may re-enter the store."""
+        visible: list[tuple[tuple[str, str], Artifact]] = []
+        for key, artifact, guard in snapshot:
+            if guard is not None:
+                try:
+                    allowed = bool(guard(key[1]))
+                except BaseException:
+                    allowed = False
+                if not allowed:
+                    continue
+            visible.append((key, artifact))
+        return visible
+
     def _is_visible(self, key: tuple[str, str]) -> bool:
         with self._lock:
-            if key in self._revoked or key not in self._artifacts:
-                return False
-            guarded = self._governed_guards.get(key[0])
-        if guarded is None:
-            return True
-        try:
-            return bool(guarded[1](key[1]))
-        except BaseException:
-            return False
+            snapshot = self._visibility_snapshot_unlocked((key,))
+        return bool(self._resolve_visible(snapshot))
 
     def publish(self, artifact: Artifact) -> str:
         """Publish an artifact to the store.
@@ -274,6 +298,7 @@ class ArtifactStore:
                 raise ValueError(_CANONICAL_VALUE_ERROR) from exc
             self._artifacts[key] = immutable
             self._sealed_digests[key] = sealed_digest
+            self._by_id.setdefault(immutable.artifact_id, []).append(key)
             self._by_task.setdefault((workflow_id, immutable.task_id), []).append(key)
             self._by_domain.setdefault((workflow_id, immutable.domain), []).append(key)
             self._by_agent.setdefault((workflow_id, immutable.agent_id), []).append(key)
@@ -312,7 +337,7 @@ class ArtifactStore:
             if workflow_id is not None:
                 key = (workflow_id, artifact_id)
             else:
-                matches = [key for key in self._artifacts if key[1] == artifact_id]
+                matches = list(self._by_id.get(artifact_id, ()))
                 if any(key[0] in self._governed_guards for key in matches):
                     raise GovernanceBypassDenied(
                         "workflow_id_required_for_governed_read"
@@ -344,35 +369,26 @@ class ArtifactStore:
     def get_by_task(self, task_id: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts for a task."""
         with self._lock:
-            ids = list(self._by_task.get((workflow_id, task_id), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_task.get((workflow_id, task_id), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def get_by_domain(self, domain: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts in a domain."""
         with self._lock:
-            ids = list(self._by_domain.get((workflow_id, domain), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_domain.get((workflow_id, domain), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def get_by_agent(self, agent_id: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts produced by an agent."""
         with self._lock:
-            ids = list(self._by_agent.get((workflow_id, agent_id), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_agent.get((workflow_id, agent_id), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def watch(self, key: str, callback: Any, *, workflow_id: str | None = None) -> None:
         """Register a watcher for a task_id or domain.
@@ -416,16 +432,14 @@ class ArtifactStore:
     def count(self) -> int:
         """Number of currently visible artifacts."""
         with self._lock:
-            keys = list(self._artifacts)
-        return sum(self._is_visible(key) for key in keys)
+            snapshot = self._visibility_snapshot_unlocked(self._artifacts)
+        return len(self._resolve_visible(snapshot))
 
     def summary(self) -> dict[str, Any]:
         """Store summary statistics."""
         with self._lock:
-            keys = list(self._artifacts)
-            artifacts = dict(self._artifacts)
-        visible_keys = [key for key in keys if self._is_visible(key)]
-        visible = [artifacts[key] for key in visible_keys]
+            snapshot = self._visibility_snapshot_unlocked(self._artifacts)
+        visible = [artifact for _key, artifact in self._resolve_visible(snapshot)]
         return {
             "total_artifacts": len(visible),
             "domains": len({artifact.domain for artifact in visible}),

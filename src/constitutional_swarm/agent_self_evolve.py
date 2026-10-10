@@ -177,6 +177,16 @@ def discover_agents(root: Path | str = ".", *, include_templates: bool = True) -
             # frontmatter often contains display names with spaces/title case.
             records.append(AgentRecord(name=path.stem, kind="template", path=path, data=payload))
 
+    # Reports are keyed by name; a duplicate would silently shadow another
+    # agent's checks and let the --fail-under gate pass on partial data.
+    seen: dict[str, AgentRecord] = {}
+    for record in records:
+        prior = seen.setdefault(record.name, record)
+        if prior is not record:
+            raise ValueError(
+                f"duplicate agent name {record.name!r}: {prior.kind} {prior.path} "
+                f"and {record.kind} {record.path}"
+            )
     return records
 
 
