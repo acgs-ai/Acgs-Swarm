@@ -111,7 +111,6 @@ class TestCodexAgentOSErrorOnRead:
                 return_value=mock_proc,
             ),
             patch("pathlib.Path.read_text", side_effect=OSError("permission denied")),
-            patch("pathlib.Path.unlink"),
         ):
             patch_text, stats = agent._generate_patch(task)
 
