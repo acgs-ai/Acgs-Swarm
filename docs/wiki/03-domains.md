@@ -18,9 +18,13 @@ policy checks run *in the runtime path*, not only in post-hoc audit.
 
 - **Agent DNA** (`dna.py`): each agent embeds an `AgentDNA` co-processor.
   `validate(text)` returns a `DNAValidationResult` (valid + violations + risk).
-  It is designed to sit on the local hot path. The former `443 ns` pin is withdrawn. `check_maci`
-  and `govern` extend it; `constitutional_dna` is a decorator that wraps any
-  callable. A disabled DNA raises `DNADisabledError` rather than silently passing.
+  It is designed to sit on the local hot path. The former `443 ns` pin is withdrawn. `govern`
+  (and the `constitutional_dna` decorator, which wraps any callable) enforces
+  the result: it raises `ConstitutionalViolationError` on an invalid result or a
+  verified Z3 counterexample unless `block_on_violation=False`, and raises on
+  WARN-tier matches only with `block_on_warnings=True`. `govern(action_type=...)`
+  puts `check_maci` on the governed path. A disabled DNA raises
+  `DNADisabledError` rather than silently passing.
 - **Why local enforcement:** a central gate is a single point of failure and a
   bottleneck; embedding the check makes every agent independently accountable.
 

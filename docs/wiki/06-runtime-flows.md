@@ -64,7 +64,8 @@ This is the flow the quickstart in `README.md` demonstrates.
 2. **Request validation:**
    `assignment = mesh.request_validation(producer_id, output, artifact_id)`
    → `PeerAssignment` listing the selected peers. Peer selection is
-   **trust-weighted** (`_select_peers`: weighted sampling + one exploration slot),
+   **trust-weighted** (`mesh/core.py:_select_peers_unlocked`: weighted sampling +
+   one exploration slot),
    so Flow 6's trust matrix steers who validates.
 3. **Each peer signs and votes:**
    ```python
@@ -130,7 +131,8 @@ Replicas converge to the same head set without a coordinator
    `spectral_norm()` report health.
 3. **Continuous-time (research):** `swarm_ode.integrate(...)` advances `H` with
    `projected_rk4_step` (re-projecting each step); `add_dp_noise` for DP gossip.
-4. The updated trust weights flow back into `mesh._select_peers` (Flow 3 step 2),
+4. The updated trust weights flow back into `mesh/core.py:_select_peers_unlocked`
+   (Flow 3 step 2),
    closing the loop — better-trusted peers are sampled more, with one exploration
    slot for discovery.
 
@@ -147,10 +149,16 @@ The productized, hardened flow (`governed_handoff.py`).
 1. `acgs-swarm run` → `_intake` loads the task + constitution and **fails closed**
    if a declared constitution version/hash ≠ pinned `608508a9bd224290`.
 2. An adapter (`MockAdapter` / `ExternalAgentAdapter` for Codex/Claude) proposes
-   `Action`s.
+   `Action`s. The external adapter's command is resolved on
+   `FIXED_SUBPROCESS_PATH` (`/usr/bin:/bin:/usr/local/bin`) or must be
+   absolute. A relative, blank or unresolvable command fails before spawn.
 3. `PolicyEngine.decide(action)` → `PolicyDecision`. The `tool_call` gate is
-   **default-DENY** against `DEFAULT_COMMAND_ALLOWLIST = (true, echo)`;
-   the constitution may extend, never weaken it.
+   **default-DENY** against the closed, code-owned `SAFE_COMMANDS` table
+   (`true` with no arguments, `echo` with plain-word arguments).
+   `command_allowlist` may only select from that table and can never add an
+   executable, flag, or argument shape. A list, tuple or set narrows the
+   table, a non-sequence value (for example a string) enables nothing, and an
+   absent or null value enables the whole table.
 4. Approved actions execute; each step is hash-linked into an audit chain
    (`AuditLogger`, `replay_hashes`).
 5. Schema v2 `build_bundle(signer=BundleSigner, constitutional_version=...)`
