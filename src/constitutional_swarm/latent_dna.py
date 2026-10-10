@@ -64,6 +64,31 @@ def _transformers_available() -> bool:
     return importlib.util.find_spec("transformers") is not None
 
 
+def _split_output(output: Any) -> tuple[Tensor, tuple[Any, ...] | None]:
+    """Split a layer output into ``(hidden, rest)``.
+
+    HuggingFace transformer layers return a tuple whose first element is the
+    hidden state; plain modules return the tensor itself (``rest`` is None).
+    """
+    if isinstance(output, tuple):
+        return output[0], output[1:]
+    return output, None
+
+
+# Config attributes that declare the residual-stream width, in lookup order.
+_WIDTH_ATTRS: tuple[str, ...] = ("hidden_size", "n_embd", "d_model")
+
+
+def _declared_hidden_width(model: Any) -> int | None:
+    """Return the residual width the model config declares, if any."""
+    config = getattr(model, "config", None)
+    for attr in _WIDTH_ATTRS:
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
 @runtime_checkable
 class _HFModelLike(Protocol):
     """Minimal duck-type protocol for HuggingFace-compatible models.
@@ -120,6 +145,7 @@ class _BODESHook:
             raise ValueError(f"gamma must be in (0, 1], got {gamma}")
 
         self.v_viol = v_viol  # [hidden_dim]
+        self.dim = int(v_viol.shape[0])
         self.threshold = threshold
         self.gamma = gamma
 
@@ -157,12 +183,7 @@ class _BODESHook:
         Shape: [batch, seq_len, hidden_dim].
         """
         # Extract hidden states from layer output (tuple or tensor)
-        if isinstance(output, tuple):
-            hidden = output[0]
-            rest = output[1:]
-        else:
-            hidden = output
-            rest = None
+        hidden, rest = _split_output(output)
 
         # hidden: [batch, seq_len, hidden_dim]
         batch, seq_len, _hidden_dim = hidden.shape
@@ -318,12 +339,7 @@ class _BODESSubspaceHook:
         input: tuple[Any, ...],
         output: Any,
     ) -> Any:
-        if isinstance(output, tuple):
-            hidden = output[0]
-            rest = output[1:]
-        else:
-            hidden = output
-            rest = None
+        hidden, rest = _split_output(output)
 
         batch, seq_len, hidden_dim = hidden.shape
         with self._stats_lock:
@@ -504,9 +520,23 @@ class LatentDNAWrapper:
     # ──────────────────────────────────────────────────────────────────────
 
     def enable(self) -> None:
-        """Register the BODES hook. Idempotent."""
+        """Register the BODES hook. Idempotent.
+
+        Raises:
+            ValueError: if the model config declares a residual width
+                (``hidden_size`` / ``n_embd`` / ``d_model``) that differs from
+                the steering vector/subspace width. Without this check every
+                forward pass would bypass steering (fail open).
+        """
         if self._handle is not None:
             return
+        declared = _declared_hidden_width(self.model)
+        if declared is not None and declared != self._hook_impl.dim:
+            raise ValueError(
+                f"BODES steering width {self._hook_impl.dim} does not match the model's "
+                f"declared hidden width {declared}; refusing to enable a hook that "
+                "would bypass steering on every token"
+            )
         with self._hook_impl._stats_lock:
             self._hook_impl.interventions = 0
             self._hook_impl.steer_failures = 0
@@ -661,39 +691,12 @@ class LatentDNAWrapper:
         Returns:
             Unit-normalized violation vector [hidden_dim].
         """
-        if layer_attr_path is None:
-            path = LatentDNAWrapper._auto_detect_path(model)
-        else:
-            path = layer_attr_path
-        target_layer = LatentDNAWrapper._resolve_layer(model, path, layer_idx)
-
-        activations: list[Tensor] = []
-
-        def _capture_hook(module: nn.Module, input: tuple[Any, ...], output: Any) -> None:
-            h = output[0] if isinstance(output, tuple) else output
-            # Mean over seq_len: [batch, hidden_dim]
-            activations.append(h.mean(dim=1).detach().cpu())
-
-        handle = target_layer.register_forward_hook(_capture_hook)
-        try:
-            model.eval()
-            with torch.no_grad():
-                safe_acts = []
-                for inp in safe_inputs:
-                    activations.clear()
-                    model(**inp)
-                    safe_acts.append(activations[0])
-
-                unsafe_acts = []
-                for inp in unsafe_inputs:
-                    activations.clear()
-                    model(**inp)
-                    unsafe_acts.append(activations[0])
-        finally:
-            handle.remove()
-
-        safe_mean = torch.cat(safe_acts, dim=0).mean(dim=0)  # [hidden_dim]
-        unsafe_mean = torch.cat(unsafe_acts, dim=0).mean(dim=0)  # [hidden_dim]
+        safe_mean = _collect_mean_activations(model, safe_inputs, layer_idx, layer_attr_path).mean(
+            dim=0
+        )  # [hidden_dim]
+        unsafe_mean = _collect_mean_activations(
+            model, unsafe_inputs, layer_idx, layer_attr_path
+        ).mean(dim=0)  # [hidden_dim]
 
         v_viol = unsafe_mean - safe_mean
         v_viol = v_viol / v_viol.norm()
@@ -748,38 +751,12 @@ class LatentDNAWrapper:
                 "For single pair, use extract_violation_vector (mean-difference)."
             )
 
-        if layer_attr_path is None:
-            path = LatentDNAWrapper._auto_detect_path(model)
-        else:
-            path = layer_attr_path
-        target_layer = LatentDNAWrapper._resolve_layer(model, path, layer_idx)
-
-        activations: list[Tensor] = []
-
-        def _capture_hook(module: nn.Module, input: tuple[Any, ...], output: Any) -> None:
-            h = output[0] if isinstance(output, tuple) else output
-            activations.append(h.mean(dim=1).detach().cpu())
-
-        handle = target_layer.register_forward_hook(_capture_hook)
-        try:
-            model.eval()
-            with torch.no_grad():
-                safe_acts = []
-                for inp in safe_inputs:
-                    activations.clear()
-                    model(**inp)
-                    safe_acts.append(activations[0])
-
-                unsafe_acts = []
-                for inp in unsafe_inputs:
-                    activations.clear()
-                    model(**inp)
-                    unsafe_acts.append(activations[0])
-        finally:
-            handle.remove()
-
-        safe_cat = torch.cat(safe_acts, dim=0)  # [N, hidden_dim]
-        unsafe_cat = torch.cat(unsafe_acts, dim=0)  # [N, hidden_dim]
+        safe_cat = _collect_mean_activations(
+            model, safe_inputs, layer_idx, layer_attr_path
+        )  # [N, hidden_dim]
+        unsafe_cat = _collect_mean_activations(
+            model, unsafe_inputs, layer_idx, layer_attr_path
+        )  # [N, hidden_dim]
 
         # Contrastive PCA: SVD on centered paired differences
         diffs = unsafe_cat - safe_cat  # [N, hidden_dim]
@@ -794,3 +771,39 @@ class LatentDNAWrapper:
         # Normalize each row
         norms = components.norm(dim=1, keepdim=True)
         return components / norms
+
+
+def _collect_mean_activations(
+    model: _HFModelLike,
+    inputs: list[dict[str, Tensor]],
+    layer_idx: int,
+    layer_attr_path: str | None,
+) -> Tensor:
+    """Run ``inputs`` through ``model`` and return per-input mean activations.
+
+    Captures the first output of layer ``layer_idx`` on each forward pass,
+    averages it over the sequence dimension and concatenates the results to
+    ``[N, hidden_dim]`` (on CPU). The capture hook is always removed.
+    """
+    path = LatentDNAWrapper._auto_detect_path(model) if layer_attr_path is None else layer_attr_path
+    target_layer = LatentDNAWrapper._resolve_layer(model, path, layer_idx)
+
+    activations: list[Tensor] = []
+
+    def _capture_hook(module: nn.Module, input: tuple[Any, ...], output: Any) -> None:
+        hidden, _rest = _split_output(output)
+        # Mean over seq_len: [batch, hidden_dim]
+        activations.append(hidden.mean(dim=1).detach().cpu())
+
+    collected: list[Tensor] = []
+    handle = target_layer.register_forward_hook(_capture_hook)
+    try:
+        model.eval()
+        with torch.no_grad():
+            for inp in inputs:
+                activations.clear()
+                model(**inp)
+                collected.append(activations[0])
+    finally:
+        handle.remove()
+    return torch.cat(collected, dim=0)
