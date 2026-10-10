@@ -27,6 +27,12 @@ Wire format (JSON):
         ...
     ]
 
+Transport security:
+    ``transport_security="auto"`` (default) uses plaintext ``ws://`` only for
+    loopback hosts (127.0.0.1, localhost, ::1) and TLS ``wss://`` for every
+    other host. A ``secret_token`` is never sent or accepted over plaintext on a
+    non-loopback host; such configurations raise ``ValueError``.
+
 Optional dependency: websockets>=12.0
 Install: pip install 'constitutional-swarm[transport]'
 
@@ -45,8 +51,10 @@ import hmac
 import json
 import logging
 import math
+import os
 import random
 import secrets
+import ssl
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -58,6 +66,14 @@ from constitutional_swarm.merkle_crdt import (
     MerkleCRDT,
     normalize_json_value,
     thaw_json_value,
+)
+from constitutional_swarm.remote_vote_transport.protocol import (
+    TransportSecurity,
+    _build_ssl_context,
+    _format_uri_host,
+    _is_loopback_host,
+    _parse_ws_endpoint,
+    _resolve_transport_security,
 )
 
 log = logging.getLogger(__name__)
@@ -80,6 +96,7 @@ MAX_SESSION_NODES = 100_000
 MAX_SESSION_BYTES = 32 * 1024 * 1024
 MAX_CONNECTIONS = 4096
 DEFAULT_GOSSIP_CHUNK_SIZE = 256
+_TRANSPORT_SECURITY_MODES = ("auto", "tls", "plaintext")
 PROTOCOL_VERSION = 1
 
 # ---------------------------------------------------------------------------
@@ -443,7 +460,13 @@ class GossipServer:
             first message before any node batches are accepted.  Connections
             that omit or fail the auth message are closed immediately.
             This is a defence-in-depth measure; production deployments
-            should additionally use TLS and network-level access control.
+            should additionally use network-level access control.
+        transport_security: ``"auto"`` (default) serves plaintext only on a
+            loopback host and requires TLS material on any other host;
+            ``"tls"`` always requires it; ``"plaintext"`` never uses TLS and is
+            refused on a non-loopback host when ``secret_token`` is set.
+        ssl_context / certfile / keyfile: server TLS material
+            (``PROTOCOL_TLS_SERVER`` context, or a PEM certificate chain).
     """
 
     def __init__(
@@ -459,6 +482,10 @@ class GossipServer:
         max_connections: int = 128,
         max_nodes_per_session: int = 8192,
         max_bytes_per_session: int = MAX_SESSION_BYTES,
+        transport_security: TransportSecurity = "auto",
+        ssl_context: ssl.SSLContext | None = None,
+        certfile: str | os.PathLike[str] | None = None,
+        keyfile: str | os.PathLike[str] | None = None,
     ) -> None:
         if (
             isinstance(auth_timeout_s, bool)
@@ -489,8 +516,32 @@ class GossipServer:
             )
         if secret_token is not None:
             _require_text(secret_token, "secret_token", max_bytes=4096)
+        if transport_security not in _TRANSPORT_SECURITY_MODES:
+            raise ValueError(f"transport_security must be one of {_TRANSPORT_SECURITY_MODES}")
+        scheme, parsed_host, parsed_port = _parse_ws_endpoint(host)
+        resolved_mode = _resolve_transport_security(
+            transport_security=transport_security, scheme=scheme, host=parsed_host
+        )
+        if (
+            resolved_mode == "plaintext"
+            and secret_token is not None
+            and not _is_loopback_host(parsed_host)
+        ):
+            raise ValueError(
+                "refusing to accept secret_token over plaintext on non-loopback "
+                f"host {parsed_host!r}; configure TLS"
+            )
+        self.ssl_context = _build_ssl_context(
+            resolved_mode,
+            server_side=True,
+            ssl_context=ssl_context,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
+        self.transport_security = transport_security
         self.crdt = crdt
-        self.host = host
+        self.host = parsed_host
+        port = parsed_port or port
         self.port = port
         self._secret_token = secret_token
         self._allow_unauthenticated = allow_unauthenticated
@@ -522,6 +573,7 @@ class GossipServer:
             self.host,
             self.port,
             max_size=MAX_BATCH_BYTES,
+            ssl=self.ssl_context,
         )
         # Record actual bound port (useful when port=0 for OS-assigned)
         sockets = self._server.sockets
@@ -700,7 +752,7 @@ class GossipServer:
                                 _encode_envelope("ack", ok=False, message="invalid CID")
                             )
                             continue
-                        self.crdt.merge_nodes(envelope)
+                        self.crdt._merge_verified_nodes(envelope)
                         nodes_received += len(envelope)
                         await websocket.send(
                             _encode_envelope("ack", ok=True, nodes_received=len(envelope))
@@ -729,7 +781,7 @@ class GossipServer:
                             raise ValueError("node session budget exceeded")
                         if any(not node.verify_cid() for node in nodes):
                             raise ValueError("node CID verification failed")
-                        self.crdt.merge_nodes(nodes)
+                        self.crdt._merge_verified_nodes(nodes)
                         nodes_received += len(nodes)
                     elif message_type == "complete":
                         work_rounds += 1
@@ -767,14 +819,69 @@ class GossipClient:
 
     The client is stateless — it opens, sends, closes. For long-running
     agents, SwarmNode reuses GossipClient across rounds.
+
+    ``transport_security="auto"`` (default) connects with plaintext ``ws://``
+    only to loopback peers and with TLS ``wss://`` to every other peer; a
+    ``ws://``/``wss://`` URL host selects the scheme explicitly. An explicit
+    ``ssl_context`` (``PROTOCOL_TLS_CLIENT``, ``CERT_REQUIRED``, ``check_hostname``)
+    requires ``transport_security="tls"``.
+    Sending ``secret_token`` over plaintext to a non-loopback peer raises
+    ``ValueError`` before any connection is opened.
     """
 
-    def __init__(self, *, connect: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        connect: Callable[..., Any] | None = None,
+        transport_security: TransportSecurity = "auto",
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
+        if transport_security not in _TRANSPORT_SECURITY_MODES:
+            raise ValueError(f"transport_security must be one of {_TRANSPORT_SECURITY_MODES}")
         self._connect = connect
+        self.transport_security = transport_security
+        if ssl_context is None:
+            self.ssl_context = None
+        elif transport_security == "auto":
+            raise ValueError("auto transport cannot use an explicit SSL context")
+        else:
+            self.ssl_context = _build_ssl_context(
+                transport_security, server_side=False, ssl_context=ssl_context
+            )
+            if (
+                ssl_context.verify_mode != ssl.CERT_REQUIRED
+                or ssl_context.check_hostname is not True
+            ):
+                raise ValueError(
+                    "client ssl_context must verify peers: verify_mode=CERT_REQUIRED "
+                    "and check_hostname=True"
+                )
 
-    def _connection(self, uri: str) -> Any:
+    def _endpoint(
+        self, host: str, port: int, secret_token: str | None
+    ) -> tuple[str, ssl.SSLContext | None]:
+        """Resolve the peer URI and TLS context; refuse plaintext secrets off-host."""
+        scheme, parsed_host, parsed_port = _parse_ws_endpoint(host)
+        mode = _resolve_transport_security(
+            transport_security=self.transport_security, scheme=scheme, host=parsed_host
+        )
+        if mode == "plaintext" and secret_token is not None and not _is_loopback_host(
+            parsed_host
+        ):
+            raise ValueError(
+                "refusing to send secret_token over plaintext to non-loopback "
+                f"host {parsed_host!r}; configure TLS"
+            )
+        context = _build_ssl_context(mode, server_side=False, ssl_context=self.ssl_context)
+        uri = (
+            f"{'wss' if mode == 'tls' else 'ws'}://"
+            f"{_format_uri_host(parsed_host)}:{parsed_port or port}"
+        )
+        return uri, context
+
+    def _connection(self, uri: str, ssl_context: ssl.SSLContext | None) -> Any:
         if self._connect is not None:
-            return self._connect(uri)
+            return self._connect(uri, ssl=ssl_context)
         try:
             import websockets  # type: ignore[import]
         except ImportError as exc:
@@ -782,7 +889,7 @@ class GossipClient:
                 "WebSocket transport requires 'websockets>=12.0'. "
                 "Install with: pip install 'constitutional-swarm[transport]'"
             ) from exc
-        return websockets.connect(uri, max_size=MAX_BATCH_BYTES)
+        return websockets.connect(uri, max_size=MAX_BATCH_BYTES, ssl=ssl_context)
 
     @staticmethod
     def _is_connection_failure(exc: Exception) -> bool:
@@ -841,11 +948,11 @@ class GossipClient:
         """Synchronize missing frontier ancestry and await terminal acknowledgement."""
         if type(chunk_size) is not int or not 1 <= chunk_size <= MAX_BATCH_NODES:
             raise ValueError(f"chunk_size must be between 1 and {MAX_BATCH_NODES}")
-        uri = f"ws://{host}:{port}"
+        uri, ssl_context = self._endpoint(host, port, secret_token)
         nodes_sent = 0
         try:
             async with asyncio.timeout(timeout):
-                async with self._connection(uri) as websocket:
+                async with self._connection(uri, ssl_context) as websocket:
                     if secret_token is not None:
                         await websocket.send(json.dumps({"type": "auth", "token": secret_token}))
                     frontier = source.frontier_snapshot()
@@ -933,10 +1040,10 @@ class GossipClient:
         if not nodes:
             return True
 
-        uri = f"ws://{host}:{port}"
+        uri, ssl_context = self._endpoint(host, port, secret_token)
         try:
             async with asyncio.timeout(timeout):
-                async with self._connection(uri) as ws:
+                async with self._connection(uri, ssl_context) as ws:
                     if secret_token is not None:
                         auth_msg = json.dumps({"type": "auth", "token": secret_token})
                         await ws.send(auth_msg)
@@ -976,6 +1083,12 @@ class SwarmNode:
         port: WebSocket server port. 0 = OS-assigned (use actual_port after start).
         reject_unverified: If True (default), reject nodes with invalid CIDs.
         gossip_batch_size: Positive maximum nodes per anti-entropy chunk.
+        transport_security: ``"auto"`` (default), ``"tls"`` or ``"plaintext"``;
+            applied to both the embedded server and the outbound client.
+        ssl_context / certfile / keyfile: server TLS material.
+        client_ssl_context: ``PROTOCOL_TLS_CLIENT`` context used to verify
+            peers (requires ``transport_security="tls"``); ``None`` uses the
+            system trust store.
 
     Usage as async context manager:
 
@@ -995,6 +1108,11 @@ class SwarmNode:
         gossip_batch_size: int = DEFAULT_GOSSIP_CHUNK_SIZE,
         secret_token: str | None = None,
         allow_unauthenticated: bool = False,
+        transport_security: TransportSecurity = "auto",
+        ssl_context: ssl.SSLContext | None = None,
+        certfile: str | os.PathLike[str] | None = None,
+        keyfile: str | os.PathLike[str] | None = None,
+        client_ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         if (
             type(gossip_batch_size) is not int
@@ -1006,7 +1124,6 @@ class SwarmNode:
         self.agent_id = agent_id
         self.crdt = MerkleCRDT(agent_id, reject_unverified=reject_unverified)
         self.registry = GossipPeerRegistry()
-        self.client = GossipClient()
         self._secret_token = secret_token
         self._server = GossipServer(
             self.crdt,
@@ -1014,6 +1131,13 @@ class SwarmNode:
             port=port,
             secret_token=secret_token,
             allow_unauthenticated=allow_unauthenticated,
+            transport_security=transport_security,
+            ssl_context=ssl_context,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
+        self.client = GossipClient(
+            transport_security=transport_security, ssl_context=client_ssl_context
         )
         self._gossip_batch_size = gossip_batch_size
         self._running = False
@@ -1051,12 +1175,6 @@ class SwarmNode:
     def host(self) -> str:
         return self._server.host
 
-    def _select_nodes_for_gossip(self) -> list[DAGNode]:
-        """Compatibility snapshot; anti-entropy uses peer-requested ancestry."""
-        return self.crdt.get_many(
-            list(self.crdt.frontier_snapshot()), limit=self._gossip_batch_size
-        )
-
     async def gossip_round(
         self,
         n_peers: int = 2,
@@ -1087,6 +1205,9 @@ class SwarmNode:
             ],
             return_exceptions=True,
         )
+        for (host, port), result in zip(peers, results, strict=True):
+            if isinstance(result, BaseException):
+                log.warning("Gossip sync to %s:%d refused: %s", host, port, result)
         successful_results = [
             result
             for result in results
