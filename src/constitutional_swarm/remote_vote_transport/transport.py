@@ -24,6 +24,26 @@ from constitutional_swarm.remote_vote_transport.protocol import (
 )
 
 
+def _require_websockets() -> Any:
+    try:
+        import websockets  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "Remote vote transport requires 'websockets>=12.0'. "
+            "Install with: pip install 'constitutional-swarm[transport]'"
+        ) from exc
+    return websockets
+
+
+def _require_verifying_client_context(context: ssl.SSLContext) -> None:
+    """Refuse client contexts that would accept an unauthenticated server."""
+    if context.verify_mode != ssl.CERT_REQUIRED or context.check_hostname is not True:
+        raise ValueError(
+            "client ssl_context must verify peers: verify_mode=CERT_REQUIRED "
+            "and check_hostname=True"
+        )
+
+
 class RemoteVoteClient:
     """WebSocket client for one-shot remote vote requests.
 
@@ -31,7 +51,9 @@ class RemoteVoteClient:
     context. ``"tls"`` uses ``wss://`` with the supplied context or a default
     client context. ``"auto"`` derives the scheme from the endpoint, otherwise
     defaulting to plaintext for loopback hosts and TLS for non-loopback hosts;
-    explicit contexts therefore require ``transport_security="tls"``.
+    explicit contexts therefore require ``transport_security="tls"`` and must
+    verify the server (``CERT_REQUIRED`` and ``check_hostname``); this is checked
+    at construction and again before every connection.
     """
 
     def __init__(
@@ -51,6 +73,8 @@ class RemoteVoteClient:
                 server_side=False,
                 ssl_context=ssl_context,
             )
+            if self.ssl_context is not None:
+                _require_verifying_client_context(self.ssl_context)
 
     async def request_vote(
         self,
@@ -60,13 +84,7 @@ class RemoteVoteClient:
         *,
         timeout: float = 5.0,
     ) -> RemoteVoteResponse:
-        try:
-            import websockets  # type: ignore[import]
-        except ImportError as exc:
-            raise ImportError(
-                "Remote vote transport requires 'websockets>=12.0'. "
-                "Install with: pip install 'constitutional-swarm[transport]'"
-            ) from exc
+        websockets = _require_websockets()
 
         scheme, parsed_host, parsed_port = _parse_ws_endpoint(host)
         resolved_port = parsed_port or port
@@ -80,6 +98,8 @@ class RemoteVoteClient:
             server_side=False,
             ssl_context=self.ssl_context,
         )
+        if ssl_context is not None:
+            _require_verifying_client_context(ssl_context)
         uri = f"{'wss' if resolved_mode == 'tls' else 'ws'}://{_format_uri_host(parsed_host)}:{resolved_port}"
         async with asyncio.timeout(timeout):
             async with websockets.connect(uri, ssl=ssl_context) as ws:
@@ -129,13 +149,7 @@ class RemoteVoteServer:
         self._actual_port: int = self.port
 
     async def start(self) -> None:
-        try:
-            import websockets  # type: ignore[import]
-        except ImportError as exc:
-            raise ImportError(
-                "Remote vote transport requires 'websockets>=12.0'. "
-                "Install with: pip install 'constitutional-swarm[transport]'"
-            ) from exc
+        websockets = _require_websockets()
         self._server = await websockets.serve(
             self._handle_connection,
             self.host,

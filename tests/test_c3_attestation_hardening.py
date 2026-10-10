@@ -865,7 +865,11 @@ class TestC3Transport:
 
         trusted_request = prepare_request(trusted_mesh, "art-trusted")
         peer.handle_vote_request(trusted_request)
-        cache_before = OrderedDict(peer._request_nonce_cache)
+        caches_before = {
+            signer: OrderedDict(cache)
+            for signer, cache in peer._request_nonce_caches.items()
+        }
+        assert caches_before
 
         untrusted_request = prepare_request(untrusted_mesh, "art-untrusted")
         assert ConstitutionalMesh.verify_remote_vote_request(
@@ -874,7 +878,7 @@ class TestC3Transport:
         with pytest.raises(ValueError, match="signer is not trusted"):
             peer.handle_vote_request(untrusted_request)
 
-        assert peer._request_nonce_cache == cache_before
+        assert peer._request_nonce_caches == caches_before
 
     def test_tls_server_requires_credentials_before_start(self):
         from constitutional_swarm.remote_vote_transport import RemoteVoteServer

@@ -51,8 +51,13 @@ class MeshProof:
     artifact_id: str = ""
     protocol_version: int = 2
 
-    def verify(self) -> bool:
-        """Independently verify the proof chain."""
+    def verify(self, *, allow_legacy_v1: bool = False) -> bool:
+        """Independently verify the proof chain.
+
+        Legacy v1 roots are colon-joined, not domain-separated, and truncated to
+        128 bits, so they verify only when the caller passes
+        ``allow_legacy_v1=True`` (historical fixture generation).
+        """
         if self.protocol_version == 2:
             recomputed = compute_vote_envelope_root_from_hashes(
                 task_id=self.task_id,
@@ -64,7 +69,7 @@ class MeshProof:
                 accepted=self.accepted,
                 envelope_hashes=self.vote_hashes,
             )
-        elif self.protocol_version == 1:
+        elif self.protocol_version == 1 and allow_legacy_v1 is True:
             recomputed = _compute_merkle_root(
                 self.assignment_id,
                 self.content_hash,
