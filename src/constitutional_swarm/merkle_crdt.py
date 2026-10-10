@@ -66,11 +66,15 @@ class FrozenJSONList(tuple[Any, ...]):
 class FrozenJSONDict(Mapping[str, Any]):
     """Recursively immutable JSON object with mapping-compatible equality."""
 
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "_normalized")
     _data: Mapping[str, Any]
+    # True only when built by normalize_json_value() under limits no looser than
+    # the DAGNode metadata defaults; hand-built instances are never trusted.
+    _normalized: bool
 
     def __init__(self, data: dict[str, Any]) -> None:
         object.__setattr__(self, "_data", MappingProxyType(data))
+        object.__setattr__(self, "_normalized", False)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise TypeError("frozen JSON objects cannot be modified")
@@ -96,6 +100,9 @@ def normalize_json_value(
 ) -> Any:
     """Validate, detach, and recursively freeze a JSON-compatible value."""
     remaining = [max_items]
+    within_metadata_limits = (
+        max_depth <= MAX_METADATA_DEPTH and max_items <= MAX_METADATA_ITEMS
+    )
 
     def freeze(item: Any, depth: int) -> Any:
         if depth > max_depth:
@@ -115,7 +122,9 @@ def normalize_json_value(
                 if not isinstance(key, str):
                     raise TypeError("JSON object keys must be strings")
                 frozen[key] = freeze(nested, depth + 1)
-            return FrozenJSONDict(frozen)
+            result = FrozenJSONDict(frozen)
+            object.__setattr__(result, "_normalized", within_metadata_limits)
+            return result
         if isinstance(item, (list, tuple)):
             remaining[0] -= len(item)
             if remaining[0] < 0:
@@ -136,6 +145,8 @@ def thaw_json_value(value: Any) -> Any:
 
 
 def _normalize_metadata(metadata: Any) -> FrozenJSONDict:
+    if type(metadata) is FrozenJSONDict and metadata._normalized:
+        return metadata
     normalized = normalize_json_value(metadata)
     if not isinstance(normalized, FrozenJSONDict):
         raise TypeError("metadata must be a JSON object")
@@ -370,6 +381,25 @@ class MerkleCRDT:
                 if node.cid in self._nodes:
                     continue
                 if self._reject_unverified and not node.verify_cid():
+                    continue
+                self._store_unlocked(node)
+                added += 1
+        return added
+
+    def _merge_verified_nodes(self, nodes: list[DAGNode]) -> int:
+        """Merge nodes whose CIDs the caller has already verified.
+
+        Trust contract: every node MUST have passed ``verify_cid()`` in the
+        caller (the gossip server rejects the whole frame otherwise). This
+        skips the second hash so each received node is hashed exactly once.
+        Use ``merge_nodes()`` for any input that has not been verified.
+
+        Returns the number of new nodes added.
+        """
+        added = 0
+        with self._lock:
+            for node in nodes:
+                if node.cid in self._nodes:
                     continue
                 self._store_unlocked(node)
                 added += 1
