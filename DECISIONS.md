@@ -648,7 +648,13 @@ above.
   fail to reopen with a generic error ("APCC SQLite store semantic validation
   failed" or "APCC authority store semantic validation failed"). The store runs
   the same per-row validator when writing as when reopening, so it cannot seal
-  a state it would reject.
+  a state it would reject. A fresh stage whose `expected_node_version` differs
+  from the node's version is refused before any write, so one test in the
+  frozen B2 file `tests/test_apcc_postgres.py` now passes
+  `expected_node_version="1"` when it stages after a commit, as its neighbours
+  already do. That file's SHA-256 moves from `dff15b7f…` to `177d3137…`;
+  `postgres_store.py` keeps `576c0449…`. The dated `docs/internal/APCC-1-*`
+  records still describe the pair as it was when they were written.
 - **APCC observation and empirical (C33, C34).** The request an observation
   answers comes from the caller (`expected_request`) and is compared before any
   cryptographic work; the verified result records `request_digest`. B4 pins its
