@@ -1496,7 +1496,7 @@ class TestC7ResumeMeshReview:
             with pytest.raises(KeyError):
                 mesh.get_result(historical_id)
 
-    def test_jsonl_and_sqlite_fail_closed_on_every_inconsistent_hash_tag(self, tmp_path):
+    def test_jsonl_and_sqlite_quarantine_every_inconsistent_hash_tag(self, tmp_path, caplog):
         from dataclasses import replace
 
         import pytest
@@ -1524,17 +1524,26 @@ class TestC7ResumeMeshReview:
             ),
         }
 
+        assignment_id = str(record.assignment["assignment_id"])
+        # C28 mesh-settle-1: inconsistent tags are quarantined (logged, never
+        # loaded) instead of aborting mesh construction.
         for kind in ("jsonl", "sqlite"):
             for tag, mismatched in mismatches.items():
                 store = self._store(kind, tmp_path / f"mismatch-{kind}-{tag}")
                 store.append(mismatched)
-                with pytest.raises(ValueError, match="constitutional hash"):
-                    ConstitutionalMesh(
+                caplog.clear()
+                with caplog.at_level("WARNING", logger="constitutional_swarm.mesh.core"):
+                    mesh = ConstitutionalMesh(
                         constitution,
                         quorum=3,
                         settlement_store=store,
                         auto_reconcile=False,
                     )
+                assert f"quarantining settlement {assignment_id}" in caplog.text
+                assert "constitutional hash" in caplog.text
+                assert assignment_id not in mesh._final_results
+                with pytest.raises(KeyError, match="not found"):
+                    mesh.get_result(assignment_id)
 
     def test_foreign_pending_is_counted_skipped_and_left_untouched(self):
         import pytest

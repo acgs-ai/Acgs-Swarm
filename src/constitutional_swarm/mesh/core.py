@@ -30,8 +30,10 @@ import random
 import threading
 import time
 import uuid
+import warnings
 from collections import OrderedDict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -72,6 +74,7 @@ from constitutional_swarm.mesh.settlement import (
 )
 from constitutional_swarm.mesh.voting import RemoteVoteRequest, ValidationVote
 from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
     SignedAssignment,
     VoteEnvelope,
     VoteSignerRegistry,
@@ -109,6 +112,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_MAX_QUARANTINED_SETTLEMENT_IDS = 1_000
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +157,7 @@ class ConstitutionalMesh:
         max_pending_assignments: int = 10_000,
         max_settled_results: int = 10_000,
         max_shadow_metrics: int = 1_000,
-        complete_evidence: bool = False,
+        complete_evidence: bool | None = None,
         vote_registry: VoteSignerRegistry | None = None,
         evidence_mode: Literal["independent", "single_operator_dev"] = "independent",
         assigner_private_key: Ed25519PrivateKey | bytes | str | None = None,
@@ -212,7 +217,16 @@ class ConstitutionalMesh:
         self._risk_scoring = risk_scoring
         self._peers_per_validation = peers_per_validation
         self._quorum = quorum
-        self._complete_evidence = complete_evidence
+        if complete_evidence is not None:
+            # Proof-grade verification always requires the complete signed
+            # electorate (verify_vote_envelopes), so the flag selects nothing.
+            warnings.warn(
+                "ConstitutionalMesh(complete_evidence=...) is deprecated and has no "
+                "effect: settlement evidence always requires every assigned peer's "
+                "signed vote envelope",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._evidence_mode = evidence_mode
         # Seeded randomness is only used for deterministic peer assignment in tests/benchmarks.
         self._rng = random.Random(seed) if seed is not None else random.SystemRandom()
@@ -275,6 +289,10 @@ class ConstitutionalMesh:
             OrderedDict()
         )
         self._final_results: OrderedDict[str, MeshResult] = OrderedDict()
+        # Bounded record of persisted settlements rejected at startup, keyed by
+        # assignment id with a cause code; the total count is never truncated.
+        self._quarantined_settlements: OrderedDict[str, str] = OrderedDict()
+        self._quarantined_settlement_count = 0
         self._max_pending_assignments = max_pending_assignments
         self._max_settled_results = max_settled_results
         self._total_validations = 0
@@ -367,8 +385,18 @@ class ConstitutionalMesh:
 
     @property
     def vote_registry(self) -> VoteSignerRegistry:
-        """Return the locked signer registry used to authorize vote evidence."""
+        """Return the live, mutable signer registry used to authorize vote evidence.
+
+        Mutate identities through the mesh wrappers, which reserve the assigner
+        identity. Verifiers that must not observe later mutation should use
+        ``assigner_trust_root`` or ``vote_registry.frozen_copy()``.
+        """
         return self._vote_registry
+
+    @property
+    def assigner_trust_root(self) -> FrozenVoteSignerRegistry:
+        """Return the immutable assigner trust root pinned at construction."""
+        return self._assigner_trust_root
 
     @property
     def assigner_id(self) -> str:
@@ -1010,6 +1038,7 @@ class ConstitutionalMesh:
                     content="",
                 )
                 self._votes.pop(assignment_id, None)
+                self._purge_signed_envelopes_locked(assignment_id)
                 self._settled_assignments.discard(assignment_id)
                 self._settled_voters.pop(assignment_id, None)
                 self._total_settled += 1
@@ -1039,6 +1068,10 @@ class ConstitutionalMesh:
                 raise KeyError(f"Assignment {assignment_id} not found")
             self._require_current_assignment_constitution(assignment)
             self._assert_assignment_payload_complete(assignment)
+            if voter_id not in assignment.peers:
+                raise UnauthorizedVoterError(
+                    f"{voter_id} is not assigned to validation {assignment_id}"
+                )
             if voter_id not in self._agent_vote_private_keys:
                 raise UnauthorizedVoterError(
                     f"{voter_id} is not a locally managed signer; "
@@ -1048,32 +1081,26 @@ class ConstitutionalMesh:
             voter_dna = self._voter_dna_locked(voter_id)
 
         result = voter_dna.validate(content)
-
-        if result.valid:
+        approved = result.valid
+        reason = (
+            "constitutional check passed"
+            if approved
+            else "; ".join(result.violations)
+        )
+        signature = self.sign_vote(
+            assignment_id, voter_id, approved=approved, reason=reason
+        )
+        try:
             return self.submit_vote(
                 assignment_id,
                 voter_id,
-                approved=True,
-                reason="constitutional check passed",
-                signature=self.sign_vote(
-                    assignment_id,
-                    voter_id,
-                    approved=True,
-                    reason="constitutional check passed",
-                ),
+                approved=approved,
+                reason=reason,
+                signature=signature,
             )
-        return self.submit_vote(
-            assignment_id,
-            voter_id,
-            approved=False,
-            reason="; ".join(result.violations),
-            signature=self.sign_vote(
-                assignment_id,
-                voter_id,
-                approved=False,
-                reason="; ".join(result.violations),
-            ),
-        )
+        finally:
+            with self._lock:
+                self._signed_envelopes_by_signature.pop(signature, None)
 
     # -- Bulk operations ---------------------------------------------------
 
@@ -1511,6 +1538,7 @@ class ConstitutionalMesh:
         for assignment_id in stale_ids:
             self._assignments.pop(assignment_id, None)
             self._votes.pop(assignment_id, None)
+            self._purge_signed_envelopes_locked(assignment_id)
             self._settled_assignments.discard(assignment_id)
             self._settled_voters.pop(assignment_id, None)
         if stale_ids:
@@ -1525,8 +1553,19 @@ class ConstitutionalMesh:
             evicted_id, _ = self._final_results.popitem(last=False)
             self._assignments.pop(evicted_id, None)
             self._votes.pop(evicted_id, None)
+            self._purge_signed_envelopes_locked(evicted_id)
             self._settled_assignments.discard(evicted_id)
             self._settled_voters.pop(evicted_id, None)
+
+    def _purge_signed_envelopes_locked(self, assignment_id: str) -> None:
+        """Drop unsubmitted locally signed envelopes for a closed assignment."""
+        stale = [
+            signature
+            for signature, envelope in self._signed_envelopes_by_signature.items()
+            if envelope.assignment_id == assignment_id
+        ]
+        for signature in stale:
+            del self._signed_envelopes_by_signature[signature]
 
     def summary(self) -> dict[str, Any]:
         """Mesh statistics."""
@@ -1559,6 +1598,8 @@ class ConstitutionalMesh:
                 "pending_settlements": pending_settlements,
                 "total_votes": total_votes,
                 "settlement_storage": settlement_storage,
+                "quarantined_settlements": self._quarantined_settlement_count,
+                "quarantined_settlement_ids": list(self._quarantined_settlements),
                 "avg_reputation": (
                     sum(a.reputation for a in self._agents.values()) / len(self._agents)
                     if self._agents
@@ -1603,30 +1644,6 @@ class ConstitutionalMesh:
                     metrics, "spectral_spectral_norm"
                 ),
             }
-
-    def _select_peers(
-        self,
-        available: list[str],
-        needed: int,
-        producer_id: str,
-    ) -> list[str]:
-        """Select peers, optionally weighted by manifold trust.
-
-        When ``_use_manifold`` is True and the manifold is converged,
-        peer selection is weighted by the manifold trust vector from the
-        producer to each candidate.  One slot is always filled by random
-        selection (exploration) to prevent permanent exclusion of
-        low-trust peers.
-
-        Falls back to uniform random sampling when the manifold is
-        disabled, not yet converged, or the producer is not indexed.
-        """
-        return self._select_peers_unlocked(
-            available,
-            needed,
-            producer_id,
-            trust_raw=self._copy_raw_trust_locked(),
-        )
 
     def _sample_weighted_peers(
         self,
@@ -2003,21 +2020,11 @@ class ConstitutionalMesh:
             protocol_version=2,
         )
 
-    def _persist_settlement(
-        self, assignment: PeerAssignment, result: MeshResult
-    ) -> None:
-        """Append a settled assignment/result snapshot to disk when configured."""
-        votes = list(self._votes.get(assignment.assignment_id, []))
-        self._persist_settlement_record(
-            self._build_settlement_record(assignment, result),
-            votes=votes,
-        )
-
     def _persist_settlement_record(
         self,
         record: SettlementRecord,
         *,
-        votes: list[Any],
+        votes: list[VoteEnvelope],
     ) -> None:
         """Append a pre-built settlement record when configured.
 
@@ -2119,20 +2126,39 @@ class ConstitutionalMesh:
         if self._settlement_store is None:
             return
 
-        for record in self._settlement_store.load_all():
-            assignment = self._deserialize_assignment(record.assignment)
-            assignment = replace(assignment, is_recovered=True)
-            result = self._deserialize_result(record.result)
-            if not self._stored_record_is_current(record, assignment, result):
-                continue
+        for index, record in enumerate(self._settlement_store.load_all()):
+            # Parsing, hash-tag checks and evidence verification share one
+            # quarantine boundary: a malformed or pre-proof-grade historical
+            # record is skipped, never fatal to mesh construction, and is
+            # recorded so summary() makes the rejection visible.
+            cause = "malformed"
             try:
+                assignment = self._deserialize_assignment(record.assignment)
+                assignment = replace(assignment, is_recovered=True)
+                result = self._deserialize_result(record.result)
+                cause = "hash_tag_mismatch"
+                if not self._stored_record_is_current(record, assignment, result):
+                    continue
+                cause = "evidence_rejected"
                 envelopes, result = self._verified_settlement_evidence(
                     record, assignment, result
                 )
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as exc:
+                raw_id = (
+                    record.assignment.get("assignment_id")
+                    if isinstance(record.assignment, dict)
+                    else None
+                )
+                record_id = (
+                    raw_id if isinstance(raw_id, str) and raw_id else f"<unknown#{index}>"
+                )
+                self._record_quarantined_settlement(record_id, cause)
                 logger.warning(
-                    "quarantining settlement %s without authorized vote evidence",
-                    assignment.assignment_id,
+                    "quarantining settlement %s without authorized vote evidence "
+                    "(%s): %s",
+                    record_id,
+                    cause,
+                    exc,
                 )
                 continue
             self._assignments[assignment.assignment_id] = assignment
@@ -2141,6 +2167,24 @@ class ConstitutionalMesh:
             self._remember_final_result_locked(assignment.assignment_id, result)
             self._total_validations += 1
             self._total_settled += 1
+
+    def _record_quarantined_settlement(self, record_id: str, cause: str) -> None:
+        self._quarantined_settlement_count += 1
+        self._quarantined_settlements[record_id] = cause
+        self._quarantined_settlements.move_to_end(record_id)
+        while len(self._quarantined_settlements) > _MAX_QUARANTINED_SETTLEMENT_IDS:
+            self._quarantined_settlements.popitem(last=False)
+
+    @property
+    def quarantined_settlements(self) -> Mapping[str, str]:
+        """Read-only map of persisted settlements rejected at startup to cause codes.
+
+        Cause codes: ``malformed``, ``hash_tag_mismatch``, ``evidence_rejected``.
+        At most the most recent ``_MAX_QUARANTINED_SETTLEMENT_IDS`` ids are kept;
+        ``summary()["quarantined_settlements"]`` holds the untruncated count.
+        """
+        with self._lock:
+            return MappingProxyType(dict(self._quarantined_settlements))
 
     def _stored_record_is_current(
         self,
@@ -2202,13 +2246,10 @@ class ConstitutionalMesh:
             expected_quorum=self._effective_quorum(assignment),
             require_independent=self._evidence_mode != "single_operator_dev",
         )
+        # verify_assignment_vote_envelopes binds the envelope count and voter
+        # set to the signed roster, so unassigned or missing voters cannot pass.
         for envelope in envelopes:
             self._verify_envelope_assignment_metadata(envelope, assignment)
-        assigned = {normalize_voter_id(peer) for peer in assignment.peers}
-        if any(item.voter_id not in assigned for item in envelopes):
-            raise ValueError("mesh settlement contains an unassigned voter")
-        if self._complete_evidence and len(envelopes) != len(assignment.peers):
-            raise ValueError("complete-evidence settlement is missing peer votes")
 
         votes_for = sum(item.approved for item in envelopes)
         votes_against = len(envelopes) - votes_for
@@ -2392,7 +2433,7 @@ class ConstitutionalMesh:
         self,
         record: SettlementRecord,
         *,
-        votes: list[Any],
+        votes: list[VoteEnvelope],
     ) -> SettlementRecord:
         """Return the exact immutable record produced by successful Phase 2."""
         from constitutional_swarm.governance_receipts import (
@@ -2411,7 +2452,7 @@ class ConstitutionalMesh:
     def _record_with_serialized_votes(
         self,
         record: SettlementRecord,
-        votes: list[Any],
+        votes: list[VoteEnvelope],
     ) -> SettlementRecord:
         """Install the exact authenticated vote evidence used by receipts."""
         return replace(record, votes=self._vote_dicts(votes))
@@ -2461,15 +2502,6 @@ class ConstitutionalMesh:
         if getattr(self, "_settle_crash_point", None) == point:
             os._exit(17)
 
-    def _public_key_hex(self, voter_id: str) -> str | None:
-        public_key = self._agent_vote_public_keys.get(voter_id)
-        if public_key is None:
-            return None
-        return public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        ).hex()
-
     def receipt_trust_registry(self) -> dict[str, dict[str, Any]]:
         """Export public grants without mutating the mesh trust registry.
 
@@ -2494,33 +2526,17 @@ class ConstitutionalMesh:
         }
         return grants
 
-    def _vote_dicts(self, votes: list[Any]) -> tuple[dict[str, Any], ...]:
-        from constitutional_swarm.mesh.vote_envelope import vote_envelope_to_dict
-
+    @staticmethod
+    def _vote_dicts(votes: list[VoteEnvelope]) -> tuple[dict[str, Any], ...]:
+        """Serialize authenticated vote envelopes; any other evidence is rejected."""
         payload: list[dict[str, Any]] = []
         for vote in votes:
-            if isinstance(vote, VoteEnvelope):
-                payload.append(vote_envelope_to_dict(vote))
-                continue
-            if isinstance(vote, dict):
-                item = dict(vote)
-                if not item.get("public_key_hex"):
-                    item["public_key_hex"] = self._public_key_hex(str(item.get("voter_id", "")))
-                payload.append(item)
-                continue
-            payload.append(
-                {
-                    "assignment_id": vote.assignment_id,
-                    "voter_id": vote.voter_id,
-                    "approved": vote.approved,
-                    "reason": vote.reason,
-                    "signature": vote.signature,
-                    "constitutional_hash": vote.constitutional_hash,
-                    "content_hash": vote.content_hash,
-                    "timestamp": vote.timestamp,
-                    "public_key_hex": self._public_key_hex(vote.voter_id),
-                }
-            )
+            if not isinstance(vote, VoteEnvelope):
+                raise TypeError(
+                    "settlement vote evidence must be VoteEnvelope instances, "
+                    f"got {type(vote).__name__}"
+                )
+            payload.append(vote_envelope_to_dict(vote))
         return tuple(payload)
 
     def _build_settlement_record(
@@ -2721,10 +2737,22 @@ class ConstitutionalMesh:
         """
         voter_id = normalize_voter_id(voter_id)
         with self._lock:
+            if assignment_id in self._final_results:
+                raise AssignmentSettledError(
+                    f"Assignment {assignment_id} is already settled"
+                )
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 raise KeyError(f"Assignment {assignment_id} not found")
             self._require_current_assignment_constitution(assignment)
+            if assignment.is_recovered:
+                raise RecoveredAssignmentError(
+                    f"Assignment {assignment_id} is already durably settled"
+                )
+            if voter_id not in assignment.peers:
+                raise UnauthorizedVoterError(
+                    f"{voter_id} is not assigned to validation {assignment_id}"
+                )
             signing_key = self._agent_vote_private_keys.get(voter_id)
             if signing_key is None:
                 raise UnauthorizedVoterError(
@@ -2781,10 +2809,12 @@ class ConstitutionalMesh:
         approved: bool,
         reason: str = "",
     ) -> VoteEnvelope:
-        signature = self.sign_vote(
-            assignment_id, voter_id, approved=approved, reason=reason
-        )
+        # One (reentrant) lock section: a concurrent settle/evict purge cannot
+        # run between signing and reading the cached envelope.
         with self._lock:
+            signature = self.sign_vote(
+                assignment_id, voter_id, approved=approved, reason=reason
+            )
             return self._signed_envelopes_by_signature[signature]
 
     def submit_vote_envelope(self, envelope: VoteEnvelope) -> ValidationVote:
