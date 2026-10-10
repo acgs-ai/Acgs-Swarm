@@ -14,7 +14,6 @@ import pytest
 from constitutional_swarm import ConstitutionalMesh
 from constitutional_swarm.bittensor.cascade import (
     CascadeStage,
-    ConstitutionDelta,
     PrecedentCascade,
 )
 from constitutional_swarm.bittensor.island_evolution import (

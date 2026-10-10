@@ -10,7 +10,6 @@ from constitutional_swarm.bittensor.authenticity_detector import (
     AuthenticityScore,
     DimensionScore,
 )
-from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
 from tests.test_c14_protocol_hardening import (
     c14_precedent_signed_record,

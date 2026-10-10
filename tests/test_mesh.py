@@ -352,7 +352,7 @@ class TestRegistrationModeTransitions:
         replacement_local_key = Ed25519PrivateKey.generate()
         mesh.register_local_signer("peer-1", vote_private_key=replacement_local_key)
 
-        vote = mesh.validate_and_vote(assignment.assignment_id, "peer-1")
+        mesh.validate_and_vote(assignment.assignment_id, "peer-1")
 
         envelope = mesh._vote_envelopes[assignment.assignment_id][0]
         assert verify_vote_envelope(
