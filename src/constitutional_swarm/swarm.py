@@ -273,6 +273,44 @@ class TaskDAG:
         ]
 
 
+def workflow_bindings(
+    dag: TaskDAG,
+) -> tuple[
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+    dict[str, str],
+]:
+    """Return the (topology, capabilities, input_digests) an authority binds a DAG to.
+
+    The single source of truth for the workflow input digest: provisioning
+    (``create_workflow``) and ``SwarmExecutor.load_dag`` (``attach_workflow``)
+    must produce byte-identical digests or attach is denied, so every caller
+    imports this helper instead of re-deriving the canonical JSON.
+    """
+    nodes = dag.nodes
+    topology = {node_id: node.depends_on for node_id, node in nodes.items()}
+    capabilities = {
+        node_id: node.required_capabilities for node_id, node in nodes.items()
+    }
+    input_digests = {
+        node_id: hashlib.sha256(
+            json.dumps(
+                {
+                    "title": node.title,
+                    "description": node.description,
+                    "domain": node.domain,
+                    "required_capabilities": node.required_capabilities,
+                    "depends_on": node.depends_on,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        for node_id, node in nodes.items()
+    }
+    return topology, capabilities, input_digests
+
+
 class SwarmExecutor:
     """Executes a task DAG using a swarm of agents.
 
@@ -319,6 +357,9 @@ class SwarmExecutor:
         self._all_ready_unconstrained: bool = True
         # Whether the DAG has any constrained nodes at all. Set once at load.
         self._dag_has_constrained: bool = False
+        # True when a local mutation (claim/produce/commit) may have left the
+        # incremental indexes in a different order than a fresh rebuild.
+        self._indexes_dirty: bool = False
 
     def _authority_call(self, operation: str, /, *args: Any, **kwargs: Any) -> Any:
         client = self._execution_client
@@ -333,6 +374,7 @@ class SwarmExecutor:
             raise GovernanceBypassDenied("authority_unavailable") from exc
 
     def _rebuild_ready_index(self) -> None:
+        self._indexes_dirty = False
         self._ready_ids = set()
         self._ready_list = []
         self._ready_index = {}
@@ -378,29 +420,7 @@ class SwarmExecutor:
                     raise GovernanceBypassDenied(
                         "policy_version is required for governed execution"
                     )
-                topology = {
-                    node.node_id: node.depends_on for node in dag.nodes.values()
-                }
-                capabilities = {
-                    node.node_id: node.required_capabilities
-                    for node in dag.nodes.values()
-                }
-                input_digests = {
-                    node.node_id: hashlib.sha256(
-                        json.dumps(
-                            {
-                                "title": node.title,
-                                "description": node.description,
-                                "domain": node.domain,
-                                "required_capabilities": node.required_capabilities,
-                                "depends_on": node.depends_on,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest()
-                    for node in dag.nodes.values()
-                }
+                topology, capabilities, input_digests = workflow_bindings(dag)
                 try:
                     authoritative_states = self._authority_call(
                         "attach_workflow",
@@ -458,17 +478,29 @@ class SwarmExecutor:
         )
         if len(states) != len(node_ids):
             raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
+        changed = self._indexes_dirty
         for node_id, state in zip(node_ids, states, strict=True):
             node = self._dag.nodes[node_id]
-            node.status = ExecutionStatus(state.status)
-            node.claimed_by = state.claimed_by
-            node.artifact_id = state.artifact_id
-            if state.attempt_id is None:
-                node.metadata.pop("attempt_id", None)
-            else:
-                node.metadata["attempt_id"] = state.attempt_id
-        self._rebuild_ready_index()
-        self._build_dep_index()
+            status = ExecutionStatus(state.status)
+            if (
+                node.status is not status
+                or node.claimed_by != state.claimed_by
+                or node.artifact_id != state.artifact_id
+                or node.metadata.get("attempt_id") != state.attempt_id
+            ):
+                changed = True
+                node.status = status
+                node.claimed_by = state.claimed_by
+                node.artifact_id = state.artifact_id
+                if state.attempt_id is None:
+                    node.metadata.pop("attempt_id", None)
+                else:
+                    node.metadata["attempt_id"] = state.attempt_id
+        # Indexes are pure functions of node state: skip the O(N+E) rebuild when
+        # neither the authority nor a local mutation changed anything.
+        if changed:
+            self._rebuild_ready_index()
+            self._build_dep_index()
 
     def authoritative_artifact(self, artifact_id: str) -> Artifact | None:
         """Read only an artifact backed by a currently valid governed commit."""
@@ -590,6 +622,7 @@ class SwarmExecutor:
             node.claimed_by = agent_id
             node.metadata["attempt_id"] = attempt_id
             node.metadata["attempt_authorization"] = authorization
+            self._indexes_dirty = True
             self._ready_ids.discard(node_id)
             idx = self._ready_index.pop(node_id, -1)
             if idx >= 0:
@@ -648,6 +681,7 @@ class SwarmExecutor:
             )
             node.status = ExecutionStatus.RESULT_PRODUCED
             node.artifact_id = artifact.artifact_id
+            self._indexes_dirty = True
             return self._authority_call(
                 "prepare_receipt_payload",
                 workflow_id=self._dag.dag_id,
@@ -671,6 +705,7 @@ class SwarmExecutor:
             if decision.outcome is not CommitOutcome.COMMITTED:
                 return decision
             node = self._dag.nodes[decision.node_id]
+            self._indexes_dirty = True
             refreshed_ids = (
                 decision.node_id,
                 *self._children.get(decision.node_id, ()),

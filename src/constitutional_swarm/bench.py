@@ -8,7 +8,6 @@ utilization, and throughput to prove governance scales O(N), not O(N^2).
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 import time
@@ -37,9 +36,11 @@ from constitutional_swarm.capability import Capability, CapabilityRegistry
 from constitutional_swarm.compiler import DAGCompiler, GoalSpec
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.governed_commit import (
+    CommitOutcome,
     sign_attempt_authorization,
     sign_governed_receipt,
 )
+from constitutional_swarm.swarm import workflow_bindings
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,37 +113,6 @@ def _write_key_bundle(
         )
     finally:
         os.close(descriptor)
-
-
-def _workflow_bindings(
-    dag: Any,
-) -> tuple[
-    dict[str, tuple[str, ...]],
-    dict[str, tuple[str, ...]],
-    dict[str, str],
-]:
-    nodes = dag.nodes
-    topology = {node_id: node.depends_on for node_id, node in nodes.items()}
-    capabilities = {
-        node_id: node.required_capabilities for node_id, node in nodes.items()
-    }
-    input_digests = {
-        node_id: hashlib.sha256(
-            json.dumps(
-                {
-                    "title": node.title,
-                    "description": node.description,
-                    "domain": node.domain,
-                    "required_capabilities": node.required_capabilities,
-                    "depends_on": node.depends_on,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        for node_id, node in nodes.items()
-    }
-    return topology, capabilities, input_digests
 
 
 def _start_benchmark_authority(
@@ -336,7 +306,7 @@ class SwarmBenchmark:
                 policy_version=policy_version,
                 signing_keys=signing_keys,
             )
-            topology, capabilities, input_digests = _workflow_bindings(dag)
+            topology, capabilities, input_digests = workflow_bindings(dag)
             authority.admin_client.create_workflow(
                 workflow_id=dag.dag_id,
                 nodes=topology,
@@ -368,13 +338,15 @@ class SwarmBenchmark:
             # Simulation loop: round-robin agents claiming available tasks
             max_iterations = num_tasks * num_agents + num_tasks * 10
             iteration = 0
+            committed = 0
 
             while not executor.is_complete and iteration < max_iterations:
                 iteration += 1
                 any_claimed = False
 
                 for agent_id in agent_ids:
-                    if executor.is_complete:
+                    # Local count: each executor.is_complete is an authority sync.
+                    if committed >= num_tasks:
                         break
 
                     idle_start = time.perf_counter_ns()
@@ -416,11 +388,13 @@ class SwarmBenchmark:
                             constitutional_hash=dna.hash,
                         ),
                     )
-                    executor.commit(
+                    decision = executor.commit(
                         executor.build_request(
                             sign_governed_receipt(payload, signing_keys[agent_id])
                         )
                     )
+                    if decision.outcome is CommitOutcome.COMMITTED:
+                        committed += 1
                     total_work_time_ns += time.perf_counter_ns() - work_start
 
                 if not any_claimed and not executor.is_complete:
