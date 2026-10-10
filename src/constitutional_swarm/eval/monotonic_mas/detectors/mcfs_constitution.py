@@ -90,8 +90,10 @@ def mcfs_role_rules() -> list[Rule]:
                 # Cover synonym attacks: verb-pool x noun-pool with optional article.
                 # Catches "circumvent the consensus threshold", "bypass quorum",
                 # "skip super-majority", "evade voting threshold", etc.
+                # Separator class [-\s]? because normalize_payload turns the
+                # word-joining '-' into a space ("super majority").
                 r"(circumvent|bypass|skip|evade|override)\s+(the\s+)?"
-                r"(quorum|consensus|super-?majority|voting(\s+threshold)?)",
+                r"(quorum|consensus|super[-\s]?majority|voting(\s+threshold)?)",
             ],
             category="role_drift",
             subcategory="improper_authentication",

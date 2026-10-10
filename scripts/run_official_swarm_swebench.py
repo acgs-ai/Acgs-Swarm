@@ -21,6 +21,12 @@ import tempfile
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from constitutional_swarm.swe_bench.run_one_by_one import (  # noqa: E402
+    _safe_path_component,
+)
 
 
 def load_instance_ids(predictions_path: Path) -> list[str]:
@@ -40,8 +46,15 @@ def load_predictions(predictions_path: Path) -> list[dict[str, object]]:
 
 def get_official_report_path(predictions_path: Path, run_id: str) -> Path:
     predictions = load_predictions(predictions_path)
-    model_name = str(predictions[0]["model_name_or_path"]).replace("/", "__")
-    return Path(f"{model_name}.{run_id}.json")
+    # Mirrors the official harness naming ("/" -> "__"), but both parts must
+    # be single safe path components so the report path cannot escape the
+    # directory it is joined onto.
+    model_name = _safe_path_component(
+        str(predictions[0]["model_name_or_path"]).replace("/", "__"),
+        field_name="model_name_or_path",
+    )
+    safe_run_id = _safe_path_component(run_id, field_name="run_id")
+    return Path(f"{model_name}.{safe_run_id}.json")
 
 
 def build_per_instance_comparison(
@@ -389,16 +402,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _default_output(tmp_dir: Path | None, name: str) -> Path:
+    if tmp_dir is None:
+        raise RuntimeError(f"no private output directory for default {name}")
+    return tmp_dir / name
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    tmp_dir = Path(tempfile.gettempdir())
-    swarm_output = args.swarm_output or (tmp_dir / f"{args.run_id}_swarm.json")
-    predictions_output = args.predictions_output or (tmp_dir / f"{args.run_id}_predictions.jsonl")
-    final_report_output = args.final_report_output or (
-        tmp_dir / f"{args.run_id}_final_report_bundle.json"
+    # Validate before any subprocess runs: run_id names the official report
+    # file and the harness run directory.
+    _safe_path_component(args.run_id, field_name="run_id")
+    # Defaults live in a fresh private (0700) directory with fixed file names:
+    # predictable names in the shared temp dir could be pre-created/symlinked
+    # or swapped by another local user between the swarm subprocess writing
+    # predictions and the official eval reading them. run_id is never used in
+    # a temp file name, so it cannot steer the path either.
+    tmp_dir: Path | None = None
+    if not (
+        args.swarm_output
+        and args.predictions_output
+        and args.final_report_output
+        and args.final_report_markdown_output
+    ):
+        tmp_dir = Path(tempfile.mkdtemp(prefix="swe-official-"))
+        print(f"Writing default run outputs to {tmp_dir}", file=sys.stderr)
+    swarm_output = args.swarm_output or _default_output(tmp_dir, "swarm.json")
+    predictions_output = args.predictions_output or _default_output(
+        tmp_dir, "predictions.jsonl"
     )
-    final_report_markdown_output = args.final_report_markdown_output or (
-        tmp_dir / f"{args.run_id}_final_report_bundle.md"
+    final_report_output = args.final_report_output or _default_output(
+        tmp_dir, "final_report_bundle.json"
+    )
+    final_report_markdown_output = args.final_report_markdown_output or _default_output(
+        tmp_dir, "final_report_bundle.md"
     )
 
     swarm_cmd = build_swarm_command(
@@ -439,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     subprocess.run(eval_cmd, check=True, cwd=_REPO_ROOT)
     official_report_path = _REPO_ROOT / get_official_report_path(predictions_output, args.run_id)
+    if not official_report_path.resolve().is_relative_to(_REPO_ROOT.resolve()):
+        raise ValueError("official report path escapes the repository root")
     write_final_report_bundle(
         swarm_output_path=swarm_output,
         predictions_output_path=predictions_output,

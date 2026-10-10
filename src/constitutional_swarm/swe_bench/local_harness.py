@@ -850,6 +850,9 @@ class LocalSWEBenchHarness:
             result.error = f"pip install target failed (rc={rc})"
             result.log_tail = out[-2000:]
             result.metadata["env_stage"] = "pip-install"
+            failure_class = _classify_env_failure(out)
+            if failure_class is not None:
+                result.metadata["env_failure_class"] = failure_class
             return venv_path, None
         result.metadata["env_python"] = venv_py
         return venv_path, venv_py
@@ -928,6 +931,29 @@ def _detect_python_version(worktree: Path) -> str | None:
         return match.group(1)
     fallback = re.search(r"(\d+\.\d+)", req)
     return fallback.group(1) if fallback else None
+
+
+# Build-log signatures of a native extension / toolchain failure while
+# installing the target repo. Matched case-insensitively over the FULL pip
+# output (not the 2000-char tail). Keep tight: a match relabels an env
+# failure as an external native-build blocker; it never marks a run resolved.
+_NATIVE_BUILD_FAILURE_RE = re.compile(
+    r"failed building wheel for"
+    r"|could not build wheels for"
+    r"|can't find rust compiler"
+    r"|requires rust"
+    r"|error: command '[^']*(?:gcc|g\+\+|cc|clang|cl\.exe)' failed"
+    r"|microsoft visual c\+\+ [\d.]+ or greater is required"
+    r"|fatal error: [\w./-]+\.h: no such file or directory",
+    re.IGNORECASE,
+)
+
+
+def _classify_env_failure(output: str) -> str | None:
+    """Classify a failed ``pip install <worktree>`` log, or return None."""
+    if _NATIVE_BUILD_FAILURE_RE.search(output):
+        return "native-build-incompatibility"
+    return None
 
 
 def _safe_id(raw: str, *, field_name: str = "identifier") -> str:
