@@ -22,10 +22,12 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from time import time
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from cryptography.exceptions import InvalidSignature
@@ -90,10 +92,69 @@ try:
 except (TypeError, ValueError):
     _HAS_SAFE_DIR_FD_REPLACE = False
 
-# Code-owned default tool/test command allowlist. The deterministic ``tool_call``
-# gate is default-DENY against this set. Keep this to inert commands; interpreter
-# and test-runner commands remain denied even if a local policy allowlists them.
-DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = ("true", "echo")
+# Code-owned closed safe-command set for the deterministic ``tool_call`` gate.
+# Only executables listed here can ever run, and only with argument shapes their
+# spec permits. Configuration (``command_allowlist``) may SELECT a subset of these
+# names but can never add an executable, flag, or argument shape. Anything that
+# does not match is denied (fail closed). Interpreters, launchers, shells, and
+# any other unlisted executable are therefore impossible to enable: there is no
+# denylist to bypass, and lookup is by exact name (``python3.12``, ``ruby3.3``
+# etc. simply are not keys).
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,:+=@%-]*")
+
+
+@dataclass(frozen=True)
+class SafeCommandSpec:
+    """Argument policy for one code-owned safe command.
+
+    ``allowed_flags`` lists the exact flag tokens accepted. Every other argument
+    must be a positional that fully matches ``positional_pattern`` (``None``
+    means no positionals). Path separators and leading ``-`` never match the
+    positional patterns used here, so unlisted flags and ``--opt=value`` forms
+    are rejected rather than passed through.
+    """
+
+    name: str
+    allowed_flags: frozenset[str] = frozenset()
+    positional_pattern: re.Pattern[str] | None = None
+    max_positionals: int = 0
+    max_argument_length: int = 256
+
+    def validate(self, arguments: list[str]) -> None:
+        positionals = 0
+        for argument in arguments:
+            if argument in self.allowed_flags:
+                continue
+            if len(argument) > self.max_argument_length:
+                raise ValueError(
+                    f"argument for {self.name!r} exceeds {self.max_argument_length} "
+                    "characters; fail closed"
+                )
+            if self.positional_pattern is None or not self.positional_pattern.fullmatch(
+                argument
+            ):
+                raise ValueError(
+                    f"argument {argument!r} is not permitted for safe command "
+                    f"{self.name!r}; fail closed"
+                )
+            positionals += 1
+            if positionals > self.max_positionals:
+                raise ValueError(
+                    f"too many arguments for safe command {self.name!r}; fail closed"
+                )
+
+
+SAFE_COMMANDS: Mapping[str, SafeCommandSpec] = MappingProxyType(
+    {
+        "true": SafeCommandSpec(name="true"),
+        "echo": SafeCommandSpec(
+            name="echo", positional_pattern=_PLAIN_WORD, max_positionals=64
+        ),
+    }
+)
+
+# Backwards-compatible name for the default selection (every safe command).
+DEFAULT_COMMAND_ALLOWLIST: tuple[str, ...] = tuple(SAFE_COMMANDS)
 DEFAULT_SECRET_COMMAND_PATTERNS: tuple[str, ...] = (
     r"\b(cat|less|more|head|tail|sed|awk|grep|rg)\b.*"
     r"(\.env|secret|credential|id_rsa|token)",
@@ -109,148 +170,28 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {"HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"}
 )
 
-# Executables that can execute arbitrary code from their arguments — interpreters,
-# test runners, generic launchers, and shells. The ``tool_call`` gate denies these
-# UNCONDITIONALLY: a local policy may not re-enable them via ``command_allowlist``,
-# because e.g. ``python -c <code>``, a ``pytest`` conftest, or ``bash -c`` would
-# bypass every other gate (protected paths, secret patterns, file-write rules).
-# Match is on the resolved basename; ``_is_denied_interpreter`` also catches
-# version-suffixed names (``python3.11``) the literal set would otherwise miss.
-DENIED_INTERPRETER_COMMANDS: frozenset[str] = frozenset(
-    {
-        "ant",
-        "awk",
-        "bash",
-        "bpython",
-        "busybox",
-        "bun",
-        "cc",
-        "chroot",
-        "chrt",
-        "clang",
-        "cmake",
-        "ctest",
-        "dash",
-        "deno",
-        "doas",
-        "docker",
-        "ed",
-        "env",
-        "ex",
-        "find",
-        "fish",
-        "flock",
-        "g++",
-        "gawk",
-        "gcc",
-        "gdb",
-        "git",
-        "gmake",
-        "go",
-        "gradle",
-        "gradlew",
-        "hatch",
-        "ionice",
-        "ipython",
-        "java",
-        "javac",
-        "ksh",
-        "less",
-        "ltrace",
-        "lua",
-        "make",
-        "man",
-        "mawk",
-        "meson",
-        "more",
-        "mvn",
-        "nawk",
-        "nice",
-        "ninja",
-        "nix",
-        "node",
-        "nodejs",
-        "nohup",
-        "nox",
-        "npm",
-        "npx",
-        "nsenter",
-        "nvim",
-        "pdm",
-        "perl",
-        "php",
-        "pip",
-        "pip2",
-        "pip3",
-        "pipenv",
-        "pipx",
-        "pkexec",
-        "pnpm",
-        "podman",
-        "poetry",
-        "py.test",
-        "pypy",
-        "pypy3",
-        "pytest",
-        "python",
-        "python2",
-        "python3",
-        "rscript",
-        "rsync",
-        "ruby",
-        "runuser",
-        "scp",
-        "sed",
-        "setsid",
-        "sh",
-        "sqlite3",
-        "ssh",
-        "stdbuf",
-        "strace",
-        "su",
-        "sudo",
-        "systemd-run",
-        "tar",
-        "taskset",
-        "tclsh",
-        "timeout",
-        "toolbox",
-        "tox",
-        "unshare",
-        "unzip",
-        "uv",
-        "uvx",
-        "vi",
-        "vim",
-        "watch",
-        "xargs",
-        "yarn",
-        "zip",
-        "zsh",
-    }
-)
 
-# Version-suffixed interpreter basenames (python3.11, python3.12, pypy3.10, ...).
-_DENIED_INTERPRETER_PATTERN = re.compile(
-    r"^(python|pypy|pip)\d+(\.\d+)*$", re.IGNORECASE
-)
+def _select_safe_commands(configured: Any) -> set[str]:
+    """Return the safe commands an operator selection enables.
 
+    A missing selection enables every safe command; a malformed (non-list)
+    selection enables nothing. A list can only narrow the code-owned set:
+    unknown names are ignored, never added, and an empty list enables nothing.
+    """
 
-def _is_denied_interpreter(executable: str) -> bool:
-    """Return True if ``executable`` (a resolved basename) is an interpreter-class
-    command that may never be re-enabled through ``command_allowlist``."""
-    name = executable.lower()
-    return name in DENIED_INTERPRETER_COMMANDS or bool(
-        _DENIED_INTERPRETER_PATTERN.match(name)
-    )
+    if configured is None:
+        return set(SAFE_COMMANDS)
+    if not isinstance(configured, (list, tuple, set, frozenset)):
+        return set()
+    return {name for name in (str(item) for item in configured) if name in SAFE_COMMANDS}
 
 
 def _scrubbed_env() -> dict[str, str]:
-    """Harden configured signing state, then return a minimal child environment."""
+    """Harden the supervisor process, then return a minimal child environment."""
 
-    # Public subprocess boundaries can be called without ``run_task``. Loading
-    # here makes process hardening an invariant of every governed child launch.
-    _load_bundle_signer()
+    # Every governed launch hardens first, whether or not a signer is configured,
+    # so no child ever starts while the supervisor is inspectable via procfs.
+    _secure_signer_process()
 
     child_env = {
         name: value
@@ -264,7 +205,7 @@ def _scrubbed_env() -> dict[str, str]:
 def _resolve_command(
     command: str, *, command_allowlist: set[str] | frozenset[str]
 ) -> list[str]:
-    """Parse, authorize, and resolve a command against the fixed executable path."""
+    """Parse, authorize against the closed safe set, and resolve on the fixed path."""
 
     try:
         argv = shlex.split(command)
@@ -273,27 +214,24 @@ def _resolve_command(
     if not argv:
         raise ValueError("empty tool command")
     executable = argv[0]
-    denied_argument = next(
-        (
-            argument.replace("\\", "/").rsplit("/", 1)[-1]
-            for argument in argv
-            if _is_denied_interpreter(
-                argument.replace("\\", "/").rsplit("/", 1)[-1]
-            )
-        ),
-        None,
-    )
-    if denied_argument is not None:
+    name = executable.replace("\\", "/").rsplit("/", 1)[-1]
+    spec = SAFE_COMMANDS.get(name)
+    if spec is None:
         raise ValueError(
-            f"interpreter or launcher {denied_argument!r} is not allowed for task directives"
+            f"command {name!r} is not in the code-owned safe-command allowlist "
+            "(interpreters, launchers, and unlisted executables are never allowed); "
+            "fail closed"
         )
-    if Path(executable).name != executable or "/" in executable or "\\" in executable:
+    if name not in command_allowlist:
+        raise ValueError(
+            f"safe command {name!r} is not selected by command_allowlist; fail closed"
+        )
+    if name != executable:
         raise ValueError("path-qualified executable is not allowed")
-    if executable not in command_allowlist:
-        raise ValueError(f"command {executable!r} not in allowlist; fail closed")
-    resolved = shutil.which(executable, path=FIXED_SUBPROCESS_PATH)
+    spec.validate(argv[1:])
+    resolved = shutil.which(name, path=FIXED_SUBPROCESS_PATH)
     if resolved is None or not Path(resolved).is_absolute():
-        raise ValueError(f"command {executable!r} cannot be resolved on the fixed path")
+        raise ValueError(f"command {name!r} cannot be resolved on the fixed path")
     return [resolved, *argv[1:]]
 
 
@@ -408,11 +346,10 @@ class PolicyDecision:
 class PolicyEngine:
     """Apply the code-owned governed handoff policy.
 
-    Command allowlists are safe only for commands whose complete argument
-    language cannot launch another command. Allowlisting a command-capable tool
-    is equivalent to granting arbitrary code execution, so known interpreters,
-    launchers, wrappers, and shell-escape-capable tools remain unconditionally
-    denied.
+    Tool commands are authorized against the closed ``SAFE_COMMANDS`` table,
+    whose entries each carry an explicit argument policy. ``command_allowlist``
+    only selects a subset of that table; it can never add an executable, so
+    interpreters, launchers, and wrappers cannot be enabled by configuration.
     """
 
     def __init__(
@@ -452,16 +389,9 @@ class PolicyEngine:
         self.secret_patterns = [
             re.compile(pattern, re.IGNORECASE) for pattern in secret_patterns
         ]
-        # Default-DENY allowlist: only executables named here may run. A
-        # constitution may EXTEND but the code-owned default always applies when
-        # the constitution provides no (non-empty) list.
-        allowlist = policy.get("command_allowlist")
-        configured_allowlist = (
-            {str(name) for name in allowlist} if isinstance(allowlist, list) else set()
-        )
-        self.command_allowlist = (
-            set(DEFAULT_COMMAND_ALLOWLIST) | configured_allowlist
-        ) - set(DENIED_INTERPRETER_COMMANDS)
+        # Closed set: a configured list narrows SAFE_COMMANDS (an empty list
+        # enables nothing); a missing or non-list value enables the whole set.
+        self.command_allowlist = _select_safe_commands(policy.get("command_allowlist"))
 
     def decide(self, gate: str, subject: str, **context: Any) -> PolicyDecision:
         if gate == "intake":
@@ -755,6 +685,10 @@ def _mark_process_non_dumpable() -> None:
         if error_number:
             raise OSError(error_number, os.strerror(error_number))
         raise OSError("prctl(PR_SET_DUMPABLE, 0) failed")
+    # Read the state back: a filtered or emulated prctl that reports success
+    # without clearing the flag must not be trusted.
+    if prctl(3, 0, 0, 0, 0) != 0:  # PR_GET_DUMPABLE
+        raise OSError("PR_GET_DUMPABLE did not report 0 after PR_SET_DUMPABLE; fail closed")
 
 
 def _read_signing_key_file(path: str) -> str:
@@ -1218,11 +1152,7 @@ def run_local_command(
     cwd: Path,
     command_allowlist: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    effective_allowlist = (
-        set(DEFAULT_COMMAND_ALLOWLIST)
-        if command_allowlist is None
-        else set(command_allowlist)
-    ) - set(DENIED_INTERPRETER_COMMANDS)
+    effective_allowlist = _select_safe_commands(command_allowlist)
     argv = _resolve_command(command, command_allowlist=effective_allowlist)
     completed = subprocess.run(
         argv,
