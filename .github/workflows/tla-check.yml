@@ -112,7 +112,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install locked test environment
-        run: uv sync --no-sources --extra dev
+        # make setup records .venv/.make-extras, which check-env requires.
+        run: make setup EXTRAS=dev
 
       - name: Cache tla2tools.jar
         id: cache-tla
