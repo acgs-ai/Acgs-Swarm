@@ -212,10 +212,12 @@ def test_detect_from_weights_rejects_unusable_reference() -> None:
     r = ad._unit(rng.standard_normal(8))
     candidate = {"candidate.W_O": rng.standard_normal((8, 8))}
 
-    with pytest.raises(ValueError, match="shares no matrix names"):
-        ad.detect_from_weights(
-            candidate, r, reference={"other.W_O": rng.standard_normal((8, 8))}
-        )
+    no_overlap = ad.detect_from_weights(
+        candidate, r, reference={"other.W_O": rng.standard_normal((8, 8))}
+    )
+    assert no_overlap.abliterated is True
+    assert no_overlap.score == 1.0
+    assert "missing reference matrices" in no_overlap.reasons[0]
 
     with pytest.raises(ValueError, match="reference refusal energy"):
         ad.detect_from_weights(

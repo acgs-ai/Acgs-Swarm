@@ -23,7 +23,8 @@ References
 - Generalized Byzantine Quorums (Alchieri et al. 2020) — asymmetric trust
 - Sybil-Resilient Reality-Aware Social Choice (Shahaf et al. 2018)
 
-This is a tractable MVP — we use ``hashlib.sha256(seed || validator_id)``
+This is a tractable MVP — we use a domain-separated, length-framed SHA-256
+digest of ``(seed, validator_id)`` (:func:`~constitutional_swarm.framing.framed_digest`)
 as the VRF surrogate. A production deployment would swap in RFC 9381
 ECVRF or BLS-based sortition. The committee selection contract
 (deterministic from public seed + verifiable by anyone with the seed)
@@ -32,10 +33,15 @@ is preserved under either implementation.
 
 from __future__ import annotations
 
-import hashlib
 import heapq
+import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from constitutional_swarm.framing import framed_digest
+
+_VRF_DOMAIN = b"acgs-swarm/committee-vrf/v1"
+_VRF_RETRY_DOMAIN = b"acgs-swarm/committee-vrf-retry/v1"
 
 __all__ = [
     "CommitteeSelection",
@@ -44,6 +50,7 @@ __all__ = [
     "SybilBoundViolation",
     "ValidatorIdentity",
     "ValidatorSet",
+    "domain_share_exceeded",
 ]
 
 
@@ -78,8 +85,10 @@ class ValidatorIdentity:
     public_key_bytes: bytes | None = None
 
     def __post_init__(self) -> None:
-        if not self.agent_id:
-            raise ValueError("agent_id must be non-empty")
+        if type(self.agent_id) is not str or not self.agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        if "\x00" in self.agent_id:
+            raise ValueError("agent_id must not contain NUL characters")
         if self.stake < 0.0:
             raise ValueError(f"stake must be non-negative, got {self.stake}")
         if not 0.0 <= self.reputation <= 1.0:
@@ -97,12 +106,22 @@ class ValidatorIdentity:
 class FaultDomainPolicy:
     """Cap on per-fault-domain contribution to committee weight.
 
-    ``max_fraction`` is the ceiling on any single fault_domain's share
-    of the total effective committee weight. Setting
-    ``max_fraction=0.2`` means no single AS / issuer / org can hold more
-    than 20 % of voting power no matter how many validator identities
-    they register. This is what makes the scheme sybil-resistant: an
-    attacker must actually spread across independent fault domains.
+    ``max_fraction`` caps any single fault_domain's *counted* weight at
+    ``max_fraction`` times the total *raw* (uncapped) effective weight of
+    the committee or set. Setting ``max_fraction=0.2`` means no single
+    AS / issuer / org can contribute more than 20 % of the raw weight to a
+    quorum, no matter how many validator identities they register; the
+    excess is discarded. This bounds the adversary's absolute contribution,
+    which is what makes the scheme sybil-resistant: an attacker must
+    actually spread across independent fault domains.
+
+    Note that this is *not* a bound on a domain's share of the counted
+    (post-cap) total: when other domains are small, a capped domain can
+    still hold more than ``max_fraction`` of the counted weight. Callers
+    that need the stronger guarantee (no domain holds more than
+    ``max_fraction`` of the raw weight at all) opt in with
+    ``CommitteeSelection.has_quorum(..., enforce_domain_share=True)`` or
+    ``CertificateVerificationPolicy(enforce_domain_share=True)``.
 
     ``untagged_policy`` controls how validators with empty
     ``fault_domain`` are treated:
@@ -144,6 +163,9 @@ class CommitteeSelection:
     ``capped_weight`` applies the policy cap per domain — this is the
     value that matters for the safety threshold. ``domain_weights``
     maps fault_domain → the weight actually counted (post-cap).
+    ``raw_domain_weights`` maps fault_domain → the uncapped weight and
+    ``max_fraction`` records the policy cap used; both are required by
+    ``has_quorum(..., enforce_domain_share=True)``.
     """
 
     members: tuple[str, ...]
@@ -151,17 +173,58 @@ class CommitteeSelection:
     capped_weight: float
     domain_weights: Mapping[str, float]
     seed: str
+    raw_domain_weights: Mapping[str, float] = field(default_factory=dict)
+    max_fraction: float | None = None
 
-    def has_quorum(self, threshold_fraction: float = 2 / 3) -> bool:
+    def exceeds_domain_share(self) -> bool:
+        """True if any domain holds more than ``max_fraction`` of raw weight.
+
+        Fails closed: returns True when the raw per-domain data or the
+        policy cap needed to decide is missing.
+        """
+        if self.max_fraction is None or not self.raw_domain_weights or self.weight <= 0:
+            return True
+        return domain_share_exceeded(
+            self.raw_domain_weights.values(), self.weight, self.max_fraction
+        )
+
+    def has_quorum(
+        self,
+        threshold_fraction: float = 2 / 3,
+        *,
+        enforce_domain_share: bool = False,
+    ) -> bool:
         """True if capped weight meets the threshold fraction of raw weight.
 
         A committee ``has_quorum(2/3)`` when the honest lower bound,
         computed under the fault-domain cap, is at least 2/3 of the
-        raw uncapped weight.
+        raw uncapped weight. With ``enforce_domain_share=True`` the
+        committee is additionally rejected when any single fault domain
+        holds more than ``max_fraction`` of the raw committee weight.
         """
         if self.weight <= 0:
             return False
+        if enforce_domain_share and self.exceeds_domain_share():
+            return False
         return self.capped_weight / self.weight >= threshold_fraction
+
+
+def domain_share_exceeded(
+    raw_domain_weights: Iterable[float],
+    raw_total: float,
+    max_fraction: float,
+) -> bool:
+    """True if any raw domain weight exceeds ``max_fraction * raw_total``.
+
+    Shared by :meth:`CommitteeSelection.has_quorum` and the quorum
+    certificate verifier so both apply the identical rule. Equality within
+    floating-point tolerance is permitted.
+    """
+    ceiling = max_fraction * raw_total
+    return any(
+        w > ceiling and not math.isclose(w, ceiling, rel_tol=1e-12, abs_tol=0.0)
+        for w in raw_domain_weights
+    )
 
 
 class ValidatorSet:
@@ -185,6 +248,9 @@ class ValidatorSet:
     ) -> None:
         self._policy = policy or FaultDomainPolicy()
         self._validators: dict[str, ValidatorIdentity] = {}
+        # Keys of removed validators: re-registering a removed id with a
+        # different key requires an explicit ``rekey=True``.
+        self._retired_keys: dict[str, bytes] = {}
         for v in validators:
             self.add(v)
 
@@ -201,13 +267,63 @@ class ValidatorSet:
     def __iter__(self):
         return iter(self._validators.values())
 
-    def add(self, validator: ValidatorIdentity) -> None:
-        """Register a validator. Overwrites any existing entry with the same agent_id."""
+    def add(
+        self,
+        validator: ValidatorIdentity,
+        *,
+        replace: bool = False,
+        rekey: bool = False,
+    ) -> None:
+        """Register a validator.
+
+        Raises ``ValueError`` if ``agent_id`` is already registered, unless
+        ``replace=True`` is passed explicitly. Even with ``replace=True`` a
+        registered (non-None) public key of a *live* identity can never change
+        or be dropped: that key is the trust root quorum certificates verify
+        against. Re-registering a previously removed ``agent_id`` with a
+        different key (including dropping it to ``None``) raises unless
+        ``rekey=True`` is passed explicitly; ``rekey`` has no effect on live
+        identities, so re-keying always takes a ``remove`` plus an explicit
+        ``add(..., rekey=True)``.
+        """
+        retired = self._retired_keys.get(validator.agent_id)
+        if (
+            validator.agent_id not in self._validators
+            and retired is not None
+            and validator.public_key_bytes != retired
+            and not rekey
+        ):
+            raise ValueError(
+                f"validator {validator.agent_id!r} was removed with a different public key; "
+                "pass rekey=True to re-register it under a new key"
+            )
+        existing = self._validators.get(validator.agent_id)
+        if existing is not None:
+            if not replace:
+                raise ValueError(
+                    f"validator {validator.agent_id!r} is already registered; "
+                    "pass replace=True to update it"
+                )
+            if (
+                existing.public_key_bytes is not None
+                and validator.public_key_bytes != existing.public_key_bytes
+            ):
+                raise ValueError(
+                    f"cannot change the registered public key of validator "
+                    f"{validator.agent_id!r}"
+                )
         self._validators[validator.agent_id] = validator
+        self._retired_keys.pop(validator.agent_id, None)
 
     def remove(self, agent_id: str) -> None:
-        """Remove a validator. Silent if not registered."""
-        self._validators.pop(agent_id, None)
+        """Remove a validator. Silent if not registered.
+
+        The removed identity's public key is remembered so that a later
+        :meth:`add` cannot silently re-key it (see ``rekey``).
+        """
+        removed = self._validators.pop(agent_id, None)
+        if removed is not None and removed.public_key_bytes is not None:
+            self._retired_keys[agent_id] = removed.public_key_bytes
 
     def get(self, agent_id: str) -> ValidatorIdentity | None:
         return self._validators.get(agent_id)
@@ -275,13 +391,11 @@ class CommitteeSelector:
         """
         if weight <= 0:
             return float("inf")
-        digest = hashlib.sha256(f"{seed}\x00{agent_id}".encode()).digest()
+        digest = framed_digest(_VRF_DOMAIN, seed, agent_id)
         # Uniform in (0, 1] — avoid 0 to keep log defined
         raw = int.from_bytes(digest[:8], "big") + 1
         u = raw / (1 << 64)
         # -ln(u)/w priority → weighted sample without replacement
-        import math
-
         return -math.log(u) / weight
 
     def select(
@@ -321,6 +435,7 @@ class CommitteeSelector:
                 capped_weight=0.0,
                 domain_weights={},
                 seed=seed,
+                max_fraction=self._set.policy.max_fraction,
             )
         # Priority-sample the k lowest-score validators
         k = min(committee_size, len(candidates))
@@ -354,6 +469,8 @@ class CommitteeSelector:
             capped_weight=capped_weight,
             domain_weights=capped_domain_weights,
             seed=seed,
+            raw_domain_weights=per_domain,
+            max_fraction=policy.max_fraction,
         )
 
     def select_until_independent(
@@ -364,20 +481,26 @@ class CommitteeSelector:
         exclude: Sequence[str] = (),
         max_retries: int = 8,
         threshold_fraction: float = 2 / 3,
+        enforce_domain_share: bool = False,
     ) -> CommitteeSelection:
         """Select a committee with enough fault-domain independence.
 
-        Calls :meth:`select` with seed variants (``seed\\x00<k>``) until
-        the committee's capped/raw ratio meets ``threshold_fraction``,
-        or ``max_retries`` is exhausted. If all retries fail, raises
+        Calls :meth:`select` with seed variants until the committee's
+        capped/raw ratio meets ``threshold_fraction`` (and, with
+        ``enforce_domain_share=True``, no domain exceeds ``max_fraction``
+        of raw weight), or ``max_retries`` is exhausted. Retry ``k >= 1``
+        uses the hex of a domain-separated framed digest of ``(seed, k)``
+        so retry seeds cannot collide with caller-chosen seeds. If all retries fail, raises
         :class:`SybilBoundViolation` — meaning the validator set itself
         is too sybil-concentrated to produce a safe committee of the
         requested size.
         """
         for attempt in range(max_retries):
-            probe_seed = seed if attempt == 0 else f"{seed}\x00{attempt}"
+            probe_seed = (
+                seed if attempt == 0 else framed_digest(_VRF_RETRY_DOMAIN, seed, attempt).hex()
+            )
             result = self.select(probe_seed, committee_size, exclude=exclude)
-            if result.has_quorum(threshold_fraction):
+            if result.has_quorum(threshold_fraction, enforce_domain_share=enforce_domain_share):
                 return result
         raise SybilBoundViolation(
             f"Could not assemble a committee of size {committee_size} "

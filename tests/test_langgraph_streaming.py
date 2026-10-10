@@ -30,6 +30,10 @@ class _StreamState(TypedDict, total=False):
     patch: str
     governed: bool
     other: str
+    governance_status: str
+    settled: bool
+    risk_score: float
+    violations: list[str]
 
 
 def _build_settling_graph() -> Any:
@@ -38,21 +42,23 @@ def _build_settling_graph() -> Any:
     def produce(state: _StreamState) -> dict:
         return {"patch": "diff --git a b", "governed": True}
 
+    def validate(state: _StreamState) -> dict:
+        return {"governed": True, "risk_score": 0.0, "violations": []}
+
     def settle(state: _StreamState) -> dict:
-        # Pass through governed + patch so they appear in the ``settle`` update chunk.
-        # Under stream_mode="updates", each chunk shows only that node's writes, so the
-        # settle node must re-emit any field the CRDT bridge needs to observe.
         return {
             "other": "settled",
-            "governed": bool(state.get("governed", False)),
-            "patch": state.get("patch", ""),
+            "governance_status": "accepted",
+            "settled": True,
         }
 
     builder = StateGraph(_StreamState)
     builder.add_node("produce", produce)
+    builder.add_node("validate", validate)
     builder.add_node("settle", settle)
     builder.add_edge(START, "produce")
-    builder.add_edge("produce", "settle")
+    builder.add_edge("produce", "validate")
+    builder.add_edge("validate", "settle")
     builder.add_edge("settle", END)
     return builder.compile()
 
@@ -82,7 +88,7 @@ async def test_settled_chunk_appended_to_crdt() -> None:
     crdt = MerkleCRDT("agent-test")
     assert crdt.size == 0
 
-    inputs = {"task_id": "t-1"}
+    inputs = {"task_id": "t-1", "constitutional_hash": CONSTITUTIONAL_HASH}
     chunks = await _drain(stream_to_crdt(graph, inputs, crdt))
 
     # Exactly one append from the ``settle`` node update.
@@ -95,7 +101,13 @@ async def test_payload_is_canonical_json_with_constitutional_hash() -> None:
     graph = _build_settling_graph()
     crdt = MerkleCRDT("agent-test")
 
-    await _drain(stream_to_crdt(graph, {"task_id": "t-2"}, crdt))
+    await _drain(
+        stream_to_crdt(
+            graph,
+            {"task_id": "t-2", "constitutional_hash": CONSTITUTIONAL_HASH},
+            crdt,
+        )
+    )
 
     assert crdt.size == 1
     (only_cid,) = list(crdt.all_cids())
@@ -126,7 +138,7 @@ async def test_gossip_round_called_once_per_settle() -> None:
     await _drain(
         stream_to_crdt(
             graph,
-            {"task_id": "t-3"},
+            {"task_id": "t-3", "constitutional_hash": CONSTITUTIONAL_HASH},
             crdt,
             gossip_node=gossip_node,
             gossip_peers=3,
@@ -141,7 +153,13 @@ async def test_no_settle_leaves_crdt_empty() -> None:
     graph = _build_non_settling_graph()
     crdt = MerkleCRDT("agent-test")
 
-    chunks = await _drain(stream_to_crdt(graph, {"task_id": "t-4"}, crdt))
+    chunks = await _drain(
+        stream_to_crdt(
+            graph,
+            {"task_id": "t-4", "constitutional_hash": CONSTITUTIONAL_HASH},
+            crdt,
+        )
+    )
 
     # Graph emitted chunks but none from a ``settle`` node.
     assert len(chunks) >= 1

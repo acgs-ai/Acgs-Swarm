@@ -12,11 +12,13 @@ from constitutional_swarm.private_vote import (
     MissingRevealError,
     PrivateBallotBox,
     RevealRecord,
+    _signing_payload_commit,
     build_commit,
     build_reveal,
     compute_nullifier,
     tally,
 )
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 EPOCH = bytes.fromhex("00" * 16)
@@ -28,6 +30,13 @@ def _kp():
     return sk
 
 
+def _pub(sk):
+    return sk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
@@ -35,21 +44,25 @@ def _kp():
 
 class TestNullifier:
     def test_deterministic(self):
-        secret = b"voter-seed-1"
-        n1 = compute_nullifier(secret, EPOCH, SUBJECT)
-        n2 = compute_nullifier(secret, EPOCH, SUBJECT)
+        voter_pub = _pub(_kp())
+        n1 = compute_nullifier(voter_pub=voter_pub, epoch=EPOCH, subject=SUBJECT)
+        n2 = compute_nullifier(voter_pub=voter_pub, epoch=EPOCH, subject=SUBJECT)
         assert n1 == n2
 
     def test_epoch_separation(self):
-        secret = b"voter-seed-1"
-        n1 = compute_nullifier(secret, EPOCH, SUBJECT)
-        n2 = compute_nullifier(secret, bytes.fromhex("ff" * 16), SUBJECT)
-        n3 = compute_nullifier(secret, EPOCH, bytes.fromhex("ff" * 16))
+        voter_pub = _pub(_kp())
+        n1 = compute_nullifier(voter_pub=voter_pub, epoch=EPOCH, subject=SUBJECT)
+        n2 = compute_nullifier(
+            voter_pub=voter_pub, epoch=bytes.fromhex("ff" * 16), subject=SUBJECT
+        )
+        n3 = compute_nullifier(
+            voter_pub=voter_pub, epoch=EPOCH, subject=bytes.fromhex("ff" * 16)
+        )
         assert len({n1, n2, n3}) == 3
 
-    def test_empty_secret_rejected(self):
+    def test_invalid_public_key_rejected(self):
         with pytest.raises(ValueError):
-            compute_nullifier(b"", EPOCH, SUBJECT)
+            compute_nullifier(voter_pub=b"", epoch=EPOCH, subject=SUBJECT)
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +122,17 @@ class TestBuildCommit:
 
 
 class TestBallotBox:
-    def _fresh(self):
-        return PrivateBallotBox(epoch=EPOCH, subject=SUBJECT)
+    def _fresh(self, *keys):
+        return PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset(_pub(key) for key in keys),
+            strict_v2=False,
+        )
 
     def _voter(self, box, choice, secret, sk=None):
-        sk = sk or _kp()
+        if sk is None:
+            raise AssertionError("tests must register the voter key before creating the box")
         c, r = build_commit(
             voter_private_key=sk,
             voter_secret=secret,
@@ -125,10 +144,11 @@ class TestBallotBox:
         return c, r, sk
 
     def test_happy_path_tally(self):
-        box = self._fresh()
-        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1")
-        _, r2, _ = self._voter(box, BallotChoice.YEA, b"s2")
-        _, r3, _ = self._voter(box, BallotChoice.NAY, b"s3")
+        keys = [_kp(), _kp(), _kp()]
+        box = self._fresh(*keys)
+        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1", keys[0])
+        _, r2, _ = self._voter(box, BallotChoice.YEA, b"s2", keys[1])
+        _, r3, _ = self._voter(box, BallotChoice.NAY, b"s3", keys[2])
         box.close_commit_phase()
         box.submit_reveal(r1)
         box.submit_reveal(r2)
@@ -142,14 +162,15 @@ class TestBallotBox:
         assert result.rejected == ()
 
     def test_reveal_before_close_rejected(self):
-        box = self._fresh()
-        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1")
+        sk = _kp()
+        box = self._fresh(sk)
+        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1", sk)
         with pytest.raises(InvalidRevealError, match="phase"):
             box.submit_reveal(r1)
 
     def test_commit_after_close_rejected(self):
-        box = self._fresh()
         sk = _kp()
+        box = self._fresh(sk)
         c, _ = build_commit(
             voter_private_key=sk,
             voter_secret=b"sX",
@@ -162,9 +183,10 @@ class TestBallotBox:
             box.submit_commit(c)
 
     def test_missing_reveal_returns_rejected(self):
-        box = self._fresh()
-        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1")
-        _, _, _ = self._voter(box, BallotChoice.NAY, b"s2")
+        sk1, sk2 = _kp(), _kp()
+        box = self._fresh(sk1, sk2)
+        _, r1, _ = self._voter(box, BallotChoice.YEA, b"s1", sk1)
+        _, _, _ = self._voter(box, BallotChoice.NAY, b"s2", sk2)
         box.close_commit_phase()
         box.submit_reveal(r1)
         result = box.tally()
@@ -173,22 +195,23 @@ class TestBallotBox:
         assert any(reason == "missing reveal" for _, reason in result.rejected)
 
     def test_require_all_revealed_raises(self):
-        box = self._fresh()
-        self._voter(box, BallotChoice.YEA, b"s1")
+        sk = _kp()
+        box = self._fresh(sk)
+        self._voter(box, BallotChoice.YEA, b"s1", sk)
         box.close_commit_phase()
         with pytest.raises(MissingRevealError):
             box.tally(require_all_revealed=True)
 
-    def test_double_vote_same_secret_rejected(self):
-        box = self._fresh()
-        self._voter(box, BallotChoice.YEA, b"shared-secret")
+    def test_double_vote_same_key_with_rotated_secret_rejected(self):
+        sk = _kp()
+        box = self._fresh(sk)
+        self._voter(box, BallotChoice.YEA, b"secret-one", sk)
         with pytest.raises(DoubleVoteError):
-            # Different keypair, same voter secret → same nullifier
-            self._voter(box, BallotChoice.NAY, b"shared-secret")
+            self._voter(box, BallotChoice.NAY, b"secret-two", sk)
 
     def test_epoch_mismatch_rejected(self):
-        box = self._fresh()
         sk = _kp()
+        box = self._fresh(sk)
         c, _ = build_commit(
             voter_private_key=sk,
             voter_secret=b"s1",
@@ -200,8 +223,9 @@ class TestBallotBox:
             box.submit_commit(c)
 
     def test_tampered_reveal_rejected(self):
-        box = self._fresh()
-        _, r, _ = self._voter(box, BallotChoice.YEA, b"s1")
+        sk = _kp()
+        box = self._fresh(sk)
+        _, r, _ = self._voter(box, BallotChoice.YEA, b"s1", sk)
         box.close_commit_phase()
         # Swap the choice in the reveal (signature will not match)
         forged = RevealRecord(
@@ -215,8 +239,8 @@ class TestBallotBox:
             box.submit_reveal(forged)
 
     def test_tampered_commit_signature_rejected(self):
-        box = self._fresh()
         sk = _kp()
+        box = self._fresh(sk)
         c, _ = build_commit(
             voter_private_key=sk,
             voter_secret=b"s1",
@@ -258,14 +282,21 @@ class TestTallyFunction:
         commits2 = list(reversed(commits1))
         reveals1 = [r for _, r in triples]
         reveals2 = list(reversed(reveals1))
-        t1 = tally(commits1, reveals1, epoch=EPOCH, subject=SUBJECT)
-        t2 = tally(commits2, reveals2, epoch=EPOCH, subject=SUBJECT)
+        eligible = frozenset(_pub(sk) for sk in (sk1, sk2, sk3))
+        t1 = tally(
+            commits1, reveals1, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible,
+            strict_v2=False,
+        )
+        t2 = tally(
+            commits2, reveals2, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible,
+            strict_v2=False,
+        )
         assert t1.accepted == t2.accepted
         assert dict(t1.totals) == dict(t2.totals)
 
-    def test_nullifier_first_wins(self):
-        # Two commits with same nullifier → only one tallied
-        sk1, sk2 = _kp(), _kp()
+    def test_voter_first_wins(self):
+        # Two commits from the same eligible key → only one tallied.
+        sk1 = _kp()
         c1, r1 = build_commit(
             voter_private_key=sk1,
             voter_secret=b"shared",
@@ -274,17 +305,23 @@ class TestTallyFunction:
             choice=BallotChoice.YEA,
         )
         c2, r2 = build_commit(
-            voter_private_key=sk2,
-            voter_secret=b"shared",
+            voter_private_key=sk1,
+            voter_secret=b"rotated-secret",
             epoch=EPOCH,
             subject=SUBJECT,
             choice=BallotChoice.NAY,
         )
         assert c1.nullifier == c2.nullifier
-        result = tally([c1, c2], [r1, r2], epoch=EPOCH, subject=SUBJECT)
-        # Exactly one accepted; one rejected for duplicate nullifier
+        result = tally(
+            [c1, c2],
+            [r1, r2],
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk1)}),
+            strict_v2=False,
+        )
         assert result.total_valid == 1
-        assert any(reason == "duplicate nullifier" for _, reason in result.rejected)
+        assert any(reason == "duplicate voter" for _, reason in result.rejected)
 
     def test_reveal_opens_wrong_commit_rejected(self):
         sk = _kp()
@@ -302,7 +339,14 @@ class TestTallyFunction:
             choice=BallotChoice.YEA,
             nonce=b"\x00" * 32,  # different nonce → won't open
         )
-        result = tally([c], [bad_reveal], epoch=EPOCH, subject=SUBJECT)
+        result = tally(
+            [c],
+            [bad_reveal],
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({_pub(sk)}),
+            strict_v2=False,
+        )
         assert result.total_valid == 0
         assert any("does not open" in reason for _, reason in result.rejected)
 
@@ -335,6 +379,8 @@ class TestTallyFunction:
                 [bad_reveal],
                 epoch=EPOCH,
                 subject=SUBJECT,
+                eligible_voters=frozenset({_pub(sk)}),
+                strict_v2=False,
                 require_all_revealed=True,
             )
 
@@ -388,6 +434,8 @@ class TestMultipleRevealsProtection:
             [bad_reveal, valid_reveal],  # bad first
             epoch=EPOCH,
             subject=SUBJECT,
+            eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
         )
         assert result.totals[BallotChoice.YEA] == 1, (
             "valid reveal should be found even when preceded by an invalid reveal"
@@ -411,7 +459,14 @@ class TestMultipleRevealsProtection:
             signature=b"\x00" * 64,
         )
 
-        result = tally([commit], [bad_reveal], epoch=EPOCH, subject=SUBJECT)
+        result = tally(
+            [commit],
+            [bad_reveal],
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
+        )
         assert result.totals[BallotChoice.YEA] == 0
         assert len(result.rejected) == 1
 
@@ -419,10 +474,15 @@ class TestMultipleRevealsProtection:
 class TestSubmitCommitV2Validation:
     """P2: PrivateBallotBox.submit_commit must validate v2 field consistency."""
 
-    def _box(self):
+    def _box(self, commit):
         from constitutional_swarm.private_vote import PrivateBallotBox
 
-        return PrivateBallotBox(epoch=EPOCH, subject=SUBJECT)
+        return PrivateBallotBox(
+            epoch=EPOCH,
+            subject=SUBJECT,
+            eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
+        )
 
     def _commit(self, proof_scheme=None, validity_proof=None):
         from constitutional_swarm.private_vote import (
@@ -442,14 +502,27 @@ class TestSubmitCommitV2Validation:
             choice=BallotChoice.YEA,
         )
         # Rebuild as v2 with custom proof fields
+        version = _V2_VERSION
+        signature = sk.sign(
+            _signing_payload_commit(
+                version,
+                commit.epoch,
+                commit.subject,
+                commit.voter,
+                commit.commit,
+                commit.nullifier,
+                proof_scheme,
+                validity_proof,
+            )
+        )
         return CommitRecord(
-            version=_V2_VERSION,
+            version=version,
             epoch=commit.epoch,
             subject=commit.subject,
             voter=commit.voter,
             commit=commit.commit,
             nullifier=commit.nullifier,
-            signature=commit.signature,
+            signature=signature,
             proof_scheme=proof_scheme,
             validity_proof=validity_proof,
         )
@@ -457,27 +530,27 @@ class TestSubmitCommitV2Validation:
     def test_v2_proof_scheme_without_validity_proof_rejected(self):
         from constitutional_swarm.private_vote import InvalidCommitError
 
-        box = self._box()
         bad = self._commit(proof_scheme="zkp_v1", validity_proof=None)
+        box = self._box(bad)
         with pytest.raises(InvalidCommitError, match="both be set or both absent"):
             box.submit_commit(bad)
 
     def test_v2_validity_proof_without_proof_scheme_rejected(self):
         from constitutional_swarm.private_vote import InvalidCommitError
 
-        box = self._box()
         bad = self._commit(proof_scheme=None, validity_proof=b"proof_bytes")
+        box = self._box(bad)
         with pytest.raises(InvalidCommitError, match="both be set or both absent"):
             box.submit_commit(bad)
 
     def test_v2_both_none_accepted(self):
         """v2 with both fields None is valid (backward-compatible)."""
-        box = self._box()
         valid = self._commit(proof_scheme=None, validity_proof=None)
+        box = self._box(valid)
         box.submit_commit(valid)  # must not raise
 
-    def test_v2_both_set_accepted(self):
-        """v2 with both fields set is valid (requires registered prover at tally time)."""
-        box = self._box()
-        valid = self._commit(proof_scheme="zkp_v1", validity_proof=b"proof")
-        box.submit_commit(valid)  # must not raise
+    def test_v2_both_set_requires_registered_verifier_at_admission(self):
+        commit = self._commit(proof_scheme="zkp_v1", validity_proof=b"proof")
+        box = self._box(commit)
+        with pytest.raises(InvalidCommitError, match="no verifier"):
+            box.submit_commit(commit)

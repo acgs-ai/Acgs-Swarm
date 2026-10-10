@@ -31,13 +31,20 @@ depend on the model's internal alignment and survive abliteration:
 |---|---|---|
 | `AgentDNA.validate` (rule engine + risk scorer + Z3) | output-external | ✅ catches the violation in the emitted text |
 | Mesh peer quorum (`mesh/core.py`) | output-external | ✅ honest peers reject; Byzantine-tolerant to <1/3 |
-| Role-drift detectors incl. cross-encoder (`eval/.../semantic.py`) | output-external | ✅ semantic channel resists synonym evasion |
+| Role-drift detectors incl. cross-encoder (`eval/.../semantic.py`) | output-external | ⚠️ semantic channel adds synonym-evasion coverage when its local model is available |
 | Gossip / settlement / constitutional-hash guard | protocol-level | ✅ structural invariants |
 
 **Headline claim (paper-relevant):** *constitutional governance is abliteration-robust
 by externalization* — removing a model's internal refusal does not remove the
 swarm's ability to catch what that model produces, because enforcement lives in
 output validation + peer quorum, not in the model's weights.
+
+The semantic evidence is a fixed, curated regression panel. Its wording was
+model-scored during development, so it is not an unbiased estimate of
+generalization. The semantic channel also reports `unavailable` when the local
+cross-encoder cannot be loaded, including offline installations without a
+cached model; external rule, risk, and quorum defenses remain the dependable
+abliteration boundary in that state.
 
 ## Where it bites
 

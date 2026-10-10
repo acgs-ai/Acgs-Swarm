@@ -14,7 +14,7 @@ import re
 import secrets
 import sqlite3
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,6 +24,7 @@ from typing import Iterator, Protocol, cast
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from ..framing import framed_digest
 from .codec import (
     canonical_statement,
     decode_authority_status,
@@ -123,6 +124,7 @@ from .ports import (
     SupersessionDenied,
     SupersessionRequest,
     SupersessionResult,
+    validate_runtime_signers,
 )
 from .verifier import (
     CausalClosureLimits,
@@ -133,7 +135,6 @@ from .verifier import (
     _evidence,
     _header,
     _verify_signature,
-    verify_causal_closure,
     verify_historical,
 )
 
@@ -146,6 +147,11 @@ _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _SEMANTIC_CHECKPOINT_DOMAIN = b"APCC-SEMANTIC-CHECKPOINT-V1"
 _SEMANTIC_CHECKPOINT_GENESIS = sha256_digest(b"APCC-1/semantic-checkpoint/genesis")
 _SCHEMA_VERSION_INCOMPATIBLE = "APCC authority schema version is incompatible"
+_CANDIDATE_ROW_COLUMNS = (
+    "workflow_id,node_id,attempt_id,agent_id,lifecycle,expected_version,result,"
+    "subject_json,context_json,predecessors_json,proposal_digest,proposal_json,"
+    "audit_event_id"
+)
 
 
 class _FaultProbe(Protocol):
@@ -977,14 +983,47 @@ def _trust(config: APCCAuthorityConfig) -> ScopedTrust:
     return ScopedTrust(config.trust_bindings)
 
 
+def _placeholder_certificate(
+    config: APCCAuthorityConfig, request: AtomicCommitRequest
+) -> CommitCertificate:
+    """Unsealed certificate shell used only to evaluate request evidence."""
+    return CommitCertificate(
+        CertificateHeader(
+            "APCC-1.0-draft",
+            "apcc.commit-certificate",
+            "APCC-CJ1",
+            "SHA-256",
+            "Ed25519",
+            config.authority_store_id,
+            config.commit_trust.key_id,
+            "1",
+        ),
+        request.subject,
+        request.context,
+        request.evidence,
+        CertificateDecision("committed", "OK", request.commit_id, request.nonce, "0"),
+        request.bindings,
+        request.signatures,
+    )
+
+
+_AUDIT_ID_DOMAIN = b"apcc.audit-id.v2"
+# Decision audit ids are recomputed independently by observation.py with the
+# legacy NUL-joined encoding.  Their parts are a commit id followed only by
+# fixed-format b64u digests / reason codes (no NUL), so the join is injective.
+_LEGACY_DECISION_AUDIT_KINDS = frozenset({"commit", "DENIED", "CONFLICTED", "conflict"})
+
+
 def _audit_id(kind: str, *parts: str) -> str:
-    return sha256_digest((kind + "\x00" + "\x00".join(parts)).encode("utf-8"))
+    """Return the persisted audit/event identity for ``kind`` over ``parts``.
 
-
-def _request_identity(request: AtomicCommitRequest) -> str:
-    """Bind replay identity to every typed field supplied to the authority."""
-
-    return sha256_digest(_authority_request_json(request).encode("utf-8"))
+    Schema v4: every kind except the legacy decision family uses the H2
+    length-prefixed ``framed_digest`` transcript, so distinct part tuples can
+    never share an identity (apcc-stores-4).
+    """
+    if kind in _LEGACY_DECISION_AUDIT_KINDS:
+        return sha256_digest((kind + "\x00" + "\x00".join(parts)).encode("utf-8"))
+    return b64u_encode(framed_digest(_AUDIT_ID_DOMAIN, kind, *parts))
 
 
 def _authority_request_object(request: AtomicCommitRequest) -> dict[str, object]:
@@ -1082,9 +1121,9 @@ def _public_request_digest(request: AtomicCommitRequest) -> str:
 
 
 def _proposal_identity(request: AtomicCommitRequest) -> str:
-    """Digest every typed field authorized by the COMMIT_PENDING transition."""
+    """Bind replay/proposal identity to every typed field supplied to the authority."""
 
-    return _request_identity(request)
+    return sha256_digest(_authority_request_json(request).encode("utf-8"))
 
 
 def _trusted_now(clock: object) -> int:
@@ -1096,20 +1135,6 @@ def _trusted_now(clock: object) -> int:
     ):
         raise ValueError(FailureCode.INVALID_DECIMAL_STRING.value)
     return value
-
-
-def _validate_runtime_signers(
-    config: APCCAuthorityConfig, runtime: AuthorityRuntime
-) -> None:
-    for role, binding in (
-        (AuthoritySigningRole.COMMIT, config.commit_trust),
-        (AuthoritySigningRole.STATUS, config.status_trust),
-    ):
-        if (
-            bytes(runtime.key_provider.public_key(role, binding.key_id))
-            != binding.public_key
-        ):
-            raise ValueError("APCC runtime signer does not match public configuration")
 
 
 def _has_later_generation_revocation(
@@ -1299,13 +1324,6 @@ class _AuthorityReaderCore:
             ).fetchone()
             if candidate is None:
                 raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
-            subject = CommitCertificate.from_object(
-                _certificate_shell(
-                    _loads(_row_text(candidate[1])),
-                    _loads(_row_text(candidate[2])),
-                    _loads(_row_text(candidate[3])),
-                )
-            ).subject
             certificate = CommitCertificate.from_object(
                 _certificate_shell(
                     _loads(_row_text(candidate[1])),
@@ -1329,7 +1347,7 @@ class _AuthorityReaderCore:
                 )
             )
             return CommitContext(
-                subject,
+                certificate.subject,
                 certificate.context,
                 CandidateState(
                     request.workflow_id,
@@ -1785,6 +1803,12 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         super().__init__(config.authority_store_id)
         self._config = config
         self._runtime = runtime
+        self._scoped_trust = _trust(config)
+
+    @property
+    def authority_config(self) -> APCCAuthorityConfig:
+        """Public configuration this store was opened (and attested) with."""
+        return self._config
 
     def _transaction(self) -> AbstractContextManager[_AuthorityConnection]:
         raise NotImplementedError
@@ -1837,6 +1861,9 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 ).fetchone()
                 if template is None or node is None:
                     raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
+                node_version = str(node[0])
+                if request.expected_node_version != node_version:
+                    raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
                 connection.execute(
                     "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -1845,7 +1872,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                         request.subject.attempt_id,
                         request.subject.agent_id,
                         CandidateLifecycle.EXECUTING.value,
-                        str(node[0]),
+                        node_version,
                         None,
                         _json(request.subject.to_object()),
                         template[0],
@@ -1858,7 +1885,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 row = (
                     CandidateLifecycle.EXECUTING.value,
                     None,
-                    request.expected_node_version,
+                    node_version,
                     _json(request.subject.to_object()),
                 )
             if sha256_digest(request.result_bytes) != request.subject.output_digest:
@@ -1913,6 +1940,12 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                         request.subject.attempt_id,
                     ),
                 )
+            self._validate_written_candidate(
+                connection,
+                request.subject.workflow_id,
+                request.subject.node_id,
+                request.subject.attempt_id,
+            )
         if quarantined:
             raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
         return StageResultResult(
@@ -1923,6 +1956,32 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 CandidateLifecycle.RESULT_STAGED,
             ),
             audit,
+        )
+
+    def _validate_written_candidate(
+        self,
+        connection: _AuthorityConnection,
+        workflow_id: str,
+        node_id: str,
+        attempt_id: str,
+    ) -> None:
+        """Run the reopen validator on a candidate row before it is sealed."""
+        row = connection.execute(
+            f"SELECT {_CANDIDATE_ROW_COLUMNS} FROM candidates "
+            "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+            (workflow_id, node_id, attempt_id),
+        ).fetchone()
+        logical = connection.execute(
+            "SELECT 1 FROM logical_nodes WHERE workflow_id=? AND node_id=?",
+            (workflow_id, node_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("APCC SQLite store semantic validation failed")
+        _validate_candidate_row(
+            row,
+            {(workflow_id, node_id)} if logical is not None else set(),
+            self._config,
+            self._scoped_trust,
         )
 
     def assemble_evidence(
@@ -1993,9 +2052,9 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                     else FailureCode.ILLEGAL_NODE_STATE
                 )
                 raise ValueError(code.value)
-            audit = _audit_id(
-                target.value, proposal.commit_id, _proposal_identity(proposal)
-            )
+            request_json = _authority_request_json(proposal)
+            proposal_digest = sha256_digest(request_json.encode("utf-8"))
+            audit = _audit_id(target.value, proposal.commit_id, proposal_digest)
             if target is CandidateLifecycle.EVIDENCE_ASSEMBLED:
                 connection.execute(
                     "UPDATE candidates SET lifecycle=?, context_json=?, predecessors_json=?, audit_event_id=?, proposal_digest=?, proposal_json=? "
@@ -2010,8 +2069,8 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                             ]
                         ),
                         audit,
-                        _proposal_identity(proposal),
-                        _authority_request_json(proposal),
+                        proposal_digest,
+                        request_json,
                         proposal.subject.workflow_id,
                         proposal.subject.node_id,
                         proposal.subject.attempt_id,
@@ -2023,9 +2082,9 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                     "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
                     (
                         target.value,
-                        _proposal_identity(proposal),
+                        proposal_digest,
                         audit,
-                        _authority_request_json(proposal),
+                        request_json,
                         proposal.subject.workflow_id,
                         proposal.subject.node_id,
                         proposal.subject.attempt_id,
@@ -2418,7 +2477,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             return FailureCode.TRANSACTION_ABORTED
 
     def _certificate_error(self, certificate: CommitCertificate) -> FailureCode | None:
-        evidence_error = _evidence(certificate, _trust(self._config))
+        evidence_error = _evidence(certificate, self._scoped_trust)
         if evidence_error is not None:
             return evidence_error
         return _bindings(certificate)
@@ -2459,7 +2518,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         envelope = encode_envelope(
             payload, seal_key_id=seal.key_id, seal_signature_b64u=seal.signature_b64u
         )
-        verdict = verify_historical(envelope, trust=_trust(self._config))
+        verdict = verify_historical(envelope, trust=self._scoped_trust)
         if not verdict.ok:
             code = verdict.code or FailureCode.TRANSACTION_ABORTED
             raise ValueError(code.value)
@@ -2632,8 +2691,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         request_digest = _operation_identity(
             request.new_proposal, request.old_certificate_digest
         )
-        connection = self._connection()
-        try:
+        with self._read_transaction() as connection:
             existing = connection.execute(
                 "SELECT 1 FROM commit_index WHERE commit_id=? AND request_digest=?",
                 (request.new_proposal.commit_id, request_digest),
@@ -2642,16 +2700,11 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 return _supersession_replay(
                     connection, request.new_proposal.commit_id, request_digest
                 )
-        finally:
-            connection.close()
         self._commit(request.new_proposal, supersede_old=request.old_certificate_digest)
-        connection = self._connection()
-        try:
+        with self._read_transaction() as connection:
             replay = _supersession_replay(
                 connection, request.new_proposal.commit_id, request_digest
             )
-        finally:
-            connection.close()
         self._hit("after_supersession_commit_before_response")
         return replay
 
@@ -2685,6 +2738,15 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             )
         self._hit("before_revocation_fence")
         if request.scope is RevocationScope.CERTIFICATE:
+            owner = connection.execute(
+                "SELECT workflow_id FROM certificates WHERE certificate_digest=?",
+                (request.target_id,),
+            ).fetchone()
+            if owner is not None and _row_text(owner[0]) != request.workflow_id:
+                raise ValueError(
+                    "certificate revocation target does not belong to the "
+                    "revocation workflow"
+                )
             disposition = _latest_disposition(connection, request.target_id)
             if disposition is not CertificateDisposition.CURRENT:
                 raise ValueError("certificate revocation target is not current")
@@ -3141,7 +3203,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                         return FailureCode.INVALID_PREDECESSOR
                     if total_bytes + len(envelope) > limits.max_total_bytes:
                         return FailureCode.SIZE_LIMIT_EXCEEDED
-                    historical = verify_historical(envelope, trust=_trust(self._config))
+                    historical = verify_historical(envelope, trust=self._scoped_trust)
                     if not historical.ok or historical.certificate is None:
                         return FailureCode.INVALID_PREDECESSOR
                     resolved = historical.certificate
@@ -3185,52 +3247,6 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 return FailureCode.INVALID_PREDECESSOR
             if _has_later_generation_revocation(connection, certificate):
                 return FailureCode.INVALID_PREDECESSOR
-        return None
-
-    def _persisted_causal_error(
-        self, connection: _AuthorityConnection, digest: str
-    ) -> FailureCode | None:
-        resolver = _AuthorityPredecessorResolver(connection)
-        root_envelope = resolver.resolve_predecessor(digest)
-        if root_envelope is None:
-            return FailureCode.INVALID_PREDECESSOR
-        closure = verify_causal_closure(
-            root_envelope,
-            trust=_trust(self._config),
-            resolver=resolver,
-        )
-        if not closure.ok:
-            if closure.code in {
-                FailureCode.DEPTH_LIMIT_EXCEEDED,
-                FailureCode.SIZE_LIMIT_EXCEEDED,
-            }:
-                return closure.code
-            return FailureCode.INVALID_PREDECESSOR
-
-        pending = [digest]
-        seen: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            state = _latest_disposition(connection, current)
-            if state is None or state is CertificateDisposition.REVOKED:
-                return FailureCode.INVALID_PREDECESSOR
-            envelope = resolver.resolve_predecessor(current)
-            if envelope is None:
-                return FailureCode.INVALID_PREDECESSOR
-            try:
-                detached = decode_envelope(envelope)
-                certificate = decode_certificate(detached.payload)
-            except Exception:
-                return FailureCode.INVALID_PREDECESSOR
-            if _has_later_generation_revocation(connection, certificate):
-                return FailureCode.INVALID_PREDECESSOR
-            pending.extend(
-                predecessor.certificate_digest
-                for predecessor in certificate.bindings.predecessors
-            )
         return None
 
     def recover(self, request: RecoveryRequest) -> CommitResult:
@@ -3353,7 +3369,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         runtime: AuthorityRuntime,
     ) -> None:
         path = Path(path)
-        _validate_runtime_signers(config, runtime)
+        validate_runtime_signers(config, runtime)
         if path.exists():
             connection = _connect_reader(path)
             try:
@@ -3568,7 +3584,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             connection.close()
         if reader.authority_store_id != config.authority_store_id:
             raise ValueError("APCC authority store identity mismatch")
-        _validate_runtime_signers(config, runtime)
+        validate_runtime_signers(config, runtime)
         store = object.__new__(cls)
         _AuthorityStoreCore.__init__(store, config, runtime)
         store.database_path = Path(path)
@@ -4247,6 +4263,118 @@ def _attest_sqlite_read_connection(
     _verify_semantic_checkpoint(connection, config, _SCHEMA_FINGERPRINT)
 
 
+def _validate_candidate_row(
+    row: Sequence[object],
+    logical_keys: Set[tuple[str, str]],
+    config: APCCAuthorityConfig,
+    trust: ScopedTrust,
+) -> None:
+    """Validate one persisted candidate row exactly as store reopen does.
+
+    Shared by the full semantic validator and by the mutation paths that write
+    candidate rows, so the authority never seals a row its own reopen rejects.
+    """
+    invalid = ValueError("APCC SQLite store semantic validation failed")
+    (
+        workflow,
+        node,
+        attempt,
+        agent,
+        lifecycle,
+        expected_version,
+        result,
+        subject_json,
+        context_json,
+        predecessors_json,
+        proposal_digest,
+        proposal_json,
+        audit_event_id,
+    ) = row
+    try:
+        subject_object = _loads(str(subject_json))
+        context_object = _loads(str(context_json))
+        predecessor_objects = _loads(str(predecessors_json))
+        subject = CertificateSubject.from_object(
+            cast("dict[str, object]", subject_object)
+        )
+        CertificateContext.from_object(cast("dict[str, object]", context_object))
+        if not isinstance(predecessor_objects, list):
+            raise ValueError("invalid predecessors")
+        predecessors = tuple(
+            PredecessorRef.from_object(item) for item in predecessor_objects
+        )
+    except Exception as error:
+        raise invalid from error
+    try:
+        canonical_expected_version = str(
+            _canonical_nonnegative_decimal(
+                expected_version, maximum=_MAX_SAFE_INTEGER
+            )
+        )
+    except ValueError as error:
+        raise invalid from error
+    if (
+        _json(subject_object) != subject_json
+        or _json(context_object) != context_json
+        or _json([item.to_object() for item in predecessors]) != predecessors_json
+        or (str(workflow), str(node)) not in logical_keys
+        or subject.workflow_id != workflow
+        or subject.node_id != node
+        or subject.attempt_id != attempt
+        or subject.agent_id != agent
+        or canonical_expected_version != expected_version
+    ):
+        raise invalid
+    state = CandidateLifecycle(str(lifecycle))
+    if state is CandidateLifecycle.EXECUTING:
+        if (
+            result is not None
+            or proposal_digest is not None
+            or proposal_json is not None
+        ):
+            raise invalid
+    elif (
+        result is None or sha256_digest(_row_bytes(result)) != subject.output_digest
+    ):
+        raise invalid
+    if state in {
+        CandidateLifecycle.EVIDENCE_ASSEMBLED,
+        CandidateLifecycle.COMMIT_PENDING,
+    }:
+        try:
+            proposal = _request_from_json(str(proposal_json))
+        except Exception as error:
+            raise invalid from error
+        if (
+            proposal_json != _authority_request_json(proposal)
+            or proposal_digest != _proposal_identity(proposal)
+            or proposal.subject != subject
+            or proposal.context.to_object() != context_object
+            or proposal.bindings.predecessors != predecessors
+            or proposal.bindings.expected_node_version != expected_version
+            or _evidence(_placeholder_certificate(config, proposal), trust)
+            is not None
+        ):
+            raise invalid
+        expected_candidate_audit = _audit_id(
+            state.value, proposal.commit_id, _proposal_identity(proposal)
+        )
+        if audit_event_id != expected_candidate_audit:
+            raise invalid
+    elif state is CandidateLifecycle.RESULT_STAGED:
+        if audit_event_id != _audit_id(
+            "stage",
+            _row_text(workflow),
+            _row_text(node),
+            _row_text(attempt),
+            subject.output_digest,
+            _row_text(expected_version),
+        ):
+            raise invalid
+    elif proposal_digest is not None or proposal_json is not None:
+        raise invalid
+
+
 def _validate_semantic_integrity(
     connection: _AuthorityConnection, config: APCCAuthorityConfig
 ) -> _SemanticSnapshot:
@@ -4368,128 +4496,9 @@ def _validate_semantic_integrity(
         )
     }
     for row in connection.execute(
-        "SELECT workflow_id,node_id,attempt_id,agent_id,lifecycle,expected_version,result,subject_json,context_json,predecessors_json,proposal_digest,proposal_json,audit_event_id FROM candidates"
+        f"SELECT {_CANDIDATE_ROW_COLUMNS} FROM candidates"
     ):
-        (
-            workflow,
-            node,
-            attempt,
-            agent,
-            lifecycle,
-            expected_version,
-            result,
-            subject_json,
-            context_json,
-            predecessors_json,
-            proposal_digest,
-            proposal_json,
-            audit_event_id,
-        ) = row
-        try:
-            subject_object = _loads(str(subject_json))
-            context_object = _loads(str(context_json))
-            predecessor_objects = _loads(str(predecessors_json))
-            subject = CertificateSubject.from_object(
-                cast("dict[str, object]", subject_object)
-            )
-            CertificateContext.from_object(cast("dict[str, object]", context_object))
-            if not isinstance(predecessor_objects, list):
-                raise ValueError("invalid predecessors")
-            predecessors = tuple(
-                PredecessorRef.from_object(item) for item in predecessor_objects
-            )
-        except Exception as error:
-            raise invalid from error
-        try:
-            canonical_expected_version = str(
-                _canonical_nonnegative_decimal(
-                    expected_version, maximum=_MAX_SAFE_INTEGER
-                )
-            )
-        except ValueError as error:
-            raise invalid from error
-        if (
-            _json(subject_object) != subject_json
-            or _json(context_object) != context_json
-            or _json([item.to_object() for item in predecessors]) != predecessors_json
-            or (str(workflow), str(node)) not in logical_keys
-            or subject.workflow_id != workflow
-            or subject.node_id != node
-            or subject.attempt_id != attempt
-            or subject.agent_id != agent
-            or canonical_expected_version != expected_version
-        ):
-            raise invalid
-        state = CandidateLifecycle(str(lifecycle))
-        if state is CandidateLifecycle.EXECUTING:
-            if (
-                result is not None
-                or proposal_digest is not None
-                or proposal_json is not None
-            ):
-                raise invalid
-        elif (
-            result is None or sha256_digest(_row_bytes(result)) != subject.output_digest
-        ):
-            raise invalid
-        if state in {
-            CandidateLifecycle.EVIDENCE_ASSEMBLED,
-            CandidateLifecycle.COMMIT_PENDING,
-        }:
-            try:
-                proposal = _request_from_json(str(proposal_json))
-            except Exception as error:
-                raise invalid from error
-            if (
-                proposal_json != _authority_request_json(proposal)
-                or proposal_digest != _proposal_identity(proposal)
-                or proposal.subject != subject
-                or proposal.context.to_object() != context_object
-                or proposal.bindings.predecessors != predecessors
-                or proposal.bindings.expected_node_version != expected_version
-                or _evidence(
-                    CommitCertificate(
-                        CertificateHeader(
-                            "APCC-1.0-draft",
-                            "apcc.commit-certificate",
-                            "APCC-CJ1",
-                            "SHA-256",
-                            "Ed25519",
-                            config.authority_store_id,
-                            config.commit_trust.key_id,
-                            "1",
-                        ),
-                        proposal.subject,
-                        proposal.context,
-                        proposal.evidence,
-                        CertificateDecision(
-                            "committed", "OK", proposal.commit_id, proposal.nonce, "0"
-                        ),
-                        proposal.bindings,
-                        proposal.signatures,
-                    ),
-                    _trust(config),
-                )
-                is not None
-            ):
-                raise invalid
-            expected_candidate_audit = _audit_id(
-                state.value, proposal.commit_id, _proposal_identity(proposal)
-            )
-            if audit_event_id != expected_candidate_audit:
-                raise invalid
-        elif state is CandidateLifecycle.RESULT_STAGED:
-            if audit_event_id != _audit_id(
-                "stage",
-                _row_text(workflow),
-                _row_text(node),
-                _row_text(attempt),
-                subject.output_digest,
-                _row_text(expected_version),
-            ):
-                raise invalid
-        elif proposal_digest is not None or proposal_json is not None:
-            raise invalid
+        _validate_candidate_row(row, logical_keys, config, trust)
 
     audits = {
         str(audit_id): str(event_json)
@@ -4673,27 +4682,7 @@ def _validate_semantic_integrity(
             and reason != FailureCode.NONCE_REPLAY.value
         ):
             immutable_failure = _evidence(
-                CommitCertificate(
-                    CertificateHeader(
-                        "APCC-1.0-draft",
-                        "apcc.commit-certificate",
-                        "APCC-CJ1",
-                        "SHA-256",
-                        "Ed25519",
-                        config.authority_store_id,
-                        config.commit_trust.key_id,
-                        "1",
-                    ),
-                    request.subject,
-                    request.context,
-                    request.evidence,
-                    CertificateDecision(
-                        "committed", "OK", request.commit_id, request.nonce, "0"
-                    ),
-                    request.bindings,
-                    request.signatures,
-                ),
-                _trust(config),
+                _placeholder_certificate(config, request), trust
             )
             if immutable_failure is not None and reason != immutable_failure.value:
                 raise invalid
@@ -4884,9 +4873,12 @@ def _validate_semantic_integrity(
         ):
             raise invalid
         if control_scope == RevocationScope.CERTIFICATE.value:
+            revoked_certificate = certificates.get(control_target)
             if (
                 control_generation is not None
                 or latest.get(control_target) is not CertificateDisposition.REVOKED
+                or revoked_certificate is None
+                or revoked_certificate.subject.workflow_id != control_workflow
             ):
                 raise invalid
         else:
@@ -5416,14 +5408,3 @@ def _supersession_replay(
         _row_text(outbox[0]),
     )
 
-
-def _outbox_id(path: Path, commit_id: str) -> str:
-    connection = _connect(path)
-    try:
-        row = connection.execute(
-            "SELECT event_id FROM apcc_outbox WHERE event_kind='COMMIT' AND operation_id=?",
-            (commit_id,),
-        ).fetchone()
-        return row[0] if row else ""
-    finally:
-        connection.close()

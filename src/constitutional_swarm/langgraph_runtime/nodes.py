@@ -13,33 +13,19 @@ Wraps:
 
 from __future__ import annotations
 
-import json
+import math
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
-
-if TYPE_CHECKING:
-    from constitutional_swarm.langgraph_runtime.state import SwarmGraphState
-
-# ---------------------------------------------------------------------------
-# serialize_for_crdt resolution
-#
-# Unit 2 (state.py) defines the canonical serializer.  Until Unit 2 lands we
-# fall back to a minimal local implementation that mirrors the documented
-# contract: stable JSON encoding, private keys (prefixed with "_") stripped.
-# Resolving at import time keeps `append_crdt_node` hot-path allocation-free.
-# ---------------------------------------------------------------------------
-try:  # pragma: no cover - the fallback branch is exercised in worktrees
-    from constitutional_swarm.langgraph_runtime.state import (
-        serialize_for_crdt as _serialize_for_crdt,
-    )
-except ImportError:  # Unit 2 not merged yet
-
-    def _serialize_for_crdt(state: SwarmGraphState) -> str:
-        """Local fallback serializer; reconciled when Unit 2 merges."""
-        public = {k: v for k, v in state.items() if not str(k).startswith("_")}
-        return json.dumps(public, default=str, sort_keys=True)
+from constitutional_swarm.langgraph_runtime.guards import (
+    has_clean_validation_evidence,
+    has_pinned_constitutional_hash,
+)
+from constitutional_swarm.langgraph_runtime.state import (
+    SwarmGraphState,
+    serialize_for_crdt,
+)
 
 
 def validate_node(state: Mapping[str, Any], *, dna: Any) -> dict[str, Any]:
@@ -48,18 +34,48 @@ def validate_node(state: Mapping[str, Any], *, dna: Any) -> dict[str, Any]:
     Empty patch short-circuits with empty violations + zero risk (matches the
     'no_patch_to_govern' branch in swe_bench/governed_agent.py:109).
     """
+    if dna is None:
+        raise ValueError("dna is required for constitutional patch validation")
+    if not has_pinned_constitutional_hash(getattr(dna, "hash", None)):
+        raise ValueError("DNA hash does not match the package constitutional hash")
+
     patch = state.get("patch", "")
     if not patch:
         return {"violations": [], "risk_score": 0.0, "governed": True}
     result = dna.validate(patch)
-    violations = [
-        getattr(v, "rule_id", str(v))
-        for v in (getattr(result, "violations", ()) or ())
-    ]
+    if not has_pinned_constitutional_hash(getattr(dna, "hash", None)):
+        raise ValueError("DNA hash changed during constitutional patch validation")
+    if (
+        not hasattr(result, "valid")
+        or not hasattr(result, "violations")
+        or not hasattr(result, "risk_score")
+    ):
+        raise ValueError("validator returned incomplete validation evidence")
+    valid = result.valid
+    if type(valid) is not bool:
+        raise ValueError("validator valid verdict must be a boolean")
+    reported_violations = result.violations
+    if type(reported_violations) not in (list, tuple):
+        raise ValueError("validator violations must be a concrete sequence")
+    violations: list[str] = []
+    for violation in reported_violations:
+        rule_id = getattr(violation, "rule_id", violation)
+        if type(rule_id) is not str:
+            raise ValueError("validator violation identifiers must be strings")
+        violations.append(rule_id)
+    reported_risk = result.risk_score
+    if type(reported_risk) not in (int, float):
+        raise ValueError("validator risk_score must be numeric")
+    try:
+        risk_score = float(reported_risk)
+    except OverflowError as exc:
+        raise ValueError("validator risk_score is outside the supported range") from exc
+    if not math.isfinite(risk_score) or risk_score < 0.0:
+        raise ValueError("validator risk_score must be finite and non-negative")
     return {
         "violations": violations,
-        "risk_score": float(getattr(result, "risk_score", 0.0) or 0.0),
-        "governed": True,
+        "risk_score": risk_score,
+        "governed": valid,
     }
 
 
@@ -77,19 +93,37 @@ def generate_node(
     return {
         "patch": patch,
         "intervention_rate": float(stats.get("intervention_rate", 0.0)),
-        "constitutional_hash": CONSTITUTIONAL_HASH,
+        "cid": "",
+        "governed": False,
+        "risk_score": 0.0,
+        "violations": [],
+        "settled": False,
+        "governance_status": "rejected",
     }
 
 
 def append_crdt_node(state: Mapping[str, Any], *, crdt: Any) -> dict[str, Any]:
     """Append the current state to a MerkleCRDT.  Returns the new CID in state."""
-    # ``dict(state)`` matches the eventual Unit 2 ``serialize_for_crdt`` signature
+    constitutional_hash = state.get("constitutional_hash", "")
+    if not has_pinned_constitutional_hash(constitutional_hash):
+        raise ValueError(
+            "constitutional hash mismatch: "
+            f"expected {CONSTITUTIONAL_HASH!r}, got {constitutional_hash!r}"
+        )
+    if not has_clean_validation_evidence(state):
+        raise ValueError("clean validation evidence is required before CRDT append")
+    if crdt is None:
+        return {"cid": ""}
+    # ``serialize_for_crdt`` accepts a plain mapping snapshot.
     # (operates on a concrete dict, not the ``Mapping`` protocol). The cast bridges
     # the read-only ``Mapping`` parameter to the ``SwarmGraphState`` TypedDict the
     # serializer declares; keys are a superset by construction.
-    payload = _serialize_for_crdt(cast("SwarmGraphState", dict(state)))
-    governed = bool(state.get("governed", False))
-    node = crdt.append(payload=payload, bodes_passed=governed)
+    payload = serialize_for_crdt(cast("SwarmGraphState", dict(state)))
+    node = crdt.append(
+        payload=payload,
+        bodes_passed=True,
+        constitutional_hash=constitutional_hash,
+    )
     # MerkleCRDT.append returns a DAGNode whose CID lives on .cid; stubs may
     # return a plain string -- coerce uniformly via str().
     cid = getattr(node, "cid", node)
@@ -124,7 +158,20 @@ def settle_node(state: Mapping[str, Any]) -> dict[str, Any]:
     Vote collection is decoupled (Plan invariant #9 -- mesh handles voting; the
     graph only reflects whether quorum was reached upstream).
     """
-    return {"settled": bool(state.get("quorum_reached", False))}
+    if not has_pinned_constitutional_hash(
+        state.get("constitutional_hash")
+    ) or not has_clean_validation_evidence(state):
+        return {
+            "patch": "",
+            "cid": "",
+            "governed": False,
+            "settled": False,
+            "governance_status": "rejected",
+        }
+    return {
+        "settled": bool(state.get("quorum_reached", False)),
+        "governance_status": "accepted",
+    }
 
 
 __all__ = [

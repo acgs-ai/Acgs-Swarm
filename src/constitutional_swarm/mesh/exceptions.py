@@ -39,3 +39,7 @@ class SettlementPersistenceError(RuntimeError):
 
 class RemoteVoteReplayError(Exception):
     """Remote vote request reused a nonce inside the active replay window."""
+
+
+class MeshCapacityError(RuntimeError):
+    """Mesh cannot accept more unresolved work without exceeding its bound."""

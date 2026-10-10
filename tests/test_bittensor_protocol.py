@@ -176,7 +176,7 @@ class TestValidationSynapse:
             constitutional_hash="608508a9bd224290",
         )
         assert synapse.accepted is True
-        assert synapse.is_verified is True
+        assert synapse.is_verified is False
         assert synapse.quorum_met is True
 
     def test_not_verified_without_proof(self):
@@ -217,9 +217,11 @@ class TestValidatorConfig:
 
     def test_defaults(self):
         config = ValidatorConfig(constitution_path="/path")
-        assert config.peers_per_validation == 3
-        assert config.quorum == 2
+        assert config.peers_per_validation == 5
+        assert config.quorum == 3
+        assert config.complete_evidence is True
         assert config.use_manifold is True
+        assert config.single_operator_dev is False
 
 
 def _write_test_constitution(tmp_path) -> str:
@@ -269,7 +271,7 @@ async def test_local_protocol_bridge_round_trip_preserves_constitution_hash(tmp_
         deliberation_handler=_governance_handler,
     )
     client = ValidatorDendriteClient(constitution_path)
-    client.register_local_miner(MinerAxonServer(miner))
+    client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
     case = owner.package_case(
         "Need a provenance-preserving governance recommendation",
@@ -291,6 +293,8 @@ async def test_local_protocol_bridge_round_trip_preserves_constitution_hash(tmp_
             peers_per_validation=3,
             quorum=2,
             use_manifold=False,
+            complete_evidence=False,
+            single_operator_dev=True,
         )
     )
     for miner_uid in ("miner-bridge", "peer-1", "peer-2", "peer-3"):

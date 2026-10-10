@@ -28,6 +28,13 @@ if str(SRC_ROOT) not in sys.path:
 
 DELTA = 1e-5
 RADIUS = 1.0
+DP_MATRIX_DIMENSION = 50
+DP_SIGMA_FIXTURES = {
+    1.0: 57.21038854,
+    2.0: 30.39300970,
+    4.0: 16.37049377,
+    8.0: 9.01801824,
+}
 
 
 def _parse_ints(raw: str) -> list[int]:
@@ -90,10 +97,12 @@ def _make_spectral(n: int, seed: int, *, r: float = RADIUS) -> Any:
 
     rng = random.Random(seed)
     manifold = SpectralSphereManifold(num_agents=n, r=r)
+    updates = []
     for i in range(n):
         for j in range(n):
             if i != j:
-                manifold.update_trust(i, j, rng.uniform(0.0, 1.0))
+                updates.append((i, j, rng.uniform(0.0, 1.0)))
+    manifold.update_trust_batch(updates)
     return manifold
 
 
@@ -264,26 +273,28 @@ def ode_stability_benchmark(*, n: int, steps: int, seed: int) -> dict[str, Any]:
 
 
 def dp_calibration_table() -> dict[str, Any]:
-    ode_modules = _load_ode_modules()
-    if ode_modules is None:
-        return {"available": False, "pass": False, "reason": "torch unavailable"}
-
-    calibrate_sigma = ode_modules["calibrate_sigma"]
-    rows = []
-    for epsilon in (1.0, 2.0, 4.0, 8.0):
-        baseline = 2.0 * RADIUS * math.sqrt(2.0 * math.log(1.25 / DELTA)) / epsilon
-        residual = calibrate_sigma(RADIUS, 0.1, epsilon, DELTA)
-        rows.append(
-            {
-                "epsilon": epsilon,
-                "baseline_sigma": baseline,
-                "alpha_0_1_sigma": residual,
-                "reduction": 1.0 - residual / baseline,
-            }
-        )
+    rows = [
+        {
+            "epsilon": epsilon,
+            "sigma": _dp_sigma(epsilon=epsilon, matrix_dimension=DP_MATRIX_DIMENSION),
+        }
+        for epsilon in (1.0, 2.0, 4.0, 8.0)
+    ]
+    sensitivity = 2.0 * RADIUS * math.sqrt(DP_MATRIX_DIMENSION)
     return {
         "available": True,
-        "pass": all(abs(row["reduction"] - 0.1) < 1e-12 for row in rows),
+        "pass": all(
+            math.isclose(
+                row["sigma"],
+                DP_SIGMA_FIXTURES[row["epsilon"]],
+                rel_tol=1e-8,
+                abs_tol=1e-10,
+            )
+            for row in rows
+        ),
+        "matrix_dimension": DP_MATRIX_DIMENSION,
+        "certified_spectral_bound": RADIUS,
+        "l2_sensitivity": sensitivity,
         "rows": rows,
     }
 
@@ -572,13 +583,28 @@ def _ndss_claim(**kwargs: Any) -> ClaimEvidence:
     )
 
 
-def _dp_sigma(*, epsilon: float, alpha: float, r: float = 1.0, delta: float = 1e-5) -> float:
-    if epsilon <= 0:
-        raise ValueError("epsilon must be positive")
-    if not 0 <= alpha < 1:
-        raise ValueError("alpha must be in [0, 1)")
-    sensitivity = 2.0 * (1.0 - alpha) * r
-    return sensitivity * math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon
+def _dp_sigma(
+    *,
+    epsilon: float,
+    matrix_dimension: int,
+    r: float = 1.0,
+    delta: float = 1e-5,
+) -> float:
+    """Calibrate matrix-Gaussian noise from the production DP contract."""
+    from constitutional_swarm.privacy_accountant import (
+        PrivacyAccountant,
+        matrix_l2_sensitivity,
+    )
+
+    sensitivity = matrix_l2_sensitivity(
+        certified_spectral_bound=r,
+        matrix_dimension=matrix_dimension,
+    )
+    accountant = PrivacyAccountant(epsilon=epsilon, delta=delta)
+    sigma = accountant.required_sigma(sensitivity=sensitivity)
+    accountant.spend(sensitivity=sensitivity, sigma=sigma)
+    accountant.assert_budget()
+    return sigma
 
 
 def _rounded(value: float, places: int = 2) -> float:
@@ -616,10 +642,7 @@ def _iclr_evidence() -> list[ClaimEvidence]:
         residual_alpha=0.1,
     )
     formula_sigma = {
-        epsilon: {
-            alpha: _dp_sigma(epsilon=epsilon, alpha=alpha)
-            for alpha in (0.0, 0.1, 0.2, 0.5)
-        }
+        epsilon: _dp_sigma(epsilon=epsilon, matrix_dimension=DP_MATRIX_DIMENSION)
         for epsilon in (1.0, 2.0, 4.0, 8.0)
     }
     return [
@@ -703,15 +726,31 @@ def _iclr_evidence() -> list[ClaimEvidence]:
         _iclr_claim(
             claim_id="ICLR-15",
             paper="ICLR 2027",
-            basis="dp_formula",
+            basis="dp_formula_errata",
             status="formula",
-            passed=all(
-                abs(1.0 - formula_sigma[eps][alpha] / formula_sigma[eps][0.0] - alpha) < 1e-12
-                for eps in formula_sigma
-                for alpha in (0.1, 0.2, 0.5)
+            passed=False,
+            measurements={
+                "formula_sigma": formula_sigma,
+                "matrix_dimension": DP_MATRIX_DIMENSION,
+                "certified_spectral_bound": RADIUS,
+                "l2_sensitivity": 2.0 * RADIUS * math.sqrt(DP_MATRIX_DIMENSION),
+                "producer": "_dp_sigma",
+                "corrected_calibration_verified": all(
+                    math.isclose(
+                        value,
+                        DP_SIGMA_FIXTURES[epsilon],
+                        rel_tol=1e-8,
+                        abs_tol=1e-10,
+                    )
+                    for epsilon, value in formula_sigma.items()
+                ),
+                "published_table_requires_errata": True,
+                "errata_proposed": True,
+            },
+            note=(
+                "Corrected all-epsilon calibration for the errata proposal; the immutable "
+                "paper table uses an unsupported spectral-norm sensitivity and residual discount."
             ),
-            measurements={"formula_sigma": formula_sigma, "producer": "_dp_sigma"},
-            note="Live Gaussian formula; published table scale is a separate calibration.",
         ),
         _iclr_claim(
             claim_id="ICLR-16",
@@ -779,10 +818,15 @@ def _ndss_protocol_rows() -> dict[int, dict[str, float | int | bool]]:
 def _ndss_evidence() -> list[ClaimEvidence]:
     protocol = _ndss_protocol_rows()
     dp_rows = {
-        1.0: {"theory": 3.456, "empirical": 3.461, "relative_error_pct": 0.14},
-        2.0: {"theory": 1.728, "empirical": 1.730, "relative_error_pct": 0.12},
-        4.0: {"theory": 0.864, "empirical": 0.865, "relative_error_pct": 0.12},
-        8.0: {"theory": 0.432, "empirical": 0.433, "relative_error_pct": 0.23},
+        epsilon: {
+            "corrected_theory": _dp_sigma(
+                epsilon=epsilon,
+                matrix_dimension=DP_MATRIX_DIMENSION,
+            ),
+            "published_empirical_entry_is_formula_check": True,
+            "published_dp_verified_is_unsupported": True,
+        }
+        for epsilon in (1.0, 2.0, 4.0, 8.0)
     }
     latency = {
         "spectral_projection_ms": 1.2,
@@ -824,8 +868,13 @@ def _ndss_evidence() -> list[ClaimEvidence]:
                 "epsilon_k_formula": "epsilon*sqrt(2*k*ln(1/delta))",
                 "delta_k_formula": "k*delta",
                 "example_k10_delta1e-5_delta_k": 10 * 1e-5,
+                "approximation_only": True,
+                "live_budget_certificate": False,
             },
-            note="Pins the stated approximate composition formula.",
+            note=(
+                "Pins the paper's historical approximation; live sessions must use "
+                "PrivacyAccountant spend/assert_budget for a budget certificate."
+            ),
         ),
         _ndss_claim(
             claim_id="NDSS-10",
@@ -833,14 +882,20 @@ def _ndss_evidence() -> list[ClaimEvidence]:
             basis="spectral_noise_bound",
             status="formula",
             passed=all(
-                sigma * math.sqrt(n) <= 1.0 + 1e-12
-                for n, sigma in [(10, 1 / math.sqrt(10)), (50, 1 / math.sqrt(50))]
+                2.0 * sigma * math.sqrt(n) <= 1.0 + 1e-12
+                for n, sigma in [(10, 1 / (2 * math.sqrt(10))), (50, 1 / (2 * math.sqrt(50)))]
             ),
             measurements={
-                "rule": "if sigma <= r/sqrt(n), then sigma*sqrt(n) <= r",
-                "examples": {"n10": 1 / math.sqrt(10), "n50": 1 / math.sqrt(50)},
+                "leading_spectral_scale": "2*sigma*sqrt(n)",
+                "heuristic_threshold": "sigma <= r/(2*sqrt(n))",
+                "examples": {
+                    "n10": 1 / (2 * math.sqrt(10)),
+                    "n50": 1 / (2 * math.sqrt(50)),
+                },
+                "heuristic_only": True,
+                "privacy_or_tail_certificate": False,
             },
-            note="Checks the expected spectral norm inequality used in the protocol text.",
+            note="Checks a leading-scale dynamics heuristic, not a probabilistic certificate.",
         ),
         _ndss_claim(
             claim_id="NDSS-13",
@@ -885,31 +940,55 @@ def _ndss_evidence() -> list[ClaimEvidence]:
         _ndss_claim(
             claim_id="NDSS-17",
             paper="NDSS 2027",
-            basis="dp_formula",
+            basis="dp_formula_errata",
             status="formula",
-            passed=abs(_dp_sigma(epsilon=2.0, alpha=0.1) - _dp_sigma(epsilon=1.0, alpha=0.1) / 2.0)
-            < 1e-12,
-            measurements={"dp_rows": dp_rows},
-            note="Checks exact DP accuracy table values and max relative error.",
+            passed=False,
+            measurements={
+                "dp_rows": dp_rows,
+                "matrix_dimension": DP_MATRIX_DIMENSION,
+                "corrected_calibration_verified": all(
+                    math.isclose(
+                        row["corrected_theory"],
+                        DP_SIGMA_FIXTURES[epsilon],
+                        rel_tol=1e-8,
+                        abs_tol=1e-10,
+                    )
+                    for epsilon, row in dp_rows.items()
+                ),
+                "published_table_requires_errata": True,
+                "errata_proposed": True,
+            },
+            note=(
+                "Corrected theoretical values for the errata proposal. The published empirical "
+                "cells say formula check; no empirical samples exist until the experiment reruns."
+            ),
         ),
         _ndss_claim(
             claim_id="NDSS-18",
             paper="NDSS 2027",
-            basis="dp_formula",
+            basis="dp_formula_errata",
             status="formula",
-            passed=abs(
-                1.0 - _dp_sigma(epsilon=2.0, alpha=0.1) / _dp_sigma(epsilon=2.0, alpha=0.0) - 0.1
-            )
-            < 1e-12,
+            passed=False,
             measurements={
-                "max_relative_error_pct": max(
-                    row["relative_error_pct"] for row in dp_rows.values()
+                "epsilon2_corrected_sigma": dp_rows[2.0]["corrected_theory"],
+                "published_epsilon2_baseline_sigma": 4.84,
+                "published_epsilon2_residual_sigma": 4.36,
+                "legacy_harness_constants_unverified": [1.92, 1.73],
+                "residual_discount_supported": False,
+                "published_narrative_requires_errata": True,
+                "errata_proposed": True,
+                "corrected_calibration_verified": math.isclose(
+                    dp_rows[2.0]["corrected_theory"],
+                    DP_SIGMA_FIXTURES[2.0],
+                    rel_tol=1e-8,
+                    abs_tol=1e-10,
                 ),
-                "epsilon2_baseline_sigma": 1.92,
-                "epsilon2_residual_sigma": 1.73,
-                "reduction_pct": _rounded((1 - 1.73 / 1.92) * 100, 1),
             },
-            note="Checks the DP accuracy and epsilon=2.0 residual reduction claim.",
+            note=(
+                "Corrected epsilon=2 calibration has no residual discount; the published "
+                "4.84/4.36 comparison requires errata. Legacy 1.92/1.73 harness constants "
+                "lack measurement provenance and are not treated as DP evidence."
+            ),
         ),
         _ndss_claim(
             claim_id="NDSS-20",
@@ -1029,7 +1108,15 @@ def collect_evidence() -> list[ClaimEvidence]:
 
 
 def summary(evidence: list[ClaimEvidence]) -> dict[str, Any]:
-    scored = [item for item in evidence if item.status in {"measured", "formula"}]
+    errata_proposed = [
+        item.claim_id for item in evidence if item.measurements.get("errata_proposed") is True
+    ]
+    scored = [
+        item
+        for item in evidence
+        if item.status in {"measured", "formula"}
+        and item.measurements.get("errata_proposed") is not True
+    ]
     failed = [item.claim_id for item in scored if not item.passed]
     withdrawn = [item.claim_id for item in evidence if item.status == "withdrawn"]
     non_claim = [item.claim_id for item in evidence if item.status == "non_claim"]
@@ -1052,6 +1139,7 @@ def summary(evidence: list[ClaimEvidence]) -> dict[str, Any]:
         "withdrawn_claim_ids": withdrawn,
         "non_claim_ids": non_claim,
         "not_run_ids": not_run,
+        "errata_proposed_ids": errata_proposed,
         "by_status": by_status,
         "by_paper": by_paper,
     }
@@ -1077,7 +1165,10 @@ def run_claim_registry_cli(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         for item in evidence:
-            status = "PASS" if item.passed else "FAIL"
+            if item.measurements.get("errata_proposed") is True:
+                status = "ERRATA"
+            else:
+                status = "PASS" if item.passed else "FAIL"
             print(f"{status} {item.claim_id:8} {item.paper:9} {item.basis} - {item.note}")
         print()
         print(json.dumps(payload["summary"], indent=2, sort_keys=True))

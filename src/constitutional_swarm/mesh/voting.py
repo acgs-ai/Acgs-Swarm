@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
+from typing import Literal
+
+from constitutional_swarm.mesh.vote_envelope import SignedAssignment
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,11 +26,18 @@ class ValidationVote:
     @property
     def vote_hash(self) -> str:
         """Deterministic hash of this vote for proof chain."""
-        payload = (
-            f"{self.assignment_id}:{self.voter_id}:{self.approved}"
-            f":{self.reason}:{self.signature}:{self.constitutional_hash}:{self.content_hash}"
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+        payload = {
+            "approved": self.approved,
+            "assignment_id": self.assignment_id,
+            "constitutional_hash": self.constitutional_hash,
+            "content_hash": self.content_hash,
+            "reason": self.reason,
+            "signature": self.signature,
+            "timestamp": self.timestamp,
+            "voter_id": self.voter_id,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(b"constitutional-swarm.validation-vote.v2\x00" + encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,3 +56,9 @@ class RemoteVoteRequest:
     timestamp: float
     request_signer_public_key: str
     request_signature: str
+    task_id: str = ""
+    assigned_peers: tuple[str, ...] = ()
+    quorum: int = 0
+    evidence_mode: Literal["independent", "single_operator_dev"] = "independent"
+    protocol_version: int = 3
+    signed_assignment: SignedAssignment | None = None

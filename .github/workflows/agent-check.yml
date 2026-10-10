@@ -26,7 +26,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Create environment (standalone resolution)
-        run: uv sync --no-sources --extra dev --extra transport
+        run: uv sync --locked --no-sources --extra dev --extra transport
 
       - name: Agent self-check (registries + doc completeness)
         run: uv run --no-sync python scripts/agent_check.py

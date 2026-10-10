@@ -5,24 +5,114 @@ repo evidence. It is intentionally conservative: local scaffolding can support a
 public study, but it is not a substitute for collected blind-review results or
 external replication.
 
+## C15 Correction and Current Status
+
+The C12 forensic review invalidated the earlier completion interpretation. C15
+introduces controls for the local key-substitution and cross-condition-linkage
+defects in newly generated C15-format packs. The security rework adds
+reviewer-specific pseudonyms, opaque packet ordering, canonical packet checks in
+seal and verify paths, copied-answer diagnostics, and a strict evidence-name
+allowlist. The final rework removes plain unblinded-artifact hashes from
+coordinator manifests, adds a greater-than-95-percent reviewer-answer agreement
+diagnostic, requires a retained nonce source for standalone packet generation,
+and reports specific reviewer-packet leak codes. These changes define local
+integrity controls; they do not supply authenticated external provenance or new
+empirical study evidence. Historical commands and published numbers below remain
+recorded, but they are not current success evidence. The previous
+statement that the
+"public-study tier is verified" applied only to the presence and old-schema
+validation of the owner-published blind-review data and scorecard. It did not
+establish structural blinding, bind result claims to the bytes of referenced
+files, or use the incident as the statistical unit of independence.
+
+The C15 local validation contract requires the implementation to:
+
+- reject direct or mechanically normalized answer copies in reviewer artifacts;
+- treat all seven hidden answers as synthetic assessment classifications derived
+  deterministically from exposed incident attributes, without claiming that the
+  copy guard proves human reconstructability;
+- disclose that legitimate evidence availability and content can still reveal
+  condition identity even when schemas and superficial value domains match;
+- regenerate the answer key, condition key, templates, manifests, and every
+  manifested reviewer artifact from the secret per-pack `pack_nonce`, requiring
+  byte equality before scoring;
+- separately require `--verify-replication-kit` and reviewer-packet generation
+  from `--coordinator-pack` to regenerate and byte-compare the complete
+  coordinator pack, including unblinded `artifacts/**` sources omitted from
+  plain-hash manifests;
+- require an expected precollection commitment supplied separately from the
+  mutable bundle and bind that digest into the answer seal;
+- use the fixed six-reviewer cohort, with a balanced
+  assignment that exposes each reviewer to one condition per underlying
+  incident and reviewer-specific, condition-specific HMAC-SHA256 incident
+  pseudonyms, with packet rows and paths ordered only by opaque pseudonym;
+- reject answer rows outside the regenerated reviewer assignment;
+- compute significance only from the sealed answer matrix using an exact
+  one-sided sign test over incident-stratified, between-reviewer contrasts;
+- hash actual referenced file bytes during bundle construction and re-hash them
+  during validation, while rejecting logical evidence names outside the fixed
+  required set plus optional scorecard;
+- omit plain hashes of unblinded source artifacts from the coordinator reviewer
+  manifest and kit manifest; `--verify-replication-kit` and reviewer-packet
+  generation from `--coordinator-pack` regenerate those sources from the
+  retained nonce for path and byte verification;
+- keep `coordinator_pack/reviewer_manifest.json` and `kit_manifest.json`
+  coordinator-only until unblinding, distributing only isolated filtered
+  reviewer manifests;
+- derive standalone reviewer packets from a retained coordinator pack or nonce
+  file, reject a missing nonce source, and warn on compatibility-only inline
+  nonce input;
+- treat command lines, attestor names, and unsigned provenance as diagnostics.
+  They cannot set external-success or independence fields true. Exact or
+  greater-than-95-percent reviewer answer agreement is also diagnostic, not
+  authenticated copying or independence evidence; and
+- return explicit `unblinded_artifact_present` and
+  `coordinator_manifest_present` audit issues for those packet leak classes.
+
+Earlier per-answer significance, including `p ≈ 1.9e-211`, is superseded and
+requires incident-level reanalysis. The recorded values below are not edited or
+silently reinterpreted.
+
+Current status remains open pending regeneration, recollection, reanalysis, and
+authenticated non-ACGS provenance. The owner-published artifacts use the earlier
+schema and do not acquire C15 validity retroactively. C15 also leaves explicit
+trust boundaries: authenticity of the out-of-band commitment channel, semantic
+condition cues because value signatures differ by condition, reviewers sharing
+packets across cohorts, coordinator disclosure of hidden material, authenticated
+reviewer identity, and authenticated external execution.
+The audit therefore records that no completed external replication bundle exists
+that authenticates the claimed submitter, execution, or independence.
+
 ## Success Criteria Checklist
 
 | Requirement | Current evidence | Status |
 |---|---|---|
 | Fixed forensic questionnaire: who acted, authority, rule, evidence, approval or denial, failure, defensibility | `FORENSIC_QUESTIONNAIRE` in `src/constitutional_swarm/forensic_benchmark.py`; validated by `tests/test_governance_receipts.py` | Satisfied locally |
-| Matched artifact conditions: ungoverned logs, centralized structured logs, ACGS receipts and audit artifacts | `BASELINES` and generated artifact directories in `artifact_pack_to_files()` | Satisfied locally |
-| Blind reviewers see artifacts but not hidden ground truth or true condition labels | `artifact_pack_to_files()` writes coordinator-only `protocol.json`, `answer_key.json`, and `condition_key.json` separately; `--generate-reviewer-packet` writes only reviewer-safe files; reviewer-facing `reviewer_protocol.json`, `reviewer_instructions.md`, `reviewer_artifacts/<condition_label>/`, and `reviewer_answer_template.csv` use blinded labels and omit `ground_truth`, `answer_key`, `correct_answer`, `artifact_condition`, and true baseline names; `reviewer_manifest.json` hashes only reviewer-safe files; `--audit-reviewer-packet` verifies checksums and rejects coordinator-only files or true condition-name leaks | Satisfied locally |
-| Adversarial incident set includes collusion, memory poisoning, rule gaming, fragmented actions, and misleading traces | `ADVERSARIAL_TECHNIQUES` and deterministic `generate_incident_specs()` cover all five techniques across 50 to 200 incidents | Satisfied locally |
-| Scored outputs include accuracy, time, confidence calibration, inter-reviewer agreement, and delta versus strongest baseline | `score_reviewer_answers()`, `paired_sign_test_p_value()`, `build_result_bundle()`, and `validate_result_bundle()` compute and gate the required fields; `--validate-collected-answers` checks returned reviewer CSVs before unblinding; `--seal-collected-answers` hashes the collected blind CSV and reviewer manifest after validation; `--verify-collected-answers-seal` proves the scored CSV still matches the pre-unblinding seal; `--build-result-bundle` now requires the verified seal, reviewer packet, and public answer-matrix/seal references before loading hidden keys; `--validate-result-bundle` emits a compact summary of incidents, reviewers, questions, conditions, strongest baseline, delta, p-value, answer evidence, and external replication references; `--completion-audit-result-bundle` emits a conservative prompt-to-artifact checklist plus `required_public_artifacts` mapping with bundle references, known hashes, and verifier commands; `--write-external-replication-submission` renders a copy-paste issue/discussion draft plus JSON package for a validated rerun bundle; `--validate-external-replication-submission` checks the rendered package against the validated bundle and the public request template; `--validate-required-public-artifacts` validates the standalone public-evidence inventory, including required proof claims, duplicate/unknown artifact rejection, and artifact-specific verifier-command coverage, and exact required-reference mapping, immutable/non-placeholder bundle references, sha256 shape checks, and reference-field mapping, and canonical verifier-command equality, and completion remains blocked until live public-study and external-replication evidence is independently verified; `validate_answer_matrix()` and `--validate-answer-matrix` reject incomplete incident/condition/reviewer/question answer matrices before scoring | Satisfied locally
-| Result gate rejects toy, internal-only, or statistically weak success claims | `ExternalReplicationRecord` requires immutable/public reviewer-cohort and independent-attestation URIs; `ConditionScore` bounds reject impossible metric values; `validate_result_bundle()` recomputes strongest baseline, performance delta, and `acgs_wins` from condition scores, and rejects insufficient incidents, reviewers, questions, conditions, scorecard answer-count mismatches, non-significant p-values, incomplete replication, ACGS-internal replicators, TODO placeholders, weak artifact/reviewer-cohort/scorecard/attestation references that are not `https://`, `ipfs://`, `ar://`, or `sha256:`, plus reserved example/local placeholder hosts, and replication commands that skip reviewer-packet audit, replication-kit verification, reviewer-cohort validation, answer-matrix/seal/result-bundle binding, attestation cross-checks, or the final completion-audit result-bundle gate; `--validate-replication-metadata` applies the external replication metadata subset of the same gate; `--verify-replication-kit` proves copied kits still match `kit_manifest.json` and reruns the blind reviewer-packet audit; `--study-readiness-report` can declare the kit ready for reviewer launch while still reporting `success_evidence: false`; replication metadata templates are generated with `completed: false` and tested as non-success evidence | Satisfied locally |
-| Public benchmark with 50 to 200 adversarial incidents has collected blind-review responses | Public GitHub release `acgs-v0.1-benchmark-kit-2026-05-16` exposes owner-published blind-answer matrix, answer seal, and reviewer cohort manifest under immutable release URLs; the completion audit validates this public-study evidence, but it is not independent replication evidence | Satisfied via public release (owner-published public-study evidence only) |
-| ACGS artifacts beat the strongest baseline significantly on collected public-study data | Deterministic fixtures and the owner-published public release demonstrate the scoring path; no non-ACGS public-study scorecard exists yet | Open |
+| Matched artifact conditions: ungoverned logs, centralized structured logs, ACGS receipts and audit artifacts | `BASELINES` and generated artifact directories use one typed schema. C15 keeps integrity fields and strength fingerprints condition-neutral where feasible, while value signatures and legitimate evidence content can still differ by condition. Raw-log unknowns remain `unknown`/`unavailable`. | Defined locally; semantic-unblinding assessment remains empirical |
+| Blind reviewers see artifacts but not hidden ground truth or true condition labels | Coordinator-only keys, nonce, coordinator reviewer manifest, and kit manifest remain outside reviewer packets. C15 uses per-reviewer packets, balanced one-condition-per-incident assignments, reviewer-specific condition HMAC pseudonyms, opaque packet ordering, and structural answer-copy diagnostics. The controls do not prove human blinding or prevent reviewers from sharing packets across cohorts. | Local isolation controls present; empirical and collusion limits remain open |
+| Adversarial incident set includes collusion, memory poisoning, rule gaming, fragmented actions, and misleading traces | `ADVERSARIAL_TECHNIQUES` and `generate_artifact_pack()` (nonce-randomized incident sources) cover all five techniques across 50 to 200 incidents | Satisfied locally |
+| Scored outputs include accuracy, time, confidence calibration, inter-reviewer agreement, and delta versus strongest baseline | C15 computes the p-value from the sealed matrix with an exact one-sided sign test over incident-stratified, between-reviewer contrasts. Reviewer/question cells do not inflate the binomial sample size. Callers cannot supply a p-value override. Existing published statistics require reanalysis. | Requires C15-format incident-level reanalysis |
+| Result gate rejects substituted keys, changed artifacts, toy data, or statistically weak claims | The result gate regenerates and byte-compares the keys and manifested reviewer artifacts, requires a separately supplied precollection commitment, re-hashes referenced evidence, enforces reviewer assignment, and rejects unknown evidence logical names. Unblinded `artifacts/**` sources are excluded from result-evidence manifests; `--verify-replication-kit` and `--generate-reviewer-packet --coordinator-pack` regenerate and byte-compare the complete coordinator pack to protect them. Syntactically valid hashes, locally stored commitment records, metadata, attestor names, and self-reported commands do not prove independence. | Local integrity checks defined; external provenance remains open |
+| Public benchmark with 50 to 200 adversarial incidents has collected blind-review responses | The public release exposes owner-published artifacts under the earlier schema. Generator v5 changes pseudonyms, manifest membership, packet bytes, and commitments, so the pack must be regenerated and answers recollected under the revised contract. | Historical evidence; not current success proof |
+| ACGS artifacts beat the strongest baseline significantly on collected public-study data | Earlier per-answer significance is superseded. No C15-compliant incident-stratified reanalysis or authenticated non-ACGS public-study scorecard exists yet. | Open |
 | Inter-reviewer agreement is reported from real blind reviewers | Synthetic test answers and the owner-published release evidence report agreement; no independent reviewer cohort has rerun the benchmark | Open |
-| Non-ACGS group reruns the benchmark and reproduces the advantage | `ExternalReplicationRecord` schema and validation exist, but no completed external replication bundle exists | Open |
+| Non-ACGS group reruns the benchmark and reproduces the advantage | `ExternalReplicationRecord` can be checked for local shape and consistency, but the current format authenticates neither the submitter nor execution. `authenticated_provenance`, `external_success`, `independence_verified`, and `success_evidence` remain false. | Open; no authenticated provenance mechanism |
 
-## Current Verification Evidence
+## Historical Verification Evidence
 
-Fresh local checks from this work lane:
+The following outputs are preserved from earlier work lanes. They predate the
+C15 commitment, assignment, and provenance contract and cannot close the current
+audit. Literal values such as `reviewer_count=2`, `valid=true`, and
+`success_evidence=true` describe the historical validator only; the current
+contract requires the fixed balanced six-reviewer cohort and cannot authenticate
+external success.
+
+The historical seal commands below are retained verbatim as historical evidence.
+They are not current instructions. Generator v5 changes manifest membership, packet bytes, and
+precollection commitments, so current seal and verify invocations must use a
+newly generated pack and separately pass its coordinator-only `--protocol-json`,
+`--answer-key-json`, and `--condition-key-json` inputs. The nonce remains inside
+the coordinator-only condition key and must not be distributed to reviewers.
 
 ```bash
 python -m pytest tests/test_governance_receipts.py tests/test_v0_1_scope_docs.py -q
@@ -88,10 +178,12 @@ python scripts/run_governance_benchmark.py --study-readiness-report /tmp/acgs-be
 # report inter-reviewer agreement from real reviewers,
 # complete non-ACGS external replication metadata
 
-That readiness snapshot is kept as historical local evidence; the public
-GitHub release now supplies owner-published blind-review data and scorecard
-artifacts, so the public-study tier is verified. Those artifacts still do not
-satisfy the remaining independent non-ACGS replication requirement.
+That readiness snapshot is kept as historical local evidence. The earlier audit
+said the "public-study tier is verified" because the GitHub release supplied
+owner-published blind-review data and scorecard artifacts. C12 supersedes that
+conclusion: those artifacts still require structural-blinding, referenced-file,
+and incident-level statistical revalidation. The independent non-ACGS replication requirement
+remains open as well.
 
 python scripts/run_governance_benchmark.py --validate-result-bundle /tmp/acgs-bench-audit/kit/result-bundle.json
 # valid=true, acgs_inter_reviewer_agreement=1.0, acgs_wins=true,
@@ -328,6 +420,11 @@ Fresh scored-audit evidence from this turn:
   requirement:
   - `non_acgs_external_replication_verified`
 
+That was the old gate's result. The displayed `p_value_vs_strongest_baseline`
+is historical and must not be used as a success claim until the sealed answer
+matrix is reanalyzed with the incident as the unit of independence and every
+referenced file is re-hashed successfully.
+
 The current blocker payload from `--completion-audit-result-bundle` remains:
 
 - `non_acgs_external_replication_verified`
@@ -340,7 +437,12 @@ rg -n \
 
 ## Completion Decision
 
-Do not mark the active goal complete from local evidence alone. The owner-published
-public-study artifacts are verified, but they are not independent replication
-evidence. The remaining completion blocker is external to this repo state:
-completed non-ACGS replication.
+Do not mark the active goal complete from local evidence alone. The
+owner-published public-study artifacts exist, but their scientific claims are
+not currently verified under the C15 contract. Completion requires regenerated
+reviewer artifacts, new answers collected under the isolated assignment,
+incident-stratified between-reviewer reanalysis from the commitment-bound sealed
+matrix, successful canonical byte regeneration and referenced-file re-hashing,
+and authenticated non-ACGS replication provenance. The current format provides
+no provenance mechanism capable of setting external-success or independence
+true. Therefore no success claim is verified by this audit.

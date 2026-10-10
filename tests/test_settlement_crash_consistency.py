@@ -25,6 +25,36 @@ from constitutional_swarm.settlement_store import JSONLSettlementStore, Settleme
 _DIGEST_A = "11" * 32
 
 
+def _crash_vote_private_key(index: int):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return Ed25519PrivateKey.from_private_bytes(bytes([index + 1]) * 32)
+
+
+def _crash_assigner_private_key():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return Ed25519PrivateKey.from_private_bytes(bytes([250]) * 32)
+
+
+def _crash_vote_registry():
+    from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+
+    registry = VoteSignerRegistry()
+    registry.register(
+        "crash-test-assigner",
+        _crash_assigner_private_key().public_key(),
+        roles={"assigner"},
+    )
+    for index in range(4):
+        registry.register(
+            f"agent-{index:02d}",
+            _crash_vote_private_key(index).public_key(),
+            roles={"voter", "validator"},
+        )
+    return registry
+
+
 def _roles() -> dict[str, RoleIdentity]:
     return {
         "constitution_author": RoleIdentity(
@@ -105,15 +135,23 @@ def _mesh_worker() -> None:
         Constitution.default(),
         seed=7,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
         receipt_signing_private_key=receipt_key,
+        vote_registry=_crash_vote_registry(),
+        assigner_private_key=_crash_assigner_private_key(),
+        assigner_id="crash-test-assigner",
+        evidence_mode="single_operator_dev",
     )
     mesh._settle_crash_point = os.environ.get("ACGS_SETTLE_CRASH")
     for index in range(4):
-        mesh.register_local_signer(f"agent-{index:02d}")
+        mesh.register_local_signer(
+            f"agent-{index:02d}",
+            vote_private_key=_crash_vote_private_key(index),
+        )
     assignment = mesh.request_validation("agent-00", "summarize notes", "art-crash")
     Path(os.environ["ACGS_ASSIGNMENT_FILE"]).write_text(assignment.assignment_id, encoding="utf-8")
-    for voter in assignment.peers[:2]:
+    for voter in assignment.peers:
         mesh.validate_and_vote(assignment.assignment_id, voter)
     os._exit(0)
 
@@ -134,7 +172,7 @@ def _run_worker(tmp_path: Path, *, mode: str, backend: str, assignment_id: str) 
             "ACGS_STORE_PATH": str(store_path),
             "ACGS_STORE_BACKEND": backend,
             "ACGS_ASSIGNMENT_ID": assignment_id,
-            "PYTHONPATH": "src:.",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
         }
     )
     completed = subprocess.run(
@@ -232,7 +270,7 @@ def _run_mesh_crash(tmp_path: Path, *, point: str, backend: str = "jsonl") -> tu
             "ACGS_STORE_BACKEND": backend,
             "ACGS_ASSIGNMENT_FILE": str(assignment_file),
             "ACGS_RECEIPT_KEY": key.private_bytes_raw().hex(),
-            "PYTHONPATH": "src:.",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
         }
     )
     completed = subprocess.run(
@@ -261,7 +299,12 @@ def test_mesh_settle_crash_after_pending_is_recoverable(tmp_path) -> None:
         Constitution.default(),
         seed=3,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=_crash_vote_registry(),
+        assigner_private_key=_crash_assigner_private_key(),
+        assigner_id="crash-test-assigner",
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
     assert report.settled == 1
@@ -293,7 +336,12 @@ def test_mesh_settle_crash_after_append_keeps_committed_row(tmp_path) -> None:
         Constitution.default(),
         seed=3,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=_crash_vote_registry(),
+        assigner_private_key=_crash_assigner_private_key(),
+        assigner_id="crash-test-assigner",
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
     assert report.failed == 0
@@ -331,7 +379,12 @@ def test_tampered_pending_votes_fail_closed(tmp_path) -> None:
         Constitution.default(),
         seed=3,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=_crash_vote_registry(),
+        assigner_private_key=_crash_assigner_private_key(),
+        assigner_id="crash-test-assigner",
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
     assert report.failed == 1
@@ -364,7 +417,12 @@ def test_empty_pending_votes_fail_closed(tmp_path) -> None:
         Constitution.default(),
         seed=3,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=_crash_vote_registry(),
+        assigner_private_key=_crash_assigner_private_key(),
+        assigner_id="crash-test-assigner",
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
     assert report.failed == 1

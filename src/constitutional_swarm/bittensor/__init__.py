@@ -135,10 +135,13 @@ from constitutional_swarm.bittensor.subnet_owner import (
 from constitutional_swarm.bittensor.synapse_adapter import (
     HAS_BITTENSOR,
     GovernanceDeliberation,
+    authenticate_response,
     bt_to_deliberation,
     bt_to_judgment,
     deliberation_to_bt,
     judgment_to_bt,
+    request_binding_digest,
+    verify_axon_response_signature,
 )
 from constitutional_swarm.bittensor.synapses import (
     DeliberationSynapse,
@@ -265,9 +268,12 @@ __all__ = [
     "ValidatorStats",
     "WeightUpdate",
     "ZKPStubProver",
+    "authenticate_response",
     "bt_to_deliberation",
     "bt_to_judgment",
     "deliberation_to_bt",
     "judgment_to_bt",
+    "request_binding_digest",
+    "verify_axon_response_signature",
     "verify_merkle_path",
 ]

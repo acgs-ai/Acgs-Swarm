@@ -40,6 +40,7 @@ def _build_mesh(*, seed: int, shadow_spectral: bool) -> ConstitutionalMesh:
         seed=seed,
         use_manifold=True,
         shadow_spectral=shadow_spectral,
+        evidence_mode="single_operator_dev",
     )
     for index in range(8):
         mesh.register_local_signer(f"agent-{index:02d}", domain=f"domain-{index % 3}")
@@ -69,9 +70,9 @@ def test_shadow_spectral_tracking_never_changes_live_peer_assignment() -> None:
         if assignment_live.peers != assignment_shadow.peers:
             divergence_count += 1
 
-        for peer in assignment_live.peers[:2]:
+        for peer in assignment_live.peers:
             _signed_vote(live, assignment_live.assignment_id, peer, approved=True)
-        for peer in assignment_shadow.peers[:2]:
+        for peer in assignment_shadow.peers:
             _signed_vote(shadow, assignment_shadow.assignment_id, peer, approved=True)
 
     shadow_summary: dict[str, Any] | None = shadow.shadow_metrics_summary()

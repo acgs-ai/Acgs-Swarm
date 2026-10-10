@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 import argparse
-import hashlib
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-TLC_JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
-TLC_VERSION_LINE = "TLC2 Version 2.19 of 08 August 2024"
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from _tlc_common import (  # noqa: E402
+    TLC_JAR_SHA256,
+    TLC_VERSION_LINE,
+    resolve_java,
+    stage_jar,
+)
+from _tlc_common import sha256_file as _sha256  # noqa: E402
+
 DEFAULT_CONFIGS = (
     "apcc_safety.cfg",
     "apcc_liveness.cfg",
@@ -115,14 +125,6 @@ def classify_result(exit_code: int, output: str, expected_witness: str | None) -
     )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _stats(output: str) -> str:
     lines = [
         line.strip()
@@ -132,11 +134,13 @@ def _stats(output: str) -> str:
     return " | ".join(lines) if lines else "state statistics unavailable"
 
 
-def run_config(jar: Path, specs: Path, config: str, timeout: int) -> bool:
+def run_config(
+    jar: Path, specs: Path, config: str, timeout: int, java: str = "java"
+) -> bool:
     module = CONFIG_MODULE[config]
     completed = subprocess.run(
         [
-            "java",
+            java,
             "-cp",
             str(jar),
             "tlc2.TLC",
@@ -173,20 +177,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", action="append", choices=DEFAULT_CONFIGS)
     parser.add_argument("--timeout", type=int, default=360)
     args = parser.parse_args(argv)
-    if not args.tlc_jar.is_file() or _sha256(args.tlc_jar) != TLC_JAR_SHA256:
-        print(
-            "FAIL: TLC jar is missing or does not match pinned v1.7.4 SHA-256",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        results = [
-            run_config(args.tlc_jar, args.specs, config, args.timeout)
-            for config in tuple(args.config or DEFAULT_CONFIGS)
-        ]
-    except subprocess.TimeoutExpired as exc:
-        print(f"FAIL: TLC timeout after {exc.timeout}s", file=sys.stderr)
-        return 2
+    with tempfile.TemporaryDirectory(prefix="apcc-tlc-") as private_dir:
+        # Hash and execute one private copy so the checked bytes are the run bytes.
+        try:
+            jar = stage_jar(args.tlc_jar, Path(private_dir))
+            jar_valid = _sha256(jar) == TLC_JAR_SHA256
+        except OSError:
+            jar_valid = False
+        if not jar_valid:
+            print(
+                "FAIL: TLC jar is missing or does not match pinned v1.7.4 SHA-256",
+                file=sys.stderr,
+            )
+            return 2
+        java = resolve_java("java")
+        try:
+            results = [
+                run_config(jar, args.specs, config, args.timeout, java)
+                for config in tuple(args.config or DEFAULT_CONFIGS)
+            ]
+        except subprocess.TimeoutExpired as exc:
+            print(f"FAIL: TLC timeout after {exc.timeout}s", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"FAIL: could not start Java ({java}): {exc}", file=sys.stderr)
+            return 2
     return 0 if all(results) else 1
 
 

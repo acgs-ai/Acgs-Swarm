@@ -14,16 +14,26 @@ would be false-green. The subprocess gives a hermetic interpreter.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_SRC = _REPO_ROOT / "src"
 
 
 def _run_isolated(snippet: str) -> subprocess.CompletedProcess[str]:
     """Run ``snippet`` in a fresh interpreter; return the completed process."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_REPO_SRC)
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(snippet)],
         capture_output=True,
+        cwd=_REPO_ROOT,
+        env=env,
         text=True,
     )
 

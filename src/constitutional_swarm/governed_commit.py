@@ -13,7 +13,7 @@ import json
 import secrets
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
@@ -55,6 +55,7 @@ from constitutional_swarm.apcc.ports import (
     AssembleEvidenceRequest,
     AtomicCommitRequest,
     AuthorityRuntime,
+    CurrentStatusRequest,
     LogicalNodeStatusRequest,
     ProposeCommitRequest,
     RevocationRequest,
@@ -70,15 +71,14 @@ from constitutional_swarm.apcc.gcb_projection import (
     _GCBProjectionPlan,
 )
 from constitutional_swarm.apcc.sqlite_store import SQLiteAuthorityStore
+from constitutional_swarm.apcc.verifier import TrustBinding
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
 
 GCB_RECEIPT_PROFILE = "acgs-swarm/gcb-receipt/v1"
 GCB_SIGNATURE_ALGORITHM = "Ed25519"
 GCB_COMMIT_INTENT = "governed_commit"
-_DOMAIN = b"ACGS-SWARM\x00GCB\x00V1\x00"
 _VERDICT_DOMAIN = b"ACGS-SWARM\x00GCB\x00VERDICT\x00V1\x00"
-_CONTROL_DOMAIN = b"ACGS-SWARM\x00GCB\x00CONTROL\x00V1\x00"
 _CONTROL_SIGNER_DOMAIN = b"ACGS-SWARM-GCB-CONTROL-V1"
 _MAX_WORKFLOW_NODES = 1000
 _ATTEMPT_DOMAIN = b"ACGS-SWARM\x00GCB\x00ATTEMPT\x00V1\x00"
@@ -202,8 +202,13 @@ class GovernedReceiptPayload:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def canonical_bytes(self) -> bytes:
-        statement = {
+    def _producer_statement(self) -> dict[str, str]:
+        """The APCC producer statement: the exact agent-signed projection.
+
+        Both the agent signature (``canonical_bytes``) and the APCC proposal
+        digest are derived from this one mapping so they cannot drift.
+        """
+        return {
             "protocol_version": "APCC-1.0-draft",
             "statement_type": "apcc.producer-statement",
             "producer_key_id": self.key_id,
@@ -221,7 +226,11 @@ class GovernedReceiptPayload:
             "issued_at_ms": str(self.issued_at * 1000),
             "expires_at_ms": str(self.expires_at * 1000),
         }
-        return domain_preimage(PROPOSAL_DOMAIN, canonical_statement(statement))
+
+    def canonical_bytes(self) -> bytes:
+        return domain_preimage(
+            PROPOSAL_DOMAIN, canonical_statement(self._producer_statement())
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,13 +481,6 @@ def sign_authoritative_verdict(
     return _sign_authoritative_verdict(unsigned, private_key, detached=False)
 
 
-def sign_control_command(
-    command: ControlCommand, private_key: Ed25519PrivateKey
-) -> ControlCommand:
-    signature = private_key.sign(command.canonical_bytes())
-    return replace(command, signature=base64.b64encode(signature).decode("ascii"))
-
-
 def _signed_receipt_material(receipt: SignedGovernedReceipt) -> str:
     return json.dumps(
         {"payload": receipt.payload.to_dict(), "signature": receipt.signature},
@@ -517,6 +519,29 @@ def _apcc_predecessors(
     return tuple(
         sorted(references, key=lambda item: canonical_statement(item.to_object()))
     )
+
+
+def _policy_binding_for(
+    config: APCCAuthorityConfig, scope: Sequence[str]
+) -> TrustBinding | None:
+    """Return the configured policy binding for an exact scope, if any."""
+    resolved = tuple(scope)
+    return next(
+        (binding for binding in config.policy_trust if binding.scope == resolved),
+        None,
+    )
+
+
+def _policy_signer_public_key(signer: Any, policy_version: str) -> bytes:
+    """Return the signer's key for an explicit policy version.
+
+    Single-key signers that take no version argument are still accepted; the
+    caller always compares the result with the configured trust binding.
+    """
+    try:
+        return bytes(signer.public_key_bytes(policy_version))
+    except TypeError:
+        return bytes(signer.public_key_bytes())
 
 
 @final
@@ -594,6 +619,8 @@ class GovernedCommitBoundary:
         verifier_key_id: str,
         admin_public_key: Ed25519PublicKey | None,
         admin_key_id: str,
+        trusted_verifier_public_key: bytes,
+        trusted_admin_public_key: bytes,
         allow_apcc_peer: bool = False,
     ) -> None:
         existed = Path(self.path).exists() and Path(self.path).stat().st_size > 0
@@ -753,6 +780,16 @@ class GovernedCommitBoundary:
                 != seal["admin_key_fingerprint"]
             ):
                 raise GovernanceBypassDenied("authority_anchor_integrity_failure")
+            # Trust anchors come from the caller's bootstrap, never from the row
+            # being verified: a rewritten seal (key plus fingerprint) is refused.
+            if (
+                bytes(seal["verifier_public_key"]) != trusted_verifier_public_key
+                or bytes(seal["admin_public_key"]) != trusted_admin_public_key
+                or seal["verifier_key_id"] != verifier_key_id
+                or seal["admin_key_id"] != admin_key_id
+                or seal["verifier_policy_id"] != verifier_policy_id
+            ):
+                raise GovernanceBypassDenied("authority_anchor_mismatch")
             self.store_id = seal["store_id"]
             self.verifier_policy_id = seal["verifier_policy_id"]
             self.verifier_key_id = seal["verifier_key_id"]
@@ -950,6 +987,8 @@ class GovernedCommitBoundary:
             separators=(",", ":"),
         )
         try:
+            # ``_transaction`` is the sole finalize+COMMIT owner; the committed
+            # decision is returned only after the write fence has been released.
             with self._transaction() as conn:
                 prior = conn.execute(
                     "SELECT * FROM gcb_control_events WHERE command_id=?",
@@ -999,9 +1038,14 @@ class GovernedCommitBoundary:
                         denial,
                         current_version,
                     )
+                # A denied transition must leave no partial writes behind: the
+                # action runs under a savepoint that is rolled back on denial.
+                conn.execute("SAVEPOINT gcb_control_action")
                 try:
                     result = self._apply_control_action(conn, command)
                 except (GovernanceBypassDenied, KeyError, TypeError, ValueError) as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT gcb_control_action")
+                    conn.execute("RELEASE SAVEPOINT gcb_control_action")
                     reason = str(exc) or type(exc).__name__
                     self._record_control(
                         conn,
@@ -1026,6 +1070,7 @@ class GovernedCommitBoundary:
                         reason,
                         current_version,
                     )
+                conn.execute("RELEASE SAVEPOINT gcb_control_action")
                 next_version = current_version + 1
                 changed = conn.execute(
                     """UPDATE store_seal SET control_version=?
@@ -1043,22 +1088,18 @@ class GovernedCommitBoundary:
                     next_version,
                     result,
                 )
-                if command.action is ControlAction.REVOKE_ROOT:
-                    # The SQLite COMMIT is the fence linearization point.  A
-                    # crash or response loss after it must not undo authority.
-                    if hasattr(self, "_apcc_store"):
-                        self._apcc_store._finalize_attached_gcb_transaction(conn)
-                    conn.commit()
-                    self._inject_fault(
-                        _GCBFaultCheckpoint.AFTER_REVOCATION_FENCE_COMMIT
-                    )
-                return ControlDecision(
+                committed = ControlDecision(
                     command.command_id,
                     CommitOutcome.COMMITTED,
                     "verified_admin_transition",
                     next_version,
                     result,
                 )
+            if command.action is ControlAction.REVOKE_ROOT:
+                # The SQLite COMMIT is the fence linearization point.  A crash
+                # or response loss after it must not undo authority.
+                self._inject_fault(_GCBFaultCheckpoint.AFTER_REVOCATION_FENCE_COMMIT)
+            return committed
         except sqlite3.Error:
             return ControlDecision(
                 command.command_id,
@@ -1436,10 +1477,9 @@ class GovernedCommitBoundary:
                 ):
                     raise GovernanceBypassDenied("recovery_topology_mismatch")
             self._verify_committed_evidence(conn, workflow_id)
-            return {
-                node_id: self._effective_node_state(conn, row)
-                for node_id, row in stored.items()
-            }
+            return self._effective_node_states(
+                tuple(stored.values()), self._revoked_roots(conn, workflow_id)
+            )
 
     def _verify_committed_evidence(
         self, conn: sqlite3.Connection, workflow_id: str
@@ -1501,18 +1541,13 @@ class GovernedCommitBoundary:
                 verdict_body = json.loads(evidence["verdict_material"])
                 verdict_body["decision"] = VerdictDecision(verdict_body["decision"])
                 verdict = AuthoritativeVerdict(**verdict_body)
-                policy_binding = next(
+                policy_binding = _policy_binding_for(
+                    self._apcc_config,
                     (
-                        binding
-                        for binding in self._apcc_config.policy_trust
-                        if binding.scope
-                        == (
-                            receipt.payload.verifier_policy_id,
-                            receipt.payload.policy_version,
-                            str(receipt.payload.policy_epoch),
-                        )
+                        receipt.payload.verifier_policy_id,
+                        receipt.payload.policy_version,
+                        str(receipt.payload.policy_epoch),
                     ),
-                    None,
                 )
                 if policy_binding is None:
                     raise ValueError("untrusted policy binding")
@@ -1949,20 +1984,6 @@ class GovernedCommitBoundary:
     ) -> CommitRequest:
         return CommitRequest(receipt, verdict)
 
-    def _apcc_validation_reason(self, request: CommitRequest) -> str | None:
-        request_hash = request.canonical_hash()
-        with self._connect() as connection:
-            prior = connection.execute(
-                "SELECT * FROM decisions WHERE commit_id=?", (request.commit_id,)
-            ).fetchone()
-            if (
-                prior is not None
-                and prior["request_hash"] == request_hash
-                and prior["outcome"] == CommitOutcome.COMMITTED.value
-            ):
-                return None
-            return self._validate(connection, request)
-
     def _deny_invalid_apcc_request(
         self, request: CommitRequest
     ) -> CommitDecision | None:
@@ -2034,24 +2055,7 @@ class GovernedCommitBoundary:
             payload.policy_epoch,
         )
         registry_binding = self._apcc_config.registry_trust[0]
-        producer = {
-            "protocol_version": "APCC-1.0-draft",
-            "statement_type": "apcc.producer-statement",
-            "producer_key_id": payload.key_id,
-            "workflow_id": payload.workflow_id,
-            "node_id": payload.node_id,
-            "attempt_id": payload.attempt_id,
-            "agent_id": payload.agent_id,
-            "actor_authority": payload.authority_snapshot_digest,
-            "input_digest": payload.input_digest,
-            "output_digest": payload.output_digest,
-            "predecessor_root": payload.predecessor_root,
-            "expected_node_version": str(payload.expected_node_state_version),
-            "commit_id": payload.commit_id,
-            "nonce": payload.nonce,
-            "issued_at_ms": str(payload.issued_at * 1000),
-            "expires_at_ms": str(payload.expires_at * 1000),
-        }
+        producer = payload._producer_statement()
         proposal_digest = sha256_digest(canonical_statement(producer))
         policy = {
             "protocol_version": "APCC-1.0-draft",
@@ -2194,22 +2198,15 @@ class GovernedCommitBoundary:
         policy_version: str,
         policy_epoch: int,
     ) -> Any:
-        scope = (policy_id, policy_version, str(policy_epoch))
-        binding = next(
-            (
-                candidate
-                for candidate in self._apcc_config.policy_trust
-                if candidate.scope == scope
-            ),
-            None,
+        binding = _policy_binding_for(
+            self._apcc_config, (policy_id, policy_version, str(policy_epoch))
         )
         if binding is None or self._policy_signer is None:
             raise GovernanceBypassDenied("untrusted_policy_binding")
-        try:
-            signer_public_key = self._policy_signer.public_key_bytes(policy_version)
-        except TypeError:
-            signer_public_key = self._policy_signer.public_key_bytes()
-        if bytes(signer_public_key) != binding.public_key:
+        signer_public_key = _policy_signer_public_key(
+            self._policy_signer, policy_version
+        )
+        if signer_public_key != binding.public_key:
             raise GovernanceBypassDenied("untrusted_policy_binding")
         return binding
 
@@ -2519,18 +2516,13 @@ class GovernedCommitBoundary:
         receipt_digest = _signed_receipt_digest(request.receipt)
         policy_binding = None
         if hasattr(self, "_apcc_config"):
-            policy_binding = next(
+            policy_binding = _policy_binding_for(
+                self._apcc_config,
                 (
-                    binding
-                    for binding in self._apcc_config.policy_trust
-                    if binding.scope
-                    == (
-                        workflow["verifier_policy_id"],
-                        workflow["policy_version"],
-                        str(workflow["policy_epoch"]),
-                    )
+                    workflow["verifier_policy_id"],
+                    workflow["policy_version"],
+                    str(workflow["policy_epoch"]),
                 ),
-                None,
             )
             if policy_binding is None:
                 return "untrusted_policy_binding"
@@ -2610,16 +2602,20 @@ class GovernedCommitBoundary:
                    ORDER BY event_id LIMIT ?""",
                 (projection.workflow_id, limit),
             ).fetchall()
+            # One topology read and one batched status read per dispatch,
+            # not one closure walk and one attested read per outbox row.
+            revoked = self._revoked_nodes(conn, projection.workflow_id)
+            consumable = self._apcc_consumable_nodes(
+                conn, projection.workflow_id, [row["node_id"] for row in rows]
+            )
             for row in rows:
-                if not self._apcc_node_is_consumable(
-                    conn, row["workflow_id"], row["node_id"]
-                ):
+                if row["node_id"] not in consumable:
                     conn.execute(
                         "UPDATE outbox SET dispatched=1 WHERE event_id=?",
                         (row["event_id"],),
                     )
                     continue
-                if self._is_revoked_closure(conn, row["workflow_id"], row["node_id"]):
+                if row["node_id"] in revoked:
                     conn.execute(
                         "UPDATE outbox SET dispatched=1 WHERE event_id=?",
                         (row["event_id"],),
@@ -2780,6 +2776,71 @@ class GovernedCommitBoundary:
             return False
         return status.status is AuthorityStatusValue.CURRENT
 
+    def _apcc_consumable_nodes(
+        self,
+        conn: sqlite3.Connection,
+        workflow_id: str,
+        node_ids: Sequence[str],
+    ) -> set[str]:
+        """Batched ``_apcc_node_is_consumable``: the same per-node verdicts.
+
+        A node is consumable only if its certificate is CURRENT.  A malformed
+        digest excludes only that node.  If the store rejects a whole chunk
+        (for example one unknown or undisposed certificate), every node in
+        that chunk is re-checked individually, so one bad certificate never
+        suppresses the other rows' publication.
+        """
+        if not hasattr(self, "_apcc_store"):
+            return set(node_ids)
+        digests: dict[str, str] = {}
+        for node_id in dict.fromkeys(node_ids):
+            logical = conn.execute(
+                """SELECT certificate_digest FROM logical_nodes
+                   WHERE workflow_id=? AND node_id=?""",
+                (workflow_id, node_id),
+            ).fetchone()
+            if logical is not None and logical["certificate_digest"] is not None:
+                digests[node_id] = logical["certificate_digest"]
+        consumable: set[str] = set()
+        pending = list(digests.items())
+        while pending:
+            chunk, pending = pending[:_MAX_WORKFLOW_NODES], pending[_MAX_WORKFLOW_NODES:]
+            batch: list[tuple[str, CurrentStatusRequest]] = []
+            for node_id, digest in chunk:
+                try:
+                    batch.append(
+                        (
+                            node_id,
+                            CurrentStatusRequest(
+                                digest, b64u_encode(secrets.token_bytes(16))
+                            ),
+                        )
+                    )
+                except ValueError:
+                    continue
+            if not batch:
+                continue
+            requests = tuple(request for _node_id, request in batch)
+            try:
+                results = self._apcc_store.current_status_batch(requests)
+            except (RuntimeError, ValueError):
+                consumable.update(
+                    node_id
+                    for node_id, _request in batch
+                    if self._apcc_node_is_consumable(conn, workflow_id, node_id)
+                )
+                continue
+            if len(results) != len(requests):
+                raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
+            for (node_id, request), result in zip(batch, results, strict=True):
+                if result.request != request:
+                    raise GovernanceBypassDenied(
+                        "authority_status_batch_order_mismatch"
+                    )
+                if result.status.status is AuthorityStatusValue.CURRENT:
+                    consumable.add(node_id)
+        return consumable
+
     def pending_outbox(self) -> int:
         with self._connect() as conn:
             return conn.execute(
@@ -2830,31 +2891,6 @@ class GovernedCommitBoundary:
             row["commit_id"],
         )
 
-    def _effective_node_state(
-        self, conn: sqlite3.Connection, row: sqlite3.Row
-    ) -> GovernedNodeState:
-        state = self._node_state(row)
-        workflow_id = row["workflow_id"]
-        node_id = row["node_id"]
-        if not self._is_revoked_closure(conn, workflow_id, node_id):
-            return state
-        roots = {
-            root["root_node_id"]
-            for root in conn.execute(
-                "SELECT root_node_id FROM revoked_roots WHERE workflow_id=?",
-                (workflow_id,),
-            ).fetchall()
-        }
-        if node_id in roots:
-            status = "revoked"
-        elif row["status"] in {"revoked", "superseded", "blocked"}:
-            status = row["status"]
-        elif row["status"] == "governed_committed":
-            status = "superseded"
-        else:
-            status = "blocked"
-        return replace(state, status=status)
-
     @classmethod
     def _effective_node_states(
         cls,
@@ -2863,18 +2899,7 @@ class GovernedCommitBoundary:
     ) -> dict[str, GovernedNodeState]:
         """Compute one workflow's revocation closure without per-node SQL."""
         row_by_id = {str(row["node_id"]): row for row in rows}
-        children: dict[str, list[str]] = {}
-        for node_id, row in row_by_id.items():
-            for predecessor in json.loads(row["predecessors"]):
-                children.setdefault(str(predecessor), []).append(node_id)
-        revoked_nodes: set[str] = set()
-        pending = list(revoked_roots)
-        while pending:
-            node_id = pending.pop()
-            if node_id in revoked_nodes:
-                continue
-            revoked_nodes.add(node_id)
-            pending.extend(children.get(node_id, ()))
+        revoked_nodes = cls._descendants(cls._children_map(rows), revoked_roots)
         states: dict[str, GovernedNodeState] = {}
         for node_id, row in row_by_id.items():
             state = cls._node_state(row)
@@ -2891,6 +2916,71 @@ class GovernedCommitBoundary:
                 status = "blocked"
             states[node_id] = replace(state, status=status)
         return states
+
+    @staticmethod
+    def _children_map(rows: Sequence[sqlite3.Row]) -> dict[str, list[str]]:
+        """Invert one workflow's predecessor lists into a children adjacency map.
+
+        Every node row is a key.  CREATE_WORKFLOW rejects unknown predecessors,
+        so a predecessor without a node row means the stored topology was
+        tampered with; fail closed rather than silently shrink a closure.
+        """
+        children: dict[str, list[str]] = {str(row["node_id"]): [] for row in rows}
+        for row in rows:
+            node_id = str(row["node_id"])
+            for predecessor in json.loads(row["predecessors"]):
+                if str(predecessor) not in children:
+                    raise GovernanceBypassDenied("workflow_topology_integrity_failure")
+                children[str(predecessor)].append(node_id)
+        return children
+
+    @staticmethod
+    def _descendants(
+        children: Mapping[str, Sequence[str]], seeds: Iterable[str]
+    ) -> set[str]:
+        """Seeds plus everything reachable from them (linear BFS).
+
+        ``children`` must come from ``_children_map``; a seed with no node row
+        is an integrity failure, not an empty closure.
+        """
+        reached: set[str] = set()
+        pending = list(seeds)
+        while pending:
+            node_id = pending.pop()
+            if node_id in reached:
+                continue
+            if node_id not in children:
+                raise GovernanceBypassDenied("workflow_topology_integrity_failure")
+            reached.add(node_id)
+            pending.extend(children[node_id])
+        return reached
+
+    @staticmethod
+    def _revoked_roots(conn: sqlite3.Connection, workflow_id: str) -> set[str]:
+        return {
+            row["root_node_id"]
+            for row in conn.execute(
+                "SELECT root_node_id FROM revoked_roots WHERE workflow_id=?",
+                (workflow_id,),
+            ).fetchall()
+        }
+
+    def _topology(
+        self, conn: sqlite3.Connection, workflow_id: str
+    ) -> dict[str, list[str]]:
+        return self._children_map(
+            conn.execute(
+                "SELECT node_id,predecessors FROM nodes WHERE workflow_id=?",
+                (workflow_id,),
+            ).fetchall()
+        )
+
+    def _revoked_nodes(self, conn: sqlite3.Connection, workflow_id: str) -> set[str]:
+        """Every node in the revocation closure of one workflow."""
+        roots = self._revoked_roots(conn, workflow_id)
+        if not roots:
+            return set()
+        return self._descendants(self._topology(conn, workflow_id), roots)
 
     @staticmethod
     def _decision(row: sqlite3.Row) -> CommitDecision:
@@ -3040,33 +3130,6 @@ class GovernedCommitBoundary:
             )
         return _canonical_digest(entries)
 
-    def _unlock_children(
-        self, conn: _LegacyTransaction, workflow_id: str, committed_node_id: str
-    ) -> None:
-        rows = conn.execute(
-            "SELECT * FROM nodes WHERE workflow_id=? AND status='blocked'",
-            (workflow_id,),
-        ).fetchall()
-        for row in rows:
-            predecessors = json.loads(row["predecessors"])
-            if committed_node_id not in predecessors:
-                continue
-            if self._is_revoked_closure(conn, workflow_id, row["node_id"]):
-                continue
-            placeholders = ",".join("?" for _ in predecessors)
-            states = conn.execute(
-                f"SELECT status,commit_id FROM nodes WHERE workflow_id=? AND node_id IN ({placeholders})",
-                (workflow_id, *predecessors),
-            ).fetchall()
-            if len(states) == len(predecessors) and all(
-                state["status"] == "governed_committed" and state["commit_id"]
-                for state in states
-            ):
-                conn.execute(
-                    "UPDATE nodes SET status='ready',version=version+1 WHERE workflow_id=? AND node_id=?",
-                    (workflow_id, row["node_id"]),
-                )
-
     def _taint_descendants(
         self, conn: sqlite3.Connection, workflow_id: str, agent_id: str
     ) -> None:
@@ -3079,19 +3142,9 @@ class GovernedCommitBoundary:
                 (workflow_id, agent_id),
             ).fetchall()
         }
-        changed = True
-        while changed:
-            changed = False
-            for row in conn.execute(
-                "SELECT node_id,predecessors FROM nodes WHERE workflow_id=?",
-                (workflow_id,),
-            ).fetchall():
-                if row["node_id"] not in tainted and tainted.intersection(
-                    json.loads(row["predecessors"])
-                ):
-                    tainted.add(row["node_id"])
-                    changed = True
-        for node_id in tainted:
+        if tainted:
+            tainted = self._descendants(self._topology(conn, workflow_id), tainted)
+        for node_id in sorted(tainted):
             conn.execute(
                 """UPDATE nodes SET tainted=1,
                    status=CASE WHEN status='governed_committed' THEN status ELSE 'revoked' END,
@@ -3102,21 +3155,7 @@ class GovernedCommitBoundary:
     def _descendant_closure(
         self, conn: sqlite3.Connection, workflow_id: str, root_node_id: str
     ) -> set[str]:
-        closure = {root_node_id}
-        rows = conn.execute(
-            "SELECT node_id,predecessors FROM nodes WHERE workflow_id=?",
-            (workflow_id,),
-        ).fetchall()
-        changed = True
-        while changed:
-            changed = False
-            for row in rows:
-                if row["node_id"] not in closure and closure.intersection(
-                    json.loads(row["predecessors"])
-                ):
-                    closure.add(row["node_id"])
-                    changed = True
-        return closure
+        return self._descendants(self._topology(conn, workflow_id), (root_node_id,))
 
     def _is_revoked_closure(
         self, conn: _LegacyTransaction, workflow_id: str, node_id: str
@@ -3173,14 +3212,6 @@ class TrustedGovernanceBootstrap:
         ).hexdigest()[:32]
         self.default_verdict = VerdictDecision.ALLOW
 
-    @staticmethod
-    def _key_id(public_key: Ed25519PublicKey) -> str:
-        return hashlib.sha256(
-            public_key.public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-        ).hexdigest()[:32]
-
     def provision(
         self,
         path: str | Path,
@@ -3201,9 +3232,17 @@ class TrustedGovernanceBootstrap:
         resolved = Path(path)
         if resolved.exists() and resolved.stat().st_size > 0:
             raise GovernanceBypassDenied("authority_store_already_exists")
+        # The sealed verifier is the configured binding the bootstrap names
+        # (policy_trust[0]); the signer must hold exactly that version's key.
+        verifier_binding = self.config.policy_trust[0]
+        if (
+            _policy_signer_public_key(self._policy_signer, verifier_binding.scope[1])
+            != verifier_binding.public_key
+        ):
+            raise GovernanceBypassDenied("untrusted_policy_binding")
         SQLiteAuthorityStore.provision(resolved, self.config, (), runtime=self.runtime)
         verifier_public = Ed25519PublicKey.from_public_bytes(
-            bytes(self._policy_signer.public_key_bytes())
+            verifier_binding.public_key
         )
         admin_public = Ed25519PublicKey.from_public_bytes(
             bytes(self._control_signer.public_key_bytes())
@@ -3255,6 +3294,8 @@ class TrustedGovernanceBootstrap:
             verifier_key_id=self.verifier_key_id,
             admin_public_key=admin_public_key,
             admin_key_id=self.admin_key_id,
+            trusted_verifier_public_key=self.config.policy_trust[0].public_key,
+            trusted_admin_public_key=bytes(self._control_signer.public_key_bytes()),
             allow_apcc_peer=True,
         )
         store = SQLiteAuthorityStore._open_gcb(
@@ -3279,18 +3320,13 @@ class TrustedGovernanceBootstrap:
     ) -> AuthoritativeVerdict:
         payload = receipt.payload
         now = self.runtime.clock.now_ms() // 1000
-        binding = next(
+        binding = _policy_binding_for(
+            self.config,
             (
-                candidate
-                for candidate in self.config.policy_trust
-                if candidate.scope
-                == (
-                    payload.verifier_policy_id,
-                    payload.policy_version,
-                    str(payload.policy_epoch),
-                )
+                payload.verifier_policy_id,
+                payload.policy_version,
+                str(payload.policy_epoch),
             ),
-            None,
         )
         if binding is None:
             # Preserve a signed denial path for malformed receipts. Validation

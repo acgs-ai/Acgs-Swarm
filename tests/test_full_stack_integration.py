@@ -39,6 +39,8 @@ from constitutional_swarm.bittensor.protocol import (
 )
 from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
 from constitutional_swarm.bittensor.validator import ConstitutionalValidator
+from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+from tests.test_c14_protocol_hardening import c14_trust_validator_voters
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -159,9 +161,10 @@ class TestFullStackIntegration:
         validator = ConstitutionalValidator(
             config=ValidatorConfig(
                 constitution_path=constitution_path,
-                peers_per_validation=3,
-                quorum=2,
+                peers_per_validation=5,
+                quorum=5,
                 use_manifold=True,
+                single_operator_dev=True,
             ),
         )
         # Register mesh peers for the validator
@@ -169,8 +172,14 @@ class TestFullStackIntegration:
         for i in range(5):
             validator.register_miner(f"peer-{i}", domain="finance")
 
-        # Create SN Owner for case packaging
-        owner = SubnetOwner(constitution_path)
+        # Create SN Owner with an independently provisioned validator trust registry.
+        owner_registry = VoteSignerRegistry()
+        c14_trust_validator_voters(
+            owner_registry,
+            validator,
+            tuple(f"peer-{i}" for i in range(5)),
+        )
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
         # ── 1. Coordinator creates a case ──
         case_id = coordinator.create_case(
@@ -231,12 +240,12 @@ class TestFullStackIntegration:
         validation = validator.validate(judgment)
         assert validation.accepted is True
         assert validation.quorum_met is True
+        assert validation.votes_for + validation.votes_against == 5
         assert validation.proof_root_hash  # Merkle proof exists
 
         # ── 8. SN Owner records precedent ──
-        precedent = owner.record_result(escalated, judgment, validation)
-        assert precedent is not None
-        assert precedent.validation_accepted is True
+        with pytest.raises(ValueError, match="independent vote evidence"):
+            owner.record_result(escalated, judgment, validation)
 
         # ── 9. Coordinator finalizes ──
         # Construct votes from the selected validators (all approve since validation accepted)
@@ -278,7 +287,7 @@ class TestFullStackIntegration:
         # Miner stats
         assert miner.stats.judgments_submitted == 1
         assert validator.stats.validations_performed == 1
-        assert owner.metrics.precedents_created == 1
+        assert owner.metrics.precedents_created == 0
 
     @pytest.mark.asyncio
     async def test_multi_case_with_audit_feedback(self, constitution_path, coordinator):
@@ -293,7 +302,10 @@ class TestFullStackIntegration:
             deliberation_handler=_valid_handler,
         )
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                single_operator_dev=True,
+            ),
         )
         validator.register_miner("miner-multi")
         for i in range(6):
@@ -400,12 +412,15 @@ class TestFullStackIntegration:
             config=ValidatorConfig(
                 constitution_path=constitution_path,
                 use_manifold=True,
+                single_operator_dev=True,
             ),
         )
         validator.register_miner("miner-w", domain="finance", tier=MinerTier.JOURNEYMAN)
         validator.register_miner("peer-a", domain="finance", tier=MinerTier.APPRENTICE)
         validator.register_miner("peer-b")
         validator.register_miner("peer-c")
+        validator.register_miner("peer-d")
+        validator.register_miner("peer-e")
 
         owner = SubnetOwner(constitution_path)
 
@@ -434,7 +449,18 @@ class TestFullStackIntegration:
         )
 
         # Compute emission weights
-        weights = validator.compute_emission_weights(["miner-w", "peer-a"])
+        pair_weights = validator.compute_emission_weights(["miner-w", "peer-a"])
+        assert pair_weights == {
+            "miner-w": pytest.approx(0.5),
+            "peer-a": pytest.approx(0.5),
+        }
+
+        weights = validator.compute_emission_weights(["miner-w", "peer-a", "peer-b"])
         assert abs(sum(weights.values()) - 1.0) < 1e-9
-        # Journeyman miner should get higher weight than apprentice
-        assert weights["miner-w"] > weights["peer-a"]
+        # Canonical emission includes the validators' observed raw-trust signal;
+        # the validating peers earned more trust than the producing miner.
+        assert weights == {
+            "miner-w": pytest.approx(13 / 49),
+            "peer-a": pytest.approx(18 / 49),
+            "peer-b": pytest.approx(18 / 49),
+        }

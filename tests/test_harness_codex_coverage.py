@@ -117,6 +117,7 @@ def test_codex_agent_build_prompt_string_fail_to_pass():
     agent.sandbox = "none"
     agent.extra_args = []
     agent.codex_binary = "/usr/bin/codex"
+    agent.timeout_s = 60.0
 
     task = {
         "instance_id": "test-1",
@@ -161,7 +162,7 @@ def test_codex_agent_build_prompt_string_fail_to_pass_with_hints():
 
 
 def test_codex_agent_generate_patch_oserror_on_read():
-    """OSError when reading last_path → last_message = '' (lines 163-164)."""
+    """Read failure falls back to stdout even when stderr has diagnostics."""
     from constitutional_swarm.swe_bench.codex_agent import CodexSWEBenchAgent
 
     agent = CodexSWEBenchAgent.__new__(CodexSWEBenchAgent)
@@ -169,8 +170,9 @@ def test_codex_agent_generate_patch_oserror_on_read():
     agent.sandbox = "none"
     agent.extra_args = []
     agent.codex_binary = "/usr/bin/codex"
+    agent.timeout_s = 60.0
 
-    _ = {
+    task = {
         "instance_id": "test-3",
         "repo": "a/b",
         "base_commit": "abc",
@@ -184,7 +186,7 @@ def test_codex_agent_generate_patch_oserror_on_read():
     mock_proc.stdout = (
         "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
     )
-    mock_proc.stderr = ""
+    mock_proc.stderr = "non-fatal runner diagnostic"
 
     mock_path = MagicMock(spec=Path)
     mock_path.name = "/tmp/test_last.txt"
@@ -193,9 +195,13 @@ def test_codex_agent_generate_patch_oserror_on_read():
     mock_path.unlink.return_value = None
 
     with (
-        patch("subprocess.run", return_value=mock_proc),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
-        patch("pathlib.Path") as mock_path_cls,
+        patch(
+            "constitutional_swarm.swe_bench.codex_agent._run_process",
+            return_value=mock_proc,
+        ),
+        patch("constitutional_swarm.swe_bench.codex_agent.tempfile.NamedTemporaryFile")
+        as mock_tmp,
+        patch("constitutional_swarm.swe_bench.codex_agent.Path") as mock_path_cls,
     ):
         mock_ctx = MagicMock()
         mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
@@ -205,9 +211,12 @@ def test_codex_agent_generate_patch_oserror_on_read():
 
         mock_path_cls.return_value = mock_path
 
-        # Can't easily test without full subprocess mock chain, so just verify
-        # the method exists and the OSError path is reachable via unit logic
-        pass
+        patch_text, stats = agent._generate_patch(task)
+
+    assert patch_text == mock_proc.stdout
+    assert stats["raw_length"] == 0
+    assert stats["patch_length"] == len(mock_proc.stdout)
+    mock_path.unlink.assert_called_once_with()
 
 
 def test_codex_agent_generate_patch_oserror_direct():
@@ -219,6 +228,7 @@ def test_codex_agent_generate_patch_oserror_direct():
     agent.sandbox = "none"
     agent.extra_args = []
     agent.codex_binary = "/usr/bin/codex"
+    agent.timeout_s = 60.0
 
     task = {
         "instance_id": "oserr-test",
@@ -241,7 +251,10 @@ def test_codex_agent_generate_patch_oserror_direct():
     fake_path.read_text.side_effect = OSError("no such file")
     fake_path.unlink.return_value = None
 
-    with patch("subprocess.run", return_value=mock_proc):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        return_value=mock_proc,
+    ):
         with patch("constitutional_swarm.swe_bench.codex_agent.Path", return_value=fake_path):
             with patch("tempfile.NamedTemporaryFile") as mock_ntf:
                 mock_ntf_ctx = MagicMock()
@@ -250,13 +263,10 @@ def test_codex_agent_generate_patch_oserror_direct():
                 mock_ntf_ctx.name = "/tmp/fake_last.txt"
                 mock_ntf.return_value = mock_ntf_ctx
 
-                try:
-                    patch_text, stats = agent._generate_patch(task)
-                    # OSError → last_message = "" → patch extracted from stdout
-                    assert isinstance(patch_text, str)
-                    assert isinstance(stats, dict)
-                except Exception:
-                    pass  # Any error path is acceptable
+                patch_text, stats = agent._generate_patch(task)
+                assert patch_text == fake_diff
+                assert stats["raw_length"] == 0
+                assert stats["patch_length"] == len(patch_text)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +283,7 @@ def test_codex_agent_generate_patch_oserror_on_unlink():
     agent.sandbox = "none"
     agent.extra_args = []
     agent.codex_binary = "/usr/bin/codex"
+    agent.timeout_s = 60.0
 
     task = {
         "instance_id": "unlink-test",
@@ -294,7 +305,10 @@ def test_codex_agent_generate_patch_oserror_on_unlink():
     fake_path.read_text.return_value = fake_diff
     fake_path.unlink.side_effect = OSError("already deleted")
 
-    with patch("subprocess.run", return_value=mock_proc):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        return_value=mock_proc,
+    ):
         with patch("constitutional_swarm.swe_bench.codex_agent.Path", return_value=fake_path):
             with patch("tempfile.NamedTemporaryFile") as mock_ntf:
                 mock_ntf_ctx = MagicMock()
@@ -303,12 +317,9 @@ def test_codex_agent_generate_patch_oserror_on_unlink():
                 mock_ntf_ctx.name = "/tmp/fake_last2.txt"
                 mock_ntf.return_value = mock_ntf_ctx
 
-                try:
-                    patch_text, _ = agent._generate_patch(task)
-                    # Should not raise even if unlink fails
-                    assert isinstance(patch_text, str)
-                except Exception:
-                    pass  # Acceptable
+                patch_text, stats = agent._generate_patch(task)
+                assert patch_text == fake_diff
+                assert stats["patch_length"] == len(patch_text)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +336,7 @@ def test_codex_agent_generate_patch_nonzero_returncode():
     agent.sandbox = "none"
     agent.extra_args = []
     agent.codex_binary = "/usr/bin/codex"
+    agent.timeout_s = 60.0
 
     task = {
         "instance_id": "fail-test",
@@ -343,7 +355,10 @@ def test_codex_agent_generate_patch_nonzero_returncode():
     fake_path = MagicMock(spec=Path)
     fake_path.unlink.return_value = None
 
-    with patch("subprocess.run", return_value=mock_proc):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        return_value=mock_proc,
+    ):
         with patch("constitutional_swarm.swe_bench.codex_agent.Path", return_value=fake_path):
             with patch("tempfile.NamedTemporaryFile") as mock_ntf:
                 mock_ntf_ctx = MagicMock()
@@ -352,12 +367,10 @@ def test_codex_agent_generate_patch_nonzero_returncode():
                 mock_ntf_ctx.name = "/tmp/fake_last3.txt"
                 mock_ntf.return_value = mock_ntf_ctx
 
-                try:
-                    patch_text, stats = agent._generate_patch(task)
-                    assert patch_text == ""
-                    assert "stderr_tail" in stats
-                except Exception:
-                    pass
+                patch_text, stats = agent._generate_patch(task)
+                assert patch_text == ""
+                assert stats["error"] == "codex_exit_nonzero"
+                assert stats["stderr_tail"] == "something went wrong"
 
 
 # ---------------------------------------------------------------------------

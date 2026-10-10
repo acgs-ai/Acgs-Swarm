@@ -16,6 +16,8 @@ Integration points
 from __future__ import annotations
 
 import logging
+import math
+import numbers
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +27,16 @@ if TYPE_CHECKING:
     from constitutional_swarm.latent_dna import LatentDNAWrapper
 
 _log = logging.getLogger(__name__)
+
+
+def _validate_timeout_seconds(value: object, *, field_name: str = "timeout_s") -> float:
+    """Return a finite positive timeout or reject an unbounded configuration."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{field_name} must be a finite positive number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{field_name} must be a finite positive number")
+    return timeout
 
 
 def _opaque_error_message(exc: Exception, *, error_id: str) -> str:
@@ -96,7 +108,7 @@ class SWEBenchAgent:
         self.wrapper = wrapper
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
-        self.timeout_s = timeout_s
+        self.timeout_s = _validate_timeout_seconds(timeout_s)
 
     # ──────────────────────────────────────────────────────────────────────
     # Public interface

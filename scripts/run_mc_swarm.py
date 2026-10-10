@@ -6,6 +6,22 @@ survives repo-level reverts. Spawns N parallel ``claude -p`` subprocesses
 per instance, evaluates each candidate via LocalSWEBenchHarness, picks the
 best by (resolved, applied, patch) score.
 
+Metric: the winner is chosen with the local harness verdict itself (oracle
+selection, stopping at the first resolved candidate), so ``resolve_rate`` is a
+pass@k rate with k = ``--agents``, not a single-sample resolve rate. The same
+holds for ``patch_rate`` (patch@k) and ``apply_rate`` (apply@k): they are rates
+over the oracle-selected winners. The summary and every row carry
+``resolve_metric="pass@k"``, ``patch_metric="patch@k"``,
+``apply_metric="apply@k"``, ``selection="oracle"`` and ``k`` so the numbers
+cannot be compared against pass@1 runs unlabelled.
+
+Candidate counters: because selection stops at the first resolved candidate,
+later candidates are never run through the harness. ``mc_applied_candidates``
+and ``mc_resolved_candidates`` (and the per-row ``n_candidates_applied`` /
+``n_candidates_resolved``) count over the ``mc_evaluated_candidates``
+(``n_candidates_evaluated``) that were actually evaluated; the rest are
+reported as ``mc_unevaluated_candidates`` (``n_candidates_unevaluated``).
+
 Usage
 -----
     python scripts/run_mc_swarm.py \
@@ -21,7 +37,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -33,30 +48,26 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from constitutional_swarm.swe_bench._diff import extract_unified_diff  # noqa: E402
+from constitutional_swarm.swe_bench._messages_agent import (  # noqa: E402
+    build_swe_bench_prompt,
+)
+
 _log = logging.getLogger(__name__)
 
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/|@@ )")
+# Oracle best-of-k selection over local-harness verdicts == pass@k; the patch
+# and apply rates of the selected winners are any-of-k rates as well.
+_RESOLVE_METRIC = "pass@k"
+_PATCH_METRIC = "patch@k"
+_APPLY_METRIC = "apply@k"
+_SELECTION = "oracle"
 
-_PROMPT_TEMPLATE = """\
-You are solving a SWE-bench task. Produce a unified diff that fixes the bug.
+# One shared extractor: a file header is required (hunk-only output is not a
+# patch) and any prose before the first header is cut.
+_extract_diff = extract_unified_diff
 
-Output rules:
-- Reply with ONLY the unified diff, no prose, no code fences, no explanation.
-- Use standard --- a/<path> and +++ b/<path> headers.
-- Paths must be relative to the repository root.
-- Do not modify tests unless the task explicitly requires it.
-
-Instance: {instance_id}
-Repository: {repo}
-Base commit: {base_commit}
-
-Tests that should flip from FAIL to PASS:
-{fail_to_pass}
-
-Problem statement:
-{problem_statement}
-
-Produce the patch now."""
+# The one shared SWE-bench prompt (same text the API adapters send).
+_build_prompt = build_swe_bench_prompt
 
 
 @dataclass
@@ -67,35 +78,6 @@ class Candidate:
     raw_length: int = 0
     timed_out: bool = False
     agent_idx: int = -1
-
-
-def _extract_diff(text: str) -> str:
-    if not text:
-        return ""
-    s = text.strip()
-    if s.startswith("```"):
-        lines = s.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    if not _DIFF_MARKER.search(s):
-        return ""
-    return s + ("\n" if not s.endswith("\n") else "")
-
-
-def _build_prompt(task: dict[str, Any]) -> str:
-    ftp = task.get("FAIL_TO_PASS") or []
-    if isinstance(ftp, str):
-        ftp = [ftp]
-    return _PROMPT_TEMPLATE.format(
-        instance_id=task.get("instance_id", "unknown"),
-        repo=task.get("repo", "unknown"),
-        base_commit=task.get("base_commit", "unknown"),
-        fail_to_pass="\n".join(f"- {t}" for t in ftp) or "(none listed)",
-        problem_statement=(task.get("problem_statement") or "").strip(),
-    )
 
 
 def _call_claude(
@@ -193,6 +175,67 @@ def _evaluate_patch(harness, instance: dict[str, Any], cand: Candidate) -> dict[
     }
 
 
+def _select_winner(
+    harness: Any, instance: dict[str, Any], cands: list[Candidate]
+) -> dict[str, Any]:
+    """Evaluate candidates in order and return the oracle winner's row.
+
+    Stops at the first resolved candidate. The per-candidate counters only
+    cover the candidates actually evaluated; ``n_candidates_evaluated`` /
+    ``n_candidates_unevaluated`` make that denominator explicit.
+    """
+    if not cands:
+        raise ValueError("at least one candidate is required")
+    best_row: dict[str, Any] | None = None
+    best_score = (-1, -1, -1)
+    winner_idx = -1
+    per_scores: list[tuple[int, int, int]] = []
+    c_applied = 0
+    c_resolved = 0
+    for ci, c in enumerate(cands):
+        row = _evaluate_patch(harness, instance, c)
+        sc = _score(row)
+        per_scores.append(sc)
+        if row.get("applied"):
+            c_applied += 1
+        if row.get("resolved"):
+            c_resolved += 1
+        if sc > best_score:
+            best_score = sc
+            best_row = row
+            winner_idx = ci
+        if sc[0] == 1:  # resolved, no need to eval rest
+            break
+    assert best_row is not None  # every score beats the (-1, -1, -1) sentinel
+
+    n = len(cands)
+    best_row["n_candidates"] = n
+    best_row["n_valid_candidates"] = sum(1 for c in cands if c.patch)
+    best_row["n_candidates_evaluated"] = len(per_scores)
+    best_row["n_candidates_unevaluated"] = n - len(per_scores)
+    best_row["n_candidates_applied"] = c_applied
+    best_row["n_candidates_resolved"] = c_resolved
+    best_row["winner_idx"] = winner_idx
+    best_row["per_candidate_scores"] = per_scores
+    best_row["n_timeouts"] = sum(1 for c in cands if c.timed_out)
+    return best_row
+
+
+def _format_progress(idx: int, total: int, row: dict[str, Any], *, k: int) -> str:
+    ft = row["fail_to_pass_passed"] + row["fail_to_pass_failed"]
+    pt = row["pass_to_pass_passed"] + row["pass_to_pass_failed"]
+    return (
+        f"[{idx}/{total}] {row['instance_id']} "
+        f"applied@{k}={row['applied']} resolved@{k}={row['resolved']} "
+        f"winner={row['winner_idx']}/{k} valid={row['n_valid_candidates']} "
+        f"evaluated={row['n_candidates_evaluated']}/{k} "
+        f"cand_applied={row['n_candidates_applied']} timeouts={row['n_timeouts']} "
+        f"F2P={row['fail_to_pass_passed']}/{ft} "
+        f"P2P={row['pass_to_pass_passed']}/{pt} "
+        f"dur={row['duration_s']:.1f}s"
+    )
+
+
 def _write_predictions(rows: list[dict[str, Any]], path: Path, model: str) -> None:
     with path.open("w") as f:
         for r in rows:
@@ -204,6 +247,66 @@ def _write_predictions(rows: list[dict[str, Any]], path: Path, model: str) -> No
                 }) + "\n")
 
 
+def _build_summary(
+    rows: list[dict[str, Any]],
+    *,
+    k: int,
+    total_cands: int,
+    total_valid: int,
+    total_applied_cands: int,
+    total_resolved_cands: int,
+    total_timeouts: int,
+) -> dict[str, Any]:
+    """Aggregate per-instance winner rows; labels every winner rate as @k."""
+    for row in rows:
+        row["resolve_metric"] = _RESOLVE_METRIC
+        row["patch_metric"] = _PATCH_METRIC
+        row["apply_metric"] = _APPLY_METRIC
+        row["selection"] = _SELECTION
+        row["k"] = k
+    total_evaluated = sum(int(r.get("n_candidates_evaluated", 0)) for r in rows)
+    n = len(rows)
+    applied = sum(1 for r in rows if r["applied"])
+    resolved = sum(1 for r in rows if r["resolved"])
+    patch_gen = sum(1 for r in rows if r["patch_generated"])
+    return {
+        "instances": n,
+        "patch_generated": patch_gen,
+        "applied": applied,
+        "resolved": resolved,
+        "patch_rate": patch_gen / n if n else 0.0,
+        "apply_rate": applied / n if n else 0.0,
+        "resolve_rate": resolved / n if n else 0.0,
+        "resolve_metric": _RESOLVE_METRIC,
+        "patch_metric": _PATCH_METRIC,
+        "apply_metric": _APPLY_METRIC,
+        "rate_metrics": {
+            "patch_rate": _PATCH_METRIC,
+            "apply_rate": _APPLY_METRIC,
+            "resolve_rate": _RESOLVE_METRIC,
+        },
+        "selection": _SELECTION,
+        "k": k,
+        "agents": k,
+        "mode": "multi-candidate",
+        "mc_total_candidates": total_cands,
+        "mc_valid_candidates": total_valid,
+        "mc_evaluated_candidates": total_evaluated,
+        "mc_unevaluated_candidates": total_cands - total_evaluated,
+        "mc_applied_candidates": total_applied_cands,
+        "mc_resolved_candidates": total_resolved_cands,
+        "mc_timeouts": total_timeouts,
+        "rows": rows,
+    }
+
+
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=10)
@@ -211,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dataset", default="princeton-nlp/SWE-bench_Lite")
     ap.add_argument("--split", default="test")
     ap.add_argument("--model", default="sonnet")
-    ap.add_argument("--agents", type=int, default=4)
+    ap.add_argument("--agents", type=_positive_int, default=4)
     ap.add_argument("--agent-timeout", type=float, default=600.0)
     ap.add_argument("--harness-timeout", type=float, default=120.0)
     ap.add_argument("--env-timeout", type=float, default=900.0)
@@ -272,77 +375,21 @@ def main(argv: list[str] | None = None) -> int:
         total_valid += sum(1 for c in cands if c.patch)
         total_timeouts += sum(1 for c in cands if c.timed_out)
 
-        best_row = None
-        best_score = (-1, -1, -1)
-        winner_idx = -1
-        per_scores = []
-        c_applied = 0
-        c_resolved = 0
-        for ci, c in enumerate(cands):
-            row = _evaluate_patch(harness, inst, c)
-            sc = _score(row)
-            per_scores.append(sc)
-            if row.get("applied"):
-                c_applied += 1
-            if row.get("resolved"):
-                c_resolved += 1
-            if sc > best_score:
-                best_score = sc
-                best_row = row
-                winner_idx = ci
-            if sc[0] == 1:  # resolved, no need to eval rest
-                break
-
-        total_applied_cands += c_applied
-        total_resolved_cands += c_resolved
-
-        if best_row is None:
-            best_row = _evaluate_patch(harness, inst, cands[0])
-            winner_idx = 0
-
-        best_row["n_candidates"] = n
-        best_row["n_valid_candidates"] = sum(1 for c in cands if c.patch)
-        best_row["n_candidates_applied"] = c_applied
-        best_row["n_candidates_resolved"] = c_resolved
-        best_row["winner_idx"] = winner_idx
-        best_row["per_candidate_scores"] = per_scores
-        best_row["n_timeouts"] = sum(1 for c in cands if c.timed_out)
+        best_row = _select_winner(harness, inst, cands)
+        total_applied_cands += best_row["n_candidates_applied"]
+        total_resolved_cands += best_row["n_candidates_resolved"]
         rows.append(best_row)
+        print(_format_progress(idx, len(instances), best_row, k=n), flush=True)
 
-        ft = best_row["fail_to_pass_passed"] + best_row["fail_to_pass_failed"]
-        pt = best_row["pass_to_pass_passed"] + best_row["pass_to_pass_failed"]
-        print(
-            f"[{idx}/{len(instances)}] {best_row['instance_id']} "
-            f"applied={best_row['applied']} resolved={best_row['resolved']} "
-            f"winner={winner_idx}/{n} valid={best_row['n_valid_candidates']} "
-            f"cand_applied={c_applied} timeouts={best_row['n_timeouts']} "
-            f"F2P={best_row['fail_to_pass_passed']}/{ft} "
-            f"P2P={best_row['pass_to_pass_passed']}/{pt} "
-            f"dur={best_row['duration_s']:.1f}s",
-            flush=True,
-        )
-
-    n = len(rows)
-    applied = sum(1 for r in rows if r["applied"])
-    resolved = sum(1 for r in rows if r["resolved"])
-    patch_gen = sum(1 for r in rows if r["patch_generated"])
-    summary = {
-        "instances": n,
-        "patch_generated": patch_gen,
-        "applied": applied,
-        "resolved": resolved,
-        "patch_rate": patch_gen / n if n else 0.0,
-        "apply_rate": applied / n if n else 0.0,
-        "resolve_rate": resolved / n if n else 0.0,
-        "agents": args.agents,
-        "mode": "multi-candidate",
-        "mc_total_candidates": total_cands,
-        "mc_valid_candidates": total_valid,
-        "mc_applied_candidates": total_applied_cands,
-        "mc_resolved_candidates": total_resolved_cands,
-        "mc_timeouts": total_timeouts,
-        "rows": rows,
-    }
+    summary = _build_summary(
+        rows,
+        k=args.agents,
+        total_cands=total_cands,
+        total_valid=total_valid,
+        total_applied_cands=total_applied_cands,
+        total_resolved_cands=total_resolved_cands,
+        total_timeouts=total_timeouts,
+    )
     print(json.dumps({k: v for k, v in summary.items() if k != "rows"}, indent=2))
     if args.output:
         args.output.write_text(json.dumps(summary, indent=2))

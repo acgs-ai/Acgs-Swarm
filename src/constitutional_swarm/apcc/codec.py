@@ -231,8 +231,6 @@ _DIGESTS = frozenset(
         "certificate_digest",
         "payload_sha256",
         "trust_log_head",
-        "expected_operation_digest",
-        "public_request_digest",
     }
 )
 _IDS = frozenset(
@@ -245,7 +243,6 @@ _IDS = frozenset(
         "agent_id",
         "policy_id",
         "commit_id",
-        "expected_commit_id",
         "producer_key_id",
         "policy_key_id",
         "authority_key_id",
@@ -618,6 +615,13 @@ def encode_envelope(
 
 def decode_envelope(raw: bytes) -> DetachedEnvelope:
     """Strictly decode an envelope and its canonical inner certificate."""
+    return _decode_envelope_certificate(raw)[0]
+
+
+def _decode_envelope_certificate(
+    raw: bytes,
+) -> tuple[DetachedEnvelope, CommitCertificate]:
+    """Decode an envelope once and return it with its decoded certificate."""
     value = _decode(raw, _ENVELOPE, MAX_ENVELOPE_BYTES)
     if value["envelope_type"] != "apcc.detached-certificate-envelope":
         raise CodecError(FailureCode.UNSUPPORTED_CERTIFICATE_TYPE)
@@ -630,12 +634,12 @@ def decode_envelope(raw: bytes) -> DetachedEnvelope:
     payload = _decode_b64u(value["payload_b64u"])
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise CodecError(FailureCode.SIZE_LIMIT_EXCEEDED)
-    decode_certificate(payload)
+    certificate = decode_certificate(payload)
     try:
         signature = Signature.from_object(value["seal"])
     except (TypeError, ValueError) as exc:
         raise CodecError(FailureCode.NONCANONICAL_ENCODING) from exc
-    return DetachedEnvelope(payload, value["payload_sha256"], signature)
+    return DetachedEnvelope(payload, value["payload_sha256"], signature), certificate
 
 
 def encode_authority_status(status: AuthorityStatus) -> bytes:
@@ -669,46 +673,6 @@ def normalize_authority_status(
     if isinstance(value, bytes):
         return decode_authority_status(value)
     return decode_authority_status(_canonical(dict(value)))
-
-
-def validate_authority_observation_request(value: object) -> None:
-    """Compatibility delegate to the canonical observation codec."""
-    from .observation import (
-        AuthorityObservationRequest,
-        encode_authority_observation_request,
-    )
-
-    if type(value) is not AuthorityObservationRequest:
-        raise TypeError("observation request has the wrong type")
-    encode_authority_observation_request(value)
-
-
-def encode_authority_observation_request(value: object) -> bytes:
-    """Compatibility delegate to :mod:`apcc.observation`."""
-    from .observation import encode_authority_observation_request as encode
-
-    return encode(value)  # type: ignore[arg-type]
-
-
-def decode_authority_observation_request(raw: bytes):
-    """Compatibility delegate to :mod:`apcc.observation`."""
-    from .observation import decode_authority_observation_request as decode
-
-    return decode(raw)
-
-
-def encode_observer_launch_attestation(value: object) -> bytes:
-    """Compatibility delegate to :mod:`apcc.observation`."""
-    from .observation import encode_observer_launch_attestation as encode
-
-    return encode(value)  # type: ignore[arg-type]
-
-
-def decode_observer_launch_attestation(raw: bytes):
-    """Compatibility delegate to :mod:`apcc.observation`."""
-    from .observation import decode_observer_launch_attestation as decode
-
-    return decode(raw)
 
 
 def canonical_statement(statement: Mapping[str, str]) -> bytes:

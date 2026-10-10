@@ -19,6 +19,10 @@ from pathlib import Path
 
 from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
 from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_registry,
+)
 
 _EXAMPLE = Path(__file__).parent.parent / "examples" / "mac_acgs_autonomous_research.py"
 _spec = importlib.util.spec_from_file_location("mac_acgs_autonomous_research", _EXAMPLE)
@@ -28,12 +32,9 @@ sys.modules["mac_acgs_autonomous_research"] = example
 _spec.loader.exec_module(example)
 
 
-def _run_cycles(loop: MacAcgsLoop, codifier=None, cycles: int = 8) -> None:
+def _run_cycles(loop: MacAcgsLoop, cycles: int = 8) -> None:
     rng = random.Random(42)
     for cycle in range(1, cycles + 1):
-        if codifier is not None:
-            codifier.observe(example.synth_precedent(rng, 2 * cycle))
-            codifier.observe(example.synth_precedent(rng, 2 * cycle + 1))
         loop.run_cycle(example.synth_approaches(rng, cycle))
 
 
@@ -67,13 +68,42 @@ def test_default_codifier_evolve_cycle_never_proposes_rules() -> None:
 
 
 def test_precedent_backed_codifier_commits_constitutional_update() -> None:
-    codifier = example.PrecedentBackedCodifier()
-    loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
-    loop.add_external_challenger("human-reviewer-1")
-    _run_cycles(loop, codifier=codifier)
+    precedents = [
+        c14_precedent_signed_record(
+            case_id=f"example-case-{index}",
+            task_id=f"example-task-{index}",
+            miner_uid=f"miner-{index % 12}",
+            judgment="deny: irreversible side effect without receipt",
+            reasoning="Side-effectful action lacked a valid decision receipt.",
+            votes_for=5,
+            votes_against=0,
+            impact_vector={
+                "safety": 0.9,
+                "security": 0.8,
+                "privacy": 0.1,
+                "fairness": 0.1,
+                "reliability": 0.2,
+                "transparency": 0.1,
+                "efficiency": 0.1,
+            },
+        )
+        for index in range(16)
+    ]
+    loop, store, codifier = example.run_with_precedents(
+        precedents,
+        c14_precedent_test_registry(),
+        reviewer_id="human-reviewer-1",
+        challenge_provider=lambda proposal: [
+            ("human-reviewer-1", f"review of {proposal.proposal_id}", 0.10)
+        ],
+    )
 
     updates = loop.constitution_updates()
     assert len(updates) >= 1
     first = updates[0] if isinstance(updates[0], dict) else updates[0].__dict__
     assert first["verdict_outcome"] == "approved"
     assert first["constitutional_hash"] == example.CONSTITUTIONAL_HASH
+    assert store.size == 16
+    assert {record.precedent_id for record in store.active_records()} == {
+        record.precedent_id for record in codifier.precedents
+    }

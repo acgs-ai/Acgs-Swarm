@@ -27,8 +27,21 @@ from typing import Any
 
 from constitutional_swarm.merkle_crdt import MerkleCRDT
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, SWEPatch
+from constitutional_swarm.swe_bench.harness import _patch_generation_metrics
 
 log = logging.getLogger(__name__)
+
+
+def _bodes_passed(result: SWEPatch) -> bool:
+    """Return True only when governance ran AND explicitly accepted the patch.
+
+    ``SWEPatch.governed`` means "a governance wrapper was present", not
+    "the patch passed": GovernedAgent sets it on rejected and empty patches
+    too. The CRDT ``bodes_passed`` flag is hashed into the node CID and
+    counted as ``bodes_validated``, so it must reflect the verdict.
+    """
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return result.governed is True and metadata.get("governance_action") == "accepted"
 
 
 class SwarmCoordinator:
@@ -88,8 +101,12 @@ class SwarmCoordinator:
 
         Returns
         -------
-        dict with keys: ``patches``, ``total``, ``resolved``, ``resolve_rate``,
-        ``crdt_size``, ``governed_count``, ``mean_intervention``.
+        Dict containing ``patches``, ``total``, the canonical patch-generation
+        metrics ``patch_generated`` and ``patch_rate``, and
+        ``evaluation_mode="patch_generation_only"``. The deprecated
+        ``resolved`` and ``resolve_rate`` keys remain aliases for those
+        generation metrics. Additional diagnostics include ``crdt_size``,
+        ``governed_count``, ``mean_intervention``, and ``mean_duration_s``.
         """
         subset = tasks if max_tasks is None else tasks[:max_tasks]
         n_agents = len(self.agents)
@@ -126,7 +143,7 @@ class SwarmCoordinator:
             patches.append(result)
             # Serialize patch result into CRDT as a DAG node
             payload = json.dumps(asdict(result))
-            shared_crdt.append(payload=payload, bodes_passed=result.governed)
+            shared_crdt.append(payload=payload, bodes_passed=_bodes_passed(result))
 
         return self._aggregate(patches, shared_crdt)
 
@@ -174,7 +191,9 @@ class SwarmCoordinator:
             for i, result in enumerate(results):
                 patches.append(result)
                 payload = json.dumps(asdict(result))
-                nodes[i % n_nodes].crdt.append(payload=payload, bodes_passed=result.governed)
+                nodes[i % n_nodes].crdt.append(
+                    payload=payload, bodes_passed=_bodes_passed(result)
+                )
 
             # Gossip rounds to converge
             for _ in range(self.n_gossip_rounds):
@@ -194,18 +213,9 @@ class SwarmCoordinator:
 
     @staticmethod
     def _aggregate(patches: list[SWEPatch], crdt: MerkleCRDT) -> dict[str, Any]:
-        total = len(patches)
-        resolved = sum(1 for p in patches if p.success)
-        governed = [p for p in patches if p.governed]
-        mean_intervention = (
-            sum(p.intervention_rate for p in governed) / len(governed) if governed else 0.0
-        )
+        metrics = _patch_generation_metrics(patches)
         return {
             "patches": patches,
-            "total": total,
-            "resolved": resolved,
-            "resolve_rate": resolved / total if total > 0 else 0.0,
+            **metrics,
             "crdt_size": crdt.size,
-            "governed_count": len(governed),
-            "mean_intervention": mean_intervention,
         }

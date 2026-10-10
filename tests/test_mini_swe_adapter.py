@@ -69,8 +69,9 @@ def test_runner_success_extracts_patch_from_trajectory(monkeypatch) -> None:
     assert result.metadata["trajectory_present"] is True
 
 
-def test_runner_builds_cli_command_contract(monkeypatch) -> None:
+def test_runner_builds_cli_command_contract(monkeypatch, tmp_path: Path) -> None:
     seen: dict[str, object] = {}
+    work_dir = tmp_path / "mini-work"
 
     def fake_run(cmd, **kwargs):
         seen["cmd"] = cmd
@@ -86,7 +87,7 @@ def test_runner_builds_cli_command_contract(monkeypatch) -> None:
         model="m",
         timeout_s=7.0,
         extra_args=["--config", "mini.yaml"],
-        work_dir="/tmp/mini-work",
+        work_dir=work_dir,
         env={"OPENAI_API_KEY": "secret"},
     )
     result = runner.run(_task())
@@ -101,7 +102,7 @@ def test_runner_builds_cli_command_contract(monkeypatch) -> None:
     assert "--model" in cmd
     assert cmd[-2:] == ["--config", "mini.yaml"]
     assert seen["timeout"] == 7.0
-    assert str(seen["cwd"]) == "/tmp/mini-work"
+    assert seen["cwd"] == work_dir.resolve()
     assert seen["env"] == {"OPENAI_API_KEY": "secret"}
     assert result.metadata["env_keys"] == ["OPENAI_API_KEY"]
 

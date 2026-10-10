@@ -11,7 +11,7 @@ import hashlib
 import json
 import threading
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any
 
 from constitutional_swarm.artifact import Artifact, ArtifactStore
@@ -36,6 +36,7 @@ NodeStatus = ExecutionStatus
 _UNSET = object()
 _AUTHORITY_TRANSPORT_ERRORS = (ConnectionError, EOFError, OSError, TimeoutError)
 _MAX_WORKFLOW_NODES = 1000
+_METADATA_ATOM_TYPES = (type(None), bool, int, float, complex, str, bytes)
 
 
 def _neg_priority(node: TaskNode) -> int:
@@ -50,19 +51,87 @@ def _with_status(
     artifact_id: str | object | None = _UNSET,
 ) -> TaskNode:
     """Clone a TaskNode while updating lifecycle fields."""
-    updates: dict[str, Any] = {
-        "status": status,
-        "metadata": dict(node.metadata),
-    }
+    owned = _node_snapshot(node)
+    owned.status = status
     if claimed_by is not _UNSET:
-        updates["claimed_by"] = claimed_by
+        owned.claimed_by = claimed_by  # type: ignore[assignment]
     if artifact_id is not _UNSET:
-        updates["artifact_id"] = artifact_id
-    return replace(node, **updates)
+        owned.artifact_id = artifact_id  # type: ignore[assignment]
+    return owned
 
 
 def _node_snapshot(node: TaskNode) -> TaskNode:
-    return replace(node, metadata=dict(node.metadata))
+    """Transfer task ownership without retaining nested caller-owned state."""
+    return TaskNode(
+        node_id=node.node_id,
+        title=node.title,
+        description=node.description,
+        domain=node.domain,
+        required_capabilities=tuple(node.required_capabilities),
+        depends_on=tuple(node.depends_on),
+        priority=node.priority,
+        max_budget_tokens=node.max_budget_tokens,
+        status=node.status,
+        claimed_by=node.claimed_by,
+        artifact_id=node.artifact_id,
+        metadata=_copy_task_metadata(node.metadata),
+    )
+
+
+def _copy_task_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Copy the supported metadata model without invoking user copy hooks."""
+    copied = _copy_metadata_value(metadata, set())
+    if not isinstance(copied, dict):
+        raise TypeError("task metadata must be a dict")
+    return copied
+
+
+def _copy_metadata_value(value: Any, active: set[int]) -> Any:
+    value_type = type(value)
+    if value_type in _METADATA_ATOM_TYPES:
+        return value
+
+    identity = id(value)
+    if identity in active:
+        raise TypeError("cyclic task metadata is unsupported")
+    active.add(identity)
+    try:
+        if value_type is dict:
+            return {
+                _copy_metadata_value(key, active): _copy_metadata_value(item, active)
+                for key, item in value.items()
+            }
+        if value_type is list:
+            return [_copy_metadata_value(item, active) for item in value]
+        if value_type is tuple:
+            return tuple(_copy_metadata_value(item, active) for item in value)
+        if value_type is set:
+            return {_copy_metadata_value(item, active) for item in value}
+        if value_type is frozenset:
+            return frozenset(_copy_metadata_value(item, active) for item in value)
+        if value_type is bytearray:
+            return bytearray(value)
+        if is_dataclass(value) and not isinstance(value, type):
+            parameters = getattr(value_type, "__dataclass_params__", None)
+            if parameters is not None and parameters.frozen:
+                try:
+                    copied_record = object.__new__(value_type)
+                except TypeError as exc:
+                    raise TypeError(
+                        f"unsupported task metadata type: {value_type.__name__}"
+                    ) from exc
+                for item in fields(value):
+                    object.__setattr__(
+                        copied_record,
+                        item.name,
+                        _copy_metadata_value(
+                            object.__getattribute__(value, item.name), active
+                        ),
+                    )
+                return copied_record
+        raise TypeError(f"unsupported task metadata type: {value_type.__name__}")
+    finally:
+        active.remove(identity)
 
 
 @dataclass
@@ -204,6 +273,44 @@ class TaskDAG:
         ]
 
 
+def workflow_bindings(
+    dag: TaskDAG,
+) -> tuple[
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+    dict[str, str],
+]:
+    """Return the (topology, capabilities, input_digests) an authority binds a DAG to.
+
+    The single source of truth for the workflow input digest: provisioning
+    (``create_workflow``) and ``SwarmExecutor.load_dag`` (``attach_workflow``)
+    must produce byte-identical digests or attach is denied, so every caller
+    imports this helper instead of re-deriving the canonical JSON.
+    """
+    nodes = dag.nodes
+    topology = {node_id: node.depends_on for node_id, node in nodes.items()}
+    capabilities = {
+        node_id: node.required_capabilities for node_id, node in nodes.items()
+    }
+    input_digests = {
+        node_id: hashlib.sha256(
+            json.dumps(
+                {
+                    "title": node.title,
+                    "description": node.description,
+                    "domain": node.domain,
+                    "required_capabilities": node.required_capabilities,
+                    "depends_on": node.depends_on,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        for node_id, node in nodes.items()
+    }
+    return topology, capabilities, input_digests
+
+
 class SwarmExecutor:
     """Executes a task DAG using a swarm of agents.
 
@@ -250,6 +357,9 @@ class SwarmExecutor:
         self._all_ready_unconstrained: bool = True
         # Whether the DAG has any constrained nodes at all. Set once at load.
         self._dag_has_constrained: bool = False
+        # True when a local mutation (claim/produce/commit) may have left the
+        # incremental indexes in a different order than a fresh rebuild.
+        self._indexes_dirty: bool = False
 
     def _authority_call(self, operation: str, /, *args: Any, **kwargs: Any) -> Any:
         client = self._execution_client
@@ -264,6 +374,7 @@ class SwarmExecutor:
             raise GovernanceBypassDenied("authority_unavailable") from exc
 
     def _rebuild_ready_index(self) -> None:
+        self._indexes_dirty = False
         self._ready_ids = set()
         self._ready_list = []
         self._ready_index = {}
@@ -309,29 +420,7 @@ class SwarmExecutor:
                     raise GovernanceBypassDenied(
                         "policy_version is required for governed execution"
                     )
-                topology = {
-                    node.node_id: node.depends_on for node in dag.nodes.values()
-                }
-                capabilities = {
-                    node.node_id: node.required_capabilities
-                    for node in dag.nodes.values()
-                }
-                input_digests = {
-                    node.node_id: hashlib.sha256(
-                        json.dumps(
-                            {
-                                "title": node.title,
-                                "description": node.description,
-                                "domain": node.domain,
-                                "required_capabilities": node.required_capabilities,
-                                "depends_on": node.depends_on,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest()
-                    for node in dag.nodes.values()
-                }
+                topology, capabilities, input_digests = workflow_bindings(dag)
                 try:
                     authoritative_states = self._authority_call(
                         "attach_workflow",
@@ -389,17 +478,29 @@ class SwarmExecutor:
         )
         if len(states) != len(node_ids):
             raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
+        changed = self._indexes_dirty
         for node_id, state in zip(node_ids, states, strict=True):
             node = self._dag.nodes[node_id]
-            node.status = ExecutionStatus(state.status)
-            node.claimed_by = state.claimed_by
-            node.artifact_id = state.artifact_id
-            if state.attempt_id is None:
-                node.metadata.pop("attempt_id", None)
-            else:
-                node.metadata["attempt_id"] = state.attempt_id
-        self._rebuild_ready_index()
-        self._build_dep_index()
+            status = ExecutionStatus(state.status)
+            if (
+                node.status is not status
+                or node.claimed_by != state.claimed_by
+                or node.artifact_id != state.artifact_id
+                or node.metadata.get("attempt_id") != state.attempt_id
+            ):
+                changed = True
+                node.status = status
+                node.claimed_by = state.claimed_by
+                node.artifact_id = state.artifact_id
+                if state.attempt_id is None:
+                    node.metadata.pop("attempt_id", None)
+                else:
+                    node.metadata["attempt_id"] = state.attempt_id
+        # Indexes are pure functions of node state: skip the O(N+E) rebuild when
+        # neither the authority nor a local mutation changed anything.
+        if changed:
+            self._rebuild_ready_index()
+            self._build_dep_index()
 
     def authoritative_artifact(self, artifact_id: str) -> Artifact | None:
         """Read only an artifact backed by a currently valid governed commit."""
@@ -454,6 +555,8 @@ class SwarmExecutor:
                         if rc.lower() in cap_names:
                             available.append(node)
                             break
+            # Detach while lifecycle fields and nested metadata are protected.
+            available = [_node_snapshot(node) for node in available]
 
         if len(available) > 1:
             first_priority = available[0].priority
@@ -461,7 +564,7 @@ class SwarmExecutor:
                 if node.priority != first_priority:
                     available.sort(key=_neg_priority)
                     break
-        return [_node_snapshot(node) for node in available]
+        return available
 
     def prepare_claim(self, node_id: str, agent_id: str) -> AttemptAuthorizationPayload:
         """Create a fresh, context-bound claim payload for the agent to sign."""
@@ -519,6 +622,7 @@ class SwarmExecutor:
             node.claimed_by = agent_id
             node.metadata["attempt_id"] = attempt_id
             node.metadata["attempt_authorization"] = authorization
+            self._indexes_dirty = True
             self._ready_ids.discard(node_id)
             idx = self._ready_index.pop(node_id, -1)
             if idx >= 0:
@@ -577,6 +681,7 @@ class SwarmExecutor:
             )
             node.status = ExecutionStatus.RESULT_PRODUCED
             node.artifact_id = artifact.artifact_id
+            self._indexes_dirty = True
             return self._authority_call(
                 "prepare_receipt_payload",
                 workflow_id=self._dag.dag_id,
@@ -600,6 +705,7 @@ class SwarmExecutor:
             if decision.outcome is not CommitOutcome.COMMITTED:
                 return decision
             node = self._dag.nodes[decision.node_id]
+            self._indexes_dirty = True
             refreshed_ids = (
                 decision.node_id,
                 *self._children.get(decision.node_id, ()),

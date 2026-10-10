@@ -42,17 +42,26 @@ Timing side-channels, traffic analysis, compromised VRF oracles.
 Let `f(D)` be the local computation producing the projected routing matrix
 `H_proj ∈ ℝⁿˣⁿ` from agent data/activations `D`.
 
-`SpectralSphereManifold` enforces `‖H_proj‖₂ ≤ r` (spectral norm ≤ r).
+The privacy API requires a caller-certified final-output bound
+`‖H_proj‖₂ ≤ r`. A deterministic SVD-based projection with a checked
+finite-precision postcondition, or an independently verified certificate, may
+establish this bound; stochastic power iteration is only an estimate and is not
+accepted as a DP certificate.
 
-The L₂ sensitivity is the maximum Euclidean distance between any two projected
-matrices in the worst case:
+The Gaussian mechanism acts on the vectorized matrix, so its L₂ norm is the
+matrix Frobenius norm. For an `n × n` matrix, `‖A‖F ≤ √n ‖A‖₂`. The certified
+spectral bound therefore implies the following worst-case sensitivity:
 
 ```
-Δf = max_{D, D'} ‖f(D) − f(D')‖₂ ≤ 2r
+Δ₂f = max_{D, D'} ‖vec(f(D) − f(D'))‖₂
+     = max_{D, D'} ‖f(D) − f(D')‖F
+     ≤ 2r√n
 ```
 
-**Proof sketch:** Both `f(D)` and `f(D')` lie on the spectral sphere of radius `r`.
-The diameter of this sphere is `2r`. By triangle inequality, `Δf ≤ 2r`. □
+**Proof sketch:** Both outputs have spectral norm at most `r`, hence Frobenius
+norm at most `r√n`. The triangle inequality gives a Frobenius diameter of
+`2r√n`. The spectral diameter `2r` is not an L₂ bound for the vectorized
+matrix. □
 
 ### Theorem 1: (ε, δ)-DP Guarantee
 
@@ -63,25 +72,30 @@ distribution to `H_proj` before broadcast:
 H̃ = H_proj + Z,    Z ~ N(0, σ²I)
 ```
 
-By the standard Gaussian mechanism, the mechanism is `(ε, δ)`-DP if:
+The implementation calibrates the Gaussian mechanism by inverting its Rényi-DP
+bound and the Balle et al. conversion used by `PrivacyAccountant`. The RDP
+bound is valid for all positive `ε`; the finite configured order grid fails
+closed if it cannot certify an extreme budget:
 
 ```
-σ = Δf · √(2 ln(1.25/δ)) / ε
-  = 2r · √(2 ln(1.25/δ)) / ε
+Δ₂f = 2r√n
+σ = PrivacyAccountant(ε, δ).required_sigma(sensitivity=Δ₂f)
 ```
 
-**Parameter guidance (r = 1.0):**
+**Parameter guidance (`r = 1.0`, `n = 50`, `δ = 10⁻⁵`):**
 
-| Privacy budget | δ      | σ (r=1.0) | Notes                        |
-|---------------|--------|-----------|------------------------------|
-| ε = 1.0       | 10⁻⁵   | ~9.69     | Strong privacy, high noise   |
-| ε = 2.0       | 10⁻⁵   | ~4.84     | Balanced                     |
-| ε = 4.0       | 10⁻³   | ~0.85     | Practical for large swarms   |
-| ε = 8.0       | 10⁻³   | ~0.43     | Loose but low overhead       |
+| Privacy budget | δ      | σ (r=1.0, n=50) | Notes                      |
+|---------------|--------|------------------|----------------------------|
+| ε = 1.0       | 10⁻⁵   | 57.21038854      | Strong privacy, high noise |
+| ε = 2.0       | 10⁻⁵   | 30.39300970      | Moderate privacy budget    |
+| ε = 4.0       | 10⁻⁵   | 16.37049377      | Looser privacy budget      |
+| ε = 8.0       | 10⁻⁵   | 9.01801824       | Loose privacy budget       |
 
-**Note on composition:** If an agent broadcasts `k` updates per session, the
-composed privacy cost is approximately `(ε√(2k ln(1/δ)), kδ)` by advanced
-composition. Budget `ε` accordingly.
+**Composition:** Use one session-scoped `PrivacyAccountant`. Before each
+broadcast, call `required_sigma` with the certified sensitivity; after the
+mechanism runs, call `spend` with the same sensitivity and sigma, then
+`assert_budget`. The accountant composes RDP across the recorded history and
+fails closed when the configured finite order grid cannot certify the budget.
 
 ---
 
@@ -93,20 +107,27 @@ it routed a specific task in a specific direction.
 
 ### Protocol Steps
 
-**Step 1 — Local Computation**  
+**Step 1 — Local Computation**
 Agent `i` computes its unprojected routing update `H_new` from local activations.
 
-**Step 2 — Spectral Projection**  
+**Step 2 — Residual Injection** (stability, α = 0.1)
 ```python
-H_proj = spectral_sphere_project(H_new, r=1.0)
+H_res = (1 - alpha) * H_new + alpha * I
 ```
 
-**Step 3 — Residual Injection** (stability, α = 0.1)  
-```
-H_proj = (1 − α) · H_proj + α · I
+**Step 3 — Final Certified Spectral Projection**
+```python
+from constitutional_swarm.swarm_ode import exact_spectral_project_torch
+
+H_proj = exact_spectral_project_torch(H_res, r=1.0)
 ```
 
-**Step 4 — DP Noise Addition**  
+Here `H_res` is a finite floating-point `torch.Tensor`. The helper computes the
+largest singular value with `torch.linalg.svdvals`, rescales when needed, and
+rechecks the result. Its finite-precision contract is `‖H_proj‖₂ ≤ r`; it raises
+if that postcondition cannot be certified.
+
+**Step 4 — DP Noise Addition**
 Sample `Z ~ N(0, σ²I)` and compute noisy public matrix:
 ```
 H̃ = H_proj + Z
@@ -120,9 +141,11 @@ Agent `i` generates proof `π` asserting:
 
 Circuit statement (informal):
 ```
-∃ H_proj, Z  such that:
+∃ H_res, H_proj, Z  such that:
+    H_res = (1-α) · H_new + α·I
+    H_proj = certified_spectral_projection(H_res, r)
     spectral_norm(H_proj) ≤ r
-    H̃ = (1-α) · H_proj + α·I + Z
+    H̃ = H_proj + Z
     Z is a valid Gaussian sample (via verifiable randomness)
 ```
 
@@ -151,9 +174,9 @@ tradeoff. At low `σ` (high ε, loose privacy) the swarm is deterministic. At
 high `σ` (tight privacy) it explores more, potentially discovering novel routing
 solutions.
 
-**Claim:** For `σ ≤ r/√n`, the Gaussian noise does not materially perturb the
-swarm's trajectory. This follows from the spectral sphere bound: the noise matrix
-has expected spectral norm `E[‖Z‖₂] ≈ σ√n`, which is ≤ r when `σ ≤ r/√n`.
+**Heuristic stability scale:** an `n × n` iid Gaussian matrix has leading
+spectral-norm scale about `2σ√n`. Thus `σ ≤ r/(2√n)` keeps that leading scale at
+or below `r`. This is a dynamics heuristic, not part of the DP proof.
 
 ---
 
@@ -171,9 +194,9 @@ has expected spectral norm `E[‖Z‖₂] ≈ σ√n`, which is ≤ r when `σ �
 
 ## 6. Open Questions
 
-1. **Sensitivity tightness:** Is `Δf = 2r` tight, or can we prove a tighter bound
-   exploiting the residual injection structure? If `H_proj` must be close to `αI`
-   (the residual attractor), the effective sensitivity may be much lower.
+1. **Sensitivity tightness:** Can the update be clipped directly in Frobenius
+   norm, yielding a declared clip bound smaller than `2r√n`? Residual structure
+   alone does not certify a discount for the final projected output.
 
 2. **zk-SNARK circuit complexity:** Proving the Gaussian draw is valid requires
    either a VRF (cheap, online assumption) or hash-to-curve (more expensive, fully
@@ -192,9 +215,9 @@ has expected spectral norm `E[‖Z‖₂] ≈ σ√n`, which is ≤ r when `σ �
 ## 7. Implementation Sketch
 
 ```python
-import math
 import numpy as np
-from constitutional_swarm.spectral_sphere import spectral_sphere_project
+import torch
+from constitutional_swarm.swarm_ode import calibrate_sigma, exact_spectral_project_torch
 
 
 def dp_broadcast_matrix(
@@ -205,27 +228,32 @@ def dp_broadcast_matrix(
     epsilon: float = 2.0,
     delta: float = 1e-5,
 ) -> tuple[list[list[float]], float]:
-    """Apply spectral projection, residual injection, and Gaussian DP noise.
+    """Apply residual injection, final spectral projection, and Gaussian noise.
 
     Returns (H_tilde, sigma) — the noisy matrix and the noise standard deviation.
     The zk-SNARK proof generation (Step 5) is out of scope here.
     """
     n = len(h_new)
 
-    # Step 2: Spectral projection
-    proj = spectral_sphere_project(h_new, r=r)
-    H = list(list(row) for row in proj.matrix)
-
-    # Step 3: Residual injection
+    # Step 2: residual injection
     beta = 1.0 - residual_alpha
-    H = [
-        [beta * H[i][j] + (residual_alpha if i == j else 0.0) for j in range(n)]
+    residual = [
+        [beta * h_new[i][j] + (residual_alpha if i == j else 0.0) for j in range(n)]
         for i in range(n)
     ]
 
+    # Step 3: exact-SVD projection with a checked finite-precision postcondition.
+    residual_tensor = torch.tensor(residual, dtype=torch.float64)
+    projected = exact_spectral_project_torch(residual_tensor, r=r)
+    H = projected.detach().cpu().numpy().tolist()
+
     # Step 4: Gaussian DP noise
-    sensitivity = 2 * r  # Lemma 1
-    sigma = sensitivity * math.sqrt(2 * math.log(1.25 / delta)) / epsilon
+    sigma = calibrate_sigma(
+        certified_spectral_bound=r,
+        matrix_dimension=n,
+        epsilon=epsilon,
+        delta=delta,
+    )
     noise = np.random.normal(0, sigma, (n, n))
     H_tilde = [[H[i][j] + noise[i][j] for j in range(n)] for i in range(n)]
 
@@ -234,7 +262,7 @@ def dp_broadcast_matrix(
 
 ---
 
-## 8. Addendum: Sensitivity-Tightening via Residual Attractors
+## 8. Addendum: Why Residual Injection Does Not Reduce the Certified Bound
 
 In Phase 2, the MCFS architecture introduced residual identity injection to prevent
 Birkhoff Uniformity Collapse:
@@ -243,43 +271,25 @@ Birkhoff Uniformity Collapse:
 H_proj = (1 − α) · Proj_r(H_new) + α · I
 ```
 
-where α ∈ (0, 1) (historically reported as a stable 142% variance
-retention for n=50 agents in the SpectralSphere research harness — a
-measured research observation, not a product SLA). While designed as a leaky integrator for topological
-stability, this formulation provides a secondary benefit: it is a strict contraction
-mapping on the L₂ sensitivity, reducing the required DP noise budget.
+where α ∈ (0, 1). The identity term cancels when comparing adjacent inputs, but
+that observation does not establish the sensitivity used by the production
+mechanism. The implementation applies residual blending before a final spectral
+projection, and the certified public contract bounds only that final output in
+spectral norm. Projection onto a convex set is non-expansive in Frobenius norm,
+but there is no certified Frobenius sensitivity for the unprojected update to
+which a `(1−α)` factor can safely be applied.
 
-### Lemma 2: Residual Sensitivity Bound
-
-Let `f(D) = Proj_r(H_new)` be the base projection function with sensitivity `Δf ≤ 2r`
-(Lemma 1). Let `g(D) = (1−α)f(D) + αI` be the residual-injected function.
-
-The L₂ sensitivity of `g` is:
+The fail-closed bound therefore remains:
 
 ```
-‖g(D) − g(D')‖₂ = ‖[(1−α)f(D) + αI] − [(1−α)f(D') + αI]‖₂
-                 = (1−α) · ‖f(D) − f(D')‖₂
+Δ₂ ≤ 2r√n
 ```
 
-The αI terms cancel exactly. Because `‖f(D) − f(D')‖₂ ≤ 2r`:
-
-```
-Δg ≤ 2(1−α)r
-```
-
-**Corollary:** Define effective radius `ρ = (1−α)r`. The tightened noise calibration:
-
-```
-σ_tight = 2(1−α)r · √(2 ln(1.25/δ)) / ε
-```
-
-Because `σ ∝ Δg`, the residual injection at α=0.1 **reduces required cryptographic
-noise by exactly 10%** for the same (ε, δ) budget. For α=0.2: 20% reduction.
-More generally: the stronger the stability injection, the less noise required.
-
-**Significance:** The topological stability fix (Phase 2) intrinsically improves
-cryptographic utility (Phase 3). The same α that prevents trust collapse also
-lowers the DP noise floor — these are not competing tradeoffs, they compound.
+independent of α. A smaller value is valid only when the mechanism enforces and
+declares a Frobenius clip norm, or when a separate proof certifies a tighter
+adjacency Lipschitz bound for the complete update path. The previously stated
+10%, 20%, and 50% residual discounts are withdrawn; author-facing replacements
+are listed in `papers/DP_SENSITIVITY_ERRATA.md`.
 
 ---
 

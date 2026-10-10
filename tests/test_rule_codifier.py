@@ -11,14 +11,42 @@ from constitutional_swarm.bittensor.rule_codifier import (
     PrecedentCluster,
     RuleCandidate,
     RuleCandidateStatus,
-    RuleCodifier,
+    RuleCodifier as _RuleCodifier,
     _append_rule_to_yaml,
     _cosine,
     _generate_rule_text,
     _infer_severity,
+    constitution_hash,
+)
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store,
 )
 
-CONST_HASH = "608508a9bd224290"
+
+GOVERNOR = "sn-owner-governor"
+
+
+def RuleCodifier(constitutional_hash, *args, **kwargs):  # type: ignore[no-untyped-def]
+    kwargs.setdefault("precedent_store", c14_precedent_test_store(constitutional_hash))
+    kwargs.setdefault("governors", {GOVERNOR})
+    return _RuleCodifier(constitutional_hash, *args, **kwargs)
+
+SIMPLE_CONSTITUTION = """\
+name: test-constitution
+rules:
+  - id: safety-01
+    text: Do not cause harm
+    severity: critical
+    hardcoded: true
+    keywords:
+      - harm
+"""
+
+
+# C38: activation only extends the YAML the codifier is pinned to, so the
+# codifier (and its precedent epoch) is pinned to SIMPLE_CONSTITUTION's hash.
+CONST_HASH = constitution_hash(SIMPLE_CONSTITUTION)
 
 _PRIVACY_VEC = {
     "safety": 0.1,
@@ -47,15 +75,14 @@ def _make_rec(
     judgment: str = "Privacy wins",
     grade: float = 0.92,
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
-        task_id="t1",
+        task_id=f"task-{case_id}",
         miner_uid="miner-01",
         judgment=judgment,
         reasoning="rationale",
-        votes_for=3,
-        votes_against=0,
-        proof_root_hash="abc",
+        votes_for=9,
+        votes_against=1,
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector=vector or _PRIVACY_VEC,
         constitutional_hash=CONST_HASH,
@@ -79,16 +106,30 @@ def _make_cluster(
     )
 
 
-SIMPLE_CONSTITUTION = """\
-name: test-constitution
-rules:
-  - id: safety-01
-    text: Do not cause harm
-    severity: critical
-    hardcoded: true
-    keywords:
-      - harm
-"""
+def _admit_records(
+    codifier: RuleCodifier,
+    records: list[PrecedentRecord],
+) -> list[PrecedentRecord]:
+    for record in records:
+        codifier.precedent_store.add(record)
+    return list(
+        codifier.precedent_store.active_records_by_id(
+            [record.precedent_id for record in records]
+        )
+    )
+
+
+def _canonical_cluster(
+    codifier: RuleCodifier,
+    *,
+    size: int = 5,
+    vector: dict | None = None,
+    prefix: str = "source",
+) -> PrecedentCluster:
+    records = [_make_rec(f"{prefix}-{i}", vector=vector) for i in range(size)]
+    source_ids = {record.precedent_id for record in records}
+    clusters = codifier.find_clusters(_admit_records(codifier, records))
+    return next(cluster for cluster in clusters if source_ids.intersection(cluster.precedent_ids))
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +170,15 @@ class TestUtilities:
 
     def test_append_rule_to_yaml_with_rules(self):
         yaml = SIMPLE_CONSTITUTION
-        block = "  - id: new-rule\n    text: new rule\n"
-        result = _append_rule_to_yaml(yaml, block)
+        rule = {"id": "new-rule", "text": "new rule"}
+        result = _append_rule_to_yaml(yaml, rule)
         assert "new-rule" in result
         assert result.index("safety-01") < result.index("new-rule")
 
     def test_append_rule_to_yaml_without_rules(self):
         yaml = "name: minimal"
-        block = "  - id: r1\n    text: rule\n"
-        result = _append_rule_to_yaml(yaml, block)
+        rule = {"id": "r1", "text": "rule"}
+        result = _append_rule_to_yaml(yaml, rule)
         assert "rules:" in result
         assert "r1" in result
 
@@ -154,7 +195,7 @@ class TestClustering:
 
     def test_find_clusters_single(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.8)
-        recs = [_make_rec(f"c{i}") for i in range(3)]
+        recs = _admit_records(codifier, [_make_rec(f"c{i}") for i in range(3)])
         clusters = codifier.find_clusters(recs)
         assert len(clusters) >= 1
 
@@ -163,24 +204,22 @@ class TestClustering:
         # 5 privacy-heavy, 5 security-heavy
         priv_recs = [_make_rec(f"priv{i}", vector=_PRIVACY_VEC) for i in range(5)]
         sec_recs = [_make_rec(f"sec{i}", vector=_SECURITY_VEC) for i in range(5)]
-        clusters = codifier.find_clusters(priv_recs + sec_recs)
+        clusters = codifier.find_clusters(_admit_records(codifier, priv_recs + sec_recs))
         # Should form 2 clusters (privacy group + security group)
         assert len(clusters) >= 1
 
-    def test_revoked_excluded_from_clustering(self):
+    def test_revoked_raw_input_rejected(self):
         codifier = RuleCodifier(CONST_HASH)
         import dataclasses
 
         r = _make_rec("c1")
         revoked = dataclasses.replace(r, is_active=False)
-        clusters = codifier.find_clusters([revoked])
-        # Revoked precedent not included in any cluster
-        for cl in clusters:
-            assert "c1" not in [pid for pid in cl.precedent_ids]
+        with pytest.raises(ValueError, match="inactive|revoked"):
+            codifier.find_clusters([revoked])
 
     def test_cluster_has_dominant_dimensions(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.7)
-        recs = [_make_rec(f"c{i}") for i in range(5)]
+        recs = _admit_records(codifier, [_make_rec(f"c{i}") for i in range(5)])
         clusters = codifier.find_clusters(recs)
         for cl in clusters:
             # dominant_dimensions should reflect high-score dims
@@ -188,7 +227,9 @@ class TestClustering:
 
     def test_cluster_validator_agreement(self):
         codifier = RuleCodifier(CONST_HASH, similarity_threshold=0.7)
-        recs = [_make_rec(f"c{i}", grade=0.90) for i in range(5)]
+        recs = _admit_records(
+            codifier, [_make_rec(f"c{i}", grade=0.90) for i in range(5)]
+        )
         clusters = codifier.find_clusters(recs)
         for cl in clusters:
             assert 0.0 <= cl.validator_agreement <= 1.0
@@ -202,37 +243,37 @@ class TestClustering:
 class TestProposeRules:
     def test_below_min_size_not_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=10, min_validator_agreement=0.5)
-        small = _make_cluster(size=5)
+        small = _canonical_cluster(codifier, size=5)
         candidates = codifier.propose_rules([small])
         assert candidates == []
 
     def test_below_min_agreement_not_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.95)
-        low_agreement = _make_cluster(size=10, agreement=0.80)
+        low_agreement = _canonical_cluster(codifier, size=10)
         candidates = codifier.propose_rules([low_agreement])
         assert candidates == []
 
     def test_qualifying_cluster_proposed(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.90)
-        good = _make_cluster(size=10, agreement=0.93)
+        good = _canonical_cluster(codifier, size=10)
         candidates = codifier.propose_rules([good])
         assert len(candidates) == 1
 
     def test_candidate_is_pending(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=5, min_validator_agreement=0.9)
-        candidates = codifier.propose_rules([_make_cluster(size=10, agreement=0.93)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier, size=10)])
         assert candidates[0].status == RuleCandidateStatus.PENDING
 
     def test_rule_id_has_prefix(self):
         codifier = RuleCodifier(
             CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5, rule_id_prefix="TEST"
         )
-        candidates = codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier)])
         assert candidates[0].rule_id.startswith("TEST-")
 
     def test_to_yaml_block_format(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        candidates = codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
+        candidates = codifier.propose_rules([_canonical_cluster(codifier)])
         block = candidates[0].to_yaml_block()
         assert "id:" in block
         assert "text:" in block
@@ -250,32 +291,32 @@ class TestProposeRules:
 class TestApprovalWorkflow:
     def _setup(self) -> tuple[RuleCodifier, RuleCandidate]:
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        cluster = _make_cluster(size=5, agreement=0.91)
+        cluster = _canonical_cluster(codifier)
         [candidate] = codifier.propose_rules([cluster])
         return codifier, candidate
 
     def test_approve(self):
         codifier, candidate = self._setup()
-        approved = codifier.approve(candidate.candidate_id)
+        approved = codifier.approve(candidate.candidate_id, governor=GOVERNOR)
         assert approved.status == RuleCandidateStatus.APPROVED
         assert approved.approved_at is not None
 
     def test_reject(self):
         codifier, candidate = self._setup()
-        rejected = codifier.reject(candidate.candidate_id, reason="contradicts safety-01")
+        rejected = codifier.reject(candidate.candidate_id, reason="contradicts safety-01", governor=GOVERNOR)
         assert rejected.status == RuleCandidateStatus.REJECTED
         assert "contradicts" in rejected.rejection_reason
 
     def test_approve_wrong_state_raises(self):
         codifier, candidate = self._setup()
-        codifier.reject(candidate.candidate_id)
+        codifier.reject(candidate.candidate_id, governor=GOVERNOR)
         with pytest.raises(ValueError, match="rejected"):
-            codifier.approve(candidate.candidate_id)
+            codifier.approve(candidate.candidate_id, governor=GOVERNOR)
 
     def test_activate(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        activated, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        activated, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
         assert activated.status == RuleCandidateStatus.ACTIVE
         assert activated.constitutional_hash_after != CONST_HASH
@@ -286,48 +327,52 @@ class TestApprovalWorkflow:
     def test_activate_not_approved_raises(self):
         codifier, candidate = self._setup()
         with pytest.raises(ValueError, match="pending"):
-            codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+            codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
     def test_revoke_active_rule(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
-        revoked = codifier.revoke(candidate.candidate_id, reason="bad rule")
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
+        revoked = codifier.revoke(candidate.candidate_id, reason="bad rule", governor=GOVERNOR)
         assert revoked.status == RuleCandidateStatus.REVOKED
         assert "bad rule" in revoked.revocation_reason
         assert codifier.active_rules == []
 
     def test_activate_appends_rule_to_yaml(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        _, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        _, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         assert "safety-01" in new_yaml  # original rule preserved
         assert candidate.rule_id in new_yaml  # new rule appended
 
     def test_multiple_rules_sequential_hashes(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        c1 = codifier.propose_rules([_make_cluster(size=5, agreement=0.91, dims=["privacy"])])[0]
-        c2 = codifier.propose_rules([_make_cluster(size=5, agreement=0.93, dims=["security"])])[0]
+        privacy = _canonical_cluster(codifier, prefix="privacy")
+        security = _canonical_cluster(
+            codifier, vector=_SECURITY_VEC, prefix="security"
+        )
+        c1 = codifier.propose_rules([privacy])[0]
+        c2 = codifier.propose_rules([security])[0]
 
-        codifier.approve(c1.candidate_id)
-        _, yaml1 = codifier.activate(c1.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(c1.candidate_id, governor=GOVERNOR)
+        _, yaml1 = codifier.activate(c1.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         hash_after_1 = codifier.constitutional_hash
 
-        codifier.approve(c2.candidate_id)
-        _, _yaml2 = codifier.activate(c2.candidate_id, yaml1)
+        codifier.approve(c2.candidate_id, governor=GOVERNOR)
+        codifier.activate(c2.candidate_id, yaml1, governor=GOVERNOR)
         hash_after_2 = codifier.constitutional_hash
 
-        assert hash_after_1 != hash_after_2  # each activation produces new hash
+        assert hash_after_1 != hash_after_2
 
     def test_nonexistent_candidate_raises(self):
         codifier = RuleCodifier(CONST_HASH)
         with pytest.raises(KeyError):
-            codifier.approve("nonexistent")
+            codifier.approve("nonexistent", governor=GOVERNOR)
 
     def test_summary(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         s = codifier.summary()
         assert s["total_candidates"] == 1
         assert s["active_rules"] == 1
@@ -335,8 +380,10 @@ class TestApprovalWorkflow:
 
     def test_pending_candidates_property(self):
         codifier = RuleCodifier(CONST_HASH, min_cluster_size=1, min_validator_agreement=0.5)
-        codifier.propose_rules([_make_cluster(size=5, agreement=0.91)])
-        codifier.propose_rules([_make_cluster(size=5, agreement=0.92)])
+        first = _canonical_cluster(codifier, prefix="first")
+        second = _canonical_cluster(codifier, vector=_SECURITY_VEC, prefix="second")
+        codifier.propose_rules([first])
+        codifier.propose_rules([second])
         assert len(codifier.pending_candidates) == 2
 
 
@@ -385,15 +432,14 @@ class TestRuleCodificationE2E:
         judgment: str = "Default judgment",
         grade: float = 0.95,
     ) -> PrecedentRecord:
-        return PrecedentRecord.create(
+        return c14_precedent_signed_record(
             case_id=case_id,
-            task_id="t-e2e",
+            task_id=f"task-{case_id}",
             miner_uid="miner-e2e",
             judgment=judgment,
             reasoning="e2e rationale",
-            votes_for=3,
-            votes_against=0,
-            proof_root_hash="e2ehash",
+            votes_for=9,
+            votes_against=1,
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=vector,
             constitutional_hash=CONST_HASH,
@@ -422,6 +468,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
 
         # Step 1: Find clusters
         clusters = codifier.find_clusters(precedents, domain="e2e-test")
@@ -447,12 +494,12 @@ class TestRuleCodificationE2E:
 
         # Step 3: Governor approves the first candidate
         target = candidates[0]
-        approved = codifier.approve(target.candidate_id)
+        approved = codifier.approve(target.candidate_id, governor=GOVERNOR)
         assert approved.status == RuleCandidateStatus.APPROVED
         assert approved.approved_at is not None
 
         # Step 4: Activate — append to constitution YAML
-        activated, new_yaml = codifier.activate(target.candidate_id, SIMPLE_CONSTITUTION)
+        activated, new_yaml = codifier.activate(target.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
         # Verify state: ACTIVE
         assert activated.status == RuleCandidateStatus.ACTIVE
@@ -479,6 +526,7 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
 
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
@@ -492,12 +540,12 @@ class TestRuleCodificationE2E:
         assert pending[0].status == RuleCandidateStatus.PENDING
 
         # Transition to APPROVED
-        codifier.approve(cid)
+        codifier.approve(cid, governor=GOVERNOR)
         approved = next(c for c in codifier.all_candidates() if c.candidate_id == cid)
         assert approved.status == RuleCandidateStatus.APPROVED
 
         # Transition to ACTIVE
-        codifier.activate(cid, SIMPLE_CONSTITUTION)
+        codifier.activate(cid, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         active = next(c for c in codifier.all_candidates() if c.candidate_id == cid)
         assert active.status == RuleCandidateStatus.ACTIVE
 
@@ -510,11 +558,12 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) >= 1
 
-        rejected = codifier.reject(candidates[0].candidate_id, reason="does not meet standards")
+        rejected = codifier.reject(candidates[0].candidate_id, reason="does not meet standards", governor=GOVERNOR)
         assert rejected.status == RuleCandidateStatus.REJECTED
         assert "does not meet standards" in rejected.rejection_reason
 
@@ -527,15 +576,16 @@ class TestRuleCodificationE2E:
             min_validator_agreement=0.70,
             similarity_threshold=0.80,
         )
+        precedents = _admit_records(codifier, precedents)
         clusters = codifier.find_clusters(precedents)
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) >= 1
 
         cid = candidates[0].candidate_id
-        codifier.approve(cid)
-        codifier.activate(cid, SIMPLE_CONSTITUTION)
+        codifier.approve(cid, governor=GOVERNOR)
+        codifier.activate(cid, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         assert len(codifier.active_rules) == 1
 
-        revoked = codifier.revoke(cid, reason="superseded by newer rule")
+        revoked = codifier.revoke(cid, reason="superseded by newer rule", governor=GOVERNOR)
         assert revoked.status == RuleCandidateStatus.REVOKED
         assert codifier.active_rules == []

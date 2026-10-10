@@ -27,6 +27,12 @@ from constitutional_swarm import (
     ValidationVote,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteSignerRegistry,
+    sign_vote_envelope,
+    signed_assignment_digest,
+    verify_vote_envelope,
+)
 
 # tests/test_mesh.py must stay stable across the planned mesh package split.
 # A few mesh-specific exception types are not top-level exports yet, so bind
@@ -35,6 +41,24 @@ _MESH_GLOBALS = ConstitutionalMesh.request_validation.__globals__
 DuplicateVoteError = _MESH_GLOBALS["DuplicateVoteError"]
 InsufficientPeersError = _MESH_GLOBALS["InsufficientPeersError"]
 UnauthorizedVoterError = _MESH_GLOBALS["UnauthorizedVoterError"]
+
+
+def _test_mesh(*args, **kwargs) -> ConstitutionalMesh:
+    kwargs.setdefault("evidence_mode", "single_operator_dev")
+    registry = kwargs.get("vote_registry")
+    if registry is not None and "assigner_private_key" not in kwargs:
+        assigner_key = getattr(registry, "_test_assigner_private_key", None)
+        if assigner_key is None:
+            assigner_key = Ed25519PrivateKey.generate()
+            registry.register(
+                "test-mesh-assigner", assigner_key.public_key(), roles={"assigner"}
+            )
+            registry._test_assigner_private_key = assigner_key
+        kwargs["assigner_private_key"] = assigner_key
+        kwargs["assigner_id"] = "test-mesh-assigner"
+    if "settlement_store" in kwargs or "settlement_store_path" in kwargs:
+        kwargs["quorum"] = max(3, kwargs.get("quorum", 3))
+    return ConstitutionalMesh(*args, **kwargs)
 
 
 class _FailingSettlementStore:
@@ -93,7 +117,9 @@ def _signed_vote(
 @pytest.fixture
 def mesh() -> ConstitutionalMesh:
     """Mesh with default constitution and 5 agents, deterministic seed."""
-    m = ConstitutionalMesh(Constitution.default(), seed=42)
+    m = _test_mesh(
+        Constitution.default(), peers_per_validation=2, quorum=2, seed=42
+    )
     for i in range(5):
         m.register_local_signer(f"agent-{i:02d}", domain=f"domain-{i % 3}")
     return m
@@ -117,7 +143,7 @@ def custom_mesh() -> ConstitutionalMesh:
         ),
     ]
     const = Constitution.from_rules(rules, name="mesh-test")
-    m = ConstitutionalMesh(const, peers_per_validation=3, quorum=2, seed=42)
+    m = _test_mesh(const, peers_per_validation=3, quorum=2, seed=42)
     for i in range(6):
         m.register_local_signer(f"peer-{i:02d}", domain=f"dom-{i % 2}")
     return m
@@ -156,7 +182,7 @@ class TestAgentManagement:
 
     def test_summary_reports_jsonl_settlement_storage(self, tmp_path) -> None:
         store = JSONLSettlementStore(tmp_path / "mesh.jsonl")
-        mesh = ConstitutionalMesh(Constitution.default(), seed=1, settlement_store=store)
+        mesh = _test_mesh(Constitution.default(), seed=1, settlement_store=store)
         summary = mesh.summary()
         assert summary["settlement_storage"]["enabled"] is True
         assert summary["settlement_storage"]["backend"] == "jsonl"
@@ -165,7 +191,7 @@ class TestAgentManagement:
 
     def test_summary_reports_sqlite_settlement_storage(self, tmp_path) -> None:
         store = SQLiteSettlementStore(tmp_path / "mesh.db")
-        mesh = ConstitutionalMesh(Constitution.default(), seed=1, settlement_store=store)
+        mesh = _test_mesh(Constitution.default(), seed=1, settlement_store=store)
         summary = mesh.summary()
         assert summary["settlement_storage"]["enabled"] is True
         assert summary["settlement_storage"]["backend"] == "sqlite"
@@ -173,14 +199,14 @@ class TestAgentManagement:
         assert summary["pending_settlements"] == 0
 
     def test_settlement_store_path_dot_db_auto_selects_sqlite(self, tmp_path) -> None:
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(), seed=2, settlement_store_path=tmp_path / "auto.db"
         )
         summary = mesh.summary()
         assert summary["settlement_storage"]["backend"] == "sqlite"
 
     def test_settlement_store_path_dot_jsonl_auto_selects_jsonl(self, tmp_path) -> None:
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(), seed=3, settlement_store_path=tmp_path / "auto.jsonl"
         )
         summary = mesh.summary()
@@ -202,7 +228,7 @@ class TestRegistrationModeTransitions:
 
     def test_local_to_remote_purges_private_key(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=1)
+        mesh = _test_mesh(const, seed=1)
         mesh.register_local_signer("agent-a")
         assert "agent-a" in mesh._agent_vote_private_keys
 
@@ -214,7 +240,7 @@ class TestRegistrationModeTransitions:
 
     def test_remote_to_local_adds_private_key(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=2)
+        mesh = _test_mesh(const, seed=2)
         remote_key = Ed25519PrivateKey.generate()
         mesh.register_remote_agent("agent-b", vote_public_key=remote_key.public_key())
         assert "agent-b" not in mesh._agent_vote_private_keys
@@ -226,7 +252,7 @@ class TestRegistrationModeTransitions:
 
     def test_local_to_remote_updates_public_key(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=3)
+        mesh = _test_mesh(const, seed=3)
         mesh.register_local_signer("agent-c")
         old_pub = mesh._agent_vote_public_keys["agent-c"]
 
@@ -237,7 +263,7 @@ class TestRegistrationModeTransitions:
 
     def test_remote_to_local_updates_public_key(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=4)
+        mesh = _test_mesh(const, seed=4)
         old_remote_key = Ed25519PrivateKey.generate()
         mesh.register_remote_agent("agent-d", vote_public_key=old_remote_key.public_key())
         old_pub = mesh._agent_vote_public_keys["agent-d"]
@@ -249,7 +275,7 @@ class TestRegistrationModeTransitions:
 
     def test_unregister_clears_key_material(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=5)
+        mesh = _test_mesh(const, seed=5)
         mesh.register_local_signer("agent-e")
         assert "agent-e" in mesh._agent_vote_private_keys
 
@@ -260,7 +286,7 @@ class TestRegistrationModeTransitions:
 
     def test_unregister_then_reregister_gets_fresh_keys(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=6)
+        mesh = _test_mesh(const, seed=6)
         mesh.register_local_signer("agent-f")
         old_priv = mesh._agent_vote_private_keys["agent-f"]
 
@@ -271,7 +297,7 @@ class TestRegistrationModeTransitions:
 
     def test_mode_transition_preserves_agent_count(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=7)
+        mesh = _test_mesh(const, seed=7)
         mesh.register_local_signer("agent-g")
         count_before = mesh.agent_count
 
@@ -284,7 +310,7 @@ class TestRegistrationModeTransitions:
 
     def test_local_to_remote_twice_is_idempotent(self) -> None:
         const = Constitution.default()
-        mesh = ConstitutionalMesh(const, seed=8)
+        mesh = _test_mesh(const, seed=8)
         mesh.register_local_signer("agent-h")
 
         remote_key = Ed25519PrivateKey.generate()
@@ -295,7 +321,7 @@ class TestRegistrationModeTransitions:
         assert mesh.agent_count == 1
 
     def test_local_signer_reregistered_remote_blocks_local_signing(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=9)
+        mesh = _test_mesh(Constitution.default(), seed=9)
         mesh.register_local_signer("producer")
         mesh.register_local_signer("peer-1")
         mesh.register_local_signer("peer-2")
@@ -313,7 +339,7 @@ class TestRegistrationModeTransitions:
             mesh.sign_vote(assignment.assignment_id, "peer-1", approved=True)
 
     def test_remote_agent_reregistered_local_can_validate_and_vote(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=10)
+        mesh = _test_mesh(Constitution.default(), seed=10)
         mesh.register_local_signer("producer")
         original_remote_key = Ed25519PrivateKey.generate()
         mesh.register_remote_agent("peer-1", vote_public_key=original_remote_key.public_key())
@@ -326,21 +352,22 @@ class TestRegistrationModeTransitions:
         replacement_local_key = Ed25519PrivateKey.generate()
         mesh.register_local_signer("peer-1", vote_private_key=replacement_local_key)
 
-        vote = mesh.validate_and_vote(assignment.assignment_id, "peer-1")
+        mesh.validate_and_vote(assignment.assignment_id, "peer-1")
 
-        assert ConstitutionalMesh.verify_vote_signature(
-            public_key=mesh.get_vote_public_key("peer-1"),
+        envelope = mesh._vote_envelopes[assignment.assignment_id][0]
+        assert verify_vote_envelope(
+            envelope,
+            mesh.vote_registry,
+            task_id=assignment.task_id,
             assignment_id=assignment.assignment_id,
-            voter_id="peer-1",
-            approved=vote.approved,
-            reason=vote.reason,
-            constitutional_hash=assignment.constitutional_hash,
+            producer_id=assignment.producer_id,
+            artifact_id=assignment.artifact_id,
             content_hash=assignment.content_hash,
-            signature=vote.signature,
+            constitutional_hash=assignment.constitutional_hash,
         )
 
     def test_registered_remote_vote_rejects_voter_id_mismatch(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=11)
+        mesh = _test_mesh(Constitution.default(), seed=11)
         mesh.register_local_signer("producer")
         remote_key = Ed25519PrivateKey.generate()
         mesh.register_remote_agent("peer-1", vote_public_key=remote_key.public_key())
@@ -371,7 +398,7 @@ class TestRegistrationModeTransitions:
             )
 
     def test_duplicate_local_registration_rotates_signing_key(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=12)
+        mesh = _test_mesh(Constitution.default(), seed=12)
         mesh.register_local_signer("producer")
         original_local_key = Ed25519PrivateKey.generate()
         mesh.register_local_signer("peer-1", vote_private_key=original_local_key)
@@ -408,19 +435,17 @@ class TestRegistrationModeTransitions:
             approved=True,
             reason="rotated local",
         )
-        assert ConstitutionalMesh.verify_vote_signature(
-            public_key=mesh.get_vote_public_key("peer-1"),
-            assignment_id=assignment.assignment_id,
-            voter_id="peer-1",
+        vote = mesh.submit_vote(
+            assignment.assignment_id,
+            "peer-1",
             approved=True,
             reason="rotated local",
-            constitutional_hash=assignment.constitutional_hash,
-            content_hash=assignment.content_hash,
             signature=replacement_signature,
         )
+        assert vote.signature == replacement_signature
 
     def test_duplicate_remote_registration_invalidates_old_signature(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=13)
+        mesh = _test_mesh(Constitution.default(), seed=13)
         mesh.register_local_signer("producer")
         original_remote_key = Ed25519PrivateKey.generate()
         mesh.register_remote_agent("peer-1", vote_public_key=original_remote_key.public_key())
@@ -471,7 +496,7 @@ class TestPeerAssignment:
     def test_peers_assigned(self, mesh: ConstitutionalMesh) -> None:
         assignment = mesh.request_validation("agent-00", "analyze code quality", "art-1")
         assert isinstance(assignment, PeerAssignment)
-        assert len(assignment.peers) == 3
+        assert len(assignment.peers) == 2
         assert assignment.producer_id == "agent-00"
 
     def test_producer_excluded_from_peers_maci(self, mesh: ConstitutionalMesh) -> None:
@@ -494,7 +519,7 @@ class TestPeerAssignment:
             mesh.request_validation("ghost", "content", "art-1")
 
     def test_insufficient_peers_raises(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), quorum=3, seed=1)
+        mesh = _test_mesh(Constitution.default(), quorum=3, seed=1)
         mesh.register_local_signer("a1")
         mesh.register_local_signer("a2")  # Only 1 peer available (exclude producer)
         with pytest.raises(InsufficientPeersError):
@@ -502,8 +527,8 @@ class TestPeerAssignment:
 
     def test_deterministic_with_seed(self) -> None:
         """Same seed produces same peer selection."""
-        m1 = ConstitutionalMesh(Constitution.default(), seed=99)
-        m2 = ConstitutionalMesh(Constitution.default(), seed=99)
+        m1 = _test_mesh(Constitution.default(), seed=99)
+        m2 = _test_mesh(Constitution.default(), seed=99)
         for m in (m1, m2):
             for i in range(5):
                 m.register_local_signer(f"a-{i}")
@@ -571,7 +596,7 @@ class TestVoting:
 
         _signed_vote(mesh, assignment.assignment_id, peers[0], approved=True)
         result = mesh.get_result(assignment.assignment_id)
-        assert result.pending_votes == 2
+        assert result.pending_votes == 1
         assert result.settled is False
 
     def test_duplicate_vote_raises(self, mesh: ConstitutionalMesh) -> None:
@@ -605,7 +630,7 @@ class TestVoting:
     def test_external_private_key_vote_verifies_against_registered_public_key(
         self,
     ) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=99)
+        mesh = _test_mesh(Constitution.default(), seed=99)
         signer_key = Ed25519PrivateKey.generate()
         mesh.register_local_signer("producer")
         mesh.register_remote_agent("peer-1", vote_public_key=signer_key.public_key())
@@ -615,34 +640,28 @@ class TestVoting:
         assignment = mesh.request_validation("producer", "safe work", "art-ext-1")
         request = mesh.prepare_remote_vote(assignment.assignment_id, "peer-1")
         assert isinstance(request, RemoteVoteRequest)
-        signature = signer_key.sign(
-            ConstitutionalMesh.build_vote_payload(
-                assignment_id=request.assignment_id,
-                voter_id=request.voter_id,
-                approved=True,
-                reason="external signer",
-                constitutional_hash=request.constitutional_hash,
-                content_hash=request.content_hash,
-            )
-        ).hex()
-        vote = mesh.submit_vote(
-            assignment.assignment_id,
-            "peer-1",
-            approved=True,
-            reason="external signer",
-            signature=signature,
-        )
-        assert vote.approved is True
-        assert ConstitutionalMesh.verify_vote_signature(
-            public_key=request.voter_public_key,
-            assignment_id=request.assignment_id,
+        assert request.signed_assignment is not None
+        envelope = sign_vote_envelope(
+            signer_key,
             voter_id=request.voter_id,
-            approved=True,
-            reason="external signer",
-            constitutional_hash=request.constitutional_hash,
+            task_id=request.task_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
             content_hash=request.content_hash,
-            signature=signature,
+            constitutional_hash=request.constitutional_hash,
+            decision="approved",
+            reason="external signer",
+            nonce=request.nonce,
+            issued_at=request.timestamp,
+            assigned_peers=request.assigned_peers,
+            quorum=request.quorum,
+            evidence_mode=request.evidence_mode,
+            assignment_digest=signed_assignment_digest(request.signed_assignment),
         )
+        vote = mesh.submit_vote_envelope(envelope)
+        assert vote.approved is True
+        assert vote.signature == envelope.signature
 
     def test_prepare_remote_vote_rejects_unassigned_peer(self, mesh: ConstitutionalMesh) -> None:
         assignment = mesh.request_validation("agent-00", "safe work", "art-remote-unassigned")
@@ -650,7 +669,7 @@ class TestVoting:
             mesh.prepare_remote_vote(assignment.assignment_id, "agent-00")
 
     def test_validate_and_vote_requires_local_signer(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=101)
+        mesh = _test_mesh(Constitution.default(), seed=101)
         remote_key = Ed25519PrivateKey.generate()
         mesh.register_local_signer("producer")
         mesh.register_remote_agent("peer-1", vote_public_key=remote_key.public_key())
@@ -661,7 +680,7 @@ class TestVoting:
             mesh.validate_and_vote(assignment.assignment_id, "peer-1")
 
     def test_register_agent_removed_raises_attribute_error(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=7)
+        mesh = _test_mesh(Constitution.default(), seed=7)
         with pytest.raises(AttributeError, match=r"register_agent.*removed"):
             mesh.register_agent("agent-x")
 
@@ -689,7 +708,7 @@ class TestVoting:
         _signed_vote(mesh, assignment.assignment_id, peers[1], approved=True)
 
         with pytest.raises(AssignmentSettledError):
-            _signed_vote(mesh, assignment.assignment_id, peers[2], approved=False)
+            _signed_vote(mesh, assignment.assignment_id, peers[0], approved=False)
 
 
 # ---------------------------------------------------------------------------
@@ -801,24 +820,35 @@ class TestCryptographicProof:
     def test_settled_result_survives_restart(self, tmp_path) -> None:
         store_path = tmp_path / "mesh-settlements.jsonl"
         constitution = Constitution.default()
+        registry = VoteSignerRegistry()
 
-        writer = ConstitutionalMesh(constitution, seed=42, settlement_store_path=store_path)
+        writer = _test_mesh(
+            constitution,
+            seed=42,
+            settlement_store_path=store_path,
+            vote_registry=registry,
+        )
         for i in range(5):
             writer.register_local_signer(f"agent-{i:02d}")
 
         result = writer.full_validation("agent-00", "restart-safe output", "art-13f")
         assert result.proof is not None
 
-        reader = ConstitutionalMesh(constitution, seed=99, settlement_store_path=store_path)
+        reader = _test_mesh(
+            constitution,
+            seed=99,
+            settlement_store_path=store_path,
+            vote_registry=registry,
+        )
         restored = reader.get_result(result.assignment_id)
         assert restored.settled is True
         assert restored.proof is not None
         assert restored.proof.root_hash == result.proof.root_hash
         assert restored.proof.verify() is True
 
-    def test_restart_rejects_mismatched_constitution_hash(self, tmp_path) -> None:
+    def test_restart_filters_historical_constitution_hash(self, tmp_path) -> None:
         store_path = tmp_path / "mesh-settlements.jsonl"
-        writer = ConstitutionalMesh(
+        writer = _test_mesh(
             Constitution.default(), seed=42, settlement_store_path=store_path
         )
         for i in range(5):
@@ -836,21 +866,29 @@ class TestCryptographicProof:
             ],
             name="other-constitution",
         )
-        with pytest.raises(ValueError, match="constitutional hash does not match"):
-            ConstitutionalMesh(other_constitution, seed=7, settlement_store_path=store_path)
+        reader = _test_mesh(
+            other_constitution, seed=7, settlement_store_path=store_path
+        )
+        with pytest.raises(KeyError):
+            reader.get_result(next(iter(writer._final_results)))
 
     def test_settled_result_survives_restart_with_sqlite_store(self, tmp_path) -> None:
         store = SQLiteSettlementStore(tmp_path / "mesh-settlements.db")
         constitution = Constitution.default()
+        registry = VoteSignerRegistry()
 
-        writer = ConstitutionalMesh(constitution, seed=42, settlement_store=store)
+        writer = _test_mesh(
+            constitution, seed=42, settlement_store=store, vote_registry=registry
+        )
         for i in range(5):
             writer.register_local_signer(f"agent-{i:02d}")
 
         result = writer.full_validation("agent-00", "sqlite-safe output", "art-13h")
         assert result.proof is not None
 
-        reader = ConstitutionalMesh(constitution, seed=99, settlement_store=store)
+        reader = _test_mesh(
+            constitution, seed=99, settlement_store=store, vote_registry=registry
+        )
         restored = reader.get_result(result.assignment_id)
         assert restored.settled is True
         assert restored.proof is not None
@@ -875,7 +913,7 @@ class TestReputation:
             assert mesh.get_reputation(p) > 1.0
 
     def test_minority_voter_loses_reputation(self, mesh: ConstitutionalMesh) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), peers_per_validation=4, quorum=3, seed=42)
+        mesh = _test_mesh(Constitution.default(), peers_per_validation=4, quorum=3, seed=42)
         for i in range(6):
             mesh.register_local_signer(f"agent-{i:02d}")
         assignment = mesh.request_validation("agent-00", "decent work", "art-15")
@@ -884,6 +922,7 @@ class TestReputation:
         _signed_vote(mesh, assignment.assignment_id, peers[0], approved=True)
         _signed_vote(mesh, assignment.assignment_id, peers[1], approved=False)
         _signed_vote(mesh, assignment.assignment_id, peers[2], approved=False)
+        _signed_vote(mesh, assignment.assignment_id, peers[3], approved=False)
 
         # Minority voter (peers[0]) loses reputation
         assert mesh.get_reputation(peers[0]) < 1.0
@@ -892,7 +931,7 @@ class TestReputation:
 
     def test_reputation_bounded(self) -> None:
         """Reputation stays in [0.0, 2.0]."""
-        mesh = ConstitutionalMesh(Constitution.default(), seed=1)
+        mesh = _test_mesh(Constitution.default(), seed=1)
         for i in range(5):
             mesh.register_local_signer(f"a-{i}")
 
@@ -918,7 +957,7 @@ class TestFullValidation:
         assert result.quorum_met is True
         assert result.proof is not None
         assert result.proof.verify() is True
-        assert result.pending_votes == 1
+        assert result.pending_votes == 0
         assert result.settled is True
 
     def test_all_agents_same_constitutional_hash(self, mesh: ConstitutionalMesh) -> None:
@@ -937,7 +976,7 @@ class TestFullValidation:
 class TestMeshAtScale:
     def test_50_agents_20_validations(self) -> None:
         """Mesh works at moderate scale with consistent results."""
-        mesh = ConstitutionalMesh(Constitution.default(), seed=123)
+        mesh = _test_mesh(Constitution.default(), seed=123)
         for i in range(50):
             mesh.register_local_signer(f"agent-{i:03d}", domain=f"domain-{i % 10}")
 
@@ -964,7 +1003,7 @@ class TestMeshAtScale:
         former 443ns figure is withdrawn). This test measures the full
         Python pipeline, not a Rust microbenchmark.
         """
-        mesh = ConstitutionalMesh(Constitution.default(), seed=7)
+        mesh = _test_mesh(Constitution.default(), seed=7)
         for i in range(10):
             mesh.register_local_signer(f"fast-{i}")
 
@@ -990,7 +1029,7 @@ class TestManifoldIntegration:
     @pytest.fixture
     def manifold_mesh(self) -> ConstitutionalMesh:
         """Mesh with manifold enabled and 5 agents."""
-        m = ConstitutionalMesh(Constitution.default(), seed=42, use_manifold=True)
+        m = _test_mesh(Constitution.default(), seed=42, use_manifold=True)
         for i in range(5):
             m.register_local_signer(f"agent-{i:02d}", domain=f"domain-{i % 3}")
         return m
@@ -1077,7 +1116,7 @@ class TestManifoldIntegration:
 
     def test_spectral_manifold_flag_switch(self) -> None:
         """Spectral manifold can be enabled without changing the default path."""
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(),
             seed=42,
             use_manifold=True,
@@ -1098,7 +1137,7 @@ class TestManifoldIntegration:
     def test_invalid_manifold_type_raises(self) -> None:
         """Unknown manifold types must fail fast at construction."""
         with pytest.raises(ValueError, match="manifold_type must be"):
-            ConstitutionalMesh(
+            _test_mesh(
                 Constitution.default(),
                 use_manifold=True,
                 manifold_type="unknown",  # type: ignore[arg-type]
@@ -1106,7 +1145,7 @@ class TestManifoldIntegration:
 
     def test_shadow_variance_diverges_from_birkhoff(self) -> None:
         """Shadow spectral metrics should retain more variance than live Birkhoff."""
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(),
             seed=42,
             use_manifold=True,
@@ -1126,8 +1165,8 @@ class TestManifoldIntegration:
 
     def test_shadow_mode_does_not_affect_routing(self) -> None:
         """Shadow updates must leave the live peer-selection path unchanged."""
-        live = ConstitutionalMesh(Constitution.default(), seed=123, use_manifold=True)
-        shadow = ConstitutionalMesh(
+        live = _test_mesh(Constitution.default(), seed=123, use_manifold=True)
+        shadow = _test_mesh(
             Constitution.default(),
             seed=123,
             use_manifold=True,
@@ -1149,9 +1188,9 @@ class TestManifoldIntegration:
             )
             assert assignment_live.peers == assignment_shadow.peers
 
-            for peer in assignment_live.peers[:2]:
+            for peer in assignment_live.peers:
                 _signed_vote(live, assignment_live.assignment_id, peer, approved=True)
-            for peer in assignment_shadow.peers[:2]:
+            for peer in assignment_shadow.peers:
                 _signed_vote(shadow, assignment_shadow.assignment_id, peer, approved=True)
 
         assert not hasattr(live, "_shadow_manifold")
@@ -1353,7 +1392,7 @@ class TestMeshSettlePersistenceIntegration:
         store = JSONLSettlementStore(tmp_path / "mesh.jsonl")
         rules = [Rule(id="R1", text="no-op rule")]
         const = Constitution.from_rules(rules, name="hash-test")
-        m = ConstitutionalMesh(
+        m = _test_mesh(
             const,
             peers_per_validation=3,
             quorum=2,
@@ -1368,7 +1407,8 @@ class TestMeshSettlePersistenceIntegration:
         peers = assignment.peers
         _signed_vote(m, assignment.assignment_id, peers[0], approved=True)
         _signed_vote(m, assignment.assignment_id, peers[1], approved=True)
-        # quorum=2, so settlement is already triggered by get_result
+        _signed_vote(m, assignment.assignment_id, peers[2], approved=True)
+        # Persistent evidence requires the complete 3-voter assignment.
         result = m.get_result(assignment.assignment_id)
         assert result.settled is True
 
@@ -1384,7 +1424,7 @@ class TestMeshSettlePersistenceIntegration:
         self, monkeypatch, tmp_path
     ) -> None:
         store = _FailingSettlementStore(tmp_path / "failing.jsonl")
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(),
             peers_per_validation=3,
             quorum=2,
@@ -1399,6 +1439,7 @@ class TestMeshSettlePersistenceIntegration:
         monkeypatch.setattr(mesh, "_maybe_finalize_result", lambda _assignment_id: None)
         _signed_vote(mesh, assignment.assignment_id, assignment.peers[0], approved=True)
         _signed_vote(mesh, assignment.assignment_id, assignment.peers[1], approved=True)
+        _signed_vote(mesh, assignment.assignment_id, assignment.peers[2], approved=True)
 
         with pytest.raises(SettlementPersistenceError):
             mesh.settle(assignment.assignment_id)
@@ -1413,7 +1454,7 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_full_validation_raises_persistence_error_after_freeze(self, tmp_path) -> None:
         store = _FailingSettlementStore(tmp_path / "failing.jsonl")
-        mesh = ConstitutionalMesh(
+        mesh = _test_mesh(
             Constitution.default(),
             peers_per_validation=3,
             quorum=2,
@@ -1435,25 +1476,25 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_startup_reconciles_pending_jsonl_settlement(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=41)
+        registry = VoteSignerRegistry()
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = _test_mesh(
+            constitution, seed=41, settlement_store=source_store, vote_registry=registry
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-jsonl")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-jsonl")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = JSONLSettlementStore(tmp_path / "mesh.jsonl")
         store.mark_pending(record)
 
-        reader = ConstitutionalMesh(constitution, seed=99, settlement_store=store)
+        reader = _test_mesh(
+            constitution, seed=99, settlement_store=store, vote_registry=registry
+        )
         restored = reader.get_result(result.assignment_id)
         assert restored.settled is True
         assert restored.proof is not None
@@ -1466,25 +1507,25 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_startup_reconciles_pending_sqlite_settlement(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=43)
+        registry = VoteSignerRegistry()
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = _test_mesh(
+            constitution, seed=43, settlement_store=source_store, vote_registry=registry
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-sqlite")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-sqlite")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = SQLiteSettlementStore(tmp_path / "mesh.db")
         store.mark_pending(record)
 
-        reader = ConstitutionalMesh(constitution, seed=101, settlement_store=store)
+        reader = _test_mesh(
+            constitution, seed=101, settlement_store=store, vote_registry=registry
+        )
         restored = reader.get_result(result.assignment_id)
         assert restored.settled is True
         assert restored.proof is not None
@@ -1497,23 +1538,23 @@ class TestMeshSettlePersistenceIntegration:
 
     def test_retry_pending_settlements_reconciles_journaled_record(self, tmp_path) -> None:
         constitution = Constitution.default()
-        source_mesh = ConstitutionalMesh(constitution, seed=47)
+        registry = VoteSignerRegistry()
+        source_store = _FailingSettlementStore(tmp_path / "source-failing.jsonl")
+        source_mesh = _test_mesh(
+            constitution, seed=47, settlement_store=source_store, vote_registry=registry
+        )
         for i in range(5):
             source_mesh.register_local_signer(f"agent-{i:02d}")
 
-        result = source_mesh.full_validation("agent-00", "safe output", "art-reconcile-retry")
-        assignment = source_mesh._assignments[result.assignment_id]
-        record = SettlementRecord(
-            assignment=source_mesh._serialize_assignment(assignment),
-            result=source_mesh._serialize_result(result),
-            constitutional_hash=result.constitutional_hash,
-            votes=source_mesh._vote_dicts(
-                source_mesh._votes.get(assignment.assignment_id, [])
-            ),
-        )
+        with pytest.raises(SettlementPersistenceError):
+            source_mesh.full_validation("agent-00", "safe output", "art-reconcile-retry")
+        record = source_store.load_pending()[0]
+        result = source_mesh.get_result(str(record.assignment["assignment_id"]))
 
         store = JSONLSettlementStore(tmp_path / "mesh-retry.jsonl")
-        reader = ConstitutionalMesh(constitution, seed=103, settlement_store=store)
+        reader = _test_mesh(
+            constitution, seed=103, settlement_store=store, vote_registry=registry
+        )
         store.mark_pending(record)
 
         report = reader.retry_pending_settlements()
@@ -1546,6 +1587,10 @@ class _FakeRemoteVoteResponse:
     content_hash: str
     signature: str
 
+    @property
+    def envelope(self) -> _FakeRemoteVoteResponse:
+        return self
+
 
 class _FakeClient:
     """FakeClient that returns a configurable response without a network call."""
@@ -1566,7 +1611,7 @@ class _FakeClient:
 
 def _minimal_mesh_with_remote_peer() -> tuple[ConstitutionalMesh, str, str]:
     """Return (mesh, producer_id, remote_peer_id) with one peer per validation."""
-    mesh = ConstitutionalMesh(
+    mesh = _test_mesh(
         Constitution.default(),
         seed=99,
         peers_per_validation=1,

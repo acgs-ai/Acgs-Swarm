@@ -10,8 +10,11 @@ from constitutional_swarm.bittensor.authenticity_detector import (
     AuthenticityScore,
     DimensionScore,
 )
-from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store as PrecedentStore,
+)
 
 CONST_HASH = "608508a9bd224290"
 
@@ -295,23 +298,22 @@ class TestPrecedentCompatibility:
 
     def test_empty_store_returns_neutral(self):
         det = AuthenticityDetector()
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         score = det.score(GOOD_JUDGMENT, precedent_store=store, query_vector=_PRIVACY_VEC)
         dim = self._get_dim(score)
         assert dim.score == pytest.approx(0.5)
 
     def test_similar_precedent_boosts_score(self):
         det = AuthenticityDetector()
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
-        rec = PrecedentRecord.create(
+        store = PrecedentStore(CONST_HASH)
+        rec = c14_precedent_signed_record(
             case_id="c1",
             task_id="t1",
             miner_uid="m",
             judgment="Privacy takes precedence",
             reasoning="ECHR applies",
-            votes_for=2,
-            votes_against=0,
-            proof_root_hash="abc",
+            votes_for=3,
+            votes_against=2,
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=_PRIVACY_VEC,
             constitutional_hash=CONST_HASH,
@@ -326,16 +328,15 @@ class TestPrecedentCompatibility:
 
     def test_high_similarity_flag(self):
         det = AuthenticityDetector()
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
-        rec = PrecedentRecord.create(
+        store = PrecedentStore(CONST_HASH)
+        rec = c14_precedent_signed_record(
             case_id="c1",
             task_id="t1",
             miner_uid="m",
             judgment="Privacy wins",
             reasoning="reason",
-            votes_for=2,
-            votes_against=0,
-            proof_root_hash="abc",
+            votes_for=3,
+            votes_against=2,
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector=_PRIVACY_VEC,
             constitutional_hash=CONST_HASH,

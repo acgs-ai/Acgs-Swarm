@@ -15,12 +15,12 @@ from .ports import (
     AtomicCommitRequest,
     AuthorityExecutionStore,
     AuthorityRuntime,
-    AuthoritySigningRole,
     CommitResult,
     ProposeCommitRequest,
     ProposeCommitResult,
     StageResultRequest,
     StageResultResult,
+    validate_runtime_signers,
 )
 
 
@@ -36,23 +36,16 @@ class APCCCommitService:
     ) -> None:
         if store.authority_store_id != config.authority_store_id:
             raise ValueError("authority store ID does not match APCC configuration")
+        # Concrete stores expose the configuration they attested at open; a
+        # service configured differently must not front them.  Structural
+        # capability doubles that carry no configuration skip this check.
+        store_config = getattr(store, "authority_config", None)
+        if store_config is not None and store_config != config:
+            raise ValueError("APCC configuration does not match the store")
+        validate_runtime_signers(config, runtime)
         self._store = store
         self._config = config
         self._runtime = runtime
-        self._validate_runtime_authority_keys()
-
-    def _validate_runtime_authority_keys(self) -> None:
-        pairs = (
-            (AuthoritySigningRole.COMMIT, self._config.commit_trust),
-            (AuthoritySigningRole.STATUS, self._config.status_trust),
-        )
-        for role, binding in pairs:
-            try:
-                public_key = self._runtime.key_provider.public_key(role, binding.key_id)
-            except Exception as error:
-                raise ValueError("authority signer is unavailable") from error
-            if bytes(public_key) != binding.public_key:
-                raise ValueError("authority signer does not match configured trust")
 
     def stage_result(self, request: StageResultRequest) -> StageResultResult:
         return self._store.stage_result(request)

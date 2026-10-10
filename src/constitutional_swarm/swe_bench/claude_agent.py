@@ -17,44 +17,16 @@ Usage
 
 from __future__ import annotations
 
-import logging
-import re
 from typing import Any
 
-from constitutional_swarm.swe_bench.agent import SWEBenchAgent
+from constitutional_swarm.swe_bench._diff import extract_unified_diff
+from constitutional_swarm.swe_bench._messages_agent import _MessagesAPIAgent
 
-_log = logging.getLogger(__name__)
-
-# Match the START of an applyable unified diff. We require a file header
-# (`diff --git`, `--- a/`, or `+++ b/`) — `@@` hunks alone are NOT applyable
-# because git apply needs to know which file to patch. Keeping `@@` here
-# meant LLMs that emitted hunks-only output (e.g. continuing from a prior
-# agent's truncated context) produced "successful" but unapplyable patches.
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/)")
-
-_PROMPT_TEMPLATE = """\
-You are solving a SWE-bench task. Produce a unified diff that fixes the bug.
-
-Output rules:
-- Reply with ONLY the unified diff, no prose, no code fences, no explanation.
-- Use standard ``--- a/<path>`` and ``+++ b/<path>`` headers.
-- Paths must be relative to the repository root.
-- Do not modify tests unless the task explicitly requires it.
-
-Instance: {instance_id}
-Repository: {repo}
-Base commit: {base_commit}
-
-Tests that should flip from FAIL to PASS:
-{fail_to_pass}
-
-Problem statement:
-{problem_statement}
-
-{hints_section}Produce the patch now."""
+# Backward-compatible private name; the single implementation lives in _diff.
+_extract_diff = extract_unified_diff
 
 
-class ClaudeSWEBenchAgent(SWEBenchAgent):
+class ClaudeSWEBenchAgent(_MessagesAPIAgent):
     """SWEBenchAgent that delegates patch generation to the Anthropic Messages API.
 
     Parameters
@@ -74,11 +46,6 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
     """
 
     _DEFAULT_MODEL = "claude-sonnet-4-5"
-    _DEFAULT_SYSTEM = (
-        "You are an expert software engineer. "
-        "When asked to fix a bug, output only the unified diff — "
-        "no explanation, no code fences, no markdown."
-    )
 
     def __init__(
         self,
@@ -91,11 +58,12 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
         extra_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        self._model = model or self._DEFAULT_MODEL
         super().__init__(
-            model_name=self._model,
+            model=model,
             timeout_s=timeout_s,
             max_new_tokens=max_new_tokens,
+            system_prompt=system_prompt,
+            extra_kwargs=extra_kwargs,
             **kwargs,
         )
         try:
@@ -104,97 +72,14 @@ class ClaudeSWEBenchAgent(SWEBenchAgent):
             raise ImportError(
                 "anthropic package is required. Install with `pip install anthropic`."
             ) from exc
-        self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-        self._system = system_prompt or self._DEFAULT_SYSTEM
-        self._extra_kwargs: dict[str, Any] = dict(extra_kwargs or {})
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _build_prompt(self, task: dict[str, Any]) -> str:
-        fail_to_pass = task.get("FAIL_TO_PASS") or []
-        if isinstance(fail_to_pass, str):
-            fail_to_pass = [fail_to_pass]
-        hints = task.get("hints_text") or ""
-        hints_section = f"Hints:\n{hints.strip()}\n\n" if hints.strip() else ""
-        return _PROMPT_TEMPLATE.format(
-            instance_id=task.get("instance_id", "unknown"),
-            repo=task.get("repo", "unknown"),
-            base_commit=task.get("base_commit", "unknown"),
-            fail_to_pass="\n".join(f"- {t}" for t in fail_to_pass) or "(none listed)",
-            problem_statement=(task.get("problem_statement") or "").strip(),
-            hints_section=hints_section,
-        )
-
-    def _generate_patch(self, task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        import anthropic
-
-        prompt = self._build_prompt(task)
-        stats: dict[str, Any] = {
-            "model": self._model,
-            "intervention_rate": 0.0,
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.timeout_s,
+            "max_retries": 0,
         }
-        try:
-            response = self._client.messages.create(
-                model=self._model,
-                max_tokens=self.max_new_tokens,
-                system=self._system,
-                messages=[{"role": "user", "content": prompt}],
-                **self._extra_kwargs,
-            )
-        except anthropic.APIStatusError as exc:
-            _log.warning("Anthropic API error %s: %s", exc.status_code, exc.message)
-            stats["error"] = f"api_status_{exc.status_code}"
-            stats["stderr_tail"] = str(exc.message)[:500]
-            return "", stats
-        except anthropic.APIConnectionError as exc:
-            _log.warning("Anthropic connection error: %s", exc)
-            stats["error"] = "connection_error"
-            stats["stderr_tail"] = str(exc)[:500]
-            return "", stats
-        except anthropic.APITimeoutError:
-            _log.warning("Anthropic request timed out after %.0fs", self.timeout_s)
-            stats["error"] = "timeout"
-            return "", stats
-
-        raw = ""
-        if response.content:
-            raw = response.content[0].text if hasattr(response.content[0], "text") else ""
-
-        usage = response.usage
-        stats["input_tokens"] = usage.input_tokens if usage else 0
-        stats["output_tokens"] = usage.output_tokens if usage else 0
-        stats["stop_reason"] = response.stop_reason
-
-        patch = _extract_diff(raw)
-        stats["raw_length"] = len(raw)
-        stats["patch_length"] = len(patch)
-        return patch, stats
-
-
-def _extract_diff(text: str) -> str:
-    """Extract a unified diff from *text*, stripping markdown code fences and prose prefix.
-
-    Cuts from the first occurrence of a unified-diff marker (``diff --git``,
-    ``--- a/``, ``+++ b/``, or ``@@ ``). Prose preceding that marker is
-    discarded so the result is patch-applyable by ``git apply``.
-    """
-    if not text:
-        return ""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    m = _DIFF_MARKER.search(stripped)
-    if not m:
-        return ""
-    diff_only = stripped[m.start():]
-    return diff_only + ("\n" if not diff_only.endswith("\n") else "")
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        self._anthropic = anthropic
+        self._client = anthropic.Anthropic(**client_kwargs)
 
 
 __all__ = ["ClaudeSWEBenchAgent"]

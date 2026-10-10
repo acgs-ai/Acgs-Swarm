@@ -14,6 +14,7 @@ Mirrors:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import cast
 
@@ -24,13 +25,47 @@ _QUORUM_NUMERATOR = 3
 _QUORUM_DENOMINATOR = 5
 
 
+def has_pinned_constitutional_hash(value: object) -> bool:
+    """Return whether *value* is the exact pinned hash string."""
+    return type(value) is str and value == CONSTITUTIONAL_HASH
+
+
+def has_clean_validation_evidence(state: Mapping[str, object]) -> bool:
+    """Require explicit, well-formed evidence of clean validation."""
+    if state.get("governed") is not True:
+        return False
+    violations = state.get("violations")
+    if type(violations) not in (list, tuple):
+        return False
+    concrete_violations = cast("list[object] | tuple[object, ...]", violations)
+    if len(concrete_violations) != 0:
+        return False
+    risk = state.get("risk_score")
+    if type(risk) not in (int, float):
+        return False
+    try:
+        numeric_risk = float(cast("int | float", risk))
+    except OverflowError:
+        return False
+    return math.isfinite(numeric_risk) and 0.0 <= numeric_risk < _RISK_THRESHOLD
+
+
+def has_completed_acceptance(state: Mapping[str, object]) -> bool:
+    """Require terminal acceptance, a pinned hash, and clean validation."""
+    return (
+        type(state.get("governance_status")) is str
+        and state.get("governance_status") == "accepted"
+        and has_pinned_constitutional_hash(state.get("constitutional_hash"))
+        and has_clean_validation_evidence(state)
+    )
+
+
 def constitutional_hash_guard(state: Mapping[str, object]) -> str:
     """Return 'ok' if state's constitutional_hash matches CONSTITUTIONAL_HASH, else 'halt'.
 
     Fail-closed: missing or empty hash routes to 'halt'.
     """
-    actual = state.get("constitutional_hash", "")
-    if actual == CONSTITUTIONAL_HASH:
+    if has_pinned_constitutional_hash(state.get("constitutional_hash")):
         return "ok"
     return "halt"
 
@@ -40,13 +75,7 @@ def fail_closed_guard(state: Mapping[str, object]) -> str:
 
     Mirrors swe_bench/governed_agent.py:135 - fail-closed on either signal.
     """
-    violations = state.get("violations") or []
-    # state is a generic Mapping[str, object]; risk_score is numeric per
-    # SwarmGraphState. cast bridges the read-only-object value to float().
-    risk = float(cast("float", state.get("risk_score", 0.0) or 0.0))
-    if violations or risk >= _RISK_THRESHOLD:
-        return "reject"
-    return "accept"
+    return "accept" if has_clean_validation_evidence(state) else "reject"
 
 
 def quorum_guard(state: Mapping[str, object]) -> str:
@@ -67,5 +96,8 @@ def quorum_guard(state: Mapping[str, object]) -> str:
 __all__ = [
     "constitutional_hash_guard",
     "fail_closed_guard",
+    "has_clean_validation_evidence",
+    "has_completed_acceptance",
+    "has_pinned_constitutional_hash",
     "quorum_guard",
 ]

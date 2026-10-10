@@ -15,9 +15,16 @@ Zero-retraining architecture (as specified in §5 of the Q&A doc):
   • Bayesian weight updates are separate from the retrieval index
 
 Key invariants:
-  • PrecedentRecord is only stored after validator acceptance (quorum met)
-  • A single miner's judgment never becomes precedent alone
+  • PrecedentRecord is stored only after at least five distinct authorized
+    voter envelopes verify, with at least three approvals and a strict majority
+  • Tallies and acceptance are recomputed from signatures bound to the task,
+    artifact, producer, judgment content, and constitutional hash
   • Rollback: any precedent can be revoked by marking it inactive
+
+Trust boundary: voter keys and roles come only from an independently
+provisioned VoteSignerRegistry. Unsigned or aggregate-only evidence fails
+closed, and caller-supplied counts and proof roots are checked against the
+verified envelopes.
 
 Roadmap reference: 08-subnet-implementation-roadmap.md § Phase 3
 Q&A reference:    07-subnet-concept-qa-responses.md § 5
@@ -25,14 +32,29 @@ Q&A reference:    07-subnet-concept-qa-responses.md § 5
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
 import time
 import uuid
+import warnings
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from constitutional_swarm.bittensor._validation import _validate_finite
 from constitutional_swarm.bittensor.protocol import EscalationType
+from constitutional_swarm.bittensor.synapses import judgment_content_hash
+from constitutional_swarm.mesh.vote_envelope import (
+    FrozenVoteSignerRegistry,
+    SignedAssignment,
+    VoteEnvelope,
+    VoteSignerRegistry,
+    compute_vote_envelope_root,
+    normalize_voter_id,
+    verify_assignment_vote_envelopes,
+)
 
 # ---------------------------------------------------------------------------
 # Vector utilities
@@ -47,6 +69,12 @@ _GOVERNANCE_DIMENSIONS = (
     "transparency",
     "efficiency",
 )
+
+# Escalation-rate projection defaults shared by ``escalation_rate_projection`` and
+# ``summary`` so the two cannot drift apart.
+_DEFAULT_BASELINE_ESCALATION_RATE = 0.03
+_DEFAULT_ESCALATION_DECAY_PER_1K = 0.005
+_MIN_ESCALATION_RATE = 0.005  # floor at 0.5% — some cases are always novel
 
 
 def _cosine_similarity(a: dict[str, float], b: dict[str, float]) -> float:
@@ -113,6 +141,19 @@ class PrecedentRecord:
     # Metadata
     recorded_at: float
     is_active: bool = True  # False = revoked/rolled back
+    assignment_id: str = ""
+    artifact_id: str = ""
+    content_hash: str = ""
+    vote_envelopes: tuple[VoteEnvelope, ...] = ()
+    signed_assignment: SignedAssignment | None = None
+
+    def __post_init__(self) -> None:
+        """Reject malformed precedent metadata on construction and on every replace.
+
+        ``impact_vector`` is the retrieval key that drives auto-resolution and is not
+        covered by the signed vote evidence, so its shape is a constructor invariant.
+        """
+        _validate_precedent_metadata(self)
 
     @classmethod
     def create(
@@ -129,6 +170,11 @@ class PrecedentRecord:
         impact_vector: dict[str, float],
         constitutional_hash: str,
         ambiguous_dimensions: tuple[str, ...] = (),
+        assignment_id: str = "",
+        artifact_id: str = "",
+        content_hash: str = "",
+        vote_envelopes: tuple[VoteEnvelope, ...] = (),
+        signed_assignment: SignedAssignment | None = None,
     ) -> PrecedentRecord:
         total_votes = votes_for + votes_against
         grade = votes_for / total_votes if total_votes > 0 else 0.0
@@ -149,7 +195,32 @@ class PrecedentRecord:
             ambiguous_dimensions=ambiguous_dimensions,
             constitutional_hash=constitutional_hash,
             recorded_at=time.time(),
+            assignment_id=assignment_id,
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            vote_envelopes=tuple(vote_envelopes),
+            signed_assignment=signed_assignment,
         )
+
+
+def _validate_precedent_metadata(record: PrecedentRecord) -> None:
+    for name in ("case_id", "task_id"):
+        value = getattr(record, name)
+        if type(value) is not str or not value:
+            raise ValueError(f"precedent {name} must be a non-empty string")
+    if not isinstance(record.escalation_type, EscalationType):
+        raise TypeError("precedent escalation_type must be an EscalationType")
+    if not isinstance(record.impact_vector, dict):
+        raise TypeError("precedent impact_vector must be a dict of dimension scores")
+    for key, value in record.impact_vector.items():
+        if type(key) is not str or not key:
+            raise ValueError("precedent impact_vector keys must be non-empty strings")
+        _validate_finite(f"precedent impact_vector[{key!r}]", value, maximum=1.0)
+    if not isinstance(record.ambiguous_dimensions, tuple) or any(
+        type(dimension) is not str or not dimension
+        for dimension in record.ambiguous_dimensions
+    ):
+        raise ValueError("precedent ambiguous_dimensions must be a tuple of non-empty strings")
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +269,20 @@ class RetrievalResult:
 # ---------------------------------------------------------------------------
 
 
-class PrecedentRevokedError(RuntimeError):
-    """Raised when trying to use a revoked precedent."""
+class _PrecedentRevokedError(RuntimeError):
+    """Deprecated: never raised; revoked sources fail with ``ValueError``."""
+
+
+def __getattr__(name: str) -> Any:
+    if name == "PrecedentRevokedError":
+        warnings.warn(
+            "PrecedentRevokedError is deprecated and never raised; revoked precedent "
+            "sources are rejected with ValueError",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _PrecedentRevokedError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +298,10 @@ class PrecedentStore:
     arrives, call retrieve() to find similar past cases and optionally
     get an auto-resolution if confidence is high enough.
 
+    Admission independently authenticates voter identities and signatures,
+    verifies every evidence binding, recomputes tallies and acceptance, and
+    rejects proof roots that do not match the verified envelopes.
+
     Usage::
 
         store = PrecedentStore(
@@ -227,7 +314,7 @@ class PrecedentStore:
             case_id="...", task_id="...", miner_uid="miner-01",
             judgment="Privacy takes precedence",
             reasoning="ECHR Article 8 applies",
-            votes_for=2, votes_against=0,
+            votes_for=3, votes_against=2,
             proof_root_hash="abc123",
             escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
             impact_vector={"privacy": 0.9, "transparency": 0.6, ...},
@@ -252,16 +339,41 @@ class PrecedentStore:
         self,
         constitutional_hash: str,
         auto_resolve_threshold: float = 0.85,
-        min_votes_for_precedent: int = 2,
-        min_total_validators: int = 0,
+        min_votes_for_precedent: int = 3,
+        min_total_validators: int = 5,
+        vote_registry: VoteSignerRegistry | FrozenVoteSignerRegistry | None = None,
     ) -> None:
+        if (
+            isinstance(min_votes_for_precedent, bool)
+            or not isinstance(min_votes_for_precedent, int)
+            or min_votes_for_precedent < 3
+        ):
+            raise ValueError("min_votes_for_precedent cannot be lower than 3")
+        if (
+            isinstance(min_total_validators, bool)
+            or not isinstance(min_total_validators, int)
+            or min_total_validators < 5
+        ):
+            raise ValueError("min_total_validators cannot be lower than 5")
+        if min_votes_for_precedent > min_total_validators:
+            raise ValueError("min_votes_for_precedent cannot exceed min_total_validators")
+        if min_votes_for_precedent * 5 < 3 * min_total_validators:
+            raise ValueError(
+                "Configured precedent quorum cannot weaken the 3/5 super-majority ratio"
+            )
         self._constitutional_hash = constitutional_hash
         self._auto_resolve_threshold = auto_resolve_threshold
         self._min_votes = min_votes_for_precedent
         self._min_total_validators = min_total_validators
+        self._vote_registry = (
+            None if vote_registry is None else vote_registry.frozen_copy()
+        )
         self._records: dict[str, PrecedentRecord] = {}
+        # Source indexes (active and revoked): one precedent per case and per task.
+        self._case_ids: set[str] = set()
+        self._task_ids: set[str] = set()
         self._revocation_log: list[dict[str, Any]] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Core operations
@@ -272,14 +384,168 @@ class PrecedentStore:
         return self._constitutional_hash
 
     @property
+    def vote_registry(self) -> FrozenVoteSignerRegistry | None:
+        """Return the independently provisioned voter trust registry."""
+        return self._vote_registry
+
+    def _validate_tally(self, record: PrecedentRecord) -> int:
+        for name, value in (
+            ("votes_for", record.votes_for),
+            ("votes_against", record.votes_against),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} vote count must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} vote count cannot be negative")
+        total_votes = record.votes_for + record.votes_against
+        if record.votes_for < self._min_votes:
+            raise ValueError(
+                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
+            )
+        if total_votes < self._min_total_validators:
+            raise ValueError(
+                f"Insufficient total validators: got={total_votes} "
+                f"required={self._min_total_validators}"
+            )
+        if record.votes_for <= record.votes_against:
+            raise ValueError(
+                "Precedent admission requires a strict majority: more validator votes "
+                "for than against"
+            )
+        if record.votes_for * self._min_total_validators < self._min_votes * total_votes:
+            raise ValueError(
+                "Insufficient validator super-majority: "
+                f"got={record.votes_for}/{total_votes} "
+                f"required={self._min_votes}/{self._min_total_validators}"
+            )
+        return total_votes
+
+    def verify_evidence(self, record: PrecedentRecord) -> tuple[VoteEnvelope, ...]:
+        """Verify signer authorization, bindings, tallies, and the proof root."""
+        self._validate_tally(record)
+        return self.verify_validation_evidence(
+            task_id=record.task_id,
+            producer_id=record.miner_uid,
+            judgment=record.judgment,
+            votes_for=record.votes_for,
+            votes_against=record.votes_against,
+            accepted=record.validation_accepted,
+            proof_root_hash=record.proof_root_hash,
+            assignment_id=record.assignment_id,
+            artifact_id=record.artifact_id,
+            content_hash=record.content_hash,
+            constitutional_hash=record.constitutional_hash,
+            vote_envelopes=record.vote_envelopes,
+            signed_assignment=record.signed_assignment,
+        )
+
+    def verify_validation_evidence(
+        self,
+        *,
+        task_id: str,
+        producer_id: str,
+        judgment: str,
+        votes_for: int,
+        votes_against: int,
+        accepted: bool,
+        proof_root_hash: str,
+        assignment_id: str,
+        artifact_id: str,
+        content_hash: str,
+        constitutional_hash: str,
+        vote_envelopes: Sequence[VoteEnvelope],
+        signed_assignment: SignedAssignment | None,
+    ) -> tuple[VoteEnvelope, ...]:
+        """Verify complete signed evidence for either validation outcome."""
+        if self._vote_registry is None:
+            raise ValueError("signed vote envelope admission requires a trust registry")
+        if not vote_envelopes:
+            raise ValueError("signed vote envelope evidence is required")
+        if signed_assignment is None:
+            raise ValueError("signed assignment evidence is required")
+        if not assignment_id:
+            raise ValueError("vote envelope assignment ID is required")
+        if not artifact_id:
+            raise ValueError("vote envelope artifact ID is required")
+        if not content_hash:
+            raise ValueError("vote envelope content hash is required")
+        expected_content_hash = judgment_content_hash(judgment)
+        if content_hash != expected_content_hash:
+            raise ValueError("precedent content hash does not bind the recorded judgment")
+
+        verified = verify_assignment_vote_envelopes(
+            signed_assignment,
+            vote_envelopes,
+            self._vote_registry,
+            task_id=task_id,
+            assignment_id=assignment_id,
+            producer_id=normalize_voter_id(producer_id),
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            constitutional_hash=constitutional_hash,
+        )
+        electorate_size = len(signed_assignment.assigned_peers)
+        signed_quorum = signed_assignment.quorum
+        if electorate_size < self._min_total_validators:
+            raise ValueError(
+                "signed electorate is too small for precedent admission: "
+                f"got={electorate_size} required={self._min_total_validators}"
+            )
+        if signed_quorum < self._min_votes:
+            raise ValueError(
+                "signed quorum is too small for precedent admission: "
+                f"got={signed_quorum} required={self._min_votes}"
+            )
+        if signed_quorum <= electorate_size // 2:
+            raise ValueError("signed precedent quorum must be a strict majority")
+        verified_votes_for = sum(
+            envelope.decision == "approved" for envelope in verified
+        )
+        verified_votes_against = len(verified) - verified_votes_for
+        if (votes_for, votes_against) != (
+            verified_votes_for,
+            verified_votes_against,
+        ):
+            raise ValueError(
+                "supplied vote tally does not match verified vote envelope count"
+            )
+        verified_accepted = (
+            verified_votes_for >= signed_quorum
+            and verified_votes_for > verified_votes_against
+        )
+        verified_rejected = (
+            verified_votes_against >= signed_quorum
+            and verified_votes_against > verified_votes_for
+        )
+        if not (verified_accepted or verified_rejected):
+            raise ValueError("verified vote tally has no strict-majority outcome")
+        if accepted != verified_accepted:
+            raise ValueError("validation acceptance does not match verified vote tally")
+        expected_root = compute_vote_envelope_root(
+            task_id=task_id,
+            assignment_id=assignment_id,
+            producer_id=normalize_voter_id(producer_id),
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            constitutional_hash=constitutional_hash,
+            accepted=verified_accepted,
+            envelopes=verified,
+        )
+        if proof_root_hash != expected_root:
+            raise ValueError("validation proof root does not match signed vote envelopes")
+        return verified
+
+    @property
     def size(self) -> int:
         """Number of active precedents."""
-        return sum(1 for r in self._records.values() if r.is_active)
+        with self._lock:
+            return sum(1 for r in self._records.values() if r.is_active)
 
     @property
     def total_stored(self) -> int:
         """Total records including revoked."""
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def add(self, record: PrecedentRecord) -> None:
         """Add a validated precedent record.
@@ -292,6 +558,30 @@ class PrecedentStore:
           • Minimum validator votes
           • Not already present (idempotent add raises ValueError)
         """
+        self._admit(record, exact_repeat_ok=False)
+
+    def admit(self, record: PrecedentRecord) -> PrecedentRecord:
+        """Admit *record*, treating an exact repeated observation as idempotent.
+
+        Trust boundary: signed vote evidence binds the task, assignment, producer,
+        artifact, judgment content and constitution. The precedent metadata
+        ``impact_vector``, ``escalation_type`` and ``case_id`` (and ``reasoning`` /
+        ``ambiguous_dimensions``) is NOT bound by any signature: it is trusted-caller
+        input, checked only for shape (finite values in [0, 1], enum type, non-empty
+        ids). ``impact_vector`` drives auto-resolution in :meth:`retrieve`, so only
+        admit records whose metadata comes from an owner-held case (as
+        ``SubnetOwner.record_result`` does). Follow-up: derive ``task_id`` from
+        ``H(case_id, escalation_type, canonical impact_vector)`` so the signed task
+        binding authenticates the metadata.
+        """
+        return self._admit(record, exact_repeat_ok=True)
+
+    def _admit(
+        self,
+        record: PrecedentRecord,
+        *,
+        exact_repeat_ok: bool,
+    ) -> PrecedentRecord:
         if record.constitutional_hash != self._constitutional_hash:
             raise ValueError(
                 f"Constitutional hash mismatch: "
@@ -303,20 +593,78 @@ class PrecedentStore:
                 f"Precedent {record.precedent_id} was not accepted by validators. "
                 "Only accepted judgments may be stored."
             )
+        if not record.is_active:
+            raise ValueError(f"Precedent {record.precedent_id} is inactive or revoked")
+        verified = self.verify_evidence(record)  # includes the tally policy check
         total_votes = record.votes_for + record.votes_against
-        if total_votes < self._min_total_validators:
-            raise ValueError(
-                f"Insufficient total validators: got={total_votes} "
-                f"required={self._min_total_validators}"
-            )
-        if record.votes_for < self._min_votes:
-            raise ValueError(
-                f"Insufficient validator votes: got={record.votes_for} required={self._min_votes}"
-            )
+        # replace() re-runs the metadata invariant on a detached copy of the vector.
+        canonical = dataclasses.replace(
+            record,
+            validator_grade=record.votes_for / total_votes,
+            impact_vector=dict(record.impact_vector),
+            ambiguous_dimensions=tuple(record.ambiguous_dimensions),
+            miner_uid=normalize_voter_id(record.miner_uid),
+            vote_envelopes=tuple(verified),
+            signed_assignment=record.signed_assignment,
+        )
         with self._lock:
-            if record.precedent_id in self._records:
+            existing = self._records.get(record.precedent_id)
+            if existing is not None:
+                if exact_repeat_ok and existing == canonical:
+                    return self._copy_record(existing)
                 raise ValueError(f"Precedent {record.precedent_id} already stored.")
-            self._records[record.precedent_id] = record
+            if canonical.case_id in self._case_ids:
+                raise ValueError(
+                    f"Precedent source case already stored: case_id={canonical.case_id!r}"
+                )
+            if canonical.task_id in self._task_ids:
+                raise ValueError(
+                    f"Precedent source task already stored: task_id={canonical.task_id!r}"
+                )
+            self._records[canonical.precedent_id] = canonical
+            self._case_ids.add(canonical.case_id)
+            self._task_ids.add(canonical.task_id)
+            return self._copy_record(canonical)
+
+    def active_records(self) -> tuple[PrecedentRecord, ...]:
+        """Return defensive snapshots of all currently active precedents."""
+        with self._lock:
+            return tuple(self._copy_record(r) for r in self._records.values() if r.is_active)
+
+    def active_records_by_id(self, precedent_ids: list[str]) -> tuple[PrecedentRecord, ...]:
+        """Resolve source IDs to active snapshots, failing closed on stale sources."""
+        with self._lock:
+            return self._active_records_by_id_locked(precedent_ids)
+
+    def require_canonical_records(
+        self,
+        records: Sequence[PrecedentRecord],
+    ) -> tuple[PrecedentRecord, ...]:
+        """Resolve records already admitted to this store and reject altered copies."""
+        precedent_ids = [record.precedent_id for record in records]
+        if len(set(precedent_ids)) != len(precedent_ids):
+            raise ValueError("Duplicate precedent source IDs are not canonical input")
+        with self._lock:
+            canonical = self._active_records_by_id_locked(precedent_ids)
+            for supplied, admitted in zip(records, canonical, strict=True):
+                if supplied != admitted:
+                    raise ValueError(
+                        f"Precedent source {supplied.precedent_id!r} does not match its "
+                        "canonical admitted record"
+                    )
+            return canonical
+
+    @contextmanager
+    def guard_active_sources(
+        self,
+        precedent_ids: Sequence[str],
+    ) -> Iterator[tuple[PrecedentRecord, ...]]:
+        """Hold the store lock while a consumer validates and uses active sources."""
+        self._lock.acquire()
+        try:
+            yield self._active_records_by_id_locked(precedent_ids)
+        finally:
+            self._lock.release()
 
     def retrieve(
         self,
@@ -344,24 +692,21 @@ class PrecedentStore:
         Returns:
             RetrievalResult with ranked matches and optional auto-resolution
         """
-        candidates = [
-            r
-            for r in self._records.values()
-            if r.is_active and (escalation_type is None or r.escalation_type == escalation_type)
-        ]
-
-        # Score all candidates
-        scored = [(r, _cosine_similarity(impact_vector, r.impact_vector)) for r in candidates]
-
-        # Filter and sort
-        filtered = [(r, sim) for r, sim in scored if sim >= min_similarity]
-        filtered.sort(key=lambda x: x[1], reverse=True)
-
-        # Build matches
-        matches = [
-            PrecedentMatch(precedent=r, similarity=sim, rank=i + 1)
-            for i, (r, sim) in enumerate(filtered[:k])
-        ]
+        with self._lock:
+            # Score stored references under the lock; copy only the returned top-k.
+            scored = (
+                (r, _cosine_similarity(impact_vector, r.impact_vector))
+                for r in self._records.values()
+                if r.is_active
+                and (escalation_type is None or r.escalation_type == escalation_type)
+            )
+            filtered = [(r, sim) for r, sim in scored if sim >= min_similarity]
+            filtered.sort(key=lambda item: item[1], reverse=True)
+            top = filtered[:k]
+            matches = [
+                PrecedentMatch(precedent=self._copy_record(r), similarity=sim, rank=i + 1)
+                for i, (r, sim) in enumerate(top)
+            ]
 
         # Check for auto-resolution
         auto_resolution = None
@@ -396,8 +741,6 @@ class PrecedentStore:
 
             record = self._records[precedent_id]
             # Replace with an inactive copy (PrecedentRecord is frozen)
-            import dataclasses
-
             inactive = dataclasses.replace(record, is_active=False)
             self._records[precedent_id] = inactive
 
@@ -413,27 +756,42 @@ class PrecedentStore:
     # Statistics and reporting
     # ------------------------------------------------------------------
 
-    def escalation_distribution(self) -> dict[str, int]:
-        """Count active precedents by escalation type."""
+    @staticmethod
+    def _distribution(records: Iterable[PrecedentRecord]) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for r in self._records.values():
+        for r in records:
             if r.is_active:
                 key = r.escalation_type.value
                 counts[key] = counts.get(key, 0) + 1
         return counts
 
+    @staticmethod
+    def _projection(
+        active: int,
+        baseline_rate: float = _DEFAULT_BASELINE_ESCALATION_RATE,
+        decay_per_1k: float = _DEFAULT_ESCALATION_DECAY_PER_1K,
+    ) -> float:
+        projected = baseline_rate - ((active / 1000.0) * decay_per_1k)
+        return max(_MIN_ESCALATION_RATE, projected)
+
+    def escalation_distribution(self) -> dict[str, int]:
+        """Count active precedents by escalation type."""
+        with self._lock:
+            return self._distribution(self._records.values())
+
     def miner_contribution_counts(self) -> dict[str, int]:
         """Count active precedents contributed by each miner."""
         counts: dict[str, int] = {}
-        for r in self._records.values():
-            if r.is_active:
-                counts[r.miner_uid] = counts.get(r.miner_uid, 0) + 1
+        with self._lock:
+            for r in self._records.values():
+                if r.is_active:
+                    counts[r.miner_uid] = counts.get(r.miner_uid, 0) + 1
         return counts
 
     def escalation_rate_projection(
         self,
-        baseline_rate: float = 0.03,
-        decay_per_1k: float = 0.005,
+        baseline_rate: float = _DEFAULT_BASELINE_ESCALATION_RATE,
+        decay_per_1k: float = _DEFAULT_ESCALATION_DECAY_PER_1K,
     ) -> float:
         """Estimate current escalation rate given precedent accumulation.
 
@@ -443,14 +801,16 @@ class PrecedentStore:
         baseline_rate: starting escalation rate (default 3%)
         decay_per_1k:  reduction per 1,000 active precedents (default 0.5%)
         """
-        active = self.size
-        thousands = active / 1000.0
-        projected = baseline_rate - (thousands * decay_per_1k)
-        return max(0.005, projected)  # floor at 0.5% — some cases always novel
+        return self._projection(self.size, baseline_rate, decay_per_1k)
 
     def summary(self) -> dict[str, Any]:
-        active = self.size
-        total = self.total_stored
+        with self._lock:
+            records = tuple(self._records.values())
+            revocation_entries = len(self._revocation_log)
+        active = sum(1 for record in records if record.is_active)
+        total = len(records)
+        distribution = self._distribution(records)
+        projected = self._projection(active)
         return {
             "constitutional_hash": self._constitutional_hash,
             "active_precedents": active,
@@ -458,7 +818,30 @@ class PrecedentStore:
             "revoked": total - active,
             "auto_resolve_threshold": self._auto_resolve_threshold,
             "min_votes_required": self._min_votes,
-            "escalation_distribution": self.escalation_distribution(),
-            "revocation_log_entries": len(self._revocation_log),
-            "projected_escalation_rate": self.escalation_rate_projection(),
+            "escalation_distribution": distribution,
+            "revocation_log_entries": revocation_entries,
+            "projected_escalation_rate": projected,
         }
+
+    @staticmethod
+    def _copy_record(record: PrecedentRecord) -> PrecedentRecord:
+        return dataclasses.replace(
+            record,
+            impact_vector=dict(record.impact_vector),
+            vote_envelopes=tuple(record.vote_envelopes),
+            signed_assignment=record.signed_assignment,
+        )
+
+    def _active_records_by_id_locked(
+        self,
+        precedent_ids: Sequence[str],
+    ) -> tuple[PrecedentRecord, ...]:
+        records: list[PrecedentRecord] = []
+        for precedent_id in precedent_ids:
+            record = self._records.get(precedent_id)
+            if record is None or not record.is_active:
+                raise ValueError(
+                    f"Precedent source {precedent_id!r} is not active or was revoked"
+                )
+            records.append(self._copy_record(record))
+        return tuple(records)

@@ -18,9 +18,13 @@ policy checks run *in the runtime path*, not only in post-hoc audit.
 
 - **Agent DNA** (`dna.py`): each agent embeds an `AgentDNA` co-processor.
   `validate(text)` returns a `DNAValidationResult` (valid + violations + risk).
-  It is designed to sit on the local hot path. The former `443 ns` pin is withdrawn. `check_maci`
-  and `govern` extend it; `constitutional_dna` is a decorator that wraps any
-  callable. A disabled DNA raises `DNADisabledError` rather than silently passing.
+  It is designed to sit on the local hot path. The former `443 ns` pin is withdrawn. `govern`
+  (and the `constitutional_dna` decorator, which wraps any callable) enforces
+  the result: it raises `ConstitutionalViolationError` on an invalid result or a
+  verified Z3 counterexample unless `block_on_violation=False`, and raises on
+  WARN-tier matches only with `block_on_warnings=True`. `govern(action_type=...)`
+  puts `check_maci` on the governed path. A disabled DNA raises
+  `DNADisabledError` rather than silently passing.
 - **Why local enforcement:** a central gate is a single point of failure and a
   bottleneck; embedding the check makes every agent independently accountable.
 
@@ -126,9 +130,17 @@ can blow up (one agent dominates) or collapse (everyone identical). The fix:
 - **`privacy_accountant.py`:** session-scoped RDP moments accountant for
   (ε,δ)-differential privacy; raises `PrivacyBudgetExhausted` when the cumulative
   ε-budget is spent.
-- **`private_vote.py`:** commit-reveal private voting with **nullifiers** to
-  prevent double-voting (`DoubleVoteError`), optional validity proofs (hash
-  commitment now, ZK-SNARK marker for later), and a deterministic `tally`.
+- **`private_vote.py`:** commit-reveal voting for an explicit
+  `eligible_voters=frozenset(raw Ed25519 public keys)`. Its keyword-only
+  `compute_nullifier(voter_pub=..., epoch=..., subject=...)` produces a public,
+  recomputable tag that limits each registered key to one ballot per
+  epoch/subject; the key is not proof of a person's identity or Sybil
+  resistance. Commit signatures use the `acgs-commit-sig-v2` domain and bind
+  the record version, proof scheme, and proof bytes. The ballot box fixes its
+  verifier and `strict_v2` policy at construction; strict mode rejects the
+  `HashCommitmentProver` scaffold because it provides no validity assurance.
+  Older ballots must be regenerated for the new commitment, nullifier, and
+  commit-signature formats.
 - **`federated_bridge.py`:** cross-organizational FCHP layer — verifiable
   `AgentCredential`s gate access across org boundaries with an audit log.
 - Protocol-level detail: [`docs/maci_dp_protocol.md`](../maci_dp_protocol.md).

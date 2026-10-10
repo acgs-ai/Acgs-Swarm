@@ -18,13 +18,21 @@ Contract
 
 from __future__ import annotations
 
-import json
 import ssl
-from dataclasses import asdict
 
 import pytest
 from constitutional_swarm.mesh import RemoteVoteRequest
-from constitutional_swarm.remote_vote_transport import RemoteVoteClient, RemoteVoteResponse
+from constitutional_swarm.mesh.vote_envelope import (
+    VoteEnvelope,
+    canonical_assigned_peers_hash,
+    sign_assignment,
+)
+from constitutional_swarm.remote_vote_transport import (
+    RemoteVoteClient,
+    RemoteVoteResponse,
+    encode_remote_vote_response,
+)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 FINDING_ID = "SEC-001"
 SEVERITY = "HIGH"
@@ -37,6 +45,20 @@ websockets = pytest.importorskip(
 
 
 def _minimal_request() -> RemoteVoteRequest:
+    signed_assignment = sign_assignment(
+        Ed25519PrivateKey.generate(),
+        task_id="test-task",
+        assignment_id="test-assignment",
+        assigner_id="test-assigner",
+        producer_id="test-producer",
+        artifact_id="test-artifact",
+        content_hash="0" * 64,
+        constitutional_hash="0" * 16,
+        assigned_peers=("test-voter",),
+        quorum=1,
+        selection_seed="test-seed",
+        issued_at=1234.5,
+    )
     return RemoteVoteRequest(
         assignment_id="test-assignment",
         voter_id="test-voter",
@@ -50,6 +72,11 @@ def _minimal_request() -> RemoteVoteRequest:
         timestamp=1234.5,
         request_signer_public_key="",
         request_signature="",
+        task_id="test-task",
+        assigned_peers=("test-voter",),
+        quorum=1,
+        protocol_version=3,
+        signed_assignment=signed_assignment,
     )
 
 
@@ -77,15 +104,28 @@ class _FakeConnectContext:
 
 def _ok_response(request: RemoteVoteRequest) -> str:
     response = RemoteVoteResponse(
-        assignment_id=request.assignment_id,
-        voter_id=request.voter_id,
-        approved=True,
-        reason="ok",
-        constitutional_hash=request.constitutional_hash,
-        content_hash=request.content_hash,
-        signature="00" * 64,
+        VoteEnvelope(
+            protocol_version=2,
+            voter_id=request.voter_id,
+            key_id="00" * 32,
+            task_id=request.task_id or request.artifact_id,
+            assignment_id=request.assignment_id,
+            producer_id=request.producer_id,
+            artifact_id=request.artifact_id,
+            content_hash=request.content_hash,
+            constitutional_hash=request.constitutional_hash,
+            decision="approved",
+            reason="ok",
+            nonce=request.nonce,
+            issued_at=request.timestamp,
+            signature="00" * 64,
+            assigned_peers_hash=canonical_assigned_peers_hash((request.voter_id,)),
+            assigned_peer_count=1,
+            quorum=1,
+            evidence_mode="independent",
+        )
     )
-    return json.dumps(asdict(response))
+    return encode_remote_vote_response(response)
 
 
 @pytest.mark.security

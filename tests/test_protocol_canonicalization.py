@@ -4,6 +4,8 @@ import json
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
+
 from constitutional_swarm import ConstitutionalMesh, RemoteVoteRequest, ValidationVote
 from constitutional_swarm.mesh.settlement import MeshProof
 from constitutional_swarm.protocol import (
@@ -24,7 +26,7 @@ from constitutional_swarm.settlement_store import SettlementRecord
 from scripts.generate_rust_protocol_fixtures import write_fixture_corpus
 
 
-def test_legacy_vote_payload_matches_current_mesh_signing_payload() -> None:
+def test_legacy_vote_payload_vector_is_fixture_only_and_live_path_rejects_it() -> None:
     payload = {
         "assignment_id": "assign-1",
         "voter_id": "validator-1",
@@ -34,10 +36,14 @@ def test_legacy_vote_payload_matches_current_mesh_signing_payload() -> None:
         "content_hash": "abc123",
     }
 
-    assert legacy_vote_payload_bytes(**payload) == ConstitutionalMesh.build_vote_payload(**payload)
+    assert legacy_vote_payload_bytes(**payload) == (
+        b"assign-1:validator-1:True:constitutional check passed:608508a9bd224290:abc123"
+    )
+    with pytest.raises(ValueError, match="unsupported detached vote payload protocol version"):
+        ConstitutionalMesh.build_vote_payload(**payload, protocol_version=1)
 
 
-def test_legacy_remote_request_payload_matches_current_mesh_payload() -> None:
+def test_canonical_remote_request_payload_is_versioned_and_separate_from_legacy() -> None:
     payload = {
         "assignment_id": "assign-1",
         "voter_id": "validator-1",
@@ -49,14 +55,28 @@ def test_legacy_remote_request_payload_matches_current_mesh_payload() -> None:
         "voter_public_key": "00" * 32,
         "nonce": "nonce-1",
         "timestamp": 1_713_456_789.125,
+        "task_id": "task-1",
+        "assigned_peers": ("validator-1",),
+        "quorum": 1,
     }
 
-    assert legacy_remote_vote_request_payload_bytes(
-        **payload
-    ) == ConstitutionalMesh.build_remote_vote_request_payload(**payload)
+    canonical = ConstitutionalMesh.build_remote_vote_request_payload(
+        **payload,
+        protocol_version=2,
+    )
+    legacy_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"task_id", "assigned_peers", "quorum"}
+    }
+    assert legacy_remote_vote_request_payload_bytes(**legacy_payload) != canonical
+    assert canonical.startswith(b"constitutional-swarm.remote-vote-request.v2\x00")
+    assert sha256(canonical).hexdigest() == (
+        "e5ba7a0a334f2149465e0d00a68679c8ec128ba0b1b7d7f6c44bd5817ba70c7f"
+    )
 
 
-def test_legacy_vote_hash_matches_validation_vote_property() -> None:
+def test_validation_vote_v2_hash_is_domain_separated_from_legacy() -> None:
     vote = ValidationVote(
         assignment_id="assign-1",
         voter_id="validator-1",
@@ -68,7 +88,10 @@ def test_legacy_vote_hash_matches_validation_vote_property() -> None:
         timestamp=1.0,
     )
 
-    assert legacy_vote_hash(vote) == vote.vote_hash
+    assert legacy_vote_hash(vote) != vote.vote_hash
+    assert vote.vote_hash == (
+        "09a02a3ce9b37f35df0f9efc27a38cf91d4b22d41feaa76f5871e67dfc4b4302"
+    )
 
 
 def test_canonical_protocol_encoders_are_domain_separated() -> None:
@@ -105,6 +128,7 @@ def test_canonical_protocol_encoders_are_domain_separated() -> None:
             root_hash="roothash",
             accepted=True,
             timestamp=1.0,
+            protocol_version=1,
         )
     )
     settlement_bytes = encode_settlement_record_v1(

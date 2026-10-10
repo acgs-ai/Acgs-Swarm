@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm import ConstitutionalMesh, JSONLSettlementStore, SQLiteSettlementStore
 from constitutional_swarm.governance_receipts import (
     SignatureRecord,
+    ValidatorVote,
     bundle_from_json,
     build_receipt,
     payload_canonical_bytes,
@@ -23,23 +24,36 @@ from constitutional_swarm.settlement_evidence import (
 )
 
 
-def _trusted(mesh: ConstitutionalMesh) -> dict[str, str]:
-    return {
-        RECEIPT_SIGNER_KEY_ID: mesh._receipt_signing_public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        ).hex()
-    }
+def _public_hex(public_key) -> str:
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
+
+
+def _trusted(mesh: ConstitutionalMesh) -> dict[str, object]:
+    return mesh.receipt_trust_registry()
+
+
+def _receipt_public_hex(mesh: ConstitutionalMesh) -> str:
+    return _public_hex(mesh._receipt_signing_public_key)
 
 
 def _settle(tmp_path, *, name: str = "a", backend: str = "jsonl"):
     path = tmp_path / (f"{name}.db" if backend == "sqlite" else f"{name}.jsonl")
     store = SQLiteSettlementStore(path) if backend == "sqlite" else JSONLSettlementStore(path)
-    mesh = ConstitutionalMesh(Constitution.default(), seed=7, settlement_store=store)
+    mesh = ConstitutionalMesh(
+        Constitution.default(),
+        seed=7,
+        peers_per_validation=3,
+        quorum=3,
+        settlement_store=store,
+        evidence_mode="single_operator_dev",
+    )
     for index in range(4):
         mesh.register_local_signer(f"agent-{index:02d}")
     assignment = mesh.request_validation("agent-00", "summarize notes", f"art-{name}")
-    for voter in assignment.peers[:2]:
+    for voter in assignment.peers:
         mesh.validate_and_vote(assignment.assignment_id, voter)
     return mesh, store, assignment
 
@@ -135,8 +149,22 @@ def test_untrusted_and_key_id_substitution_fail(tmp_path) -> None:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     ).hex()
-    assert bind_and_verify(record, bundle, trusted_signers={RECEIPT_SIGNER_KEY_ID: other}).valid is False
-    assert bind_and_verify(record, bundle, trusted_signers={"wrong-id": _trusted(mesh)[RECEIPT_SIGNER_KEY_ID]}).valid is False
+    assert bind_and_verify(
+        record,
+        bundle,
+        trusted_signers={
+            RECEIPT_SIGNER_KEY_ID: {
+                "identity_id": "mesh-settlement-receipt",
+                "public_key_hex": other,
+                "roles": ["settlement"],
+            }
+        },
+    ).valid is False
+    assert bind_and_verify(
+        record,
+        bundle,
+        trusted_signers={"wrong-id": _trusted(mesh)[RECEIPT_SIGNER_KEY_ID]},
+    ).valid is False
 
 
 def test_wrong_payload_type_fails(tmp_path) -> None:
@@ -208,7 +236,13 @@ def test_signed_semantic_contradiction_fails(tmp_path) -> None:
             "content": str(record.assignment.get("content_hash", "none")),
         },
         decision="approved" if not bool(record.result.get("accepted")) else "denied",
-        validator_votes=[ValidatorVote(validator_id="v", decision="approve", rationale="ok")],
+        validator_votes=[
+            ValidatorVote(
+                validator_id="v",
+                decision="approve" if not bool(record.result.get("accepted")) else "deny",
+                rationale="ok",
+            )
+        ],
         rejected_alternative="skip",
         metadata={"assignment_id": assignment.assignment_id, "claim": "local-dsse-shaped-receipt"},
     )
@@ -231,12 +265,11 @@ def test_signed_semantic_contradiction_fails(tmp_path) -> None:
         ],
     )
     trusted = {
-        RECEIPT_SIGNER_KEY_ID: rogue.public_key()
-        .public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-        .hex()
+        RECEIPT_SIGNER_KEY_ID: {
+            "identity_id": "rogue-settlement",
+            "public_key_hex": _public_hex(rogue.public_key()),
+            "roles": ["settlement"],
+        }
     }
     bound = SettlementRecord(
         assignment=record.assignment,
@@ -266,6 +299,9 @@ def test_extra_signed_receipt_in_bundle_fails(tmp_path) -> None:
             "receipt_id": first.payload.receipt_id + "-followup",
             "action": "wrong-action",
             "decision": "denied",
+            "validator_votes": [
+                ValidatorVote(validator_id="v", decision="deny", rationale="denied")
+            ],
             "previous_receipt_hash": receipt_hash(first),
             "evidence_hashes": {
                 "settlement": settlement_canonical_digest(record),
@@ -279,7 +315,7 @@ def test_extra_signed_receipt_in_bundle_fails(tmp_path) -> None:
             SignatureRecord(
                 key_id=RECEIPT_SIGNER_KEY_ID,
                 algorithm="ed25519",
-                public_key_hex=_trusted(mesh)[RECEIPT_SIGNER_KEY_ID],
+                public_key_hex=_receipt_public_hex(mesh),
                 signature_hex=rogue.sign(payload_canonical_bytes(follow)).hex(),
             )
         ],
@@ -303,7 +339,9 @@ def test_orphan_without_committed_settlement_fails(tmp_path) -> None:
 
 def test_vote_signature_is_not_a_receipt_signature(tmp_path) -> None:
     mesh, store, assignment = _settle(tmp_path)
-    vote = mesh._votes[assignment.assignment_id][0]
+    record = store.get(assignment.assignment_id)
+    assert record is not None
+    vote = record.votes[0]
     bundle = bundle_from_json(receipt_path_for(store, assignment.assignment_id).read_text())
     receipt = bundle.receipts[0]
     stolen = build_receipt(
@@ -312,8 +350,8 @@ def test_vote_signature_is_not_a_receipt_signature(tmp_path) -> None:
             SignatureRecord(
                 key_id=RECEIPT_SIGNER_KEY_ID,
                 algorithm="ed25519",
-                public_key_hex=_trusted(mesh)[RECEIPT_SIGNER_KEY_ID],
-                signature_hex=vote.signature,
+                public_key_hex=_receipt_public_hex(mesh),
+                signature_hex=vote["signature"],
             )
         ],
     )
