@@ -6,6 +6,12 @@ survives repo-level reverts. Spawns N parallel ``claude -p`` subprocesses
 per instance, evaluates each candidate via LocalSWEBenchHarness, picks the
 best by (resolved, applied, patch) score.
 
+Metric: the winner is chosen with the local harness verdict itself (oracle
+selection, stopping at the first resolved candidate), so ``resolve_rate`` is a
+pass@k rate with k = ``--agents``, not a single-sample resolve rate. The
+summary and every row carry ``resolve_metric="pass@k"``, ``selection="oracle"``
+and ``k`` so the number cannot be compared against pass@1 runs unlabelled.
+
 Usage
 -----
     python scripts/run_mc_swarm.py \
@@ -21,7 +27,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -33,9 +38,17 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from constitutional_swarm.swe_bench._diff import extract_unified_diff  # noqa: E402
+
 _log = logging.getLogger(__name__)
 
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/|@@ )")
+# Oracle best-of-k selection over local-harness verdicts == pass@k.
+_RESOLVE_METRIC = "pass@k"
+_SELECTION = "oracle"
+
+# One shared extractor: a file header is required (hunk-only output is not a
+# patch) and any prose before the first header is cut.
+_extract_diff = extract_unified_diff
 
 _PROMPT_TEMPLATE = """\
 You are solving a SWE-bench task. Produce a unified diff that fixes the bug.
@@ -67,22 +80,6 @@ class Candidate:
     raw_length: int = 0
     timed_out: bool = False
     agent_idx: int = -1
-
-
-def _extract_diff(text: str) -> str:
-    if not text:
-        return ""
-    s = text.strip()
-    if s.startswith("```"):
-        lines = s.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    if not _DIFF_MARKER.search(s):
-        return ""
-    return s + ("\n" if not s.endswith("\n") else "")
 
 
 def _build_prompt(task: dict[str, Any]) -> str:
@@ -204,6 +201,47 @@ def _write_predictions(rows: list[dict[str, Any]], path: Path, model: str) -> No
                 }) + "\n")
 
 
+def _build_summary(
+    rows: list[dict[str, Any]],
+    *,
+    k: int,
+    total_cands: int,
+    total_valid: int,
+    total_applied_cands: int,
+    total_resolved_cands: int,
+    total_timeouts: int,
+) -> dict[str, Any]:
+    """Aggregate per-instance winner rows; labels the oracle selection as pass@k."""
+    for row in rows:
+        row["resolve_metric"] = _RESOLVE_METRIC
+        row["selection"] = _SELECTION
+        row["k"] = k
+    n = len(rows)
+    applied = sum(1 for r in rows if r["applied"])
+    resolved = sum(1 for r in rows if r["resolved"])
+    patch_gen = sum(1 for r in rows if r["patch_generated"])
+    return {
+        "instances": n,
+        "patch_generated": patch_gen,
+        "applied": applied,
+        "resolved": resolved,
+        "patch_rate": patch_gen / n if n else 0.0,
+        "apply_rate": applied / n if n else 0.0,
+        "resolve_rate": resolved / n if n else 0.0,
+        "resolve_metric": _RESOLVE_METRIC,
+        "selection": _SELECTION,
+        "k": k,
+        "agents": k,
+        "mode": "multi-candidate",
+        "mc_total_candidates": total_cands,
+        "mc_valid_candidates": total_valid,
+        "mc_applied_candidates": total_applied_cands,
+        "mc_resolved_candidates": total_resolved_cands,
+        "mc_timeouts": total_timeouts,
+        "rows": rows,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=10)
@@ -313,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         pt = best_row["pass_to_pass_passed"] + best_row["pass_to_pass_failed"]
         print(
             f"[{idx}/{len(instances)}] {best_row['instance_id']} "
-            f"applied={best_row['applied']} resolved={best_row['resolved']} "
+            f"applied={best_row['applied']} resolved@{n}={best_row['resolved']} "
             f"winner={winner_idx}/{n} valid={best_row['n_valid_candidates']} "
             f"cand_applied={c_applied} timeouts={best_row['n_timeouts']} "
             f"F2P={best_row['fail_to_pass_passed']}/{ft} "
@@ -322,27 +360,15 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    n = len(rows)
-    applied = sum(1 for r in rows if r["applied"])
-    resolved = sum(1 for r in rows if r["resolved"])
-    patch_gen = sum(1 for r in rows if r["patch_generated"])
-    summary = {
-        "instances": n,
-        "patch_generated": patch_gen,
-        "applied": applied,
-        "resolved": resolved,
-        "patch_rate": patch_gen / n if n else 0.0,
-        "apply_rate": applied / n if n else 0.0,
-        "resolve_rate": resolved / n if n else 0.0,
-        "agents": args.agents,
-        "mode": "multi-candidate",
-        "mc_total_candidates": total_cands,
-        "mc_valid_candidates": total_valid,
-        "mc_applied_candidates": total_applied_cands,
-        "mc_resolved_candidates": total_resolved_cands,
-        "mc_timeouts": total_timeouts,
-        "rows": rows,
-    }
+    summary = _build_summary(
+        rows,
+        k=args.agents,
+        total_cands=total_cands,
+        total_valid=total_valid,
+        total_applied_cands=total_applied_cands,
+        total_resolved_cands=total_resolved_cands,
+        total_timeouts=total_timeouts,
+    )
     print(json.dumps({k: v for k, v in summary.items() if k != "rows"}, indent=2))
     if args.output:
         args.output.write_text(json.dumps(summary, indent=2))
