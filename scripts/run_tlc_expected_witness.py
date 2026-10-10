@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import re
 import subprocess
 import sys
@@ -13,11 +12,21 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from _tlc_common import (  # noqa: E402
+    TLC_JAR_SHA256,
+    TLC_VERSION_LINE,
+    resolve_java,
+    stage_jar,
+)
+from _tlc_common import sha256_file as _sha256  # noqa: E402
+
 
 EXPECTED_TLC_EXIT = 12
 EXPECTED_PROPERTY = "CoverageGoalNotReached"
-TLC_VERSION_LINE = "TLC2 Version 2.19 of 08 August 2024"
-TLC_JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 DEFAULT_TIMEOUT_SECONDS = 180
 
 
@@ -459,14 +468,6 @@ def classify_tlc_result(
     )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _write_log(path: Path, argv: list[str], result: WitnessResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -511,31 +512,32 @@ def run_tlc_expected_witness(
             None,
         )
         return _record_result(log_path, [], result)
-    try:
-        jar_valid = tlc_jar.is_file() and _sha256(tlc_jar) == TLC_JAR_SHA256
-    except OSError:
-        jar_valid = False
-    if not jar_valid:
-        result = WitnessResult(
-            Outcome.TLC_RUNTIME_ERROR,
-            "TLC jar is missing or its SHA-256 is not the pinned v1.7.4 digest",
-            None,
-        )
-        return _record_result(log_path, [], result)
-
     with tempfile.TemporaryDirectory(prefix="gcb-tlc-witness-") as temp_name:
         temp_root = Path(temp_name)
+        # Hash and execute one private copy so the checked bytes are the run bytes.
+        try:
+            staged_jar = stage_jar(tlc_jar, temp_root)
+            jar_valid = _sha256(staged_jar) == TLC_JAR_SHA256
+        except OSError:
+            jar_valid = False
+        if not jar_valid:
+            result = WitnessResult(
+                Outcome.TLC_RUNTIME_ERROR,
+                "TLC jar is missing or its SHA-256 is not the pinned v1.7.4 digest",
+                None,
+            )
+            return _record_result(log_path, [], result)
         java_tmp = temp_root / "java"
         metadir = temp_root / "states"
         java_tmp.mkdir()
         metadir.mkdir()
         argv = [
-            java_command,
+            resolve_java(java_command),
             f"-Djava.io.tmpdir={java_tmp}",
             "-XX:+UseParallelGC",
             "-Xmx4g",
             "-cp",
-            str(tlc_jar.resolve()),
+            str(staged_jar),
             "tlc2.TLC",
             "-deadlock",
             "-workers",

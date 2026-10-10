@@ -37,8 +37,8 @@ from constitutional_swarm.forensic_benchmark import (
 
 
 NONCE = "15" * 32
-ABSOLUTE_SRC = (
-    "/home/martin/Acgs-Swarm/.worktrees/fix-C15-forensic-commitment/src"
+ABSOLUTE_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"
 )
 
 
