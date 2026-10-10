@@ -224,8 +224,10 @@ class LocalRemotePeer:
 
         Expiries are not insertion-ordered (a later request may carry an earlier
         timestamp), so the whole bounded cache is scanned rather than its head.
+        A request is still accepted at exactly ``timestamp + W``, so a nonce is kept
+        through its expiry instant and dropped only once ``now`` passes it.
         """
-        for nonce in [nonce for nonce, expires_at in cache.items() if expires_at <= now]:
+        for nonce in [nonce for nonce, expires_at in cache.items() if expires_at < now]:
             del cache[nonce]
 
     @staticmethod
