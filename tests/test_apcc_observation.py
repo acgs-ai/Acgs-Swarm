@@ -703,6 +703,7 @@ def test_semantic_verifier_checks_full_committed_tuple_and_derives_visibility(
 
     verified = verify_authority_observation(
         signed,
+        expected_request=_target_for(commit),
         launch=launch,
         pinned_controller_public_key=controller_public,
         expected_experiment_id="experiment-1",
@@ -773,6 +774,7 @@ def test_semantic_verifier_checks_full_committed_tuple_and_derives_visibility(
         with pytest.raises(ValueError):
             verify_authority_observation(
                 forged,
+                expected_request=snapshot.request,
                 launch=launch,
                 pinned_controller_public_key=controller_public,
                 expected_experiment_id="experiment-1",
@@ -832,6 +834,7 @@ def test_semantic_verifier_accepts_only_exact_absent_denied_and_conflicted_state
         )
         verified = verify_authority_observation(
             signed,
+            expected_request=snapshot.request,
             launch=launch,
             pinned_controller_public_key=controller_public,
             expected_experiment_id="experiment-1",
@@ -882,6 +885,7 @@ def test_false_coherent_observer_claims_never_become_authority_proof(tmp_path) -
         )
         return verify_authority_observation(
             signed,
+            expected_request=committed.request,
             launch=launch,
             pinned_controller_public_key=controller_public,
             expected_experiment_id="experiment-1",
