@@ -61,6 +61,24 @@ def _l2_norm(v: list[float]) -> float:
     return math.sqrt(sum(x * x for x in v))
 
 
+def _validated_square_matrix(matrix: list[list[float]], n: int | None = None) -> int:
+    """Reject non-square or non-finite matrices; return the dimension.
+
+    Shared by the projection (verifier) and ``replace_raw_trust`` (builder) so a
+    NaN/inf entry can never reach a projected result that claims a bound.
+    """
+    size = len(matrix) if n is None else n
+    if len(matrix) != size or any(len(row) != size for row in matrix):
+        raise ValueError(f"trust matrix must be square {size}x{size}")
+    for i, row in enumerate(matrix):
+        for j, value in enumerate(row):
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"trust matrix entries must be finite, got {value!r} at [{i}][{j}]"
+                )
+    return size
+
+
 def spectral_norm_power_iter(
     matrix: list[list[float]],
     *,
@@ -110,6 +128,16 @@ def spectral_norm_power_iter(
     return sigma
 
 
+def _finite_sigma(matrix: list[list[float]], max_power_iter: int) -> float:
+    """Power-iteration sigma estimate that refuses overflowed (non-finite) results."""
+    sigma = spectral_norm_power_iter(matrix, max_iterations=max_power_iter)
+    if not math.isfinite(sigma):
+        raise ValueError(
+            "spectral norm estimate is not finite; trust matrix entries are too large to project"
+        )
+    return sigma
+
+
 def spectral_sphere_project(
     matrix: list[list[float]],
     *,
@@ -132,12 +160,16 @@ def spectral_sphere_project(
     Returns:
         SpectralProjectionResult with projected matrix and diagnostics.
     """
-    n = len(matrix)
+    if not (math.isfinite(r) and r > 0.0):
+        raise ValueError(f"r must be a finite positive radius, got {r!r}")
+    n = _validated_square_matrix(matrix)
 
-    sigma = spectral_norm_power_iter(matrix, max_iterations=max_power_iter)
+    sigma = _finite_sigma(matrix, max_power_iter)
 
     if sigma <= r + 1e-10:
-        # Already inside the sphere — no projection needed
+        # Already inside the sphere — no projection needed. Re-running power
+        # iteration on the unchanged matrix (same seed) would return the same
+        # sigma, so no verification pass is needed.
         projected = matrix
         clipped = False
     else:
@@ -145,21 +177,22 @@ def spectral_sphere_project(
         projected = [[matrix[i][j] * scale for j in range(n)] for i in range(n)]
         clipped = True
 
-    # Verification pass: power iteration is a lower bound on sigma_max.
-    # If it underestimated, the projected matrix may still exceed radius r.
-    # Re-check and iteratively rescale until within the sphere (at most 3 passes).
-    for _ in range(3):
-        sigma_check = spectral_norm_power_iter(
-            list(map(list, projected)), max_iterations=max_power_iter
-        )
-        if sigma_check <= r + 1e-10:
-            sigma = sigma_check
-            break
-        scale = r / sigma_check
-        projected = [[projected[i][j] * scale for j in range(n)] for i in range(n)]
-        sigma = r
-    else:
-        sigma = r  # conservative: claim radius even if iteration didn't converge
+        # Verification pass: power iteration is a lower bound on sigma_max.
+        # If it underestimated, the projected matrix may still exceed radius r.
+        # Re-check and rescale (at most 3 passes); the reported norm is always a
+        # measured value, never an unverified claim of r.
+        for _ in range(3):
+            sigma = _finite_sigma(projected, max_power_iter)
+            if sigma <= r + 1e-10:
+                break
+            scale = r / sigma
+            projected = [[projected[i][j] * scale for j in range(n)] for i in range(n)]
+        else:
+            sigma = _finite_sigma(projected, max_power_iter)
+            if sigma > r + 1e-10:
+                raise ArithmeticError(
+                    f"spectral projection did not converge: measured sigma {sigma!r} > r={r!r}"
+                )
 
     return SpectralProjectionResult(
         matrix=tuple(tuple(row) for row in projected),
@@ -251,6 +284,7 @@ class SpectralSphereManifold:
         """Replace raw state during an ID-stable rebuild."""
         if len(matrix) != self._n or any(len(row) != self._n for row in matrix):
             raise ValueError("replacement trust matrix dimensions do not match manifold")
+        _validated_square_matrix(matrix, self._n)
         self._raw_trust = [list(row) for row in matrix]
         self._projected = None
         self._smoothed = None
