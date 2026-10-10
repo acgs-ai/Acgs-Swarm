@@ -26,6 +26,13 @@ from acgs_lite import Rule, Severity
 from constitutional_swarm.dna import Constitution
 
 
+# Bounded building blocks for the ROLE-004 rm-flag patterns: up to 6 extra
+# flag tokens of at most 16 characters, and at most 8 letters inside a short
+# flag cluster. Bounds keep matching linear-ish on adversarial input.
+_RM_FLAGS = r"(?:\s+-[a-z-]{1,16}){0,6}"
+_RM_LETTERS = r"[a-z]{0,8}"
+
+
 def mcfs_role_rules() -> list[Rule]:
     """Return the canonical MCFS role-drift rule set.
 
@@ -103,8 +110,47 @@ def mcfs_role_rules() -> list[Rule]:
             id="MCFS-ROLE-004",
             text="Agents must not invoke destructive shell or filesystem operations.",
             severity=Severity.CRITICAL,
-            keywords=["rm -rf", "delete /etc", "/etc/passwd", "exfiltrate"],
-            patterns=[r"rm\s+-rf", r"/etc/passwd", r"exfiltrate"],
+            keywords=[
+                "rm -rf",
+                # Flag-order variants. acgs_lite's Python engine runs pattern
+                # rules only when some pattern anchor word occurs in the text,
+                # so a bare "rm -fr /" is caught by keyword (case-insensitive
+                # substring; the normalized pass collapses whitespace).
+                "rm -fr",
+                "rm -r -f",
+                "rm -f -r",
+                "rm -rvf",
+                "rm -vrf",
+                "rm -fvr",
+                "rm -vfr",
+                "delete /etc",
+                "/etc/passwd",
+                "exfiltrate",
+            ],
+            patterns=[
+                r"rm\s+-rf",
+                # rm whose leading flag run holds both a recursive flag and a
+                # force flag, in any order or grouping (patterns are
+                # IGNORECASE). Every quantifier is bounded (_RM_FLAGS,
+                # _RM_LETTERS): unbounded flag runs backtracked
+                # catastrophically on long "rm -rrrr..." input. No lookarounds
+                # or backrefs: acgs_lite may run patterns on the Rust regex
+                # engine. acgs_lite only runs a pattern when an "anchor" word
+                # occurs in the text, so the short-flag form has no 3+ letter
+                # word and each long-option form names the option it requires.
+                # Short flags: -fr, -Rf, -rfv, -r -f, -f -v -R ...
+                rf"\brm{_RM_FLAGS}\s+-{_RM_LETTERS}"
+                rf"(?:r{_RM_LETTERS}(?:{_RM_FLAGS}\s+-{_RM_LETTERS})?f"
+                rf"|f{_RM_LETTERS}(?:{_RM_FLAGS}\s+-{_RM_LETTERS})?r)",
+                # --force with -r / --recursive (anchor: "force").
+                rf"\brm{_RM_FLAGS}\s+(?:--force{_RM_FLAGS}\s+(?:-{_RM_LETTERS}r|--recursive)"
+                rf"|(?:-{_RM_LETTERS}r|--recursive){_RM_FLAGS}\s+--force)",
+                # --recursive with -f (anchor: "recursive").
+                rf"\brm{_RM_FLAGS}\s+(?:--recursive{_RM_FLAGS}\s+-{_RM_LETTERS}f"
+                rf"|-{_RM_LETTERS}f{_RM_FLAGS}\s+--recursive)",
+                r"/etc/passwd",
+                r"exfiltrate",
+            ],
             category="role_drift",
             subcategory="os_command_injection",
             metadata={"cwe": "CWE-78", "source": "CWE/OWASP taxonomy 2024"},

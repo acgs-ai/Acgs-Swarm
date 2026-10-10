@@ -35,6 +35,7 @@ import contextvars
 import fcntl
 import json
 import logging
+import re
 import sys
 import tempfile
 import threading
@@ -79,12 +80,27 @@ _RUN_ROOT_OVERRIDE: contextvars.ContextVar[Path | None] = contextvars.ContextVar
 def _safe_path_component(value: str, *, field_name: str) -> str:
     if not value or value in {".", ".."} or "\x00" in value:
         raise ValueError(f"{field_name} must be a non-empty path component")
+    if value.startswith("-"):
+        # Components also travel as argv values (official harness -id / -i);
+        # a leading dash would be parsed as an option.
+        raise ValueError(f"{field_name} must not start with '-'")
     candidate = Path(value)
     if candidate.is_absolute() or len(candidate.parts) != 1:
         raise ValueError(f"{field_name} must be a single relative path component")
     if any(part in {"", ".", ".."} for part in candidate.parts):
         raise ValueError(f"{field_name} must not contain traversal components")
     return value
+
+
+# SWE-bench ids look like "astropy__astropy-12907": start alphanumeric, then
+# only [A-Za-z0-9._-]. Anything else is rejected before it reaches a path or argv.
+_INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _safe_instance_id(value: object) -> str:
+    if not isinstance(value, str) or _INSTANCE_ID_RE.fullmatch(value) is None:
+        raise ValueError("instance_id must match [A-Za-z0-9][A-Za-z0-9._-]*")
+    return _safe_path_component(value, field_name="instance_id")
 
 
 def _run_root() -> Path:
@@ -227,7 +243,7 @@ def _normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
     instance_id = raw.get("instance_id")
     if not isinstance(instance_id, str):
         raise ValueError("instance_id must be a string path component")
-    _safe_path_component(instance_id, field_name="instance_id")
+    _safe_instance_id(instance_id)
     ftp = raw.get("FAIL_TO_PASS", "[]")
     if isinstance(ftp, str):
         try:
@@ -358,7 +374,7 @@ def _record_from_solve(
 
 
 def _save_patch(run_id: str, instance_id: str, patch: str) -> None:
-    safe_instance_id = _safe_path_component(instance_id, field_name="instance_id")
+    safe_instance_id = _safe_instance_id(instance_id)
     patch_dir = _run_dir(run_id) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = (patch_dir / f"{safe_instance_id}.diff").resolve()
@@ -374,7 +390,7 @@ def _save_candidate_patch(
     patch: str,
 ) -> None:
     """Persist one best-of-K candidate beneath the run's patch directory."""
-    safe_instance_id = _safe_path_component(instance_id, field_name="instance_id")
+    safe_instance_id = _safe_instance_id(instance_id)
     patch_dir = _run_dir(run_id) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = (patch_dir / f"{safe_instance_id}.agent{agent_index}.diff").resolve()
@@ -697,7 +713,7 @@ def run_best_of_k_batch(
             raise RuntimeError(
                 f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
             )
-        _safe_path_component(task["instance_id"], field_name="instance_id")
+        _safe_instance_id(task["instance_id"])
 
         # Build agent roster (heterogeneous if --models given).
         if models:
