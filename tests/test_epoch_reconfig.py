@@ -28,7 +28,7 @@ from constitutional_swarm.quorum_certificate import (
     CertificateVerificationPolicy,
     SignedVote,
     build_certificate,
-    build_vote_message,
+    build_vote_message_v2,
 )
 from constitutional_swarm.validator_set import (
     CommitteeSelector,
@@ -134,14 +134,15 @@ class TestTransitionCertificate:
     def _qc(proposal, validators, keys, seed):
         assignment_id, artifact_hash, epoch = transition_vote_subject(proposal)
         committee = CommitteeSelector(validators).select(seed, len(validators))
-        message = build_vote_message(assignment_id, artifact_hash, epoch)
         votes = [
             SignedVote(
                 voter_id,
                 assignment_id,
                 artifact_hash,
                 epoch,
-                keys[voter_id].sign(message),
+                keys[voter_id].sign(
+                    build_vote_message_v2(assignment_id, artifact_hash, epoch, voter_id)
+                ),
                 validators.get(voter_id).public_key_bytes,
             )
             for voter_id in committee.members

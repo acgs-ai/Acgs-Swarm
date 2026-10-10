@@ -41,7 +41,7 @@ from constitutional_swarm.quorum_certificate import (
     InvalidCertificateError,
     QuorumCertificate,
     SignedVote,
-    build_vote_message,
+    build_vote_message_v2,
     verify_certificate,
 )
 from constitutional_swarm.swe_bench import run_one_by_one
@@ -60,7 +60,7 @@ def test_quorum_certificate_rejects_embedded_attacker_public_key() -> None:
     registered_sk = Ed25519PrivateKey.generate()
     attacker_sk = Ed25519PrivateKey.generate()
     attacker_pk = _pubkey_bytes(attacker_sk)
-    msg = build_vote_message("assignment", "artifact", 1)
+    msg = build_vote_message_v2("assignment", "artifact", 1, "validator-1")
     forged_vote = SignedVote(
         voter_id="validator-1",
         assignment_id="assignment",
@@ -99,7 +99,7 @@ def test_quorum_certificate_rejects_under_threshold_serialized_certificate() -> 
         assignment_id="assignment",
         artifact_hash="artifact",
         epoch=1,
-        signature=sk.sign(build_vote_message("assignment", "artifact", 1)),
+        signature=sk.sign(build_vote_message_v2("assignment", "artifact", 1, "validator-1")),
         public_key_bytes=pk,
     )
     qc = QuorumCertificate(

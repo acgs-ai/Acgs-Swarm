@@ -28,19 +28,22 @@ import hashlib
 import json
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from constitutional_swarm.framing import framed_digest
 from constitutional_swarm.validator_set import (
     CommitteeSelection,
     CommitteeSelector,
     ValidatorSet,
+    domain_share_exceeded,
 )
 
 _BASE_THRESHOLD_FRACTION = 2 / 3
+_VOTE_V2_DOMAIN = b"acgs-swarm/qc-vote/v2"
 
 __all__ = [
     "CertificateVerificationPolicy",
@@ -50,6 +53,8 @@ __all__ = [
     "QuorumCertificate",
     "SignedVote",
     "build_certificate",
+    "build_vote_message",
+    "build_vote_message_v2",
     "detect_conflict",
     "verify_certificate",
 ]
@@ -75,6 +80,17 @@ class CertificateVerificationPolicy:
     ``committee_size=None`` deliberately means the full eligible validator set.
     A verifier accepting a subset committee must pin its expected size; the
     certificate is never allowed to select its own committee size or threshold.
+
+    ``allow_legacy_v1`` (default False) additionally accepts vote signatures
+    over the v1 message, which does not bind ``voter_id``. The verifier — not
+    the certificate — decides whether the legacy format is acceptable.
+    Because a v1 signature is valid for every id registered with the signing
+    key, legacy mode rejects any certificate whose counted voters share a
+    registered public key. Residual: legacy mode still cannot tell *which*
+    of two ids sharing a key signed, so registries used with legacy
+    certificates must give every validator a distinct key.
+    ``enforce_domain_share`` (default False) rejects committees in which any
+    fault domain holds more than ``max_fraction`` of the raw committee weight.
     """
 
     committee_size: int | None = None
@@ -82,6 +98,8 @@ class CertificateVerificationPolicy:
     unsafe_allow_sub_two_thirds: bool = False
     expected_committee_seed: str | None = None
     excluded_voter_ids: frozenset[str] = field(default_factory=frozenset)
+    allow_legacy_v1: bool = False
+    enforce_domain_share: bool = False
 
     def __post_init__(self) -> None:
         if self.committee_size is not None and (
@@ -96,6 +114,10 @@ class CertificateVerificationPolicy:
             raise ValueError("threshold_fraction must be finite and in (0, 1]")
         if type(self.unsafe_allow_sub_two_thirds) is not bool:
             raise ValueError("unsafe_allow_sub_two_thirds must be a bool")
+        if type(self.allow_legacy_v1) is not bool:
+            raise ValueError("allow_legacy_v1 must be a bool")
+        if type(self.enforce_domain_share) is not bool:
+            raise ValueError("enforce_domain_share must be a bool")
         if (
             self.threshold_fraction < _BASE_THRESHOLD_FRACTION
             and not self.unsafe_allow_sub_two_thirds
@@ -111,12 +133,13 @@ class CertificateVerificationPolicy:
 
 @dataclass(frozen=True)
 class SignedVote:
-    """An Ed25519-signed vote on ``(assignment_id, artifact_hash, epoch)``.
+    """An Ed25519-signed vote on ``(assignment_id, artifact_hash, epoch, voter_id)``.
 
-    The tuple is the vote's domain-separated payload: a single signer
-    cannot produce two votes with the same ``(assignment_id, epoch)``
-    but different ``artifact_hash`` without exposing themselves to
-    slashing.
+    The tuple is the vote's domain-separated payload (message v2, see
+    :func:`build_vote_message_v2`): a single signer cannot produce two
+    votes with the same ``(assignment_id, epoch)`` but different
+    ``artifact_hash`` without exposing themselves to slashing, and a
+    signature cannot be relabelled to a different ``voter_id``.
     """
 
     voter_id: str
@@ -130,11 +153,21 @@ class SignedVote:
         _validate_epoch(self.epoch)
 
     def message(self) -> bytes:
-        """Canonical signable message for this vote."""
+        """Canonical signable message (v2, binds ``voter_id``) for this vote."""
+        return build_vote_message_v2(
+            self.assignment_id, self.artifact_hash, self.epoch, self.voter_id
+        )
+
+    def legacy_message(self) -> bytes:
+        """Legacy v1 message (no ``voter_id``); accepted only by verifier opt-in."""
         return build_vote_message(self.assignment_id, self.artifact_hash, self.epoch)
 
     def verify(self) -> bool:
-        """Verify the Ed25519 signature. Returns False on any failure."""
+        """Verify the v2 signature against the embedded key. False on any failure.
+
+        This is a self-consistency check only; certificate verification
+        always uses the validator-set registered key instead.
+        """
         try:
             pk = Ed25519PublicKey.from_public_bytes(self.public_key_bytes)
             pk.verify(self.signature, self.message())
@@ -144,11 +177,14 @@ class SignedVote:
 
 
 def build_vote_message(assignment_id: str, artifact_hash: str, epoch: int) -> bytes:
-    """Canonical signable message.
+    """Legacy v1 signable message (deprecated for new signatures).
 
     Domain-separated: the ``"cs-qc-v1"`` prefix prevents replay of
     signatures into other protocols. Epoch is included so the same
-    artifact in a later epoch requires a fresh signature.
+    artifact in a later epoch requires a fresh signature. It does **not**
+    bind ``voter_id``; certificate verifiers reject v1 signatures unless
+    ``CertificateVerificationPolicy(allow_legacy_v1=True)``. Sign
+    :func:`build_vote_message_v2` instead.
     """
     _validate_epoch(epoch)
     payload = {
@@ -159,6 +195,25 @@ def build_vote_message(assignment_id: str, artifact_hash: str, epoch: int) -> by
         "epoch": epoch,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def build_vote_message_v2(
+    assignment_id: str,
+    artifact_hash: str,
+    epoch: int,
+    voter_id: str,
+) -> bytes:
+    """Canonical v2 signable message binding the voter identity.
+
+    A domain-separated, length-framed digest (:func:`framed_digest`) over
+    ``(assignment_id, artifact_hash, epoch, voter_id)``, so a signature is
+    only valid for the voter it names, even if two registered validators
+    share a public key.
+    """
+    _validate_epoch(epoch)
+    if type(voter_id) is not str or not voter_id:
+        raise ValueError("voter_id must be a non-empty string")
+    return framed_digest(_VOTE_V2_DOMAIN, assignment_id, artifact_hash, epoch, voter_id)
 
 
 @dataclass(frozen=True)
@@ -367,6 +422,29 @@ def build_certificate(
 # ---------------------------------------------------------------------------
 
 
+def _vote_signature_valid(
+    vote: SignedVote,
+    registry_key_bytes: bytes,
+    *,
+    allow_legacy_v1: bool,
+) -> bool:
+    """Verify ``vote`` against the registry key: v2 always, v1 only by opt-in."""
+    try:
+        registry_key = Ed25519PublicKey.from_public_bytes(registry_key_bytes)
+        messages = [vote.message()]
+        if allow_legacy_v1:
+            messages.append(vote.legacy_message())
+    except (TypeError, ValueError):
+        return False
+    for message in messages:
+        try:
+            registry_key.verify(vote.signature, message)
+        except (InvalidSignature, TypeError, ValueError):
+            continue
+        return True
+    return False
+
+
 def _verify_certificate_core(
     qc: QuorumCertificate,
     *,
@@ -411,6 +489,7 @@ def _verify_certificate_core(
     identities = {identity.agent_id: identity for identity in validator_snapshot}
     domain_policy = snapshot_set.policy
     seen_voters: set[str] = set()
+    legacy_key_owner: dict[bytes, str] = {}
     per_domain: dict[str, float] = {}
     for sv in qc.votes:
         if sv.voter_id in seen_voters:
@@ -434,13 +513,21 @@ def _verify_certificate_core(
             raise InvalidCertificateError(
                 f"embedded public key for voter {sv.voter_id!r} does not match registry"
             )
-        try:
-            registry_key = Ed25519PublicKey.from_public_bytes(ident.public_key_bytes)
-            registry_key.verify(sv.signature, sv.message())
-        except (InvalidSignature, TypeError, ValueError) as exc:
+        if policy.allow_legacy_v1:
+            # A v1 message does not bind voter_id: one signature would
+            # otherwise count once per id registered under the same key.
+            other = legacy_key_owner.setdefault(ident.public_key_bytes, sv.voter_id)
+            if other != sv.voter_id:
+                raise InvalidCertificateError(
+                    f"voters {other!r} and {sv.voter_id!r} share a registered public key; "
+                    "rejected in legacy v1 mode"
+                )
+        if not _vote_signature_valid(
+            sv, ident.public_key_bytes, allow_legacy_v1=policy.allow_legacy_v1
+        ):
             raise InvalidCertificateError(
                 f"signature from {sv.voter_id!r} failed against registry key"
-            ) from exc
+            )
         if not math.isfinite(ident.effective_weight) or ident.effective_weight < 0.0:
             raise InvalidCertificateError(f"non-finite weight for voter {sv.voter_id!r}")
         domain = domain_policy.resolve_domain(ident)
@@ -454,6 +541,19 @@ def _verify_certificate_core(
     raw_committee_weight = sum(identity.effective_weight for identity in committee_identities)
     if not math.isfinite(raw_committee_weight) or raw_committee_weight <= 0.0:
         raise InvalidCertificateError("committee weight must be finite and positive")
+    if policy.enforce_domain_share:
+        committee_domains: dict[str, float] = {}
+        for identity in committee_identities:
+            domain = domain_policy.resolve_domain(identity)
+            committee_domains[domain] = (
+                committee_domains.get(domain, 0.0) + identity.effective_weight
+            )
+        if domain_share_exceeded(
+            committee_domains.values(), raw_committee_weight, domain_policy.max_fraction
+        ):
+            raise InvalidCertificateError(
+                "a single fault domain exceeds max_fraction of raw committee weight"
+            )
     ceiling = domain_policy.max_fraction * raw_committee_weight
     recomputed = sum(min(w, ceiling) for w in per_domain.values())
     policy_threshold = policy.threshold_fraction * raw_committee_weight
@@ -510,12 +610,9 @@ def verify_certificate(
             or not effective_policy.threshold_fraction <= threshold_fraction <= 1.0
         ):
             raise ValueError("threshold_fraction must be finite and strengthen policy")
-        effective_policy = CertificateVerificationPolicy(
-            committee_size=effective_policy.committee_size,
+        effective_policy = replace(
+            effective_policy,
             threshold_fraction=max(effective_policy.threshold_fraction, threshold_fraction),
-            unsafe_allow_sub_two_thirds=effective_policy.unsafe_allow_sub_two_thirds,
-            expected_committee_seed=effective_policy.expected_committee_seed,
-            excluded_voter_ids=effective_policy.excluded_voter_ids,
         )
     achieved, _ = _verify_certificate_core(
         qc,
