@@ -11,10 +11,15 @@ import json
 import re
 import time
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any, Final, Literal
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Final so mypy infers the literal type, matching the Literal[...] model fields.
@@ -25,6 +30,9 @@ VOTE_EVIDENCE_VERSION: Final = "constitutional-swarm.vote-envelope.v3"
 MIN_RECEIPT_QUORUM: Final = 3
 _LOWER_HEX_32_RE = re.compile(r"^[0-9a-f]{64}$")
 _LOWER_HEX_64_RE = re.compile(r"^[0-9a-f]{128}$")
+# Identity prefix carried by every deterministic fixture grant that is not
+# embedded in signed receipt bytes (see governance_fixtures.py).
+FIXTURE_IDENTITY_PREFIX: Final = "fixture-"
 REQUIRED_ROLES = (
     "constitution_author",
     "executor",
@@ -123,6 +131,10 @@ class SignerTrustGrant(BaseModel):
             raise ValueError("at least one signer role is required")
         if "assigner" in value and "validator" in value:
             raise ValueError("assigner and validator roles are mutually exclusive")
+        if "settlement" in value and ("assigner" in value or "validator" in value):
+            raise ValueError(
+                "settlement role is mutually exclusive with assigner and validator roles"
+            )
         return value
 
 
@@ -418,7 +430,8 @@ def _parse_trust_grants(
         if not isinstance(key_id, str) or not key_id:
             raise ValueError("signer trust registry key IDs must be non-empty strings")
         if isinstance(raw_grant, SignerTrustGrant):
-            grant = raw_grant
+            # Re-run every validator: model_construct() and subclasses bypass them.
+            grant = SignerTrustGrant.model_validate(raw_grant.model_dump())
         elif isinstance(raw_grant, Mapping):
             grant = SignerTrustGrant.model_validate(dict(raw_grant))
         else:
@@ -435,6 +448,70 @@ def _parse_trust_grants(
         identities[grant.identity_id] = (key_id, grant.public_key_hex)
         public_key_owners[grant.public_key_hex] = grant.identity_id
     return grants
+
+
+@lru_cache(maxsize=1)
+def _repeated_byte_seed_public_keys() -> frozenset[str]:
+    """Public keys of Ed25519 seeds ``bytes([n]) * 32``; their private keys are public."""
+
+    return frozenset(
+        Ed25519PrivateKey.from_private_bytes(bytes([seed]) * 32)
+        .public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        .hex()
+        for seed in range(256)
+    )
+
+
+def _is_fixture_trust_registry(grants: Mapping[str, SignerTrustGrant]) -> bool:
+    """True when any grant is a deterministic fixture key or fixture identity."""
+
+    weak_keys = _repeated_byte_seed_public_keys()
+    return any(
+        grant.identity_id.startswith(FIXTURE_IDENTITY_PREFIX)
+        or grant.public_key_hex in weak_keys
+        for grant in grants.values()
+    )
+
+
+def _settlement_signer_conflict_issue(
+    payload: ReceiptPayload, signer_identity: str
+) -> tuple[str, str] | None:
+    """Return an issue when the settlement signer is a voter, the assigner, or the producer.
+
+    Fails closed: a present candidate identity that is not an exact, non-blank ``str``
+    cannot be compared and is reported as malformed instead of being skipped.
+    """
+
+    from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
+
+    candidates: list[Any] = [vote.validator_id for vote in payload.validator_votes]
+    candidates.extend(payload.assigned_peers or [])
+    candidates.append(payload.metadata.get("producer_id"))
+    candidates.append(payload.roles["executor"].identity_id)
+    if payload.signed_assignment is not None:
+        candidates.append(payload.signed_assignment.get("assigner_id"))
+        candidates.append(payload.signed_assignment.get("producer_id"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            normalized = normalize_voter_id(candidate)
+        except (TypeError, ValueError):
+            return (
+                "settlement_signer_identity_malformed",
+                "receipt identity compared against the settlement signer is not a "
+                "non-blank string",
+            )
+        if normalized == signer_identity:
+            return (
+                "settlement_signer_role_conflict",
+                "settlement signer identity must not be a voter, the assigner, or the producer",
+            )
+    return None
 
 
 def _vote_registry_from_grants(grants: Mapping[str, SignerTrustGrant]) -> Any:
@@ -857,11 +934,17 @@ def verify_bundle(
     trusted_signers: Mapping[str, Any] | None = None,
     expected_signer_role: Literal["validator", "coordinator", "settlement"] | None = None,
     require_independent_votes: bool = True,
+    require_proof_grade: bool = False,
 ) -> VerificationVerdict:
     """Verify a receipt bundle.
 
     Both modes fail closed. Report mode changes the output mode label while preserving
     signature diagnostics for callers that need a complete report.
+
+    ``evidence_policy`` is ``development`` when independent votes are not required or
+    when the trust registry holds a deterministic fixture key or ``fixture-`` identity.
+    With ``require_proof_grade=True`` a ``development`` policy makes the verdict invalid
+    (issue ``evidence_policy_not_proof_grade``).
     """
 
     issues: list[ReceiptIssue] = []
@@ -998,6 +1081,17 @@ def verify_bundle(
         hashes.append(current_hash)
         previous_hash = current_hash
 
+    proof_grade = require_independent_votes and not _is_fixture_trust_registry(signer_registry)
+    if require_proof_grade and not proof_grade:
+        issues.append(
+            ReceiptIssue(
+                code="evidence_policy_not_proof_grade",
+                message=(
+                    "proof-grade evidence was required, but the evidence policy is development "
+                    "(dev vote opt-out or deterministic fixture trust root)"
+                ),
+            )
+        )
     aggregate_signature_status = _aggregate_signature_status(signature_statuses)
     valid = not issues and aggregate_signature_status == "valid"
 
@@ -1007,7 +1101,7 @@ def verify_bundle(
         profile_version=bundle.profile_version,
         receipt_count=len(bundle.receipts),
         signature_status=aggregate_signature_status,  # type: ignore[arg-type]
-        evidence_policy="proof_grade" if require_independent_votes else "development",
+        evidence_policy="proof_grade" if proof_grade else "development",
         issues=issues,
         receipt_hashes=hashes,
     )
@@ -1069,6 +1163,21 @@ def _verify_receipt_signatures(
                 ReceiptIssue(
                     code="signer_role_unauthorized",
                     message=f"signature key is not authorized for role {required_role!r}",
+                    receipt_id=receipt.payload.receipt_id,
+                )
+            )
+            statuses.append("unverifiable")
+            continue
+        conflict = (
+            _settlement_signer_conflict_issue(receipt.payload, grant.identity_id)
+            if required_role == "settlement"
+            else None
+        )
+        if conflict is not None:
+            issues.append(
+                ReceiptIssue(
+                    code=conflict[0],
+                    message=conflict[1],
                     receipt_id=receipt.payload.receipt_id,
                 )
             )

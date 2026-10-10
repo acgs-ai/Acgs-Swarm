@@ -636,7 +636,9 @@ def test_c16_receipt_verification_accepts_independent_votes_by_default():
     )
 
     assert verdict.valid is True
-    assert verdict.evidence_policy == "proof_grade"
+    # C26 (governance-7): the fixture trust root uses publicly derivable keys, so the
+    # verdict is labelled development even though independent votes verify.
+    assert verdict.evidence_policy == "development"
 
 
 def test_c16_cli_dev_evidence_requires_explicit_labelled_optout(tmp_path):

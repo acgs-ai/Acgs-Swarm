@@ -32,11 +32,11 @@ from constitutional_swarm.mesh.vote_envelope import (
 
 
 _RECEIPT_SIGNERS = {
-    "audit-agent-key": (1, "provenance-coordinator"),
-    "audit-agent-key-2": (2, "denial-coordinator"),
-    "collusion-key": (3, "collusion-coordinator"),
-    "slow-key-1": (4, "slow-burn-coordinator-1"),
-    "slow-key-2": (5, "slow-burn-coordinator-2"),
+    "audit-agent-key": (1, "fixture-provenance-coordinator"),
+    "audit-agent-key-2": (2, "fixture-denial-coordinator"),
+    "collusion-key": (3, "fixture-collusion-coordinator"),
+    "slow-key-1": (4, "fixture-slow-burn-coordinator-1"),
+    "slow-key-2": (5, "fixture-slow-burn-coordinator-2"),
 }
 _VOTER_SEEDS = {
     "review-agent": 101,
@@ -78,7 +78,13 @@ def _public_key_hex(private_key: Ed25519PrivateKey) -> str:
 
 
 def fixture_trusted_signers() -> dict[str, dict[str, object]]:
-    """Return explicit identity, key, and role grants for deterministic fixtures."""
+    """Return explicit identity, key, and role grants for deterministic fixtures.
+
+    Every private key here is derived from ``bytes([n]) * 32`` and is therefore
+    public knowledge. ``verify_bundle`` detects these keys and labels any verdict
+    against this registry ``evidence_policy="development"``; never use it as a
+    production trust root.
+    """
 
     trusted: dict[str, dict[str, object]] = {}
     for key_id, (seed_byte, identity_id) in _RECEIPT_SIGNERS.items():
