@@ -20,9 +20,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, cast
 from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from constitutional_swarm import secure_files, strict_json
 from constitutional_swarm.apcc_empirical.adapters import (
     AuthorityObservation,
     BaselineBlocked,
@@ -36,12 +40,15 @@ from constitutional_swarm.apcc_empirical.adapters import (
 GCB1_COMMIT_SHA = "6e65db3e478fa315119038b616d78f4f171422db"
 GCB1_TREE_SHA = "18cf41945e9cd2e40b208d2f4cd4dbf8788bb6f0"
 GCB1_LOCK_SHA256 = "e111811f919150018e43af151f66590c5097feb9695bdf4aaafa2f8725d3f3b5"
-ADAPTER_VERSION = "gcb1-subprocess-v1"
+ADAPTER_VERSION = "gcb1-subprocess-v2"
 FROZEN_PYTHON_VERSION = "3.13.13"
 FROZEN_CRYPTOGRAPHY_VERSION = "47.0.0"
 _MAX_FRAME_BYTES = 1_048_576
 _RPC_TIMEOUT_SECONDS = 5.0
 _STATE_LOCK_TIMEOUT_SECONDS = 0.5
+_KEY_FILE_FIELDS = ("verifier", "admin", "agent", "journal")
+_MAX_KEY_FILE_BYTES = 4096
+_SEED_BYTES = 32
 JOURNAL_COVERAGE_LIMITATION = (
     "Pinned GCB-1 has no public workflow-enumeration API; an authority commit that "
     "survives while the authenticated journal index does not cannot be rediscovered."
@@ -57,7 +64,40 @@ SQLITE_PATH_SCOPE = (
     "the lifetime ownership lock under the trusted same-UID host TCB, without an "
     "open-FD no-follow guarantee."
 )
-_ENVIRONMENT_IDENTITY_SCRIPT = r"""
+# One length-prefixed tree digest for the supervisor and both subprocess
+# scripts.  Each file contributes u64be(len(path)) || path || u64be(len(data)) ||
+# data, so files cannot be merged or split without changing the digest.
+_HASH_TREE_SOURCE = r"""
+def hash_tree(root, *, exclude_bytecode):
+    digest = hashlib.sha256(b"constitutional-swarm/APCC-B5/tree-hash/v2\0")
+    for path in sorted(
+        item for item in root.rglob("*")
+        if item.is_file()
+        and not (
+            exclude_bytecode
+            and ("__pycache__" in item.parts or item.suffix == ".pyc")
+        )
+    ):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+"""
+
+
+def _compile_hash_tree() -> Callable[..., str]:
+    namespace: dict[str, Any] = {"hashlib": hashlib}
+    exec(compile(_HASH_TREE_SOURCE, "<apcc-b5-hash-tree>", "exec"), namespace)
+    return cast(Callable[..., str], namespace["hash_tree"])
+
+
+_hash_tree = _compile_hash_tree()
+
+_ENVIRONMENT_IDENTITY_SCRIPT = (
+    r"""
 import hashlib, importlib.metadata, json, sys
 from pathlib import Path
 import cryptography
@@ -65,24 +105,19 @@ import cryptography
 snapshot = Path(sys.argv[1]).resolve()
 module = snapshot / "src/constitutional_swarm/governed_commit.py"
 cryptography_root = Path(cryptography.__file__).resolve().parent
-def hash_tree(root):
-    digest = hashlib.sha256()
-    for path in sorted(
-        item for item in root.rglob("*")
-        if item.is_file() and "__pycache__" not in item.parts and item.suffix != ".pyc"
-    ):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+"""
+    + _HASH_TREE_SOURCE
+    + r"""
 material = {
     "python_version": sys.version.split()[0],
     "python_binary_sha256": hashlib.sha256(
         Path(sys.executable).resolve().read_bytes()
     ).hexdigest(),
     "cryptography_version": cryptography.__version__,
-    "cryptography_content_sha256": hash_tree(cryptography_root),
-    "environment_content_sha256": hash_tree(Path(sys.prefix).resolve()),
+    "cryptography_content_sha256": hash_tree(cryptography_root, exclude_bytecode=True),
+    "environment_content_sha256": hash_tree(
+        Path(sys.prefix).resolve(), exclude_bytecode=True
+    ),
     "distributions": sorted(
         (dist.metadata["Name"].lower(), dist.version)
         for dist in importlib.metadata.distributions()
@@ -94,11 +129,17 @@ material = {
 encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
 print(json.dumps({"material": material, "digest": hashlib.sha256(encoded).hexdigest()}))
 """
+)
 
 _UNSUPPORTED_VARIANTS = frozenset(
     {
         "predecessor-replacement-race:supersession-current",
         "predecessor-replacement-race:supersession-stale",
+        # Adapter-level P1 variant: pinned GCB-1 fixes its verifier keys in
+        # TrustedGovernanceBootstrap, so evidence-carried trust injection has no
+        # native receipt mutation.  Blocking it keeps the worker from executing
+        # an unmutated receipt as if it were the attack.
+        "unknown-key:trusted-key-injection",
     }
 )
 
@@ -137,7 +178,8 @@ class HistoricalSnapshotIdentity:
         }
 
 
-_WORKER = r"""
+_WORKER = (
+    r"""
 import base64, hashlib, hmac, importlib.metadata, json, os, secrets, sys, time, types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -178,16 +220,9 @@ if not module_path.startswith(str(snapshot)):
 if any(name.startswith("constitutional_swarm.apcc") for name in sys.modules):
     raise SystemExit("current APCC module contamination")
 
-def hash_tree(root):
-    digest = hashlib.sha256()
-    for path in sorted(
-        item for item in root.rglob("*")
-        if item.is_file() and "__pycache__" not in item.parts and item.suffix != ".pyc"
-    ):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+"""
+    + _HASH_TREE_SOURCE
+    + r"""
 
 def environment_identity():
     cryptography_root = Path(cryptography.__file__).resolve().parent
@@ -202,8 +237,10 @@ def environment_identity():
             Path(sys.executable).resolve().read_bytes()
         ).hexdigest(),
         "cryptography_version": cryptography.__version__,
-        "cryptography_content_sha256": hash_tree(cryptography_root),
-        "environment_content_sha256": hash_tree(Path(sys.prefix).resolve()),
+        "cryptography_content_sha256": hash_tree(cryptography_root, exclude_bytecode=True),
+        "environment_content_sha256": hash_tree(
+            Path(sys.prefix).resolve(), exclude_bytecode=True
+        ),
         "distributions": distributions,
         "lock_sha256": hashlib.sha256((snapshot / "uv.lock").read_bytes()).hexdigest(),
         "module_sha256": hashlib.sha256(Path(module_path).read_bytes()).hexdigest(),
@@ -224,12 +261,12 @@ trial = 0
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
-def mac_for(sequence, body):
-    material = canonical({"sequence": sequence, "body": body})
+def mac_for(direction, sequence, body):
+    material = canonical({"direction": direction, "sequence": sequence, "body": body})
     return hmac.new(secret, material, hashlib.sha256).hexdigest()
 
 def respond(sequence, body):
-    envelope = {"sequence": sequence, "body": body, "mac": mac_for(sequence, body)}
+    envelope = {"sequence": sequence, "body": body, "mac": mac_for("w2s", sequence, body)}
     print(json.dumps(envelope, sort_keys=True, separators=(",", ":")), flush=True)
 
 def mutate_receipt(receipt, variant):
@@ -642,7 +679,7 @@ while True:
         sequence, body, supplied = envelope["sequence"], envelope["body"], envelope["mac"]
         if not isinstance(sequence, int) or sequence != last_sequence + 1:
             raise ValueError("invalid supervisor sequence")
-        if not hmac.compare_digest(supplied, mac_for(sequence, body)):
+        if not hmac.compare_digest(supplied, mac_for("s2w", sequence, body)):
             raise ValueError("supervisor message is not authenticated")
         last_sequence = sequence
         command = body.get("command")
@@ -685,6 +722,65 @@ while True:
         result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
     respond(sequence, result)
 """
+)
+
+
+def _frame_mac(secret: bytes, direction: str, sequence: object, body: object) -> str:
+    """MAC one RPC frame; the direction tag stops reflected frames verifying."""
+    if direction not in ("s2w", "w2s"):
+        raise ValueError("frame direction must be s2w or w2s")
+    encoded = json.dumps(
+        {"direction": direction, "sequence": sequence, "body": body},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hmac.new(secret, encoded, hashlib.sha256).hexdigest()
+
+
+def _derive_journal_key(secret: bytes, purpose: bytes) -> bytes:
+    """HKDF-SHA256 sub-key of the dedicated journal secret, bound to the pins."""
+    if type(secret) is not bytes or len(secret) != _SEED_BYTES:
+        raise HistoricalSnapshotError("historical journal secret is malformed")
+    info = (
+        b"constitutional-swarm/APCC-B5/"
+        + purpose
+        + b"-mac/v2\0"
+        + GCB1_COMMIT_SHA.encode("ascii")
+        + b"\0"
+        + GCB1_LOCK_SHA256.encode("ascii")
+    )
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(
+        secret
+    )
+
+
+def _read_b5_key_file(key_path: Path) -> tuple[bytes, bytes, bytes, bytes]:
+    """Read an existing B5 key file under the shared private-file policy."""
+    try:
+        with secure_files.private_file(key_path) as stream:
+            raw = stream.read(_MAX_KEY_FILE_BYTES + 1)
+    except (OSError, ValueError) as error:
+        raise HistoricalSnapshotError("historical key file is unsafe") from error
+    try:
+        values = strict_json.loads(
+            raw, max_bytes=_MAX_KEY_FILE_BYTES, max_depth=2, allow_float=False
+        )
+        if type(values) is not dict or set(values) != set(_KEY_FILE_FIELDS):
+            raise ValueError("historical key schema is malformed")
+        decoded = []
+        for name in _KEY_FILE_FIELDS:
+            encoded = values[name]
+            if type(encoded) is not str:
+                raise ValueError("historical key entry must be a string")
+            seed = base64.b64decode(encoded, validate=True)
+            if len(seed) != _SEED_BYTES:
+                raise ValueError("historical key entry must be 32 bytes")
+            decoded.append(seed)
+    except ValueError as error:
+        raise HistoricalSnapshotError("historical key file is malformed") from error
+    verifier, admin, agent, journal = decoded
+    return verifier, admin, agent, journal
 
 
 class HistoricalGCBAdapter:
@@ -692,6 +788,7 @@ class HistoricalGCBAdapter:
 
     baseline_id = "B5"
     _secret: bytes
+    _journal_secret: bytes
     _process: subprocess.Popen[str] | None
     _sequence: int
     guarantees = frozenset({Capability.PROOF_VALIDATION, Capability.ATOMIC_COMMIT})
@@ -804,7 +901,7 @@ class HistoricalGCBAdapter:
             self._provision_environment()
             self._python = self._environment_root / "bin" / "python"
             self._environment_identity = self._read_environment_identity()
-            self._seeds = self._load_or_create_keys()
+            self._seeds, self._journal_secret = self._load_or_create_keys()
             database_existed = self.path.exists()
             try:
                 identity = self._start_worker()
@@ -923,9 +1020,7 @@ class HistoricalGCBAdapter:
             os.close(descriptor)
             self._state_lock_fd = None
 
-    def _validate_worker_database_path(
-        self, *, bind_if_new: bool = False
-    ) -> tuple[int, int] | None:
+    def _validate_worker_database_path(self) -> tuple[int, int] | None:
         if self.path.parent != self._state_root:
             raise HistoricalSnapshotError(
                 "historical database pathname escaped its state root"
@@ -965,8 +1060,6 @@ class HistoricalGCBAdapter:
             raise HistoricalSnapshotError(
                 "historical authority database identity changed"
             )
-        if self._database_identity is None and not bind_if_new:
-            return identity
         return identity
 
     def _record_created_path(self, path: Path) -> None:
@@ -1163,7 +1256,7 @@ class HistoricalGCBAdapter:
         self._sequence = 0
         identity = self._rpc({"command": "identity"})
         self._validate_worker_identity(identity)
-        self._database_identity = self._validate_worker_database_path(bind_if_new=True)
+        self._database_identity = self._validate_worker_database_path()
         return identity
 
     def _restart_worker(self) -> None:
@@ -1286,14 +1379,8 @@ class HistoricalGCBAdapter:
         return lock_digest
 
     def _hash_snapshot(self) -> str:
-        digest = hashlib.sha256()
-        for path in sorted(
-            item for item in self._snapshot.rglob("*") if item.is_file()
-        ):
-            digest.update(path.relative_to(self._snapshot).as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-        return digest.hexdigest()
+        # Bytecode is included: -B only stops writing it, a planted .pyc loads.
+        return _hash_tree(self._snapshot, exclude_bytecode=False)
 
     def _read_public_runtime_methods(self) -> frozenset[str]:
         source = self._snapshot / "src/constitutional_swarm/governed_commit.py"
@@ -1308,30 +1395,23 @@ class HistoricalGCBAdapter:
                 )
         raise HistoricalSnapshotError("historical governed runtime API is missing")
 
-    def _load_or_create_keys(self) -> tuple[bytes, bytes, bytes]:
+    def _load_or_create_keys(self) -> tuple[tuple[bytes, bytes, bytes], bytes]:
+        """Return the three worker signing seeds and the supervisor journal secret.
+
+        The journal secret is dedicated to journal MACs and never leaves the
+        supervisor; it is not part of the worker bootstrap frame.
+        """
         key_path = self.path.with_suffix(self.path.suffix + ".b5-keys.json")
+        if key_path.is_symlink():
+            raise HistoricalSnapshotError("historical key path cannot be a symlink")
         if key_path.exists():
-            if key_path.is_symlink():
-                raise HistoricalSnapshotError("historical key path cannot be a symlink")
-            descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                values = json.load(stream)
-            if set(values) != {"verifier", "admin", "agent"}:
-                raise HistoricalSnapshotError("historical key schema is malformed")
-            return (
-                base64.b64decode(values["verifier"], validate=True),
-                base64.b64decode(values["admin"], validate=True),
-                base64.b64decode(values["agent"], validate=True),
-            )
-        seeds = (
-            secrets.token_bytes(32),
-            secrets.token_bytes(32),
-            secrets.token_bytes(32),
-        )
+            verifier, admin, agent, journal = _read_b5_key_file(key_path)
+            return (verifier, admin, agent), journal
+        material = tuple(secrets.token_bytes(_SEED_BYTES) for _ in _KEY_FILE_FIELDS)
         key_path.parent.mkdir(parents=True, exist_ok=True)
         values = {
             name: base64.b64encode(seed).decode("ascii")
-            for name, seed in zip(("verifier", "admin", "agent"), seeds, strict=True)
+            for name, seed in zip(_KEY_FILE_FIELDS, material, strict=True)
         }
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         descriptor = os.open(key_path, flags, stat.S_IRUSR | stat.S_IWUSR)
@@ -1340,7 +1420,8 @@ class HistoricalGCBAdapter:
             stream.flush()
             os.fsync(stream.fileno())
         self._record_created_path(key_path)
-        return seeds
+        verifier, admin, agent, journal = material
+        return (verifier, admin, agent), journal
 
     def _load_journal(self) -> list[dict[str, Any]]:
         journal_exists = self._journal_path.exists()
@@ -1421,20 +1502,10 @@ class HistoricalGCBAdapter:
         return value["records"]
 
     def _journal_mac_key(self) -> bytes:
-        context = (
-            b"constitutional-swarm/APCC-B5/journal-mac-kdf/v1\0"
-            + GCB1_COMMIT_SHA.encode("ascii")
-            + b"\0"
-            + GCB1_LOCK_SHA256.encode("ascii")
-        )
-        return hmac.new(self._seeds[0], context, hashlib.sha256).digest()
+        return _derive_journal_key(self._journal_secret, b"journal")
 
     def _journal_head_mac_key(self) -> bytes:
-        return hmac.new(
-            self._journal_mac_key(),
-            b"constitutional-swarm/APCC-B5/journal-head/v1",
-            hashlib.sha256,
-        ).digest()
+        return _derive_journal_key(self._journal_secret, b"journal-head")
 
     def _read_journal_head(self) -> dict[str, Any]:
         descriptor = os.open(self._journal_head_path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -1539,12 +1610,9 @@ class HistoricalGCBAdapter:
     def _envelope(self, body: Mapping[str, Any]) -> dict[str, Any]:
         self._sequence += 1
         material = {"sequence": self._sequence, "body": dict(body)}
-        encoded = json.dumps(
-            material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
         return {
             **material,
-            "mac": hmac.new(self._secret, encoded, hashlib.sha256).hexdigest(),
+            "mac": _frame_mac(self._secret, "s2w", self._sequence, material["body"]),
         }
 
     def _send_envelope(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -1565,11 +1633,7 @@ class HistoricalGCBAdapter:
                 "historical worker frame is malformed"
             ) from error
         sequence, body = response.get("sequence"), response.get("body")
-        material = {"sequence": sequence, "body": body}
-        encoded = json.dumps(
-            material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-        expected = hmac.new(self._secret, encoded, hashlib.sha256).hexdigest()
+        expected = _frame_mac(self._secret, "w2s", sequence, body)
         if sequence != envelope.get("sequence") or not hmac.compare_digest(
             str(response.get("mac", "")), expected
         ):
@@ -1749,6 +1813,10 @@ class HistoricalGCBAdapter:
             "predecessor-replacement-race:supersession-stale": (
                 f"pinned {GCB1_COMMIT_SHA} GovernedCommitBoundary public methods "
                 "contain no predecessor status/supersession token operation"
+            ),
+            "unknown-key:trusted-key-injection": (
+                f"pinned {GCB1_COMMIT_SHA} TrustedGovernanceBootstrap fixes its "
+                "verifier keys; evidence-carried trust injection is not expressible"
             ),
         }
         return f"B5 historical public APIs cannot execute {variant_id}: {reasons[variant_id]}"
