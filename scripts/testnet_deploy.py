@@ -7,7 +7,7 @@ Usage:
 
     # Start miner
     python scripts/testnet_deploy.py miner --wallet-name <name> --wallet-hotkey <key> \
-        --constitution constitution.yaml --netuid <id>
+        --constitution constitution.yaml --netuid <id> --trusted-validators <ss58>[,<ss58>]
 
     # Start validator
     python scripts/testnet_deploy.py validator --wallet-name <name> --wallet-hotkey <key> \
@@ -24,11 +24,10 @@ import argparse
 import errno
 import json
 import os
-import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
-from typing import TextIO
+from typing import BinaryIO
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -66,50 +65,31 @@ class _AuthorityKeys:
 
 
 @contextmanager
-def _open_authority_key_file(path: str) -> Iterator[TextIO]:
-    """Open and validate a private authority file from one descriptor.
+def _open_authority_key_file(path: str) -> Iterator[BinaryIO]:
+    """Open a private authority file through the shared H3 policy.
 
-    ``O_NOFOLLOW`` protects only the final path component. Operators must keep
-    every parent directory under trusted control.
+    ``secure_files.private_file`` validates one descriptor snapshot: regular
+    file, owned by the effective user, no group/other or special mode bits,
+    exactly one link. ``O_NOFOLLOW`` protects only the final path component;
+    operators must keep every parent directory under trusted control.
     """
-    descriptor = -1
+    from constitutional_swarm.secure_files import PrivateFileError, private_file
+
     try:
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    except AttributeError as exc:
+        with private_file(path) as handle:
+            yield handle
+    except PrivateFileError as exc:
         raise ValueError(
-            "secure authority key file opening is unsupported on this platform"
+            "authority key file must be a regular file and not a symlink, owned by the "
+            "current effective user, with no group or other permissions and a single "
+            f"link (chmod 600): {path}: {exc}"
         ) from exc
-    try:
-        descriptor = os.open(path, flags)
-        metadata = os.fstat(descriptor)
     except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
         if exc.errno == errno.ELOOP:
             raise ValueError(
                 f"authority key file must be a regular file and not a symlink: {path}"
             ) from exc
         raise ValueError(f"authority key file is unreadable: {path}") from exc
-
-    try:
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(
-                f"authority key file must be a regular file and not a symlink: {path}"
-            )
-        if metadata.st_uid != os.geteuid():
-            raise ValueError(
-                f"authority key file must be owned by the current effective user: {path}"
-            )
-        if metadata.st_mode & 0o077:
-            raise ValueError(
-                f"authority key file grants group or other permissions: {path}"
-            )
-        with os.fdopen(descriptor, encoding="utf-8") as handle:
-            descriptor = -1
-            yield handle
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _load_authority_keys(path: str) -> _AuthorityKeys:
@@ -339,45 +319,6 @@ def _weight_values_for_metagraph(
     return [weights.get(normalize_voter_id(hotkey), 0.0) for hotkey in hotkeys]
 
 
-def _verify_axon_response_signature(
-    response,
-    *,
-    expected_axon_hotkey: str,
-    expected_dendrite_hotkey: str,
-) -> None:
-    """Verify the SDK's axon response-authentication tuple.
-
-    Bittensor 10.2 signs response routing metadata only. This authenticates the
-    selected axon key but does not provide payload-integrity evidence.
-    """
-    import bittensor as bt
-
-    axon = getattr(response, "axon", None)
-    dendrite = getattr(response, "dendrite", None)
-    response_axon_hotkey = getattr(axon, "hotkey", None)
-    response_dendrite_hotkey = getattr(dendrite, "hotkey", None)
-    nonce = getattr(axon, "nonce", None)
-    uuid = getattr(axon, "uuid", None)
-    signature = getattr(axon, "signature", None)
-    if response_axon_hotkey != expected_axon_hotkey:
-        raise ValueError("response axon hotkey does not match the selected request target")
-    if response_dendrite_hotkey != expected_dendrite_hotkey:
-        raise ValueError("response dendrite hotkey does not match the local requester")
-    if isinstance(nonce, bool) or not isinstance(nonce, int):
-        raise ValueError("response axon signature is missing its nonce")
-    if not isinstance(uuid, str) or not uuid:
-        raise ValueError("response axon signature is missing its UUID")
-    if not isinstance(signature, str) or not signature:
-        raise ValueError("response axon signature is missing")
-    message = f"{nonce}.{expected_dendrite_hotkey}.{expected_axon_hotkey}.{uuid}"
-    try:
-        verified = bt.Keypair(ss58_address=expected_axon_hotkey).verify(message, signature)
-    except Exception as exc:
-        raise ValueError("response axon signature is invalid") from exc
-    if not verified:
-        raise ValueError("response axon signature is invalid")
-
-
 async def _record_authenticated_response(
     response,
     *,
@@ -390,59 +331,29 @@ async def _record_authenticated_response(
     peer_routes: Mapping[str, tuple[str, int]],
     vote_client=None,
 ):
-    """Authenticate a response producer before validation or precedent admission."""
-    from dataclasses import replace
+    """Authenticate a response producer before validation or precedent admission.
 
-    from constitutional_swarm.bittensor.synapse_adapter import (
-        bt_to_judgment,
-        verify_judgment_response_signature,
-    )
+    The allow-list check runs first; ``synapse_adapter.authenticate_response``
+    then binds the response to the selected axon, the local dendrite and the
+    dispatched request (axon signature plus request-bound body signature).
+    """
+    from constitutional_swarm.bittensor import synapse_adapter
     from constitutional_swarm.mesh.vote_envelope import normalize_voter_id
 
-    _verify_axon_response_signature(
+    if not isinstance(expected_hotkey, str) or not expected_hotkey.strip():
+        raise ValueError("request target is missing an authenticated hotkey")
+    expected_identity = normalize_voter_id(expected_hotkey)
+    authorized = {normalize_voter_id(identity) for identity in authorized_identities}
+    if expected_identity not in authorized:
+        raise ValueError(
+            f"authenticated response identity {expected_identity!r} is not authorized"
+        )
+    judgment = synapse_adapter.authenticate_response(
         response,
+        dispatched=synapse_adapter.deliberation_to_bt(case.synapse),
         expected_axon_hotkey=expected_hotkey,
         expected_dendrite_hotkey=expected_dendrite_hotkey,
     )
-    verify_judgment_response_signature(
-        response,
-        expected_signer_hotkey=expected_hotkey,
-        expected_dendrite_hotkey=expected_dendrite_hotkey,
-    )
-    axon = getattr(response, "axon", None)
-    authenticated_hotkey = getattr(axon, "hotkey", None)
-    if not isinstance(authenticated_hotkey, str) or not authenticated_hotkey.strip():
-        raise ValueError("response is missing an authenticated hotkey")
-    if not isinstance(expected_hotkey, str) or not expected_hotkey.strip():
-        raise ValueError("request target is missing an authenticated hotkey")
-
-    authenticated_identity = normalize_voter_id(authenticated_hotkey)
-    expected_identity = normalize_voter_id(expected_hotkey)
-    if authenticated_identity != expected_identity:
-        raise ValueError(
-            f"authenticated response identity {authenticated_identity!r} does not match "
-            f"request target {expected_identity!r}"
-        )
-    authorized = {normalize_voter_id(identity) for identity in authorized_identities}
-    if authenticated_identity not in authorized:
-        raise ValueError(
-            f"authenticated response identity {authenticated_identity!r} is not authorized"
-        )
-
-    payload_identity = getattr(response, "miner_uid", None)
-    if not isinstance(payload_identity, str) or not payload_identity.strip():
-        raise ValueError("response payload is missing miner_uid")
-    canonical_payload_identity = normalize_voter_id(payload_identity)
-    if canonical_payload_identity != authenticated_identity:
-        raise ValueError(
-            f"payload miner_uid {canonical_payload_identity!r} does not match authenticated "
-            f"identity {authenticated_identity!r}"
-        )
-    expected_request_hash = getattr(case.synapse, "content_hash", None)
-    if response.request_content_hash != expected_request_hash:
-        raise ValueError("signed judgment response does not match the dispatched request")
-
-    judgment = replace(bt_to_judgment(response), miner_uid=authenticated_identity)
     validation = await validator.validate_remote(
         judgment,
         peer_routes=dict(peer_routes),
@@ -750,8 +661,23 @@ def cmd_register(args: argparse.Namespace) -> None:
         print("  then use --netuid <id> with the miner/validator commands.")
 
 
+def _trusted_validator_hotkeys(raw: object) -> set[str]:
+    """Parse the comma-separated trusted validator hotkeys or fail closed."""
+    if not isinstance(raw, str):
+        raw = ""
+    hotkeys = {item.strip() for item in raw.split(",") if item.strip()}
+    if not hotkeys:
+        raise ValueError(
+            "at least one trusted validator hotkey is required "
+            "(--trusted-validators <ss58>[,<ss58>...]); without one the miner "
+            "would reject every request"
+        )
+    return hotkeys
+
+
 def cmd_miner(args: argparse.Namespace) -> None:
     """Start a constitutional governance miner on testnet."""
+    trusted_validators = _trusted_validator_hotkeys(getattr(args, "trusted_validators", ""))
     _check_bittensor()
     import asyncio
     import os
@@ -806,12 +732,17 @@ def cmd_miner(args: argparse.Namespace) -> None:
         config=config,
         deliberation_handler=_deliberation_handler,
     )
-    server = MinerAxonServer(miner, response_signing_key=wallet.hotkey)
+    server = MinerAxonServer(
+        miner,
+        trusted_validator_hotkeys=trusted_validators,
+        response_signing_key=wallet.hotkey,
+    )
 
     print(f"  Constitution hash: {miner.constitution_hash}")
     print(f"  Agent ID: {config.agent_id}")
     print(f"  Capabilities: {config.capabilities}")
     print(f"  Domains: {config.domains}")
+    print(f"  Trusted validators: {len(trusted_validators)}")
 
     # Register on the metagraph
     subtensor.register(wallet=wallet, netuid=args.netuid)
@@ -819,12 +750,9 @@ def cmd_miner(args: argparse.Namespace) -> None:
 
     # Set up axon with adapter layer handlers
     axon = bt.axon(wallet=wallet, port=args.port)
-    axon.attach(
-        forward_fn=server.forward,
-        blacklist_fn=server.blacklist,
-        verify_fn=server.verify,
-        priority_fn=server.priority,
-    )
+    # attach_to composes bittensor's default_verify (dendrite signature, nonce,
+    # body-hash binding) in front of the local checks; never attach directly.
+    server.attach_to(axon)
     axon.serve(netuid=args.netuid, subtensor=subtensor)
     axon.start()
 
@@ -936,12 +864,17 @@ def cmd_validator(args: argparse.Namespace) -> None:
                     responses = []
 
                 if len(responses) != len(authorized_targets):
+                    # Positional response-to-target binding is unreliable; fail closed.
                     print(
                         "  WARNING: dendrite returned "
                         f"{len(responses)} responses for {len(authorized_targets)} "
-                        "authorized targets"
+                        "authorized targets; discarding this round"
                     )
-                for (expected_hotkey, _axon), resp in zip(authorized_targets, responses):
+                    responses = []
+                    targets = []
+                else:
+                    targets = list(authorized_targets)
+                for (expected_hotkey, _axon), resp in zip(targets, responses, strict=True):
                     if not isinstance(resp, GovernanceDeliberation):
                         continue
                     if not resp.has_response or resp.error_message is not None:
@@ -1033,6 +966,14 @@ def main() -> None:
     miner.add_argument("--port", type=int, default=8091)
     miner.add_argument("--capabilities", default="governance-judgment")
     miner.add_argument("--domains", default="general")
+    miner.add_argument(
+        "--trusted-validators",
+        required=True,
+        help=(
+            "Comma-separated SS58 hotkeys of validators allowed to query this miner; "
+            "requests from any other (or unauthenticated) caller are rejected"
+        ),
+    )
 
     # Validator
     val = subparsers.add_parser("validator", help="Start validator")
@@ -1053,8 +994,9 @@ def main() -> None:
         required=True,
         help=(
             "JSON secret key file containing assigner_id, assigner_private_key_hex, "
-            "and request_signing_private_key_hex; provision matching public keys to "
-            "remote voters before startup"
+            "and request_signing_private_key_hex; must be a single-link regular file "
+            "owned by the current user with mode 0600 (chmod 600 <file>); provision "
+            "matching public keys to remote voters before startup"
         ),
     )
     val.add_argument("--netuid", type=int, required=True)

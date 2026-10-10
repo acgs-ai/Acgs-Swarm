@@ -39,6 +39,29 @@ class DNAPreCheckFailedError(RuntimeError):
     """Raised when the miner's own DNA rejects its judgment."""
 
 
+class InvalidDeadlineError(ValueError):
+    """Raised when a request deadline is not a bounded positive integer."""
+
+
+MAX_DELIBERATION_SECONDS = 86_400
+"""Upper bound on a request's ``deadline_seconds`` (24 hours)."""
+
+
+def validate_deadline_seconds(deadline_seconds: object) -> int:
+    """Return a deadline in ``(0, MAX_DELIBERATION_SECONDS]`` or raise.
+
+    A non-positive deadline used to disable the handler timeout; an unbounded
+    one lets a requester pin the miner indefinitely. Both are rejected.
+    """
+    if type(deadline_seconds) is not int:
+        raise InvalidDeadlineError("deadline_seconds must be an integer")
+    if not 0 < deadline_seconds <= MAX_DELIBERATION_SECONDS:
+        raise InvalidDeadlineError(
+            f"deadline_seconds must be in (0, {MAX_DELIBERATION_SECONDS}], got {deadline_seconds}"
+        )
+    return deadline_seconds
+
+
 # Type for the pluggable deliberation handler
 DeliberationHandler = Callable[[str, str, dict[str, Any]], Awaitable[tuple[str, str]]]
 """async (task_description, context, metadata) -> (judgment, reasoning)"""
@@ -178,11 +201,11 @@ class ConstitutionalMiner:
                 f"Expected one of {accepted_hashes}, got {synapse.constitution_hash}"
             )
 
-        # Step 2: Run deliberation (with deadline enforcement)
+        # Step 2: Run deliberation (with bounded deadline enforcement)
         import asyncio
 
+        timeout = validate_deadline_seconds(synapse.deadline_seconds)
         start = time.monotonic()
-        timeout = synapse.deadline_seconds if synapse.deadline_seconds > 0 else None
         handler_coro = self._handler(
             synapse.context or synapse.task_dag_json,
             synapse.domain,
@@ -194,10 +217,7 @@ class ConstitutionalMiner:
                 "required_capabilities": synapse.required_capabilities,
             },
         )
-        if timeout is not None:
-            judgment, reasoning = await asyncio.wait_for(handler_coro, timeout=timeout)
-        else:
-            judgment, reasoning = await handler_coro
+        judgment, reasoning = await asyncio.wait_for(handler_coro, timeout=timeout)
         elapsed_ms = (time.monotonic() - start) * 1000
         self._stats.total_deliberation_time_ms += elapsed_ms
 
@@ -236,11 +256,3 @@ class ConstitutionalMiner:
             dna_latency_ns=dna_result.latency_ns,
             domain=synapse.domain,
         )
-
-    def record_acceptance(self) -> None:
-        """Called when validator accepts this miner's judgment."""
-        self._stats.judgments_accepted += 1
-
-    def record_rejection(self) -> None:
-        """Called when validator rejects this miner's judgment."""
-        self._stats.judgments_rejected += 1

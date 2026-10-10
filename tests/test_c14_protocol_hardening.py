@@ -2132,19 +2132,23 @@ def test_c14_testnet_provisioning_separates_frozen_owner_trust(tmp_path):
 def _c14_testnet_response(*, authenticated_hotkey: str, miner_uid: str, case, owner):
     from types import SimpleNamespace
 
+    from constitutional_swarm.bittensor.synapse_adapter import (
+        REQUEST_BINDING_FIELDS,
+        deliberation_to_bt,
+    )
+
+    dispatched = deliberation_to_bt(case.synapse)
     return SimpleNamespace(
+        **{name: getattr(dispatched, name) for name in REQUEST_BINDING_FIELDS},
         axon=SimpleNamespace(hotkey=authenticated_hotkey),
-        task_id=case.synapse.task_id,
         miner_uid=miner_uid,
         judgment="Approve with explicit safeguards and audit evidence",
         reasoning="The action is bounded and constitutionally compliant",
         artifact_hash="c14-authenticated-response-artifact",
-        constitution_hash=owner.constitution_hash,
         miner_constitution_hash=owner.constitution_hash,
         dna_valid=True,
         dna_violations=[],
         dna_latency_ns=0,
-        domain="governance",
         response_timestamp=1.0,
         request_content_hash=case.synapse.content_hash,
     )
@@ -2161,12 +2165,16 @@ async def test_c14_testnet_dispatch_rejects_spoofed_or_missing_authenticated_hot
     deploy = _c14_load_testnet_deploy_module()
     import constitutional_swarm.bittensor.synapse_adapter as adapter
 
-    monkeypatch.setattr(deploy, "_verify_axon_response_signature", lambda *_a, **_kw: None)
+    monkeypatch.setattr(adapter, "verify_axon_response_signature", lambda *_a, **_kw: None)
     monkeypatch.setattr(adapter, "verify_judgment_response_signature", lambda *_a, **_kw: None)
+    from constitutional_swarm.bittensor.synapses import DeliberationSynapse
+
     case = SimpleNamespace(
-        synapse=SimpleNamespace(
+        synapse=DeliberationSynapse(
             task_id="authenticated-task",
-            content_hash="authenticated-request-hash",
+            task_dag_json='{"task":"authenticated-task"}',
+            constitution_hash="c" * 64,
+            domain="governance",
         )
     )
     owner = SimpleNamespace(constitution_hash="c" * 64)
@@ -2210,12 +2218,16 @@ async def test_c14_testnet_dispatch_accepts_canonical_authenticated_identity(mon
     deploy = _c14_load_testnet_deploy_module()
     import constitutional_swarm.bittensor.synapse_adapter as adapter
 
-    monkeypatch.setattr(deploy, "_verify_axon_response_signature", lambda *_a, **_kw: None)
+    monkeypatch.setattr(adapter, "verify_axon_response_signature", lambda *_a, **_kw: None)
     monkeypatch.setattr(adapter, "verify_judgment_response_signature", lambda *_a, **_kw: None)
+    from constitutional_swarm.bittensor.synapses import DeliberationSynapse
+
     case = SimpleNamespace(
-        synapse=SimpleNamespace(
+        synapse=DeliberationSynapse(
             task_id="authenticated-task",
-            content_hash="authenticated-request-hash",
+            task_dag_json='{"task":"authenticated-task"}',
+            constitution_hash="c" * 64,
+            domain="governance",
         )
     )
     owner_context = SimpleNamespace(constitution_hash="c" * 64)
@@ -2268,7 +2280,7 @@ async def test_c14_testnet_authenticated_dispatch_admits_configured_voter(tmp_pa
     deploy = _c14_load_testnet_deploy_module()
     import constitutional_swarm.bittensor.synapse_adapter as adapter
 
-    monkeypatch.setattr(deploy, "_verify_axon_response_signature", lambda *_a, **_kw: None)
+    monkeypatch.setattr(adapter, "verify_axon_response_signature", lambda *_a, **_kw: None)
     monkeypatch.setattr(adapter, "verify_judgment_response_signature", lambda *_a, **_kw: None)
     private_keys = {
         f"validator-{index}": Ed25519PrivateKey.generate() for index in range(6)
@@ -2416,7 +2428,8 @@ def test_c14_testnet_verifies_axon_response_signature_against_selected_target():
 
     bt = pytest.importorskip("bittensor")
 
-    deploy = _c14_load_testnet_deploy_module()
+    from constitutional_swarm.bittensor.synapse_adapter import verify_axon_response_signature
+
     target = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
     attacker = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
     dendrite = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
@@ -2436,14 +2449,14 @@ def test_c14_testnet_verifies_axon_response_signature_against_selected_target():
         )
 
     valid = "0x" + target.sign(message).hex()
-    deploy._verify_axon_response_signature(
+    verify_axon_response_signature(
         response(valid),
         expected_axon_hotkey=target.ss58_address,
         expected_dendrite_hotkey=dendrite.ss58_address,
     )
     for invalid in (None, "", "0x" + attacker.sign(message).hex()):
         with pytest.raises(ValueError, match="signature"):
-            deploy._verify_axon_response_signature(
+            verify_axon_response_signature(
                 response(invalid),
                 expected_axon_hotkey=target.ss58_address,
                 expected_dendrite_hotkey=dendrite.ss58_address,
@@ -2508,7 +2521,7 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
     bt = pytest.importorskip("bittensor")
 
     from constitutional_swarm.bittensor.synapse_adapter import (
-        GovernanceDeliberation,
+        deliberation_to_bt,
         sign_judgment_response,
     )
     from constitutional_swarm.bittensor.synapses import DeliberationSynapse
@@ -2526,17 +2539,13 @@ def test_c14_validator_command_dispatches_only_body_signed_target_response(
     )
 
     def response(*, tampered: bool):
-        wire = GovernanceDeliberation(
-            task_id=case.synapse.task_id,
-            task_dag_json=case.synapse.task_dag_json,
-            constitution_hash=case.synapse.constitution_hash,
-            domain=case.synapse.domain,
-            judgment="approve",
-            reasoning="bounded and compliant",
-            artifact_hash="command-artifact",
-            miner_uid=target.ss58_address,
-            response_timestamp=123.0,
-        )
+        wire = deliberation_to_bt(case.synapse)
+        wire.judgment = "approve"
+        wire.reasoning = "bounded and compliant"
+        wire.artifact_hash = "command-artifact"
+        wire.miner_uid = target.ss58_address
+        wire.miner_constitution_hash = case.synapse.constitution_hash
+        wire.response_timestamp = 123.0
         wire.dendrite.hotkey = dendrite_key.ss58_address
         wire.axon.hotkey = target.ss58_address
         wire.axon.nonce = 123456789
@@ -2728,6 +2737,9 @@ def test_c14_testnet_miner_uses_wallet_address_as_signed_producer(
     attached = {}
 
     class Axon:
+        async def default_verify(self, _synapse):
+            return None
+
         def attach(self, **handlers):
             attached.update(handlers)
 
@@ -2762,13 +2774,16 @@ def test_c14_testnet_miner_uses_wallet_address_as_signed_producer(
         port=8091,
         capabilities="governance-judgment",
         domains="governance",
+        trusted_validators=validator_key.ss58_address,
     )
     deploy.cmd_miner(args)
+
+    from acgs_lite import Constitution
 
     request = GovernanceDeliberation(
         task_id="deployed-miner-task",
         task_dag_json='{"task":"deployed-miner-task"}',
-        constitution_hash=attached["forward_fn"].__self__.miner.constitution_hash,
+        constitution_hash=Constitution.from_yaml(args.constitution).hash,
         domain="governance",
     )
     request.dendrite.hotkey = validator_key.ss58_address

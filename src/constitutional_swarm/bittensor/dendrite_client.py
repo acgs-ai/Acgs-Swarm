@@ -21,6 +21,7 @@ Usage (real bittensor):
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any
 
 from acgs_lite import Constitution
@@ -28,6 +29,7 @@ from acgs_lite import Constitution
 from constitutional_swarm.bittensor.synapse_adapter import (
     HAS_BITTENSOR,
     GovernanceDeliberation,
+    authenticate_response,
     bt_to_judgment,
     deliberation_to_bt,
 )
@@ -48,7 +50,10 @@ class ValidatorDendriteClient:
       - Network: uses bt.Dendrite to query remote miners via axon
 
     In both modes, the public API is the same: query_miners() returns
-    a list of JudgmentSynapse from successful responses.
+    a list of JudgmentSynapse from successful responses. Network responses
+    are admitted only after ``authenticate_response`` binds them to the
+    queried axon hotkey, the local dendrite hotkey and the dispatched request.
+    Local mode trusts the in-process servers it was given.
     """
 
     def __init__(
@@ -143,26 +148,45 @@ class ValidatorDendriteClient:
         """Query remote miners via bt.Dendrite.
 
         Sends the GovernanceDeliberation to all active axons in the
-        metagraph and collects successful responses.
+        metagraph. Each response is authenticated against the axon it was
+        sent to; unauthenticated responses are dropped. A response count that
+        does not match the axon list, or an unknown local dendrite hotkey,
+        fails closed with no judgments.
         """
         bt_syn = deliberation_to_bt(deliberation)
         if timeout is not None:
-            bt_syn.deadline_seconds = int(timeout)
+            # Miners reject non-positive deadlines; round sub-second timeouts up.
+            bt_syn.deadline_seconds = max(1, math.ceil(timeout))
 
-        axons = self._metagraph.axons  # type: ignore[union-attr]
+        axons = list(self._metagraph.axons)  # type: ignore[union-attr]
         responses = await self._dendrite(  # type: ignore[misc]
             axons=axons,
             synapse=bt_syn,
             timeout=timeout or bt_syn.deadline_seconds,
         )
 
+        local_hotkey = getattr(getattr(self._wallet, "hotkey", None), "ss58_address", None)
+        if not isinstance(local_hotkey, str) or not local_hotkey:
+            return []
+        responses = list(responses)
+        if len(responses) != len(axons):
+            return []
+
         judgments: list[JudgmentSynapse] = []
-        for resp in responses:
+        for axon, resp in zip(axons, responses, strict=True):
             if not isinstance(resp, GovernanceDeliberation):
                 continue
-            if resp.has_response and resp.error_message is None:
-                try:
-                    judgments.append(bt_to_judgment(resp))
-                except ValueError:
-                    continue
+            if not resp.has_response or resp.error_message is not None:
+                continue
+            try:
+                judgments.append(
+                    authenticate_response(
+                        resp,
+                        dispatched=bt_syn,
+                        expected_axon_hotkey=getattr(axon, "hotkey", ""),
+                        expected_dendrite_hotkey=local_hotkey,
+                    )
+                )
+            except ValueError:
+                continue
         return judgments

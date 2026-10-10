@@ -271,7 +271,7 @@ async def test_local_protocol_bridge_round_trip_preserves_constitution_hash(tmp_
         deliberation_handler=_governance_handler,
     )
     client = ValidatorDendriteClient(constitution_path)
-    client.register_local_miner(MinerAxonServer(miner))
+    client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
     case = owner.package_case(
         "Need a provenance-preserving governance recommendation",
