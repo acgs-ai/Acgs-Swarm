@@ -645,7 +645,8 @@ def test_coord_registered_miners_and_authenticity_work_without_manifold():
 
 def test_coord_axon_rejects_body_and_axon_hotkey_spoof():
     server = MinerAxonServer(SimpleNamespace(constitution_hash="c"),
-                             trusted_validator_hotkeys={"trusted"})
+                             trusted_validator_hotkeys={"trusted"},
+                             allow_unsigned_responses=True)
     body = SimpleNamespace(impact_score=999.0, validator_hotkey="trusted")
     axon = SimpleNamespace(impact_score=999.0, axon=SimpleNamespace(hotkey="trusted"))
     assert server.blacklist(body) is True
@@ -654,7 +655,8 @@ def test_coord_axon_rejects_body_and_axon_hotkey_spoof():
 
 def test_coord_axon_accepts_authenticated_dendrite_hotkey():
     server = MinerAxonServer(SimpleNamespace(constitution_hash="c"),
-                             trusted_validator_hotkeys={"trusted"})
+                             trusted_validator_hotkeys={"trusted"},
+                             allow_unsigned_responses=True)
     syn = SimpleNamespace(impact_score=4.0, dendrite=SimpleNamespace(hotkey="trusted"),
                           validator_hotkey="spoof")
     assert server.blacklist(syn) is False

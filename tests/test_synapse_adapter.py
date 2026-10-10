@@ -330,7 +330,9 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        return MinerAxonServer(miner, allow_unauthenticated=True)
+        return MinerAxonServer(
+            miner, allow_unauthenticated=True, allow_unsigned_responses=True
+        )
 
     @pytest.mark.asyncio
     async def test_forward_fn_fills_response(self, axon_server):
@@ -448,7 +450,7 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        server = MinerAxonServer(miner)
+        server = MinerAxonServer(miner, allow_unsigned_responses=True)
         dendrite_client.register_local_miner(server)
 
         delib = DeliberationSynapse(
@@ -480,7 +482,7 @@ rules:
                 ),
                 deliberation_handler=handler,
             )
-            dendrite_client.register_local_miner(MinerAxonServer(miner))
+            dendrite_client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         delib = DeliberationSynapse(
             task_id="multi-test",
@@ -511,7 +513,7 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        dendrite_client.register_local_miner(MinerAxonServer(miner))
+        dendrite_client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         # Send with wrong hash — miner should fail, result filtered
         delib = DeliberationSynapse(
@@ -597,7 +599,7 @@ rules:
                 ),
                 deliberation_handler=deliberate,
             )
-            client.register_local_miner(MinerAxonServer(miner))
+            client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         validator = ConstitutionalValidator(
             config=ValidatorConfig(

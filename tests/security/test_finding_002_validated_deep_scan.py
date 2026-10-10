@@ -218,6 +218,7 @@ def test_axon_blacklist_and_priority_fail_closed_without_trusted_hotkey() -> Non
     server = MinerAxonServer(
         SimpleNamespace(constitution_hash="const"),
         trusted_validator_hotkeys={"validator-good"},
+        allow_unsigned_responses=True,
     )
     attacker = SimpleNamespace(
         impact_score=999.0,

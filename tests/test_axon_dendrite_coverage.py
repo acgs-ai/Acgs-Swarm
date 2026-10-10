@@ -30,7 +30,7 @@ class TestAxonServerMissingBranches:
             config=MinerConfig(constitution_path=str(path), agent_id="test"),
             deliberation_handler=handler,
         )
-        return MinerAxonServer(miner)
+        return MinerAxonServer(miner, allow_unsigned_responses=True)
 
     def _make_syn(self, axon_server):
         return GovernanceDeliberation(
@@ -125,7 +125,7 @@ class TestDendriteClientMissingBranches:
             config=MinerConfig(constitution_path=str(path), agent_id="slow"),
             deliberation_handler=slow_handler,
         )
-        server = MinerAxonServer(miner)
+        server = MinerAxonServer(miner, allow_unsigned_responses=True)
         client.register_local_miner(server)
 
         delib = DeliberationSynapse(
@@ -139,11 +139,15 @@ class TestDendriteClientMissingBranches:
 
     @pytest.mark.asyncio
     async def test_query_network_routes_and_filters_responses(self, client, tmp_path):
-        """Lines 147-167: _query_network() processes dendrite responses.
+        """_query_network() processes dendrite responses fail-closed.
 
         Patches _dendrite and _metagraph directly so HAS_BITTENSOR=False
-        environments can exercise the network query path.
+        environments can exercise the network query path. C36: a response
+        without axon authentication and a request-bound body signature is
+        dropped even when its judgment is filled.
         """
+        from types import SimpleNamespace
+
         from constitutional_swarm.bittensor.synapses import DeliberationSynapse
 
         # Build a mock response with a valid judgment
@@ -164,10 +168,14 @@ class TestDendriteClientMissingBranches:
             domain="net",
         )
 
-        # Mock dendrite returns both good and bad
+        # Mock dendrite returns both an unauthenticated filled reply and an empty one
+        client._wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator-hk"))
         client._dendrite = AsyncMock(return_value=[good_resp, bad_resp])
         client._metagraph = MagicMock()
-        client._metagraph.axons = [MagicMock()]
+        client._metagraph.axons = [
+            SimpleNamespace(hotkey="miner-a"),
+            SimpleNamespace(hotkey="miner-b"),
+        ]
 
         delib = DeliberationSynapse(
             task_id="net-test",
@@ -176,9 +184,9 @@ class TestDendriteClientMissingBranches:
             domain="net",
         )
         judgments = await client.query_miners(delib, timeout=5.0)
-        # good_resp has judgment filled → should produce one JudgmentSynapse
-        assert len(judgments) == 1
-        assert judgments[0].judgment == "allow"
+        # good_resp has a judgment but no authenticated axon identity/signature
+        assert judgments == []
+        assert client._dendrite.await_count == 1
 
     @pytest.mark.asyncio
     async def test_query_network_error_response_filtered(self, client):
