@@ -24,7 +24,7 @@ from constitutional_swarm.quorum_certificate import (
     QuorumCertificate,
     SignedVote,
     build_certificate,
-    build_vote_message,
+    build_vote_message_v2,
     detect_conflict,
     verify_certificate,
 )
@@ -65,8 +65,8 @@ def _make_validator(
     return ident, sk, pk_bytes
 
 
-def _sign(sk, assignment_id, artifact_hash, epoch):
-    return sk.sign(build_vote_message(assignment_id, artifact_hash, epoch))
+def _sign(sk, voter_id, assignment_id, artifact_hash, epoch):
+    return sk.sign(build_vote_message_v2(assignment_id, artifact_hash, epoch, voter_id))
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +137,11 @@ class TestValidatorSet:
         assert "a" in vs
         assert vs.total_weight() == pytest.approx(3.0)
 
-    def test_add_overwrites(self):
+    def test_add_overwrites_only_with_explicit_replace(self):
         vs = ValidatorSet([ValidatorIdentity("a", stake=1.0)])
-        vs.add(ValidatorIdentity("a", stake=5.0))
+        with pytest.raises(ValueError, match="already registered"):
+            vs.add(ValidatorIdentity("a", stake=5.0))
+        vs.add(ValidatorIdentity("a", stake=5.0), replace=True)
         assert len(vs) == 1
         assert vs.total_weight() == pytest.approx(5.0)
 
@@ -300,7 +302,7 @@ class TestSybilAdversarialSimulation:
 class TestSignedVote:
     def test_roundtrip_signature_verifies(self):
         _, sk, pk = _make_validator("v1")
-        sig = _sign(sk, "asgn-1", "hash-abc", 7)
+        sig = _sign(sk, "v1", "asgn-1", "hash-abc", 7)
         sv = SignedVote(
             voter_id="v1",
             assignment_id="asgn-1",
@@ -313,7 +315,7 @@ class TestSignedVote:
 
     def test_tampered_payload_fails(self):
         _, sk, pk = _make_validator("v1")
-        sig = _sign(sk, "asgn-1", "hash-abc", 7)
+        sig = _sign(sk, "v1", "asgn-1", "hash-abc", 7)
         sv = SignedVote(
             voter_id="v1",
             assignment_id="asgn-1",
@@ -327,7 +329,7 @@ class TestSignedVote:
     def test_wrong_public_key_fails(self):
         _, sk1, _ = _make_validator("v1")
         _, _, pk2 = _make_validator("v2")
-        sig = _sign(sk1, "a", "h", 1)
+        sig = _sign(sk1, "v1", "a", "h", 1)
         sv = SignedVote("v1", "a", "h", 1, sig, pk2)
         assert sv.verify() is False
 
@@ -356,7 +358,7 @@ def _make_committee_and_votes(*, artifact_hash="hash-accept", epoch=1, n_validat
             assignment_id="asgn",
             artifact_hash=artifact_hash,
             epoch=epoch,
-            signature=_sign(sks[aid], "asgn", artifact_hash, epoch),
+            signature=_sign(sks[aid], aid, "asgn", artifact_hash, epoch),
             public_key_bytes=pks[aid],
         )
         for aid in committee.members
@@ -408,7 +410,7 @@ class TestBuildCertificate:
             "asgn",
             "hash-accept",
             1,
-            _sign(rogue_sk, "asgn", "hash-accept", 1),
+            _sign(rogue_sk, "rogue", "asgn", "hash-accept", 1),
             rogue_pk,
         )
         with pytest.raises(InvalidCertificateError, match="committee"):
@@ -533,7 +535,7 @@ class TestConflictDetection:
                 assignment_id="asgn",
                 artifact_hash="hash-B",
                 epoch=1,
-                signature=_sign(sks[aid], "asgn", "hash-B", 1),
+                signature=_sign(sks[aid], aid, "asgn", "hash-B", 1),
                 public_key_bytes=pks[aid],
             )
             for aid in committee.members
@@ -561,7 +563,7 @@ class TestConflictDetection:
                 assignment_id="asgn",
                 artifact_hash="hash-B",
                 epoch=2,
-                signature=_sign(sks[aid], "asgn", "hash-B", 2),
+                signature=_sign(sks[aid], aid, "asgn", "hash-B", 2),
                 public_key_bytes=pks[aid],
             )
             for aid in committee.members
@@ -582,7 +584,7 @@ class TestConflictDetection:
                 assignment_id="asgn-DIFFERENT",
                 artifact_hash="hash-B",
                 epoch=1,
-                signature=_sign(sks[aid], "asgn-DIFFERENT", "hash-B", 1),
+                signature=_sign(sks[aid], aid, "asgn-DIFFERENT", "hash-B", 1),
                 public_key_bytes=pks[aid],
             )
             for aid in committee.members
@@ -619,7 +621,7 @@ class TestConflictDetection:
                     "asgn",
                     artifact,
                     epoch,
-                    _sign(sks[m], "asgn", artifact, epoch),
+                    _sign(sks[m], m, "asgn", artifact, epoch),
                     pks[m],
                 )
                 for m in members

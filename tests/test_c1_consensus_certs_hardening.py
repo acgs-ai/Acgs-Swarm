@@ -49,6 +49,7 @@ from constitutional_swarm.quorum_certificate import (
     SignedVote,
     build_certificate,
     build_vote_message,
+    build_vote_message_v2,
     detect_conflict,
     verify_certificate,
 )
@@ -88,7 +89,7 @@ def _vote(
     assignment_id: str = "assignment",
     epoch: int = 1,
 ) -> SignedVote:
-    message = build_vote_message(assignment_id, artifact_hash, epoch)
+    message = build_vote_message_v2(assignment_id, artifact_hash, epoch, voter_id)
     return SignedVote(
         voter_id=voter_id,
         assignment_id=assignment_id,
