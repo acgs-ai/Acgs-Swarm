@@ -12,8 +12,8 @@ import os
 import re
 import sqlite3
 import warnings
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Generator, Iterable
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -36,6 +36,81 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 
 class DuplicateSettlementError(ValueError):
     """Raised when an append-only settlement store receives a duplicate key."""
+
+
+class SettlementLockUnavailableError(RuntimeError):
+    """Raised when no OS file-lock primitive exists; settlement I/O fails closed."""
+
+
+@contextmanager
+def exclusive_file_lock(lock_path: Path) -> Generator[None, None, None]:
+    """Hold an exclusive OS advisory lock on ``lock_path`` for the block.
+
+    Shared by the settlement store and the settlement-evidence lifecycle. Uses
+    ``flock`` (POSIX, per open-file-description so threads with separate fds
+    exclude each other too) or ``msvcrt.locking`` (Windows). When neither is
+    available it raises :class:`SettlementLockUnavailableError` *before*
+    entering the block: running unlocked would let orphan reconciliation or a
+    concurrent writer corrupt durable settlement state.
+    """
+    fcntl_mod = _fcntl
+    msvcrt_mod = _msvcrt
+    if fcntl_mod is None and msvcrt_mod is None:
+        raise SettlementLockUnavailableError(
+            f"no supported file-lock primitive (fcntl/msvcrt); refusing to run "
+            f"settlement I/O unlocked for {lock_path}"
+        )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # O_NOFOLLOW: a planted symlink at the lock path must not redirect the
+    # open (and msvcrt's one-byte write) onto another file. 0o600: lock files
+    # are private to the settlement owner.
+    fd = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if fcntl_mod is not None:
+            fcntl_mod.flock(fd, fcntl_mod.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl_mod.flock(fd, fcntl_mod.LOCK_UN)
+        else:
+            assert msvcrt_mod is not None
+            if os.fstat(fd).st_size == 0:
+                # msvcrt.locking needs at least one byte to lock; write it once.
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt_mod.locking(fd, msvcrt_mod.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt_mod.locking(fd, msvcrt_mod.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
+def _first_with_assignment_id(
+    records: Iterable[SettlementRecord], assignment_id: str
+) -> SettlementRecord | None:
+    for record in records:
+        if str(record.assignment.get("assignment_id", "")) == assignment_id:
+            return record
+    return None
+
+
+def lookup_settlement(store: Any, assignment_id: str) -> SettlementRecord | None:
+    """Return one committed settlement by id, or None.
+
+    Uses the store's indexed ``get`` when it has one; otherwise falls back to
+    scanning ``load_all`` (minimal/in-memory adapters).
+    """
+    getter = getattr(store, "get", None)
+    if getter is not None:
+        return getter(assignment_id)  # type: ignore[no-any-return]
+    return _first_with_assignment_id(store.load_all(), assignment_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +189,9 @@ class JSONLSettlementStore:
     Each line stores exactly one settled assignment/result snapshot. This is the
     default adapter for local development and single-node deployments.
 
-    File-level locking (``fcntl.LOCK_EX``) serialises concurrent ``append``
-    and pending-update calls so that duplicate-detection and read-modify-write
-    operations are atomic.
+    File-level locking (:func:`exclusive_file_lock`) serialises concurrent
+    ``append``, pending-update and pending-read calls so that duplicate
+    detection and read-modify-write operations are atomic.
 
     Duplicate detection uses an in-memory assignment-id index rebuilt under the
     same lock when the log's inode/size/mtime change. JSONL is therefore safe
@@ -137,31 +212,8 @@ class JSONLSettlementStore:
     @contextmanager
     def _file_lock(self) -> Generator[None, None, None]:
         """Acquire an exclusive advisory lock around the settlement log."""
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
-        try:
-            if _fcntl is not None:
-                _fcntl.flock(fd, _fcntl.LOCK_EX)
-            elif _msvcrt is not None:
-                if os.fstat(fd).st_size == 0:
-                    # msvcrt.locking needs at least one byte to lock; write it once.
-                    os.write(fd, b"\0")
-                os.lseek(fd, 0, os.SEEK_SET)
-                _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
-            else:  # pragma: no cover - platform fallback of last resort
-                warnings.warn(
-                    "No supported file-locking primitive available; settlement log lock disabled",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+        with exclusive_file_lock(self._lock_path):
             yield
-        finally:
-            if _fcntl is not None:
-                _fcntl.flock(fd, _fcntl.LOCK_UN)
-            elif _msvcrt is not None:
-                os.lseek(fd, 0, os.SEEK_SET)
-                _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
-            os.close(fd)
 
     def _file_signature(self) -> tuple[int | None, int, int]:
         if not self.path.exists():
@@ -274,12 +326,13 @@ class JSONLSettlementStore:
             self._write_pending_payloads(payloads)
 
     def load_pending(self) -> list[SettlementRecord]:
-        return [
-            self._record_from_payload(payload) for payload in self._load_pending_payloads().values()
-        ]
+        with self._file_lock():
+            payloads = self._load_pending_payloads()
+        return [self._record_from_payload(payload) for payload in payloads.values()]
 
     def pending_count(self) -> int:
-        return len(self._load_pending_payloads())
+        with self._file_lock():
+            return len(self._load_pending_payloads())
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -291,15 +344,15 @@ class JSONLSettlementStore:
         }
 
     def get(self, assignment_id: str) -> SettlementRecord | None:
-        for record in self.load_all():
-            if str(record.assignment.get("assignment_id", "")) == assignment_id:
-                return record
-        return None
+        return _first_with_assignment_id(self.load_all(), assignment_id)
 
     def _load_pending_payloads(self) -> dict[str, dict[str, Any]]:
-        if not self.pending_path.exists():
+        """Read the pending map. Caller must hold ``_file_lock``."""
+        try:
+            fh = self.pending_path.open(encoding="utf-8")
+        except FileNotFoundError:
             return {}
-        with self.pending_path.open(encoding="utf-8") as fh:
+        with fh:
             payloads = json.load(fh)
         return {str(key): dict(value) for key, value in dict(payloads).items()}
 
@@ -310,7 +363,21 @@ class JSONLSettlementStore:
         tmp_path = self.pending_path.with_name(f"{self.pending_path.name}.tmp")
         with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(payloads, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp_path.replace(self.pending_path)
+        # The pending marker is the crash-recovery write-ahead record; make the
+        # rename durable too (best effort: some platforms cannot fsync a dir).
+        try:
+            dir_fd = os.open(str(self.pending_path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
 
     @staticmethod
     def _payload_from_record(record: SettlementRecord) -> dict[str, Any]:
@@ -356,9 +423,19 @@ class SQLiteSettlementStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        # _initialize migrates every table to the full column set, so column
+        # metadata is fixed for this instance; read it once.
+        self._columns: dict[str, frozenset[str]] = {
+            table: self._read_table_columns(table)
+            for table in ("mesh_settlements", "pending_settlements")
+        }
+
+    def _connect(self) -> closing[sqlite3.Connection]:
+        """Connection that is always closed (``with conn`` alone only commits)."""
+        return closing(sqlite3.connect(self.path))
 
     def _initialize(self) -> None:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_settlements (
@@ -456,10 +533,13 @@ class SQLiteSettlementStore:
                     raise
             conn.commit()
 
-    def _table_columns(self, table_name: str) -> set[str]:
-        with sqlite3.connect(self.path) as conn:
+    def _read_table_columns(self, table_name: str) -> frozenset[str]:
+        with self._connect() as conn:
             rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        return {str(row[1]) for row in rows}
+        return frozenset(str(row[1]) for row in rows)
+
+    def _table_columns(self, table_name: str) -> frozenset[str]:
+        return self._columns[table_name]
 
     def has_receipt_digest_column(self) -> bool:
         return "receipt_digest" in self._table_columns("mesh_settlements")
@@ -474,7 +554,7 @@ class SQLiteSettlementStore:
         assignment_id = str(record.assignment["assignment_id"])
         digest = normalize_receipt_digest(record.receipt_digest)
         votes_json = json.dumps(list(record.votes), separators=(",", ":")) if record.votes else None
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn, conn:
             try:
                 conn.execute(
                     """
@@ -518,7 +598,7 @@ class SQLiteSettlementStore:
             if pending_record.votes
             else None
         )
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn, conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO pending_settlements (
@@ -546,7 +626,7 @@ class SQLiteSettlementStore:
             conn.commit()
 
     def clear_pending(self, assignment_id: str) -> None:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn, conn:
             conn.execute(
                 "DELETE FROM pending_settlements WHERE assignment_id = ?",
                 (assignment_id,),
@@ -556,52 +636,57 @@ class SQLiteSettlementStore:
     def load_pending(self) -> list[SettlementRecord]:
         return self._load_records_from_table("pending_settlements")
 
-    def _load_records_from_table(self, table_name: str) -> list[SettlementRecord]:
+    def _load_records_from_table(
+        self, table_name: str, *, assignment_id: str | None = None
+    ) -> list[SettlementRecord]:
         if table_name not in {"mesh_settlements", "pending_settlements"}:
             raise ValueError(f"Unsupported settlement table: {table_name}")
 
         has_votes = "votes_json" in self._table_columns(table_name)
         votes_expr = "votes_json" if has_votes else "NULL"
+        # Primary-key lookup when an id is given; full ordered scan otherwise.
+        where = "WHERE assignment_id = ?" if assignment_id is not None else ""
+        params: tuple[str, ...] = (assignment_id,) if assignment_id is not None else ()
         select_with_digest = f"""
             SELECT assignment_json, result_json, constitutional_hash,
                    schema_version, is_recovered, receipt_digest, {votes_expr}
-            FROM {table_name}
+            FROM {table_name} {where}
             ORDER BY assignment_id
         """
         select_without_digest = f"""
             SELECT assignment_json, result_json, constitutional_hash,
                    schema_version, is_recovered, NULL, {votes_expr}
-            FROM {table_name}
+            FROM {table_name} {where}
             ORDER BY assignment_id
         """
         select_without_is_recovered = f"""
             SELECT assignment_json, result_json, constitutional_hash, schema_version, 0, NULL, {votes_expr}
-            FROM {table_name}
+            FROM {table_name} {where}
             ORDER BY assignment_id
         """
         select_without_schema_version = f"""
             SELECT assignment_json, result_json, constitutional_hash, 1, 0, NULL, {votes_expr}
-            FROM {table_name}
+            FROM {table_name} {where}
             ORDER BY assignment_id
         """
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             try:
-                rows = conn.execute(select_with_digest).fetchall()
+                rows = conn.execute(select_with_digest, params).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such column" not in str(exc).lower():
                     raise
                 try:
-                    rows = conn.execute(select_without_digest).fetchall()
+                    rows = conn.execute(select_without_digest, params).fetchall()
                 except sqlite3.OperationalError as inner:
                     if "no such column" not in str(inner).lower():
                         raise
                     try:
-                        rows = conn.execute(select_without_is_recovered).fetchall()
+                        rows = conn.execute(select_without_is_recovered, params).fetchall()
                     except sqlite3.OperationalError as older:
                         if "no such column" not in str(older).lower():
                             raise
-                        rows = conn.execute(select_without_schema_version).fetchall()
+                        rows = conn.execute(select_without_schema_version, params).fetchall()
         records = []
         for (
             assignment_json,
@@ -630,7 +715,7 @@ class SQLiteSettlementStore:
         return records
 
     def pending_count(self) -> int:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) FROM pending_settlements").fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -643,18 +728,19 @@ class SQLiteSettlementStore:
         }
 
     def get(self, assignment_id: str) -> SettlementRecord | None:
-        """Return one committed settlement, or None if absent."""
-        for record in self.load_all():
-            if str(record.assignment.get("assignment_id", "")) == assignment_id:
-                return record
-        return None
+        """Return one committed settlement by primary key, or None if absent."""
+        records = self._load_records_from_table("mesh_settlements", assignment_id=assignment_id)
+        return records[0] if records else None
 
 
 __all__ = [
     "DuplicateSettlementError",
     "JSONLSettlementStore",
     "SQLiteSettlementStore",
+    "SettlementLockUnavailableError",
     "SettlementRecord",
     "SettlementStore",
+    "exclusive_file_lock",
+    "lookup_settlement",
     "normalize_receipt_digest",
 ]

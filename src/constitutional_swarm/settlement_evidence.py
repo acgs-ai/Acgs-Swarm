@@ -23,7 +23,6 @@ import re
 from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 from constitutional_swarm.governance_receipts import (
@@ -36,13 +35,12 @@ from constitutional_swarm.governance_receipts import (
     settlement_canonical_digest,
     verify_bundle,
 )
-from constitutional_swarm.settlement_store import SettlementRecord, normalize_receipt_digest
-
-_fcntl: ModuleType | None
-try:
-    import fcntl as _fcntl
-except ImportError:  # pragma: no cover
-    _fcntl = None
+from constitutional_swarm.settlement_store import (
+    SettlementRecord,
+    exclusive_file_lock,
+    lookup_settlement,
+    normalize_receipt_digest,
+)
 
 RECEIPT_SIGNER_KEY_ID = "settlement-receipt"
 RECEIPT_PAYLOAD_TYPE = "application/vnd.acgs.governance-receipt.v0.1+json"
@@ -105,23 +103,16 @@ def evidence_lock(store: Any):
     """Exclusive lock shared by settlement writers and orphan reconciliation.
 
     Uses a dedicated lock file so it never nests with JSONLSettlementStore's
-    per-append advisory lock (non-recursive flock would deadlock).
+    per-append advisory lock (non-recursive flock would deadlock). Filesystem
+    stores fail closed (``SettlementLockUnavailableError``) when the platform
+    has no lock primitive; in-memory stores have no files to protect.
     """
     path = store_filesystem_path(store)
     if path is None:
         yield
         return
-    lock_path = path.with_name(path.name + ".evidence.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-    try:
-        if _fcntl is not None:
-            _fcntl.flock(fd, _fcntl.LOCK_EX)
+    with exclusive_file_lock(path.with_name(path.name + ".evidence.lock")):
         yield
-    finally:
-        if _fcntl is not None:
-            _fcntl.flock(fd, _fcntl.LOCK_UN)
-        os.close(fd)
 
 
 def write_receipt_atomic(path: Path, bundle: GovernanceReceiptBundle) -> None:
@@ -156,8 +147,18 @@ def committed_receipt_index(store: Any) -> dict[str, str]:
     return index
 
 
-def list_orphan_receipts(store: Any) -> list[Path]:
-    referenced = committed_receipt_index(store)
+def list_orphan_receipts(
+    store: Any,
+    *,
+    referenced: Mapping[str, str] | None = None,
+) -> list[Path]:
+    """Receipt files with no committed settlement pointer.
+
+    ``referenced`` lets a caller that already built the committed index (under
+    ``evidence_lock``) reuse it instead of rescanning the store.
+    """
+    if referenced is None:
+        referenced = committed_receipt_index(store)
     orphans: list[Path] = []
     store_file = store_path(store)
     root = store_file.parent
@@ -180,11 +181,7 @@ def reconcile_orphan_receipts(store: Any) -> list[str]:
     removed: list[str] = []
     with evidence_lock(store):
         referenced = committed_receipt_index(store)
-        store_name = store_path(store).name
-        for path in list_orphan_receipts(store):
-            assignment_id = parse_receipt_assignment_id(path, store_name=store_name)
-            if assignment_id is not None and assignment_id in referenced:
-                continue
+        for path in list_orphan_receipts(store, referenced=referenced):
             path.unlink(missing_ok=True)
             removed.append(str(path))
     return removed
@@ -217,13 +214,7 @@ def verify_committed_settlement_receipt(
     An orphan receipt (file present, no settlement pointer) is not completed
     evidence and fails closed.
     """
-    getter = getattr(store, "get", None)
-    record = getter(assignment_id) if getter is not None else None
-    if record is None:
-        for item in store.load_all():
-            if str(item.assignment.get("assignment_id", "")) == assignment_id:
-                record = item
-                break
+    record = lookup_settlement(store, assignment_id)
     if record is None:
         return _fail("settlement_missing", f"no committed settlement {assignment_id}")
     digest = normalize_receipt_digest(record.receipt_digest)
@@ -373,6 +364,7 @@ def bind_and_verify(
         profile_version=PROFILE_VERSION,
         receipt_count=verdict.receipt_count,
         signature_status=verdict.signature_status,
+        evidence_policy=verdict.evidence_policy,
         issues=combined,
         receipt_hashes=verdict.receipt_hashes,
     )
