@@ -60,7 +60,7 @@ class TestFailClosedGuard:
         state = {"violations": [], "risk_score": 0.0, "governed": True}
         assert fail_closed_guard(state) == "accept"
 
-    def test_accepts_clean_state_with_missing_fields(self) -> None:
+    def test_rejects_state_with_missing_fields(self) -> None:
         assert fail_closed_guard({}) == "reject"
 
     def test_accepts_state_just_below_threshold(self) -> None:
@@ -90,7 +90,7 @@ class TestFailClosedGuard:
         state = {"violations": ["v"], "risk_score": None}
         assert fail_closed_guard(state) == "reject"
 
-    def test_none_risk_score_coerces_to_zero(self) -> None:
+    def test_rejects_none_risk_score(self) -> None:
         state = {"violations": [], "risk_score": None, "governed": True}
         assert fail_closed_guard(state) == "reject"
 
