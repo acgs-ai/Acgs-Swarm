@@ -29,6 +29,7 @@ import json
 import math
 import threading
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -55,6 +56,12 @@ class DebateRole(Enum):
     PROPOSER = "proposer"
     CHALLENGER = "challenger"
     DEFENDER = "defender"
+
+
+# Fixed identity for pipeline-generated (synthetic) challenges. It can never be
+# registered, so synthetic challenges are recorded in the transcript but never
+# count toward quorum, score, or escalation.
+AUTO_CHALLENGER_ID = "auto-challenger"
 
 
 # ---------------------------------------------------------------------------
@@ -282,13 +289,20 @@ class DebateResolver:
 
     The resolver enforces:
     - Constitutional hash gate: verdict only recorded if hash matches
-    - Quorum: minimum number of distinct asserted challengers before resolution
+    - Participant registry: roles come from the operator (constructor or
+      ``register_participant``), never from a debate message. Challenges are
+      accepted only from registered CHALLENGERs other than the proposer;
+      defenses only from the proposer or a registered DEFENDER. Without a
+      registry no challenger counts, so every debate deadlocks (fail-closed).
+    - Quorum: minimum number of distinct registered challengers before resolution
     - Severity weighting: high-severity challenges reduce approval score
     - Deadlock detection: if no quorum, outcome = DEADLOCK
 
     Usage::
 
-        resolver = DebateResolver()
+        resolver = DebateResolver(
+            participants={"validator-3": [DebateRole.CHALLENGER]},
+        )
 
         proposal = resolver.propose(
             proposal_id="p-001",
@@ -319,6 +333,7 @@ class DebateResolver:
         min_challenges:       Minimum challenges required for resolution (default 1).
         escalation_threshold: Avg challenge severity above which verdict is ESCALATED.
         constitutional_hash:  Hash validated at verdict time.
+        participants:         Pinned registry ``{agent_id: roles}``.
     """
 
     # Minimum allowed challenge severity — prevents trivially-scored challenges.
@@ -336,6 +351,8 @@ class DebateResolver:
         min_challenges: int = 1,
         escalation_threshold: float = 0.85,
         constitutional_hash: str = _CONSTITUTIONAL_HASH,
+        *,
+        participants: Mapping[str, Iterable[DebateRole]] | None = None,
     ) -> None:
         if isinstance(min_challenges, bool) or not isinstance(min_challenges, int):
             raise ValueError("min_challenges must be an integer >= 1")
@@ -361,6 +378,31 @@ class DebateResolver:
         self._constitutional_hash = constitutional_hash
         self._records: dict[str, DebateRecord] = {}
         self._lock = threading.RLock()
+        self._roles: dict[str, frozenset[DebateRole]] = {}
+        if participants is not None:
+            if not isinstance(participants, Mapping):
+                raise ValueError("participants must be a mapping of agent_id to roles")
+            for agent_id, roles in participants.items():
+                self.register_participant(agent_id, *roles)
+
+    @property
+    def constitutional_hash(self) -> str:
+        """The constitutional hash this resolver enforces at verdict time."""
+        return self._constitutional_hash
+
+    def register_participant(self, agent_id: str, *roles: DebateRole) -> None:
+        """Grant debate roles to an agent (operator call; roles only accumulate)."""
+        if not isinstance(agent_id, str) or not agent_id or agent_id != agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string without surrounding space")
+        if agent_id == AUTO_CHALLENGER_ID:
+            raise ValueError(f"{AUTO_CHALLENGER_ID!r} is reserved for synthetic challenges")
+        if not roles or any(not isinstance(role, DebateRole) for role in roles):
+            raise ValueError("roles must be one or more DebateRole values")
+        with self._lock:
+            self._roles[agent_id] = self._roles.get(agent_id, frozenset()) | frozenset(roles)
+
+    def _has_role(self, agent_id: str, role: DebateRole) -> bool:
+        return role in self._roles.get(agent_id, frozenset())
 
     # ── Debate lifecycle ─────────────────────────────────────────────────
 
@@ -414,6 +456,8 @@ class DebateResolver:
         Raises:
             KeyError: if proposal_id not found.
             ValueError: if severity not in [0.0, 1.0].
+            PermissionError: if the challenger is the proposer, or is neither a
+                registered CHALLENGER nor ``AUTO_CHALLENGER_ID`` (never counted).
         """
         with self._lock:
             if proposal_id not in self._records:
@@ -422,6 +466,16 @@ class DebateResolver:
             if record.verdict is not None:
                 raise RuntimeError(
                     f"Proposal {proposal_id!r} is already resolved; cannot add challenges"
+                )
+            if challenger_id == record.proposal.proposer_id:
+                raise PermissionError(
+                    f"Challenger {challenger_id!r} is the proposer of {proposal_id!r}"
+                )
+            if challenger_id != AUTO_CHALLENGER_ID and not self._has_role(
+                challenger_id, DebateRole.CHALLENGER
+            ):
+                raise PermissionError(
+                    f"Challenger {challenger_id!r} is not a registered challenger"
                 )
             if (
                 isinstance(severity, bool)
@@ -459,6 +513,8 @@ class DebateResolver:
 
         Raises:
             KeyError: if proposal_id not found.
+            PermissionError: if the defender is neither the proposer nor a
+                registered DEFENDER.
         """
         with self._lock:
             if proposal_id not in self._records:
@@ -467,6 +523,13 @@ class DebateResolver:
             if record.verdict is not None:
                 raise RuntimeError(
                     f"Proposal {proposal_id!r} is already resolved; cannot add defenses"
+                )
+            if defender_id != record.proposal.proposer_id and not self._has_role(
+                defender_id, DebateRole.DEFENDER
+            ):
+                raise PermissionError(
+                    f"Defender {defender_id!r} may not defend {proposal_id!r}: "
+                    "only the proposer or a registered defender may defend"
                 )
             existing = sum(
                 1 for defense in record.defenses if defense.defender_id == defender_id
@@ -498,10 +561,11 @@ class DebateResolver:
 
         Algorithm:
             1. Validate constitutional hash (fail-closed on mismatch)
-            2. Check quorum using distinct asserted challenger IDs
+            2. Check quorum using distinct registered challenger IDs
+               (``AUTO_CHALLENGER_ID`` is recorded but never counted)
             3. Compute approval score:
                base = 0.5 (neutral)
-               - Each asserted challenger's strongest severity reduces score
+               - Each counted challenger's strongest severity reduces score
                - Any defense response earns one fixed bounded credit
                - Score is clamped to [0.0, 1.0]
             4. Check escalation: if avg severity > threshold → ESCALATED
@@ -540,11 +604,15 @@ class DebateResolver:
                     f"got {effective_hash!r}"
                 )
 
-            # Participant IDs are caller-asserted rather than authenticated here.
-            # The strongest message per asserted challenger prevents repeated
+            # Only registered challengers count (roles are re-checked at resolve
+            # time). The strongest message per challenger prevents repeated
             # low-severity messages from diluting both quorum and escalation.
             severity_by_challenger: dict[str, float] = {}
             for challenge in record.challenges:
+                if challenge.challenger_id == record.proposal.proposer_id or not (
+                    self._has_role(challenge.challenger_id, DebateRole.CHALLENGER)
+                ):
+                    continue
                 severity_by_challenger[challenge.challenger_id] = max(
                     challenge.severity,
                     severity_by_challenger.get(challenge.challenger_id, 0.0),
@@ -573,6 +641,7 @@ class DebateResolver:
             distinct_defender_count = len(
                 {defense.defender_id for defense in record.defenses}
             )
+            # One fixed, capped credit regardless of how many defenses or ids.
             defense_credit = (
                 self._DEFENSE_RESPONSE_CREDIT * (1.0 - max_severity)
                 if record.defenses
@@ -591,12 +660,12 @@ class DebateResolver:
             reasoning_parts = [
                 (
                     f"Challenges: {len(record.challenges)} messages from "
-                    f"{distinct_challenger_count} distinct asserted challengers, "
+                    f"{distinct_challenger_count} distinct registered challengers, "
                     f"avg strongest severity: {avg_severity:.2f}."
                 ),
                 (
                     f"Defenses: {len(record.defenses)} messages from "
-                    f"{distinct_defender_count} distinct asserted defenders."
+                    f"{distinct_defender_count} distinct defenders."
                 ),
                 f"Approval score: {score:.3f} (threshold: {self._approval_threshold}).",
             ]
@@ -627,6 +696,18 @@ class DebateResolver:
         """Get the full DebateRecord for a proposal."""
         with self._lock:
             return self._records.get(proposal_id)
+
+    def verify_transcript(self, proposal_id: str) -> bool:
+        """True iff the proposal is resolved and its sealed digest still matches.
+
+        Raises:
+            KeyError: if proposal_id not found.
+        """
+        with self._lock:
+            if proposal_id not in self._records:
+                raise KeyError(f"Proposal {proposal_id!r} not found")
+            record = self._records[proposal_id]
+        return record.verdict is not None and record.verify_integrity()
 
     def open_proposals(self) -> list[str]:
         """Proposal IDs with no verdict yet."""

@@ -34,7 +34,7 @@ from constitutional_swarm.bittensor.map_elites import (
 )
 from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
 from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
-from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
+from constitutional_swarm.mac_acgs_loop import ChallengeProvider, MacAcgsConfig, MacAcgsLoop
 from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
 CONSTITUTIONAL_HASH = "608508a9bd224290"
@@ -62,8 +62,16 @@ def synth_approaches(rng: random.Random, cycle: int, n: int = 24) -> list[MinerA
 def run_with_precedents(
     precedents: Sequence[PrecedentRecord],
     vote_registry: VoteSignerRegistry,
+    *,
+    reviewer_id: str,
+    challenge_provider: ChallengeProvider,
 ) -> tuple[MacAcgsLoop, PrecedentStore, PrecedentBackedCodifier]:
-    """Run using evidence collected and signed by external voters."""
+    """Run using evidence collected and signed by external voters.
+
+    ``challenge_provider`` is the embedding application's review queue: it
+    returns ``(reviewer_id, objection, severity)`` challenges for each
+    proposal. Synthetic auto-challenges never count toward debate quorum.
+    """
     if len(precedents) < 16:
         raise ValueError("at least 16 externally signed precedents are required")
     rng = random.Random(42)
@@ -72,8 +80,12 @@ def run_with_precedents(
         vote_registry=vote_registry.frozen_copy(),
     )
     codifier = PrecedentBackedCodifier(precedent_store=store)
-    loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
-    loop.add_external_challenger("human-reviewer-1")
+    loop = MacAcgsLoop(
+        config=MacAcgsConfig(auto_defend=True),
+        came=CAMECoordinator(codifier=codifier),
+        challenge_provider=challenge_provider,
+    )
+    loop.add_external_challenger(reviewer_id)
 
     for cycle in range(1, 9):
         codifier.observe(store.admit(precedents[2 * cycle - 2]))

@@ -6,6 +6,8 @@ from math import nan
 import sqlite3
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
@@ -13,6 +15,7 @@ from constitutional_swarm.debate_resolver import (
     Challenge,
     DebateRecord,
     DebateResolver,
+    DebateRole,
     Defense,
     FinalVerdict,
     Proposal,
@@ -309,17 +312,30 @@ class TestC10EvolutionAdmissionConsistency:
             assert log._conn.in_transaction is False
 
 
+# C43: credentials must be signed by an issuer key pinned for their org, and
+# must carry an explicit expiry after issuance.
+_C10_ISSUER = Ed25519PrivateKey.generate()
+_C10_ISSUER_KEYS = {
+    org: [
+        _C10_ISSUER.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+    ]
+    for org in ("org-a", "org-b", "c", "b:c")
+}
+
+
 def _c10_bridge_credential(
     *,
     agent_id: str = "shared-agent",
     org_id: str = "org-a",
     pubkey: str = "key-a",
     issued_at: float = 1.0,
-    expires_at: float = 0.0,
+    expires_at: float = 1e12,
     domains: tuple[str, ...] = ("privacy",),
     status: CredentialStatus = CredentialStatus.ACTIVE,
 ) -> AgentCredential:
-    return AgentCredential(
+    credential = AgentCredential(
         agent_id=agent_id,
         org_id=org_id,
         pubkey_fingerprint=pubkey,
@@ -328,6 +344,9 @@ def _c10_bridge_credential(
         expires_at=expires_at,
         domains=domains,
         status=status,
+    )
+    return replace(
+        credential, issuer_signature=_C10_ISSUER.sign(credential.signing_digest())
     )
 
 
@@ -342,7 +361,7 @@ def _c10_bridge_credential(
 def test_c10_bridge_denies_every_non_active_credential_status(
     status: CredentialStatus, reason: str
 ) -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     bridge.register_credential(_c10_bridge_credential(status=status))
 
     decision = bridge.gate("shared-agent", org_id="org-a", domain="privacy")
@@ -352,7 +371,7 @@ def test_c10_bridge_denies_every_non_active_credential_status(
 
 
 def test_c10_bridge_requires_nonempty_org_and_domain_scope() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     bridge.register_credential(_c10_bridge_credential())
 
     with pytest.raises(TypeError):
@@ -362,7 +381,7 @@ def test_c10_bridge_requires_nonempty_org_and_domain_scope() -> None:
 
 
 def test_c10_bridge_keys_credentials_and_revocations_by_org_and_agent() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     bridge.register_credential(_c10_bridge_credential(org_id="org-a", pubkey="key-a"))
     bridge.register_credential(_c10_bridge_credential(org_id="org-b", pubkey="key-b"))
 
@@ -376,7 +395,7 @@ def test_c10_bridge_keys_credentials_and_revocations_by_org_and_agent() -> None:
 
 
 def test_c10_bridge_revocation_requires_explicit_newer_credential_renewal() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     old = _c10_bridge_credential(issued_at=1.0, pubkey="key-old")
     bridge.register_credential(old)
     bridge.revoke(old.agent_id, org_id=old.org_id)
@@ -391,14 +410,14 @@ def test_c10_bridge_revocation_requires_explicit_newer_credential_renewal() -> N
 
 
 def test_c10_bridge_unknown_revocation_does_not_poison_future_registration() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     assert bridge.revoke("shared-agent", org_id="org-a") is False
     bridge.register_credential(_c10_bridge_credential())
     assert bridge.gate("shared-agent", org_id="org-a", domain="privacy").allowed
 
 
 def test_c10_bridge_default_audit_ring_reports_entry_1001_overflow() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     for index in range(1001):
         bridge.gate(f"unknown-{index}", org_id="org-a", domain="privacy")
 
@@ -411,7 +430,7 @@ def test_c10_bridge_default_audit_ring_reports_entry_1001_overflow() -> None:
 
 
 def test_c10_bridge_bounded_audit_log_makes_truncation_loud() -> None:
-    bridge = FederatedConstitutionBridge(audit_log_size=2)
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS, audit_log_size=2)
     for index in range(3):
         bridge.gate(f"unknown-{index}", org_id="org-a", domain="privacy")
 
@@ -426,7 +445,7 @@ def test_c10_bridge_bounded_audit_log_makes_truncation_loud() -> None:
 
 
 def test_c10_bridge_decision_and_audit_snapshots_cannot_mutate_internal_counts() -> None:
-    bridge = FederatedConstitutionBridge()
+    bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
     decision = bridge.gate("unknown", org_id="org-a", domain="privacy")
 
     with pytest.raises(FrozenInstanceError):
@@ -644,9 +663,22 @@ class TestC10DebateTranscriptRecords:
         assert embedded.compute_merkle_root() != structured.compute_merkle_root()
 
 
+# C43: debate roles come from a pinned registry, never from debate messages.
+_DEBATE_PARTICIPANTS: dict[str, list[DebateRole]] = {
+    **{cid: [DebateRole.CHALLENGER] for cid in ("challenger", "challenger-1", "challenger-2")},
+    **{
+        did: [DebateRole.DEFENDER]
+        for did in (
+            "same-defender", "one", "two", "repeated", "defender",
+            *(f"forged-{index}" for index in range(12)),
+        )
+    },
+}
+
+
 class TestC10DebateVerdictIntegrityRecords:
     def test_forged_identity_strings_cannot_accumulate_unbounded_credit(self) -> None:
-        resolver = DebateResolver(approval_threshold=0.6)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, approval_threshold=0.6)
         resolver.propose("proposal", "proposer", "safety", "content")
         resolver.challenge(
             "proposal", "challenger", "critical flaw", severity=0.8
@@ -660,7 +692,7 @@ class TestC10DebateVerdictIntegrityRecords:
         assert verdict.approval_score < 0.6
 
     def test_repeated_defender_messages_receive_credit_once(self) -> None:
-        resolver = DebateResolver(approval_threshold=0.6)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, approval_threshold=0.6)
         resolver.propose("proposal", "proposer", "safety", "content")
         resolver.challenge("proposal", "challenger", "minor", severity=0.1)
         for index in range(3):
@@ -687,7 +719,7 @@ class TestC10DebateVerdictIntegrityRecords:
         expected_outcome: VerdictOutcome,
     ) -> None:
         def resolve_with_defenders(defender_ids: list[str]) -> FinalVerdict:
-            resolver = DebateResolver(approval_threshold=0.6)
+            resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, approval_threshold=0.6)
             resolver.propose("proposal", "proposer", "safety", "content")
             resolver.challenge("proposal", "challenger", "flaw", severity=severity)
             for index, defender_id in enumerate(defender_ids):
@@ -707,7 +739,7 @@ class TestC10DebateVerdictIntegrityRecords:
         assert {verdict.outcome for verdict in verdicts} == {expected_outcome}
 
     def test_explicit_empty_hash_fails_without_sealing_record(self) -> None:
-        resolver = DebateResolver(constitutional_hash="constitution")
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, constitutional_hash="constitution")
         resolver.propose("proposal", "proposer", "safety", "content")
         resolver.challenge("proposal", "challenger", "minor", severity=0.1)
 
@@ -724,7 +756,7 @@ class TestC10DebateVerdictIntegrityRecords:
             DebateResolver(constitutional_hash="")
 
     def test_resolved_record_graph_is_immutable(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("proposal", "proposer", "safety", "content")
         resolver.challenge("proposal", "challenger", "minor", severity=0.1)
         verdict = resolver.resolve("proposal")
@@ -742,7 +774,7 @@ class TestC10DebateVerdictIntegrityRecords:
         assert resolver.get_record("proposal") == record
 
     def test_record_binds_custom_constitutional_hash(self) -> None:
-        resolver = DebateResolver(constitutional_hash="custom")
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, constitutional_hash="custom")
         resolver.propose("proposal", "proposer", "safety", "content")
         record = resolver.get_record("proposal")
 
@@ -751,7 +783,7 @@ class TestC10DebateVerdictIntegrityRecords:
 
 
 def test_debate_quorum_counts_distinct_asserted_challengers() -> None:
-    resolver = DebateResolver(min_challenges=2)
+    resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=2)
     resolver.propose("p-distinct-quorum", "proposer", "safety", "proposal")
     resolver.challenge(
         "p-distinct-quorum", "challenger-1", "first objection", severity=0.2
@@ -767,7 +799,7 @@ def test_debate_quorum_counts_distinct_asserted_challengers() -> None:
 
 
 def test_debate_scoring_uses_strongest_severity_per_asserted_challenger() -> None:
-    resolver = DebateResolver(min_challenges=2, escalation_threshold=0.5)
+    resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=2, escalation_threshold=0.5)
     resolver.propose("p-strongest", "proposer", "safety", "proposal")
     resolver.challenge("p-strongest", "challenger-1", "minor", severity=0.1)
     resolver.challenge("p-strongest", "challenger-1", "critical", severity=0.8)
@@ -829,7 +861,7 @@ class TestC10BridgeFollowups:
     def test_rotation_cannot_reinstate_historically_revoked_key(
         self, revocation_path: str
     ) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         old_key = _c10_bridge_credential(
             issued_at=1.0,
             pubkey="revoked-key",
@@ -884,7 +916,7 @@ class TestC10BridgeFollowups:
 
     @pytest.mark.parametrize("variant", ["DEADBEEF01", " deadbeef01", "deadbeef01 ", "DeadBeef01"])
     def test_case_or_whitespace_variant_cannot_reinstate_revoked_key(self, variant: str) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         original = _c10_bridge_credential(issued_at=1.0, pubkey="deadbeef01")
         bridge.register_credential(original)
         assert bridge.revoke(original.agent_id, org_id=original.org_id)
@@ -902,7 +934,7 @@ class TestC10BridgeFollowups:
         assert cred.pubkey_fingerprint == "abc123"
 
     def test_same_key_renewal_does_not_clear_explicit_revocation(self) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         original = _c10_bridge_credential(issued_at=1.0, pubkey="same-key")
         bridge.register_credential(original)
         bridge.revoke(original.agent_id, org_id=original.org_id)
@@ -921,7 +953,7 @@ class TestC10BridgeFollowups:
         assert decision.reason == "REVOKED"
 
     def test_same_key_renewal_does_not_clear_status_revocation(self) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         revoked = _c10_bridge_credential(
             issued_at=1.0,
             pubkey="same-key",
@@ -943,7 +975,7 @@ class TestC10BridgeFollowups:
         assert decision.reason == "REVOKED"
 
     def test_key_rotation_clears_revocation_tombstone(self) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         original = _c10_bridge_credential(issued_at=1.0, pubkey="old-key")
         bridge.register_credential(original)
         bridge.revoke(original.agent_id, org_id=original.org_id)
@@ -960,7 +992,7 @@ class TestC10BridgeFollowups:
         ).allowed
 
     def test_gate_enforces_credential_not_before_time(self) -> None:
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         credential = _c10_bridge_credential(issued_at=10.0)
         bridge.register_credential(credential)
 
@@ -984,7 +1016,7 @@ class TestC10BridgeFollowups:
     def test_empty_domains_deny_and_explicit_wildcard_allows(self) -> None:
         from constitutional_swarm.federated_bridge import ALL_DOMAINS
 
-        bridge = FederatedConstitutionBridge()
+        bridge = FederatedConstitutionBridge(issuer_keys=_C10_ISSUER_KEYS)
         empty = _c10_bridge_credential(agent_id="empty", domains=())
         wildcard = _c10_bridge_credential(
             agent_id="wildcard",
@@ -1021,6 +1053,7 @@ class TestC10BridgeFollowups:
             assert not thread.is_alive(), "audit sink ran while the gate lock was held"
 
         bridge = FederatedConstitutionBridge(
+            issuer_keys=_C10_ISSUER_KEYS,
             audit_log_size=1,
             audit_overflow_sink=sink,
         )
@@ -1035,6 +1068,7 @@ class TestC10BridgeFollowups:
             raise LookupError("sink unavailable")
 
         bridge = FederatedConstitutionBridge(
+            issuer_keys=_C10_ISSUER_KEYS,
             audit_log_size=1,
             audit_overflow_sink=failing_sink,
         )
@@ -1213,7 +1247,7 @@ class TestC10RecordFollowups:
     def test_debate_seal_binds_every_verdict_field(
         self, field_name: str, replacement: object
     ) -> None:
-        resolver = DebateResolver(constitutional_hash="constitution-a")
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, constitutional_hash="constitution-a")
         resolver.propose("proposal", "proposer", "safety", "content")
         resolver.challenge("proposal", "challenger", "minor", severity=0.1)
         resolver.defend("proposal", "defender", "rebuttal")

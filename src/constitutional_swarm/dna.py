@@ -10,13 +10,14 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import logging
 import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, overload
 
 from acgs_lite import (
     Z3_RISK_THRESHOLD,
@@ -32,6 +33,8 @@ from acgs_lite import (
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+logger = logging.getLogger(__name__)
 
 _MAX_GOVERNED_DEPTH = 64
 _MAX_GOVERNED_NODES = 10_000
@@ -58,6 +61,10 @@ class DNAValidationResult:
     # acgs-lite ships no py.typed, so some builds expose Z3* as runtime variables
     # rather than types; tolerate that here (warn_unused_ignores is off).
     z3_result: Z3VerifyResult | None = None  # type: ignore[valid-type]
+    # Rules the engine matched but the constitution marks non-blocking (WARN
+    # workflow action; surfaced with ``valid=True``). ``govern`` logs and counts
+    # them, and raises only when ``block_on_warnings=True``.
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -76,9 +83,13 @@ class AgentDNA:
         # Validate explicitly
         result = dna.validate("some action")
 
-        # Or use as decorator
+        # Or use as decorator (blocks on any violation by default)
         @dna.govern
         def my_agent(input: str) -> str: ...
+
+        # A DNA with a MACI role must name the governed action type
+        @dna.govern(action_type="propose")
+        def my_proposer(input: str) -> str: ...
     """
 
     constitution: Constitution
@@ -96,6 +107,7 @@ class AgentDNA:
     _z3: Z3ConstraintVerifier | None = field(init=False, repr=False, default=None)  # type: ignore[valid-type]
     _call_count: int = field(init=False, repr=False, default=0)
     _violation_count: int = field(init=False, repr=False, default=0)
+    _warning_count: int = field(init=False, repr=False, default=0)
     _total_latency_ns: int = field(init=False, repr=False, default=0)
     _disabled: bool = field(init=False, repr=False, default=False)
     # Per-instance lock protecting the mutable counter fields (_call_count,
@@ -216,6 +228,7 @@ class AgentDNA:
         with self._stats_lock:
             calls = self._call_count
             violations = self._violation_count
+            warning_calls = self._warning_count
             total_latency = self._total_latency_ns
         return {
             "agent_id": self.agent_id,
@@ -223,6 +236,7 @@ class AgentDNA:
             "maci_role": self.maci_role.value if self.maci_role else None,
             "calls": calls,
             "violations": violations,
+            "warnings": warning_calls,
             "avg_latency_ns": (total_latency // calls if calls > 0 else 0),
         }
 
@@ -260,6 +274,9 @@ class AgentDNA:
             result = self._engine.validate(action)
             elapsed = time.perf_counter_ns() - start
             violations = tuple(f"{v.rule_id}: {v.rule_text}" for v in result.violations)
+            warnings = tuple(
+                f"{w.rule_id}: {w.rule_text}" for w in getattr(result, "warnings", ())
+            )
             has_violations = bool(violations)
 
             # Atomically update counters under the lock.
@@ -272,6 +289,8 @@ class AgentDNA:
                     object.__setattr__(
                         self, "_violation_count", self._violation_count + 1
                     )
+                if warnings:
+                    object.__setattr__(self, "_warning_count", self._warning_count + 1)
 
             # Layer 3: Z3 formal verification (opt-in, ~50-500ms).
             # Only invoked for critical-risk actions to keep cost proportional.
@@ -289,6 +308,7 @@ class AgentDNA:
                 risk_level=risk_lv,
                 scoring_method=scoring_method,
                 z3_result=z3_result,
+                warnings=warnings,
             )
         except ConstitutionalViolationError:
             elapsed = time.perf_counter_ns() - start
@@ -308,20 +328,121 @@ class AgentDNA:
         if self._maci is not None:
             self._maci.check(self.agent_id, action_type)
 
-    def govern(self, fn: F) -> F:
+    @overload
+    def govern(self, fn: F) -> F: ...
+
+    @overload
+    def govern(
+        self,
+        fn: None = None,
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> Callable[[F], F]: ...
+
+    def govern(
+        self,
+        fn: F | None = None,
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> F | Callable[[F], F]:
         """Decorator that wraps a function with constitutional DNA validation.
 
-        Validates input before execution and output after.
+        Checks the MACI role (when ``action_type`` is given), then validates
+        input before execution and output after. A failed check (an invalid
+        result, including non-strict mode, or a verified Z3 counterexample)
+        raises ``ConstitutionalViolationError`` unless ``block_on_violation=False``
+        is passed explicitly. Rules the constitution marks WARN never fail the
+        check: they are logged and counted in ``stats["warnings"]``, and raise
+        only with ``block_on_warnings=True`` (strict mode).
+
+        Raises:
+            ValueError: at decoration time when this DNA has a ``maci_role`` but
+                no ``action_type`` is given (the role would not be enforced).
         """
-        return _GovernedCallable(self, fn)  # type: ignore[return-value]
+        if action_type is not None and (
+            not isinstance(action_type, str) or not action_type.strip()
+        ):
+            raise ValueError("action_type must be a non-empty string")
+        if self.maci_role is not None and action_type is None:
+            raise ValueError(
+                f"AgentDNA {self.agent_id!r} has maci_role={self.maci_role.value!r}; "
+                "govern() requires action_type so the role is enforced"
+            )
+        if not isinstance(block_on_violation, bool):
+            raise ValueError("block_on_violation must be a bool")
+        if not isinstance(block_on_warnings, bool):
+            raise ValueError("block_on_warnings must be a bool")
+
+        def decorator(f: F) -> F:
+            return _GovernedCallable(  # type: ignore[return-value]
+                self,
+                f,
+                action_type=action_type,
+                block_on_violation=block_on_violation,
+                block_on_warnings=block_on_warnings,
+            )
+
+        if fn is not None:
+            return decorator(fn)
+        return decorator
+
+
+def _enforce_result(
+    result: DNAValidationResult,
+    *,
+    block_on_violation: bool,
+    block_on_warnings: bool,
+) -> None:
+    """Raise for a failed check; log (and optionally raise for) WARN matches."""
+    if block_on_violation:
+        z3 = result.z3_result
+        if z3 is not None and z3.verified and not z3.satisfiable:
+            raise ConstitutionalViolationError(
+                "Z3 verification found a constitutional counterexample",
+                rule_id="Z3",
+                action=result.action,
+            )
+        if not result.valid:
+            first = result.violations[0] if result.violations else "DNA"
+            raise ConstitutionalViolationError(
+                "Constitutional DNA validation failed: " + "; ".join(result.violations),
+                rule_id=first.split(": ", 1)[0] or "DNA",
+                action=result.action,
+            )
+    if result.warnings:
+        logger.warning(
+            "constitutional DNA warning-tier rule match: %s", "; ".join(result.warnings)
+        )
+        if block_on_warnings:
+            raise ConstitutionalViolationError(
+                "Constitutional DNA warning-tier rule matched (block_on_warnings): "
+                + "; ".join(result.warnings),
+                rule_id=result.warnings[0].split(": ", 1)[0] or "DNA",
+                action=result.action,
+            )
 
 
 class _GovernedCallable:
     """Callable descriptor that distinguishes Python binding from direct calls."""
 
-    def __init__(self, dna: AgentDNA, fn: Callable[..., Any]) -> None:
+    def __init__(
+        self,
+        dna: AgentDNA,
+        fn: Callable[..., Any],
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> None:
         self._dna = dna
         self._fn = fn
+        self._action_type = action_type
+        self._block_on_violation = block_on_violation
+        self._block_on_warnings = block_on_warnings
         self._signature = inspect.signature(fn)
         self._is_async = inspect.iscoroutinefunction(fn)
         functools.update_wrapper(self, fn)
@@ -380,6 +501,24 @@ class _GovernedCallable:
             return _extract_output(next(iter(values.values())))
         return _extract_output(values) if values else ""
 
+    def _check(self, text: str) -> None:
+        _enforce_result(
+            self._dna.validate(text),
+            block_on_violation=self._block_on_violation,
+            block_on_warnings=self._block_on_warnings,
+        )
+
+    def _pre_call(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        receiver_bound: bool,
+    ) -> None:
+        if self._action_type is not None:
+            self._dna.check_maci(self._action_type)
+        self._check(self._input_text(args, kwargs, receiver_bound=receiver_bound))
+
     def _invoke_sync(
         self,
         args: tuple[Any, ...],
@@ -387,12 +526,10 @@ class _GovernedCallable:
         *,
         receiver_bound: bool,
     ) -> Any:
-        self._dna.validate(
-            self._input_text(args, kwargs, receiver_bound=receiver_bound)
-        )
+        self._pre_call(args, kwargs, receiver_bound=receiver_bound)
         result = self._fn(*args, **kwargs)
         if self._dna.validate_output and result is not None:
-            self._dna.validate(_extract_output(result))
+            self._check(_extract_output(result))
         return result
 
     async def _invoke_async(
@@ -402,12 +539,10 @@ class _GovernedCallable:
         *,
         receiver_bound: bool,
     ) -> Any:
-        self._dna.validate(
-            self._input_text(args, kwargs, receiver_bound=receiver_bound)
-        )
+        self._pre_call(args, kwargs, receiver_bound=receiver_bound)
         result = await self._fn(*args, **kwargs)
         if self._dna.validate_output and result is not None:
-            self._dna.validate(_extract_output(result))
+            self._check(_extract_output(result))
         return result
 
 
@@ -421,8 +556,15 @@ def constitutional_dna(
     maci_role: MACIRole | None = None,
     strict: bool = True,
     validate_output: bool = True,
+    action_type: str | None = None,
+    block_on_violation: bool = True,
+    block_on_warnings: bool = False,
 ) -> F | Callable[[F], F]:
     """Decorator that embeds constitutional DNA into any callable.
+
+    Blocks on any invalid validation result unless ``block_on_violation=False``;
+    WARN-tier matches are logged and raise only with ``block_on_warnings=True``.
+    ``action_type`` is required when ``maci_role`` is set.
 
     Usage:
         @constitutional_dna
@@ -468,7 +610,11 @@ def constitutional_dna(
 
     def decorator(f: F) -> F:
         dna = _build_dna()
-        governed = dna.govern(f)
+        governed = dna.govern(
+            action_type=action_type,
+            block_on_violation=block_on_violation,
+            block_on_warnings=block_on_warnings,
+        )(f)
         governed._dna = dna  # type: ignore[attr-defined]
         return governed
 
