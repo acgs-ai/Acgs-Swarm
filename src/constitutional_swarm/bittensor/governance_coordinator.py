@@ -180,9 +180,6 @@ class GovernanceCoordinator:
         # Track selection results per case for validation linkage
         self._selections: dict[str, SelectionResult] = {}
 
-        # Track finalized cases pending audit registration
-        self._pending_audit: dict[str, dict[str, Any]] = {}
-
         self._emission_calc = EmissionCalculator(
             weights=cfg.emission_weights or EmissionWeights(),
             registered_miners=registered_miners,
@@ -226,7 +223,10 @@ class GovernanceCoordinator:
         model: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Register a validator in both the pool and trust manager.
+        """Register a new validator in both the pool and trust manager.
+
+        Registration is one-shot: trust and activation of an existing validator change
+        only through the audit path, so a duplicate registration raises.
 
         Args:
             validator_id: Unique validator identifier.
@@ -234,8 +234,25 @@ class GovernanceCoordinator:
             domains: Governance domains.
             model: Model/provider for diversity tracking.
             metadata: Arbitrary metadata.
+
+        Raises:
+            ValueError: If ``validator_id`` is already known to the pool or the trust
+                manager (re-registration would reset trust or reactivate it).
         """
+        if (
+            self._pool.get(validator_id) is not None
+            or validator_id in self._trust_mgr.list_agents()
+        ):
+            raise ValueError(f"validator {validator_id!r} is already registered")
         score = trust_score if trust_score is not None else self._config.trust_config.initial_score
+        trust_config = TrustConfig(
+            initial_score=score,
+            time_decay_rate=self._config.trust_config.time_decay_rate,
+            trusted_threshold=self._config.trust_config.trusted_threshold,
+            monitored_threshold=self._config.trust_config.monitored_threshold,
+        )
+        # The pool validates trust_score; register there first so a rejected score
+        # leaves no trust-manager entry behind.
         self._pool.register(
             validator_id,
             trust_score=score,
@@ -243,18 +260,7 @@ class GovernanceCoordinator:
             model=model,
             metadata=metadata,
         )
-        try:
-            self._trust_mgr.register(
-                validator_id,
-                TrustConfig(
-                    initial_score=score,
-                    time_decay_rate=self._config.trust_config.time_decay_rate,
-                    trusted_threshold=self._config.trust_config.trusted_threshold,
-                    monitored_threshold=self._config.trust_config.monitored_threshold,
-                ),
-            )
-        except ValueError:
-            pass  # already registered, keep existing state
+        self._trust_mgr.register(validator_id, trust_config)
 
     def deactivate_validator(self, validator_id: str) -> None:
         """Remove a validator from active selection."""
@@ -364,7 +370,12 @@ class GovernanceCoordinator:
         """Finalize a case after validation.
 
         If validator_votes is provided, also registers the case for
-        spot-check auditing.
+        spot-check auditing. Supplied votes (including an empty dict) are
+        checked against the coordinator's own recorded selection before any
+        state changes: the vote keys must be exactly the selected validators
+        (full coverage, no partial or single-vote sets), the claimer never
+        votes, each decision is ``"approve"`` or ``"reject"``, and ``accepted``
+        must equal the strict approve majority of the votes.
 
         Args:
             case_id: Case to finalize.
@@ -376,6 +387,8 @@ class GovernanceCoordinator:
         Returns:
             Updated CaseRecord.
         """
+        if validator_votes is not None:
+            self._check_finalization_votes(case_id, accepted, validator_votes)
         outcome = "approved" if accepted else "rejected"
         case = self._case_mgr.finalize(case_id, outcome, proof_hash=proof_hash, _now=_now)
 
@@ -396,6 +409,35 @@ class GovernanceCoordinator:
             self.run_audit_cycle(_now=_now)
 
         return case
+
+    def _check_finalization_votes(
+        self,
+        case_id: str,
+        accepted: bool,
+        validator_votes: dict[str, str],
+    ) -> None:
+        """Reject votes that the coordinator's recorded selection does not authorize."""
+        selection = self._selections.get(case_id)
+        case = self._case_mgr.get(case_id)
+        if selection is None or case is None:
+            raise ValueError(f"case {case_id!r} has no recorded validator selection")
+        selected = set(selection.selected)
+        for voter_id, decision in validator_votes.items():
+            if case.claimer_id is not None and voter_id == case.claimer_id:
+                raise ValueError(f"case claimer {voter_id!r} cannot vote on its own result")
+            if voter_id not in selected:
+                raise ValueError(f"voter {voter_id!r} was not selected for case {case_id!r}")
+            if decision not in ("approve", "reject"):
+                raise ValueError(f"invalid vote decision {decision!r} from {voter_id!r}")
+        if set(validator_votes) != selected:
+            missing = sorted(selected - set(validator_votes))
+            raise ValueError(
+                f"finalization requires a vote from every selected validator; "
+                f"missing={missing!r}"
+            )
+        approvals = sum(decision == "approve" for decision in validator_votes.values())
+        if accepted != (approvals * 2 > len(validator_votes)):
+            raise ValueError("finalization outcome contradicts the supplied validator votes")
 
     def _register_for_audit(
         self,

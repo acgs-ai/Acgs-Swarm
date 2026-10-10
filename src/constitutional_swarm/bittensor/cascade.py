@@ -15,7 +15,6 @@ Only precedents surviving all four stages amend the living constitution.
 
 from __future__ import annotations
 
-import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,6 +23,7 @@ from typing import Any
 
 from acgs_lite import Constitution
 
+from constitutional_swarm.bittensor.synapses import judgment_content_hash, ordered_vote_hashes
 from constitutional_swarm.dna import AgentDNA
 from constitutional_swarm.mesh import (
     ConstitutionalMesh,
@@ -41,7 +41,6 @@ from constitutional_swarm.mesh.vote_envelope import (
     compute_vote_envelope_root,
     normalize_voter_id,
     verify_assignment_vote_envelopes,
-    vote_envelope_hash,
 )
 
 
@@ -553,9 +552,7 @@ class PrecedentCascade:
             or proof.producer_id != normalize_voter_id(candidate.miner_uid)
         ):
             return False
-        expected_content_hash = hashlib.sha256(
-            candidate.judgment_text.encode("utf-8")
-        ).hexdigest()[:32]
+        expected_content_hash = judgment_content_hash(candidate.judgment_text)
         try:
             envelopes = verify_assignment_vote_envelopes(
                 result.signed_assignment,
@@ -592,12 +589,7 @@ class PrecedentCascade:
             accepted=accepted,
             envelopes=envelopes,
         )
-        expected_hashes = tuple(
-            vote_envelope_hash(envelope)
-            for envelope in sorted(
-                envelopes, key=lambda envelope: (envelope.voter_id, envelope.key_id)
-            )
-        )
+        expected_hashes = ordered_vote_hashes(envelopes)
         return (
             accepted
             and result.accepted == accepted

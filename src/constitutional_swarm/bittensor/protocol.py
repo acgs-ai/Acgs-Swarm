@@ -79,8 +79,6 @@ class ValidatorConfig:
     peers_per_validation: int = 5
     quorum: int = 3
     use_manifold: bool = True
-    authenticity_detection: bool = False
-    reputation_decay_rate: float = 0.01
     complete_evidence: bool = True
     single_operator_dev: bool = False
 
@@ -115,13 +113,10 @@ class SubnetMetrics:
     total_judgments: int = 0
     total_validations: int = 0
     escalation_type_counts: dict[str, int] = field(default_factory=dict)
-    avg_judgment_time_seconds: float = 0.0
     avg_authenticity_score: float = 0.0
     precedents_created: int = 0
     active_miners: int = 0
-    active_validators: int = 0
     constitution_hash: str = ""
-    manifold_spectral_bound: float = 0.0
     manifold_is_stable: bool = True
 
     def record_escalation(self, escalation_type: EscalationType) -> None:

@@ -33,17 +33,19 @@ Q&A reference:    07-subnet-concept-qa-responses.md § 5
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import math
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+import warnings
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from constitutional_swarm.bittensor._validation import _validate_finite
 from constitutional_swarm.bittensor.protocol import EscalationType
+from constitutional_swarm.bittensor.synapses import judgment_content_hash
 from constitutional_swarm.mesh.vote_envelope import (
     FrozenVoteSignerRegistry,
     SignedAssignment,
@@ -67,6 +69,12 @@ _GOVERNANCE_DIMENSIONS = (
     "transparency",
     "efficiency",
 )
+
+# Escalation-rate projection defaults shared by ``escalation_rate_projection`` and
+# ``summary`` so the two cannot drift apart.
+_DEFAULT_BASELINE_ESCALATION_RATE = 0.03
+_DEFAULT_ESCALATION_DECAY_PER_1K = 0.005
+_MIN_ESCALATION_RATE = 0.005  # floor at 0.5% — some cases are always novel
 
 
 def _cosine_similarity(a: dict[str, float], b: dict[str, float]) -> float:
@@ -139,6 +147,14 @@ class PrecedentRecord:
     vote_envelopes: tuple[VoteEnvelope, ...] = ()
     signed_assignment: SignedAssignment | None = None
 
+    def __post_init__(self) -> None:
+        """Reject malformed precedent metadata on construction and on every replace.
+
+        ``impact_vector`` is the retrieval key that drives auto-resolution and is not
+        covered by the signed vote evidence, so its shape is a constructor invariant.
+        """
+        _validate_precedent_metadata(self)
+
     @classmethod
     def create(
         cls,
@@ -187,6 +203,26 @@ class PrecedentRecord:
         )
 
 
+def _validate_precedent_metadata(record: PrecedentRecord) -> None:
+    for name in ("case_id", "task_id"):
+        value = getattr(record, name)
+        if type(value) is not str or not value:
+            raise ValueError(f"precedent {name} must be a non-empty string")
+    if not isinstance(record.escalation_type, EscalationType):
+        raise TypeError("precedent escalation_type must be an EscalationType")
+    if not isinstance(record.impact_vector, dict):
+        raise TypeError("precedent impact_vector must be a dict of dimension scores")
+    for key, value in record.impact_vector.items():
+        if type(key) is not str or not key:
+            raise ValueError("precedent impact_vector keys must be non-empty strings")
+        _validate_finite(f"precedent impact_vector[{key!r}]", value, maximum=1.0)
+    if not isinstance(record.ambiguous_dimensions, tuple) or any(
+        type(dimension) is not str or not dimension
+        for dimension in record.ambiguous_dimensions
+    ):
+        raise ValueError("precedent ambiguous_dimensions must be a tuple of non-empty strings")
+
+
 # ---------------------------------------------------------------------------
 # Retrieval result
 # ---------------------------------------------------------------------------
@@ -233,8 +269,20 @@ class RetrievalResult:
 # ---------------------------------------------------------------------------
 
 
-class PrecedentRevokedError(RuntimeError):
-    """Raised when trying to use a revoked precedent."""
+class _PrecedentRevokedError(RuntimeError):
+    """Deprecated: never raised; revoked sources fail with ``ValueError``."""
+
+
+def __getattr__(name: str) -> Any:
+    if name == "PrecedentRevokedError":
+        warnings.warn(
+            "PrecedentRevokedError is deprecated and never raised; revoked precedent "
+            "sources are rejected with ValueError",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _PrecedentRevokedError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +369,9 @@ class PrecedentStore:
             None if vote_registry is None else vote_registry.frozen_copy()
         )
         self._records: dict[str, PrecedentRecord] = {}
+        # Source indexes (active and revoked): one precedent per case and per task.
+        self._case_ids: set[str] = set()
+        self._task_ids: set[str] = set()
         self._revocation_log: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
@@ -418,7 +469,7 @@ class PrecedentStore:
             raise ValueError("vote envelope artifact ID is required")
         if not content_hash:
             raise ValueError("vote envelope content hash is required")
-        expected_content_hash = hashlib.sha256(judgment.encode("utf-8")).hexdigest()[:32]
+        expected_content_hash = judgment_content_hash(judgment)
         if content_hash != expected_content_hash:
             raise ValueError("precedent content hash does not bind the recorded judgment")
 
@@ -510,7 +561,19 @@ class PrecedentStore:
         self._admit(record, exact_repeat_ok=False)
 
     def admit(self, record: PrecedentRecord) -> PrecedentRecord:
-        """Admit *record*, treating an exact repeated observation as idempotent."""
+        """Admit *record*, treating an exact repeated observation as idempotent.
+
+        Trust boundary: signed vote evidence binds the task, assignment, producer,
+        artifact, judgment content and constitution. The precedent metadata
+        ``impact_vector``, ``escalation_type`` and ``case_id`` (and ``reasoning`` /
+        ``ambiguous_dimensions``) is NOT bound by any signature: it is trusted-caller
+        input, checked only for shape (finite values in [0, 1], enum type, non-empty
+        ids). ``impact_vector`` drives auto-resolution in :meth:`retrieve`, so only
+        admit records whose metadata comes from an owner-held case (as
+        ``SubnetOwner.record_result`` does). Follow-up: derive ``task_id`` from
+        ``H(case_id, escalation_type, canonical impact_vector)`` so the signed task
+        binding authenticates the metadata.
+        """
         return self._admit(record, exact_repeat_ok=True)
 
     def _admit(
@@ -532,8 +595,9 @@ class PrecedentStore:
             )
         if not record.is_active:
             raise ValueError(f"Precedent {record.precedent_id} is inactive or revoked")
-        total_votes = self._validate_tally(record)
-        verified = self.verify_evidence(record)
+        verified = self.verify_evidence(record)  # includes the tally policy check
+        total_votes = record.votes_for + record.votes_against
+        # replace() re-runs the metadata invariant on a detached copy of the vector.
         canonical = dataclasses.replace(
             record,
             validator_grade=record.votes_for / total_votes,
@@ -549,15 +613,17 @@ class PrecedentStore:
                 if exact_repeat_ok and existing == canonical:
                     return self._copy_record(existing)
                 raise ValueError(f"Precedent {record.precedent_id} already stored.")
-            if any(stored.case_id == canonical.case_id for stored in self._records.values()):
+            if canonical.case_id in self._case_ids:
                 raise ValueError(
                     f"Precedent source case already stored: case_id={canonical.case_id!r}"
                 )
-            if any(stored.task_id == canonical.task_id for stored in self._records.values()):
+            if canonical.task_id in self._task_ids:
                 raise ValueError(
                     f"Precedent source task already stored: task_id={canonical.task_id!r}"
                 )
             self._records[canonical.precedent_id] = canonical
+            self._case_ids.add(canonical.case_id)
+            self._task_ids.add(canonical.task_id)
             return self._copy_record(canonical)
 
     def active_records(self) -> tuple[PrecedentRecord, ...]:
@@ -627,25 +693,20 @@ class PrecedentStore:
             RetrievalResult with ranked matches and optional auto-resolution
         """
         with self._lock:
-            candidates = [
-                self._copy_record(r)
+            # Score stored references under the lock; copy only the returned top-k.
+            scored = (
+                (r, _cosine_similarity(impact_vector, r.impact_vector))
                 for r in self._records.values()
                 if r.is_active
                 and (escalation_type is None or r.escalation_type == escalation_type)
+            )
+            filtered = [(r, sim) for r, sim in scored if sim >= min_similarity]
+            filtered.sort(key=lambda item: item[1], reverse=True)
+            top = filtered[:k]
+            matches = [
+                PrecedentMatch(precedent=self._copy_record(r), similarity=sim, rank=i + 1)
+                for i, (r, sim) in enumerate(top)
             ]
-
-        # Score all candidates
-        scored = [(r, _cosine_similarity(impact_vector, r.impact_vector)) for r in candidates]
-
-        # Filter and sort
-        filtered = [(r, sim) for r, sim in scored if sim >= min_similarity]
-        filtered.sort(key=lambda x: x[1], reverse=True)
-
-        # Build matches
-        matches = [
-            PrecedentMatch(precedent=r, similarity=sim, rank=i + 1)
-            for i, (r, sim) in enumerate(filtered[:k])
-        ]
 
         # Check for auto-resolution
         auto_resolution = None
@@ -695,15 +756,28 @@ class PrecedentStore:
     # Statistics and reporting
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _distribution(records: Iterable[PrecedentRecord]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for r in records:
+            if r.is_active:
+                key = r.escalation_type.value
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
+    def _projection(
+        active: int,
+        baseline_rate: float = _DEFAULT_BASELINE_ESCALATION_RATE,
+        decay_per_1k: float = _DEFAULT_ESCALATION_DECAY_PER_1K,
+    ) -> float:
+        projected = baseline_rate - ((active / 1000.0) * decay_per_1k)
+        return max(_MIN_ESCALATION_RATE, projected)
+
     def escalation_distribution(self) -> dict[str, int]:
         """Count active precedents by escalation type."""
-        counts: dict[str, int] = {}
         with self._lock:
-            for r in self._records.values():
-                if r.is_active:
-                    key = r.escalation_type.value
-                    counts[key] = counts.get(key, 0) + 1
-        return counts
+            return self._distribution(self._records.values())
 
     def miner_contribution_counts(self) -> dict[str, int]:
         """Count active precedents contributed by each miner."""
@@ -716,8 +790,8 @@ class PrecedentStore:
 
     def escalation_rate_projection(
         self,
-        baseline_rate: float = 0.03,
-        decay_per_1k: float = 0.005,
+        baseline_rate: float = _DEFAULT_BASELINE_ESCALATION_RATE,
+        decay_per_1k: float = _DEFAULT_ESCALATION_DECAY_PER_1K,
     ) -> float:
         """Estimate current escalation rate given precedent accumulation.
 
@@ -727,23 +801,16 @@ class PrecedentStore:
         baseline_rate: starting escalation rate (default 3%)
         decay_per_1k:  reduction per 1,000 active precedents (default 0.5%)
         """
-        active = self.size
-        thousands = active / 1000.0
-        projected = baseline_rate - (thousands * decay_per_1k)
-        return max(0.005, projected)  # floor at 0.5% — some cases always novel
+        return self._projection(self.size, baseline_rate, decay_per_1k)
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
             records = tuple(self._records.values())
-            active = sum(1 for record in records if record.is_active)
-            total = len(records)
-            distribution: dict[str, int] = {}
-            for record in records:
-                if record.is_active:
-                    key = record.escalation_type.value
-                    distribution[key] = distribution.get(key, 0) + 1
             revocation_entries = len(self._revocation_log)
-        projected = max(0.005, 0.03 - ((active / 1000.0) * 0.005))
+        active = sum(1 for record in records if record.is_active)
+        total = len(records)
+        distribution = self._distribution(records)
+        projected = self._projection(active)
         return {
             "constitutional_hash": self._constitutional_hash,
             "active_precedents": active,

@@ -19,6 +19,15 @@ signed voter envelopes and recomputes the 3/5 outcome from their bound evidence.
 The coordinator stays precedent-agnostic; this codifier is where admitted
 precedent enters the pipeline.
 
+Trust boundary: admission metadata (``impact_vector``, ``escalation_type``,
+``case_id``) is trusted-caller input and is NOT bound by the vote signatures,
+which cover only the task, assignment, producer, artifact, judgment content and
+constitution. Feed ``store.admit`` only records whose metadata comes from an
+owner-held case (e.g. ``SubnetOwner.record_result``), never metadata supplied by
+the precedent submitter. Follow-up: derive ``task_id`` from
+``H(case_id, escalation_type, canonical impact_vector)`` so the signed task binding
+authenticates the metadata.
+
 Usage::
 
     from constitutional_swarm.bittensor import (

@@ -14,10 +14,16 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from constitutional_swarm.mesh.vote_envelope import SignedAssignment, VoteEnvelope
+from constitutional_swarm.mesh.vote_envelope import (
+    SignedAssignment,
+    VoteEnvelope,
+    normalize_voter_id,
+    vote_envelope_hash,
+)
 
 _SYNAPSE_HASH_DOMAIN = b"constitutional-swarm.bittensor-synapse.v1\x00"
 
@@ -31,6 +37,29 @@ def _canonical_synapse_hash(kind: str, payload: dict[str, str]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(_SYNAPSE_HASH_DOMAIN + encoded).hexdigest()[:32]
+
+
+def judgment_content_hash(judgment: str) -> str:
+    """Return the content hash that signed vote evidence binds for *judgment*.
+
+    Single definition shared by the validator, owner, precedent store and cascade.
+    """
+    if type(judgment) is not str:
+        raise TypeError("judgment must be a string")
+    return hashlib.sha256(judgment.encode("utf-8")).hexdigest()[:32]
+
+
+def ordered_vote_hashes(envelopes: Iterable[VoteEnvelope]) -> tuple[str, ...]:
+    """Return vote envelope hashes in the canonical proof order.
+
+    The order key is ``(normalized voter_id, key_id)``. Valid envelopes already carry a
+    canonical voter_id, so this matches the mesh proof ordering exactly.
+    """
+    ordered = sorted(
+        envelopes,
+        key=lambda envelope: (normalize_voter_id(envelope.voter_id), envelope.key_id),
+    )
+    return tuple(vote_envelope_hash(envelope) for envelope in ordered)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +155,6 @@ class ValidationSynapse:
     proof_content_hash: str = ""
     constitutional_hash: str = ""
     trust_update: dict[str, Any] = field(default_factory=dict)
-    authenticity_score: float = 0.0
     timestamp: float = field(default_factory=time.time)
     vote_envelopes: tuple[VoteEnvelope, ...] = ()
     signed_assignment: SignedAssignment | None = None

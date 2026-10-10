@@ -18,7 +18,6 @@ proof root, and tallies recomputed from the signed vote envelopes.
 
 from __future__ import annotations
 
-import hashlib
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -35,13 +34,13 @@ from constitutional_swarm.bittensor.synapses import (
     DeliberationSynapse,
     JudgmentSynapse,
     ValidationSynapse,
+    judgment_content_hash,
+    ordered_vote_hashes,
 )
 from constitutional_swarm.compiler import DAGCompiler, GoalSpec
 from constitutional_swarm.mesh.vote_envelope import (
     FrozenVoteSignerRegistry,
     VoteSignerRegistry,
-    normalize_voter_id,
-    vote_envelope_hash,
 )
 from constitutional_swarm.swarm import TaskDAG
 
@@ -154,8 +153,10 @@ class SubnetOwner:
 
         Compiles the case into a TaskDAG and creates a DeliberationSynapse.
         """
-        case_id = uuid.uuid4().hex[:12]
-        task_id = uuid.uuid4().hex[:8]
+        # Full 128-bit identifiers: task_id is the precedent uniqueness key and is
+        # bound into the signed assignment and every vote envelope.
+        case_id = uuid.uuid4().hex
+        task_id = uuid.uuid4().hex
 
         # Build GoalSpec
         if steps is None:
@@ -318,17 +319,9 @@ class SubnetOwner:
         if len(vote_hashes) != len(validation.vote_envelopes):
             raise ValueError("validation proof vote count must match the validation tally")
 
-        expected_content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
-        if validation.proof_content_hash != expected_content_hash:
+        if validation.proof_content_hash != judgment_content_hash(judgment.judgment):
             raise ValueError("validation proof content hash does not bind the judgment")
-        expected_vote_hashes = tuple(
-            vote_envelope_hash(envelope)
-            for envelope in sorted(
-                validation.vote_envelopes,
-                key=lambda envelope: (normalize_voter_id(envelope.voter_id), envelope.key_id),
-            )
-        )
-        if vote_hashes != expected_vote_hashes:
+        if vote_hashes != ordered_vote_hashes(validation.vote_envelopes):
             raise ValueError("validation proof vote hashes do not match signed vote envelopes")
 
     def summary(self) -> dict[str, Any]:
