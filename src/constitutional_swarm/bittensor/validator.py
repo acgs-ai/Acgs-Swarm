@@ -14,10 +14,10 @@ primitives only.
 
 from __future__ import annotations
 
-import hashlib
 import math
 import threading
 import time
+import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -35,13 +35,17 @@ from constitutional_swarm.bittensor.emission_calculator import (
     MinerEmissionInput,
 )
 from constitutional_swarm.bittensor.protocol import MinerTier, ValidatorConfig
-from constitutional_swarm.bittensor.synapses import JudgmentSynapse, ValidationSynapse
+from constitutional_swarm.bittensor.synapses import (
+    JudgmentSynapse,
+    ValidationSynapse,
+    judgment_content_hash,
+    ordered_vote_hashes,
+)
 from constitutional_swarm.mesh import ConstitutionalMesh, MeshResult
 from constitutional_swarm.mesh.vote_envelope import (
     VoteSignerRegistry,
     normalize_voter_id,
     verify_assignment_vote_envelopes,
-    vote_envelope_hash,
 )
 
 
@@ -587,8 +591,16 @@ class ConstitutionalValidator:
         return {uid: calculated[uid] for uid in uids}
 
     def get_miner_reputation(self, miner_uid: str) -> float:
-        """Get a miner's current reputation score."""
-        return self._mesh.get_reputation(miner_uid)
+        """Deprecated: use ``validator.mesh.get_reputation(miner_uid)``."""
+        warnings.warn(
+            "ConstitutionalValidator.get_miner_reputation is deprecated; use "
+            "validator.mesh.get_reputation()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        with self._registry_lock:
+            mesh = self._mesh
+        return mesh.get_reputation(miner_uid)
 
     def summary(self) -> dict[str, Any]:
         """Combined validator + mesh + manifold statistics."""
@@ -618,7 +630,7 @@ class ConstitutionalValidator:
     ) -> ValidationSynapse:
         proof = result.proof
         producer_id = normalize_voter_id(judgment.miner_uid)
-        content_hash = hashlib.sha256(judgment.judgment.encode("utf-8")).hexdigest()[:32]
+        content_hash = judgment_content_hash(judgment.judgment)
         with self._registry_lock:
             current_constitutional_hash = self._constitution.hash
             mesh = self._mesh
@@ -667,12 +679,7 @@ class ConstitutionalValidator:
             raise ValueError("mesh result outcome does not match signed vote envelopes")
         if proof is None:
             raise ValueError("mesh result is missing its protocol v2 proof")
-        ordered_envelopes = sorted(
-            verified_envelopes, key=lambda item: (item.voter_id, item.key_id)
-        )
-        expected_vote_hashes = tuple(
-            vote_envelope_hash(envelope) for envelope in ordered_envelopes
-        )
+        expected_vote_hashes = ordered_vote_hashes(verified_envelopes)
         if (
             proof.protocol_version != 2
             or proof.task_id != judgment.task_id
@@ -699,5 +706,5 @@ class ConstitutionalValidator:
             constitutional_hash=current_constitutional_hash,
             vote_envelopes=verified_envelopes,
             signed_assignment=result.signed_assignment,
-            trust_update=self._mesh.manifold_summary() or {},
+            trust_update=mesh.manifold_summary() or {},
         )
