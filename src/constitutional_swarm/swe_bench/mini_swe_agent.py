@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from constitutional_swarm.swe_bench._diff import DIFF_MARKER, extract_unified_diff
 from constitutional_swarm.swe_bench._subprocess import (
     _run_process,
     _subprocess_env as _minimal_subprocess_env,
@@ -33,7 +34,9 @@ SCORE_SOURCE_NOT_EVALUATED = "not_evaluated"
 SCORE_SOURCE_LOCAL_HARNESS = "local_harness"
 SCORE_SOURCE_OFFICIAL_SWEBENCH = "official_swebench"
 
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/|@@ )")
+# Raw mini output and trajectory content go through the shared extractor; a
+# file header is required, so hunk-only ``@@`` output is not a patch.
+_extract_diff = extract_unified_diff
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|AUTHORIZATION|PASSWORD|SECRET)[A-Z0-9_]*)"
     r"\b\s*[:=]\s*(?:(?:Bearer|Basic|Token)\s+)?([^\s,;]+)"
@@ -295,25 +298,6 @@ def to_prediction_row(
     }
 
 
-def _extract_diff(text: str) -> str:
-    """Extract unified diff text from raw mini output or trajectory content."""
-    if not text:
-        return ""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    match = _DIFF_MARKER.search(stripped)
-    if not match:
-        return ""
-    diff = stripped[match.start() :].strip()
-    return diff + ("\n" if not diff.endswith("\n") else "")
-
-
 def _trajectory_submission(raw_json: str) -> str:
     if not raw_json:
         return ""
@@ -333,10 +317,10 @@ def _trajectory_submission(raw_json: str) -> str:
             extra = message.get("extra")
             if isinstance(extra, dict):
                 submission = extra.get("submission")
-                if isinstance(submission, str) and _DIFF_MARKER.search(submission):
+                if isinstance(submission, str) and DIFF_MARKER.search(submission):
                     return submission
             content = message.get("content")
-            if isinstance(content, str) and _DIFF_MARKER.search(content):
+            if isinstance(content, str) and DIFF_MARKER.search(content):
                 return content
     return ""
 
