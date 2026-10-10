@@ -427,9 +427,11 @@ def test_allows_inert_default_commands(
     assert _policy(tmp_path).decide("tool_call", command).outcome == ALLOW
 
 
-def test_configured_allowlist_extends_defaults_but_cannot_restore_denied_names(
+def test_configured_allowlist_selects_safe_commands_but_cannot_add_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # C25b: command_allowlist narrows the closed SAFE_COMMANDS table; unknown
+    # names (custom or denied) are never added.
     monkeypatch.setattr(
         governed_handoff.shutil,
         "which",
@@ -437,12 +439,13 @@ def test_configured_allowlist_extends_defaults_but_cannot_restore_denied_names(
     )
     engine = _policy(
         tmp_path,
-        {"command_allowlist": ["custom-check", "make"]},
+        {"command_allowlist": ["true", "custom-check", "make"]},
     )
 
-    assert engine.command_allowlist == {"true", "echo", "custom-check"}
+    assert engine.command_allowlist == {"true"}
     assert engine.decide("tool_call", "true").outcome == ALLOW
-    assert engine.decide("tool_call", "custom-check").outcome == ALLOW
+    assert engine.decide("tool_call", "echo ok").outcome == DENY
+    assert engine.decide("tool_call", "custom-check").outcome == DENY
     assert engine.decide("tool_call", "make").outcome == DENY
 
 
@@ -534,7 +537,8 @@ def test_process_hardening_syscall_uses_prctl_abi(
 
     governed_handoff._mark_process_non_dumpable()
 
-    assert calls == [(4, 0, 0, 0, 0)]
+    # C25b (L3): PR_SET_DUMPABLE is followed by a PR_GET_DUMPABLE read-back.
+    assert calls == [(4, 0, 0, 0, 0), (3, 0, 0, 0, 0)]
     assert fake_prctl.argtypes == [
         governed_handoff.ctypes.c_int,
         governed_handoff.ctypes.c_ulong,
