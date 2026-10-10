@@ -4271,12 +4271,8 @@ def test_sqlite_commit_and_revocation_outbox_identities_are_typed_and_disjoint(
     _advance_candidate(store, target)
     committed = store.atomic_commit(target)
     assert committed.certificate_digest is not None
-    revoke_audit = sha256_digest(
-        (
-            "revoke\x00CERTIFICATE\x00workflow-1\x00"
-            + committed.certificate_digest
-            + "\x001"
-        ).encode()
+    revoke_audit = sqlite_store_module._audit_id(
+        "revoke", "CERTIFICATE", "workflow-1", committed.certificate_digest, "1"
     )
     collision = _request(
         commit_id=revoke_audit,
