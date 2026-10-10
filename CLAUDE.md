@@ -92,7 +92,7 @@ make test
 - Precedent quorum: 3/5 super-majority (`min_total_validators=5, min_votes_for_precedent=3`)
 - ArweaveAuditLogger: two-phase commit — cache Phase 1 result in `_retry_state`, clear only on success
 - TierManager and PrecedentStore are thread-safe via `threading.Lock`
-- Manifold peer selection is wired in `mesh.py:_select_peers()` — trust-weighted sampling with one exploration slot
+- Manifold peer selection is wired in `mesh/core.py:_select_peers_unlocked()` (called from `_request_validation_once`) — trust-weighted sampling with one exploration slot
 
 ## Supporting docs
 

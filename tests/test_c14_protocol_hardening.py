@@ -1876,7 +1876,7 @@ def test_c14_receipt_rejects_tie_and_non_boolean_outcome():
         receipt_from_mesh_settlement(invalid_bool, envelopes, trusted_signers=grants)
 
 
-def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
+def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path, caplog):
     from dataclasses import replace
 
     import pytest
@@ -1915,14 +1915,19 @@ def test_c14_schema_v2_recovery_requires_explicit_v2_proof(tmp_path):
             },
         )
     )
-    with pytest.raises(ValueError, match="missing protocol_version"):
-        ConstitutionalMesh(
+    # C28 mesh-settle-1: a malformed record is quarantined, never authoritative.
+    with caplog.at_level("WARNING", logger="constitutional_swarm.mesh.core"):
+        reader = ConstitutionalMesh(
             constitution,
             quorum=3,
             settlement_store=missing_store,
             vote_registry=registry,
             **_c14_external_assigner(registry),
         )
+    assert f"quarantining settlement {result.assignment_id}" in caplog.text
+    assert "missing protocol_version" in caplog.text
+    with pytest.raises(KeyError, match="not found"):
+        reader.get_result(result.assignment_id)
 
     legacy_store = JSONLSettlementStore(tmp_path / "legacy.jsonl")
     legacy_store.append(
@@ -3583,7 +3588,9 @@ def test_c14_cycle2_cascade_accepts_bound_v2_evidence_and_rejects_candidate_repl
     ) is False
 
 
-def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_tamper(tmp_path):
+def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_tamper(
+    tmp_path, caplog
+):
     from dataclasses import replace
 
     import pytest
@@ -3635,8 +3642,9 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
             assignment={**record.assignment, "assigned_peers_hash": "0" * 64},
         )
     )
-    with pytest.raises(ValueError, match="assigned_peers_hash"):
-        ConstitutionalMesh(
+    # C28 mesh-settle-1: a malformed record is quarantined, never authoritative.
+    with caplog.at_level("WARNING", logger="constitutional_swarm.mesh.core"):
+        reader = ConstitutionalMesh(
             constitution,
             peers_per_validation=5,
             quorum=5,
@@ -3645,6 +3653,10 @@ def test_c14_cycle2_recovery_uses_signed_historical_quorum_and_rejects_metadata_
             **_c14_external_assigner(registry),
             evidence_mode="single_operator_dev",
         )
+    assert f"quarantining settlement {result.assignment_id}" in caplog.text
+    assert "assigned_peers_hash" in caplog.text
+    with pytest.raises(KeyError, match="not found"):
+        reader.get_result(result.assignment_id)
 
     quorum_tampered = JSONLSettlementStore(tmp_path / "quorum-tampered.jsonl")
     quorum_tampered.append(
