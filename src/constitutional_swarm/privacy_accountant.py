@@ -163,21 +163,42 @@ def _rdp_to_epsilon_balle2020(
     -------
     tuple[float, float]
         (epsilon, optimal_alpha)
+
+    Non-finite RDP values (NaN or +inf) are treated as +inf for their order,
+    so a corrupted composition can never convert to a small epsilon.
     """
     best_eps = math.inf
     best_alpha = alphas[0]
     for a, r in zip(alphas, rdp_values, strict=False):
         if a <= 1.0:
             continue
+        if not math.isfinite(r):
+            continue  # +inf for this order: it can never be the minimum
         try:
             eps = r + math.log1p(-1.0 / a) - math.log(delta * a) / (a - 1.0)
-            eps = max(0.0, eps)
         except (ValueError, ZeroDivisionError):
             continue
+        if not math.isfinite(eps):
+            continue
+        eps = max(0.0, eps)
         if eps < best_eps:
             best_eps = eps
             best_alpha = a
     return best_eps, best_alpha
+
+
+def _validated_noise_multiplier(sensitivity: float, sigma: float, sample_rate: float) -> float:
+    """Validate one Gaussian-mechanism spend and return its noise multiplier."""
+    if not math.isfinite(sensitivity) or sensitivity <= 0:
+        raise ValueError(f"sensitivity must be positive, got {sensitivity}")
+    if not math.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
+    if not math.isfinite(sample_rate) or not (0 < sample_rate <= 1.0):
+        raise ValueError(f"sample_rate must be in (0,1], got {sample_rate}")
+    nm = sigma / sensitivity
+    if not math.isfinite(nm) or nm <= 0:
+        raise ValueError("sigma / sensitivity must produce a finite positive noise multiplier")
+    return nm
 
 
 @dataclass
@@ -364,21 +385,11 @@ class PrivacyAccountant:
         float
             The ε contributed by this single step (computed via RDP).
         """
-        if not math.isfinite(sensitivity) or sensitivity <= 0:
-            raise ValueError(f"sensitivity must be positive, got {sensitivity}")
-        if not math.isfinite(sigma) or sigma <= 0:
-            raise ValueError(f"sigma must be positive, got {sigma}")
-        if not math.isfinite(sample_rate) or not (0 < sample_rate <= 1.0):
-            raise ValueError(f"sample_rate must be in (0,1], got {sample_rate}")
+        nm = _validated_noise_multiplier(sensitivity, sigma, sample_rate)
 
         # Per-step RDP contribution at the optimal alpha.
         # Use the subsampled bound so telemetry accurately reflects
         # the privacy amplification when sample_rate < 1.
-        nm = sigma / sensitivity
-        if not math.isfinite(nm) or nm <= 0:
-            raise ValueError(
-                "sigma / sensitivity must produce a finite positive noise multiplier"
-            )
         per_step_rdp = [_rdp_subsampled_gaussian(a, nm, sample_rate) for a in self.alphas]
         eps_step, _ = _rdp_to_epsilon_balle2020(per_step_rdp, self.alphas, self.delta)
 
@@ -389,6 +400,32 @@ class PrivacyAccountant:
 
         return eps_step
 
+    def spend_and_assert(
+        self, sensitivity: float, sigma: float, sample_rate: float = 1.0
+    ) -> float:
+        """Record one mechanism invocation and enforce the budget atomically.
+
+        The record is appended and the cumulative ε recomputed inside one
+        critical section, so concurrent callers cannot all pass the gate on
+        a stale view of the history (check-then-act race). The record is
+        kept even when the gate trips: the mechanism ran and its privacy
+        cost is spent. Returns the cumulative ε after this step.
+
+        Raises :class:`PrivacyBudgetExhausted` when the cumulative ε exceeds
+        (or cannot be shown to be within) the budget.
+        """
+        _validated_noise_multiplier(sensitivity, sigma, sample_rate)
+        record = _SpendRecord(sensitivity=sensitivity, sigma=sigma, sample_rate=sample_rate)
+        with self._lock:
+            self._history.append(record)
+            spent = self._epsilon_from_history(tuple(self._history))
+        if not (spent <= self.epsilon):
+            raise PrivacyBudgetExhausted(
+                f"ε budget exceeded: spent {spent:.4f} > limit {self.epsilon:.4f} "
+                f"(RDP composition, δ={self.delta})"
+            )
+        return spent
+
     def assert_budget(self) -> None:
         """Raise :class:`PrivacyBudgetExhausted` if the ε budget is exceeded.
 
@@ -398,7 +435,8 @@ class PrivacyAccountant:
         simple summation.
         """
         spent = self._current_epsilon()
-        if spent > self.epsilon:
+        # Negated comparison: a NaN on either side fails closed.
+        if not (spent <= self.epsilon):
             raise PrivacyBudgetExhausted(
                 f"ε budget exceeded: spent {spent:.4f} > limit {self.epsilon:.4f} "
                 f"(RDP composition, δ={self.delta})"
@@ -430,6 +468,6 @@ class PrivacyAccountant:
             "delta": self.delta,
             "num_mechanism_invocations": len(history),
             "budget_fraction_used": spent / self.epsilon,
-            "exhausted": spent > self.epsilon,
+            "exhausted": not (spent <= self.epsilon),
             "composition_method": "RDP (Mironov 2017) + Balle 2020 conversion",
         }

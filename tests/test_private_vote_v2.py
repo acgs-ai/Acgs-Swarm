@@ -197,6 +197,8 @@ class TestTallyV2:
             subject=SUBJECT,
             eligible_voters=frozenset(_pub(sk) for sk in keys),
             provers={} if prover is None else {prover.scheme_id: prover},
+            strict_v2=False,
+            allow_insecure_hash_prover=True,
         )
         built = []
         for i, (sk, ch) in enumerate(zip(keys, choices, strict=True)):
@@ -268,6 +270,8 @@ class TestTallyV2:
             subject=SUBJECT,
             eligible_voters=frozenset({_pub(sk1), _pub(sk2)}),
             provers={prover.scheme_id: prover},
+            strict_v2=False,
+            allow_insecure_hash_prover=True,
         )
         box.submit_commit(c1)
         box.submit_commit(c2)
@@ -340,6 +344,8 @@ class TestTallyV2:
             subject=SUBJECT,
             eligible_voters=frozenset({_pub(sk)}),
             provers={prover.scheme_id: prover},
+            strict_v2=False,
+            allow_insecure_hash_prover=True,
         )
         assert result.totals[BallotChoice.YEA] == 0
         assert any("invalid validity proof" in r for _, r in result.rejected)
@@ -375,5 +381,6 @@ class TestTallyV2:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({_pub(sk)}),
+            strict_v2=False,
         )
         assert result.totals[BallotChoice.ABSTAIN] == 1

@@ -20,6 +20,7 @@ Dependencies: torch (optional, same isolation as latent_dna.py).
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import secrets
@@ -42,6 +43,35 @@ from constitutional_swarm.privacy_accountant import PrivacyAccountant, matrix_l2
 
 _DRAND_CHAIN_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_DISCRETE_GAUSSIAN_SUPPORT_SIZE = 1_000_001
+_SEED_DOMAIN_GENERATOR = b"acgs-dgs-generator-seed-v1"
+_SEED_DOMAIN_CHILD = b"acgs-dgs-child-seed-v1"
+
+
+def _seed_digest(domain: bytes, seed: int, *extra: bytes) -> bytes:
+    """SHA-256 over length-prefixed (domain, full seed bytes, extra parts)."""
+    seed_bytes = seed.to_bytes(max(1, (seed.bit_length() + 7) // 8), "big")
+    h = hashlib.sha256()
+    for part in (domain, seed_bytes, *extra):
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def _generator_seed(seed: int) -> int:
+    """Derive the 64-bit torch generator seed from arbitrary-width seed material.
+
+    ``torch.Generator.manual_seed`` accepts only 64 bits, so the generator
+    state can never carry more than 64 bits of entropy. Hashing the full seed
+    (instead of truncating or masking it) ensures every bit of the caller's
+    seed, including private bits mixed above bit 64, influences the stream.
+    """
+    return int.from_bytes(_seed_digest(_SEED_DOMAIN_GENERATOR, seed)[:8], "big")
+
+
+def _child_seed(parent_seed: int, index: int) -> int:
+    """Derive a 256-bit child seed from the full parent seed and call index."""
+    digest = _seed_digest(_SEED_DOMAIN_CHILD, parent_seed, index.to_bytes(8, "big"))
+    return int.from_bytes(digest, "big")
 
 
 class SwarmVectorField(Protocol):
@@ -309,7 +339,8 @@ def integrate(
                 crdt.append(
                     payload=json.dumps({"step": step, "t": t, "variance": var}),
                     payload_type="ode_snapshot",
-                    bodes_passed=True,
+                    # No BODES check runs on ODE snapshots; never claim one did.
+                    bodes_passed=False,
                     constitutional_hash=_CONSTITUTIONAL_HASH,
                 )
 
@@ -334,7 +365,7 @@ def integrate(
             crdt.append(
                 payload=json.dumps({"step": n_steps, "t": t, "variance": var}),
                 payload_type="ode_snapshot",
-                bodes_passed=True,
+                bodes_passed=False,
                 constitutional_hash=_CONSTITUTIONAL_HASH,
             )
 
@@ -437,8 +468,8 @@ class DiscreteGaussianSampler:
 
     Samples from a truncated discrete Gaussian approximation using
     inverse-transform sampling over a float64 CDF (Cumulative Distribution
-    Function). Each integer-valued output is selected by a linear scan of the
-    precomputed CDF. The caller must include truncation error in its privacy
+    Function). Integer outputs are selected in bulk with
+    :func:`torch.searchsorted` over the precomputed CDF. The caller must include truncation error in its privacy
     analysis; this sampler alone is not an exact DP certificate. The local
     torch generator receives OS entropy when no seed is supplied, but torch's
     pseudorandom generator is not a cryptographic RNG.
@@ -447,16 +478,21 @@ class DiscreteGaussianSampler:
     - Output is an integer in [-tail_bound, +tail_bound]
     - PMF: Pr[X=k] ∝ exp(-k²/(2σ²))
     - The PMF table is pre-computed at construction time; each sample
-      is O(tail_bound) for the CDT scan (acceptable for small sigma).
+      is an O(log tail_bound) binary search, vectorised per call.
     - Support tables are capped at 1,000,001 entries as a resource-safety
       contract. This operational cap is not a differential-privacy theorem;
       callers needing wider support must use a streaming sampler.
-    - Reproducible: a verifier given the seed can reconstruct the CDF stream.
+    - Reproducible: a verifier given the seed and the same sequence of
+      sampling calls (same call shapes) reconstructs the output stream.
 
     Args:
         sigma: Distribution standard deviation.
         tail_bound: Truncation at ±tail_bound (default = ceil(6σ)).
-        seed: Optional integer seed for reproducibility.
+        seed: Optional non-negative integer seed of any width, for audit
+            replay. The full seed is hashed (SHA-256) into torch's 64-bit
+            generator seed; child samplers created by
+            :meth:`sensitivity_clipped_noise` get 256-bit seeds derived by
+            SHA-256 from the full parent seed and a per-call index.
 
     Example::
 
@@ -477,6 +513,8 @@ class DiscreteGaussianSampler:
             isinstance(tail_bound, bool) or not isinstance(tail_bound, int) or tail_bound <= 0
         ):
             raise ValueError(f"tail_bound must be a positive integer, got {tail_bound}")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0):
+            raise ValueError(f"seed must be a non-negative integer or None, got {seed!r}")
         self._sigma = sigma
         self._seed = seed
         self._noise_call_counter = 0
@@ -494,7 +532,8 @@ class DiscreteGaussianSampler:
                 f"{_MAX_DISCRETE_GAUSSIAN_SUPPORT_SIZE} entries"
             )
         self._tail = tail_bound
-        effective_seed = seed if seed is not None else secrets.randbits(64)
+        # Unseeded: 64 bits of OS entropy (the generator's full seed width).
+        effective_seed = _generator_seed(seed) if seed is not None else secrets.randbits(64)
         self._rng = torch.Generator().manual_seed(effective_seed)
 
         # Build CDT (Cumulative Distribution Table)
@@ -523,25 +562,27 @@ class DiscreteGaussianSampler:
             return 0.0
         return float(self._pmf[idx].item())
 
+    def _draw(self, n: int) -> Tensor:
+        """Draw ``n`` integer samples as an int64 tensor (inverse-CDF search)."""
+        u = torch.rand(n, generator=self._rng, dtype=torch.float64)
+        # First index with cdf >= u; clamp guards cdf[-1] rounding below 1.0.
+        idx = torch.searchsorted(self._cdf, u).clamp_(max=len(self._support) - 1)
+        return idx - self._tail
+
     def sample(self) -> int:
         """Draw a single sample from N_Z(0, σ²)."""
-        u = torch.rand(1, generator=self._rng, dtype=torch.float64).item()
-        for i, cdf_val in enumerate(self._cdf):
-            if u <= cdf_val.item():
-                return self._support[i]
-        return self._support[-1]  # numerical safety
+        return int(self._draw(1).item())
 
     def sample_vector(self, n: int) -> list[int]:
         """Draw n independent samples."""
-        return [self.sample() for _ in range(n)]
+        return [int(v) for v in self._draw(n).tolist()]
 
     def sample_tensor(self, shape: tuple[int, ...]) -> Tensor:
         """Draw samples into a torch Tensor of the given shape (float32)."""
         total = 1
         for s in shape:
             total *= s
-        raw = [float(self.sample()) for _ in range(total)]
-        return torch.tensor(raw, dtype=torch.float32).reshape(shape)
+        return self._draw(total).to(dtype=torch.float32).reshape(shape)
 
     def sensitivity_clipped_noise(
         self,
@@ -563,10 +604,11 @@ class DiscreteGaussianSampler:
         if not math.isfinite(sensitivity) or sensitivity <= 0:
             raise ValueError(f"sensitivity must be positive, got {sensitivity}")
         scaled_sigma = self._sigma * sensitivity
-        # Derive a unique seed per call to avoid identical noise vectors.
+        # Derive a unique seed per call with a KDF over the full parent seed;
+        # masking to 32 bits would let 2**32 guesses reconstruct the noise.
         self._noise_call_counter += 1
         derived_seed = (
-            (self._seed * 2654435761 + self._noise_call_counter) & 0xFFFFFFFF
+            _child_seed(self._seed, self._noise_call_counter)
             if self._seed is not None
             else None
         )
@@ -584,9 +626,10 @@ class DiscreteGaussianSampler:
 # ---------------------------------------------------------------------------
 # drand VRF Client — threshold VRF-seeded DP noise
 # ---------------------------------------------------------------------------
-# Uses drand's publicly verifiable randomness beacon as a VRF seed for
-# DiscreteGaussianSampler. This makes DP noise generation auditable:
-# any verifier can confirm the noise was seeded from the public beacon.
+# Uses drand's randomness beacon as a seed for DiscreteGaussianSampler.
+# This client does NOT verify the beacon's BLS signature, so a fetched entry
+# is unauthenticated: it only checks that randomness == sha256(signature)
+# and that the returned round is the one requested.
 # Reference: drand.love — League of Entropy threshold VRF
 # API: https://api.drand.sh/public/{round}
 # ---------------------------------------------------------------------------
@@ -612,10 +655,13 @@ class DrandBeaconEntry:
 class DrandClient:
     """Thin client for the drand League of Entropy randomness beacon.
 
-    Fetches publicly verifiable threshold VRF randomness from the drand
-    HTTP API.  The randomness field is a BLS12-381 aggregate signature
-    over the round number — verifiable by any party with the chain's
-    public key.
+    Fetches drand threshold-beacon randomness over HTTPS. Entries are
+    **unauthenticated**: the BLS12-381 signature is not verified against
+    the chain public key, so a malicious or compromised endpoint can serve
+    any self-consistent entry. The client only enforces two binding checks:
+    ``randomness == sha256(signature)`` and, for :meth:`at_round`, that the
+    returned round equals the requested one. Callers needing beacon
+    authenticity must verify the BLS signature independently.
 
     Usage::
 
@@ -664,11 +710,36 @@ class DrandClient:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"drand fetch failed for {url}: {exc}") from exc
 
+        if not isinstance(data, dict):
+            raise RuntimeError("drand response must be a JSON object")
+        round_number = data.get("round")
+        randomness = data.get("randomness")
+        signature = data.get("signature")
+        previous = data.get("previous_signature", "")
+        if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number < 0:
+            raise RuntimeError("drand response has an invalid round")
+        if round_spec != "latest" and round_number != int(round_spec):
+            raise RuntimeError(
+                f"drand returned round {round_number}, expected round {round_spec}"
+            )
+        if not isinstance(signature, str) or not signature:
+            raise RuntimeError("drand response is missing its signature")
+        try:
+            signature_bytes = bytes.fromhex(signature)
+        except ValueError as exc:
+            raise RuntimeError("drand signature is not hex") from exc
+        if not isinstance(randomness, str) or (
+            randomness.lower() != hashlib.sha256(signature_bytes).hexdigest()
+        ):
+            raise RuntimeError("drand randomness is not sha256(signature)")
+        if not isinstance(previous, str):
+            raise RuntimeError("drand previous_signature must be a string")
+
         return DrandBeaconEntry(
-            round_number=int(data["round"]),
-            randomness_hex=data["randomness"],
-            signature_hex=data.get("signature", ""),
-            previous_sig_hex=data.get("previous_signature", ""),
+            round_number=round_number,
+            randomness_hex=randomness.lower(),
+            signature_hex=signature,
+            previous_sig_hex=previous,
         )
 
     def latest(self) -> DrandBeaconEntry:
@@ -676,7 +747,9 @@ class DrandClient:
         return self._fetch("latest")
 
     def at_round(self, round_number: int) -> DrandBeaconEntry:
-        """Fetch the beacon entry at a specific round."""
+        """Fetch the beacon entry at a specific round (round is checked)."""
+        if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number < 0:
+            raise ValueError(f"round_number must be a non-negative integer, got {round_number!r}")
         return self._fetch(str(round_number))
 
     @staticmethod

@@ -163,6 +163,7 @@ def test_only_registered_keys_can_contribute_to_tally() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=frozenset({_pub(keys[0])}),
+        strict_v2=False,
     )
 
     assert result.total_valid == 1
@@ -182,11 +183,14 @@ def test_eligibility_membership_uses_normalized_builtin_frozenset() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=malicious,
+        strict_v2=False,
     )
     assert direct.total_valid == 1
     assert any(reason == "ineligible voter" for _, reason in direct.rejected)
 
-    box = PrivateBallotBox(epoch=EPOCH, subject=SUBJECT, eligible_voters=malicious)
+    box = PrivateBallotBox(
+        epoch=EPOCH, subject=SUBJECT, eligible_voters=malicious, strict_v2=False
+    )
     box.submit_commit(alice_commit)
     with pytest.raises(InvalidCommitError, match="ineligible voter"):
         box.submit_commit(outsider_commit)
@@ -203,6 +207,7 @@ def test_forged_noncanonical_nullifier_is_rejected() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=frozenset({_pub(alice)}),
+        strict_v2=False,
     )
 
     assert result.total_valid == 0
@@ -227,7 +232,9 @@ def _copied_digest_ballots():
 def test_copied_digest_cannot_reserve_legitimate_ballot() -> None:
     alice, mallory, alice_commit, alice_reveal, copied = _copied_digest_ballots()
     eligible = frozenset({_pub(alice), _pub(mallory)})
-    box = PrivateBallotBox(epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible)
+    box = PrivateBallotBox(
+        epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible, strict_v2=False
+    )
 
     box.submit_commit(copied)
     box.submit_commit(alice_commit)
@@ -249,6 +256,7 @@ def test_require_all_revealed_tracks_voter_commit_tuple() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=frozenset({_pub(alice), _pub(mallory)}),
+        strict_v2=False,
     )
     box.submit_commit(copied)
     box.submit_commit(alice_commit)
@@ -267,6 +275,7 @@ def test_ballot_box_rejects_ineligible_commit_at_admission() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=frozenset({_pub(alice)}),
+        strict_v2=False,
     )
 
     with pytest.raises(InvalidCommitError, match="ineligible voter"):
@@ -281,6 +290,7 @@ def test_concurrent_same_voter_submissions_store_only_one_ballot() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=frozenset({_pub(alice)}),
+        strict_v2=False,
     )
     barrier = Barrier(2)
 
@@ -328,6 +338,7 @@ def test_ballot_box_accepts_none_provers() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=eligible,
+        strict_v2=False,
         provers=None,
     )
 
@@ -342,11 +353,13 @@ def test_ballot_box_uses_identity_equality_and_hashing() -> None:
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=eligible,
+        strict_v2=False,
     )
     second = PrivateBallotBox(
         epoch=EPOCH,
         subject=SUBJECT,
         eligible_voters=eligible,
+        strict_v2=False,
     )
 
     original_hash = hash(first)
