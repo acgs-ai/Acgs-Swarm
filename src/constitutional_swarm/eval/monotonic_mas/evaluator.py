@@ -12,15 +12,21 @@ Exits 0 always; the autoresearch loop reads stdout JSON.
 from __future__ import annotations
 
 import argparse
+import ast
 import fcntl
+import functools
 import hashlib
 import importlib
 import json
 import math
 import os
+import secrets
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -38,7 +44,7 @@ from constitutional_swarm.evolution_log import (
 
 EXPECTED_HASH = "608508a9bd224290"
 LOGIT_EPS = 1e-6
-EVALUATION_VERSION = 3
+EVALUATION_VERSION = 4  # v4: R4 import-graph audit is a gate
 PRODUCTION_EVALUATION_VARIANT = "production-v1"
 
 
@@ -53,33 +59,369 @@ def logit(rate: float) -> float:
     return -math.log(1.0 - r)
 
 
-def import_graph_audit() -> dict:
-    """R4: confirm corpus generator does not import constitutional_swarm.
+_R4_GENERATOR_PATH = (
+    Path(__file__).parents[4] / "tests" / "fixtures" / "_generators" / "mast_synth.py"
+)
+_R4_AUDIT_MODULE_NAME = "_constitutional_swarm_r4_audit_generator"
+_R4_CHILD_TIMEOUT_SECONDS = 30.0
+# Import roots the real generator (mast_synth.py) needs. The static audit is an
+# allowlist: an import of any other root fails the audit closed.
+_R4_ALLOWED_IMPORT_ROOTS = frozenset(
+    {"__future__", "argparse", "hashlib", "json", "random", "pathlib"}
+)
+# Names that reach the import machinery, code execution or the loaded-module
+# table even without an import statement (builtins, or attributes of objects).
+_R4_DENIED_NAMES = frozenset(
+    {
+        "importlib",
+        "__import__",
+        "exec",
+        "eval",
+        "compile",
+        "builtins",
+        "sys",
+        "globals",
+        "locals",
+        "vars",
+        "getattr",
+        "setattr",
+        "delattr",
+        "breakpoint",
+    }
+)
+# Frame / code / traceback introspection: a route from any function or
+# generator object to the executing interpreter's frames and globals.
+_R4_INTROSPECTION_ATTRS = frozenset(
+    {
+        "gi_frame",
+        "gi_code",
+        "gi_yieldfrom",
+        "cr_frame",
+        "cr_code",
+        "ag_frame",
+        "ag_code",
+        "f_back",
+        "f_globals",
+        "f_locals",
+        "f_builtins",
+        "f_code",
+        "tb_frame",
+        "tb_next",
+    }
+)
+# Exit status the child uses when its audit hook / sys.path check detects an
+# R4 violation. Detection does not depend on the child's self-report.
+_R4_CHILD_VIOLATION_EXIT = 86
+# Module-level dunders a generator may legitimately read.
+_R4_ALLOWED_DUNDER_NAMES = frozenset({"__name__", "__file__", "__doc__"})
 
-    Re-imports the generator and inspects its module __dict__ for any name
-    starting with 'constitutional_swarm'. Raises if any are found.
+# Runs in a separate ``python -I -S`` process: executes the generator source it
+# receives on stdin (the exact bytes the parent parsed) with stdout captured.
+# Before exec it installs an audit hook (which cannot be removed) that exits
+# with VIOLATION_EXIT on an import of constitutional_swarm/site/ensurepip, or on
+# execution of any module code from such a path; after exec it exits with the
+# same status if sys.path changed or a blocked module is in sys.modules. This
+# detection does not depend on the child's report. Only then does it write its
+# report behind a per-run nonce. A generator that exits, raises or hangs
+# produces no report.
+_R4_CHILD_PROGRAM = """\
+import contextlib, io, json, os, sys
+header, _, source = sys.stdin.buffer.read().partition(b"\\n")
+meta = json.loads(header)
+namespace = {"__name__": meta["name"], "__file__": meta["path"]}
+code = compile(source, meta["path"], "exec")
+
+
+def _install_r4_guard(exit_now, violation_exit, path_snapshot, generator_code):
+    blocked = ("constitutional_swarm", "site", "ensurepip")
+
+    def blocked_name(name):
+        return any(name == b or name.startswith(b + ".") for b in blocked)
+
+    def blocked_file(filename):
+        parts = str(filename).replace("\\\\", "/").split("/")
+        return (
+            "constitutional_swarm" in parts
+            or "ensurepip" in parts
+            or parts[-1] in ("site.py", "site.pyc")
+        )
+
+    def hook(event, args):
+        # "import" covers import statements / __import__; "exec" covers every
+        # module body executed by any loader (importlib.import_module included).
+        if event == "import" and blocked_name(str(args[0])):
+            exit_now(violation_exit)
+        elif event == "exec" and args and args[0] is not generator_code:
+            if blocked_file(getattr(args[0], "co_filename", "")):
+                exit_now(violation_exit)
+
+    sys.addaudithook(hook)
+
+    def final_check():
+        if sys.path != path_snapshot or any(blocked_name(m) for m in list(sys.modules)):
+            exit_now(violation_exit)
+
+    return final_check
+
+
+_final_check = _install_r4_guard(os._exit, VIOLATION_EXIT, list(sys.path), code)
+del _install_r4_guard
+with contextlib.redirect_stdout(io.StringIO()):
+    exec(code, namespace)
+_final_check()
+report = {
+    "leaked_modules": sorted(
+        m for m in sys.modules if m.split(".")[0] == "constitutional_swarm"
+    ),
+    "leaked_names": sorted(
+        n for n in namespace if "constitutional_swarm" in str(n).lower()
+    ),
+}
+sys.stdout.write(meta["nonce"] + " " + json.dumps(report) + "\\n")
+"""
+
+
+def _static_package_imports(tree: ast.AST) -> list[str]:
+    """Return every ``constitutional_swarm`` import anywhere in ``tree``."""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules = [node.module]
+        else:
+            continue
+        found.extend(
+            module for module in modules if module.split(".")[0] == "constitutional_swarm"
+        )
+    return found
+
+
+@functools.cache
+def _allowed_modules_submodule_names() -> frozenset[str]:
+    """Attribute names under which an allowlisted module exposes another module.
+
+    ``argparse._sys`` or ``json.decoder`` would otherwise be a one-hop route from
+    an allowlisted import to an arbitrary module object.
     """
-    sys.path.insert(0, str(Path(__file__).parents[4]))  # repo root
-    try:
-        gen = importlib.import_module("tests.fixtures._generators.mast_synth")
-    except ImportError:
-        # Generator may not be on sys.path for some invocations; skip gracefully
-        return {"audited": False, "reason": "generator not importable from this context"}
+    names: set[str] = set()
+    for root in _R4_ALLOWED_IMPORT_ROOTS:
+        module = importlib.import_module(root)
+        names.update(
+            name
+            for name in dir(module)
+            if isinstance(getattr(module, name, None), types.ModuleType)
+        )
+    return frozenset(names)
 
-    leaked = [name for name in dir(gen) if "constitutional_swarm" in name.lower()]
-    # also look at the source for any 'import constitutional_swarm' line
-    gen_file = gen.__file__
-    if gen_file is None:
-        return {"audited": False, "reason": "generator module exposes no source file"}
-    src = Path(gen_file).read_text()
-    has_import_line = any(
-        line.strip().startswith(("import constitutional_swarm", "from constitutional_swarm"))
-        for line in src.splitlines()
+
+def _introspection_name(name: str) -> bool:
+    return name in _R4_INTROSPECTION_ATTRS or name.startswith("co_")
+
+
+def _denied_attribute(name: str) -> bool:
+    return (
+        name.startswith("_")
+        or name in _R4_DENIED_NAMES
+        or _introspection_name(name)
+        or name in _allowed_modules_submodule_names()
     )
-    if leaked or has_import_line:
+
+
+def _string_key(node: ast.AST) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _r4_static_findings(tree: ast.AST) -> list[str]:
+    """Return every construct outside the R4 static allowlist.
+
+    - imports: only roots in :data:`_R4_ALLOWED_IMPORT_ROOTS`, absolute, no
+      ``*``, and no imported name that is private, denied or a submodule;
+    - names: no denied name, no dunder other than ``__name__``/``__file__``/``__doc__``;
+    - attributes and match-class keyword patterns (``case C(attr=x)`` reads
+      ``attr``): no private/dunder, denied, submodule or frame/code/traceback
+      introspection attribute (``gi_frame``, ``f_back``, ``co_*``, ...);
+    - string literals used as subscript keys or call arguments (getattr-like
+      access) naming an introspection attribute.
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend(
+                f"import {alias.name}"
+                for alias in node.names
+                if alias.name.split(".")[0] not in _R4_ALLOWED_IMPORT_ROOTS
+            )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or not node.module:
+                found.append("relative import")
+            elif node.module.split(".")[0] not in _R4_ALLOWED_IMPORT_ROOTS:
+                found.append(f"from {node.module}")
+            else:
+                found.extend(
+                    f"from {node.module} import {alias.name}"
+                    for alias in node.names
+                    if alias.name == "*" or _denied_attribute(alias.name)
+                )
+        elif isinstance(node, ast.Name):
+            is_dunder = node.id.startswith("__") and node.id.endswith("__")
+            if node.id in _R4_DENIED_NAMES or (
+                is_dunder and node.id not in _R4_ALLOWED_DUNDER_NAMES
+            ):
+                found.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            if _denied_attribute(node.attr):
+                found.append(f".{node.attr}")
+        elif isinstance(node, ast.MatchClass):
+            found.extend(
+                f"case .{attr}=" for attr in node.kwd_attrs if _denied_attribute(attr)
+            )
+        elif isinstance(node, ast.Subscript):
+            key = _string_key(node.slice)
+            if key is not None and _introspection_name(key):
+                found.append(f"[{key!r}]")
+        elif isinstance(node, ast.Call):
+            # getattr-like access by string: attrgetter("f_back"), d.get("co_code")
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                key = _string_key(arg)
+                if key is not None and _introspection_name(key):
+                    found.append(f"({key!r})")
+    return found
+
+
+def _execute_generator_isolated(source: bytes, path: Path) -> dict[str, Any]:
+    """Execute generator ``source`` in a separate isolated interpreter.
+
+    The child is ``sys.executable -I -S`` (no environment, user site or
+    site-packages) with a minimal environment, a throwaway working directory
+    and a timeout. The evaluator process never executes generator code, so a
+    generator cannot patch the evaluator's in-memory scoring state. The child
+    is *not* a sandbox: it runs as the same user with the same filesystem and
+    network access. Its audit hook exit status (``violation=True``) is the
+    authoritative R4 signal; any other failure, timeout, non-zero exit or
+    missing/forged report yields ``ok=False``.
+    """
+    nonce = secrets.token_hex(16)
+    header = json.dumps(
+        {"nonce": nonce, "path": str(path), "name": _R4_AUDIT_MODULE_NAME}
+    ).encode()
+
+    def failed(reason: str, *, violation: bool = False) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "violation": violation,
+            "reason": reason,
+            "leaked_modules": [],
+            "leaked_names": [],
+        }
+
+    with tempfile.TemporaryDirectory(prefix="r4-audit-") as workdir:
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    _R4_CHILD_PROGRAM.replace(
+                        "VIOLATION_EXIT", str(_R4_CHILD_VIOLATION_EXIT)
+                    ),
+                ],
+                input=header + b"\n" + source,
+                capture_output=True,
+                timeout=_R4_CHILD_TIMEOUT_SECONDS,
+                cwd=workdir,
+                env={"PATH": os.defpath},
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return failed(
+                f"generator execution timed out after {_R4_CHILD_TIMEOUT_SECONDS}s"
+            )
+        except OSError as exc:
+            return failed(f"generator child could not start: {type(exc).__name__}")
+
+    if completed.returncode == _R4_CHILD_VIOLATION_EXIT:
+        return failed(
+            "child audit hook detected a constitutional_swarm/site/ensurepip import "
+            "or a sys.path change",
+            violation=True,
+        )
+    if completed.returncode != 0:
+        return failed(f"generator failed to execute (exit {completed.returncode})")
+    lines = completed.stdout.decode("utf-8", "replace").splitlines()
+    prefix = nonce + " "
+    if len(lines) != 1 or not lines[0].startswith(prefix):
+        return failed("generator child produced no authenticated report")
+    try:
+        report = json.loads(lines[0][len(prefix) :])
+        leaked_modules = [str(m) for m in report["leaked_modules"]]
+        leaked_names = [str(n) for n in report["leaked_names"]]
+    except (ValueError, KeyError, TypeError):
+        return failed("generator child report malformed")
+    return {
+        "ok": True,
+        "violation": False,
+        "reason": None,
+        "leaked_modules": leaked_modules,
+        "leaked_names": leaked_names,
+    }
+
+
+def import_graph_audit(generator_path: Path | None = None) -> dict:
+    """R4: confirm the corpus generator does not import constitutional_swarm.
+
+    The generator (default: the repo's ``tests/fixtures/_generators/mast_synth.py``)
+    is read exactly once and parsed. Statically, a literal
+    ``constitutional_swarm`` import raises; any construct outside the allowlist
+    (:func:`_r4_static_findings`) fails the audit closed without executing
+    anything. Only a generator that passes the static allowlist is executed,
+    and only in an isolated child interpreter
+    (:func:`_execute_generator_isolated`) fed the same bytes; the evaluator
+    process never runs generator code. The child's view of ``sys.modules``
+    and the generator namespace is then checked for leaks.
+
+    Returns ``{"audited": False, ...}`` when the generator cannot be audited;
+    the evaluator gates on ``audited is True``. Raises ``RuntimeError`` on an
+    actual R4 violation.
+    """
+    path = _R4_GENERATOR_PATH if generator_path is None else generator_path
+    try:
+        source = path.read_bytes()
+        tree = ast.parse(source, filename=str(path))
+    except (OSError, ValueError, SyntaxError) as exc:
+        return {
+            "audited": False,
+            "reason": f"generator source unavailable: {type(exc).__name__}",
+        }
+
+    static_imports = _static_package_imports(tree)
+    if static_imports:
         raise RuntimeError(
-            f"R4 violation: corpus generator leaks constitutional_swarm "
-            f"(leaked symbols={leaked}, has_import_line={has_import_line})"
+            "R4 violation: corpus generator imports constitutional_swarm "
+            f"(imports={sorted(set(static_imports))})"
+        )
+
+    findings = _r4_static_findings(tree)
+    if findings:
+        return {
+            "audited": False,
+            "reason": (
+                "generator uses constructs outside the R4 static allowlist: "
+                f"{sorted(set(findings))}"
+            ),
+        }
+
+    report = _execute_generator_isolated(source, path)
+    if report.get("violation"):
+        raise RuntimeError(f"R4 violation: {report['reason']}")
+    if not report["ok"]:
+        return {"audited": False, "reason": str(report["reason"])}
+    if report["leaked_modules"] or report["leaked_names"]:
+        raise RuntimeError(
+            "R4 violation: corpus generator leaks constitutional_swarm "
+            f"(child modules={report['leaked_modules']}, "
+            f"names={report['leaked_names']})"
         )
     return {"audited": True, "leaked": []}
 
@@ -262,6 +604,7 @@ def _validate_result(
         return value
 
     gate_fields = {
+        "r4_import_graph_audited": bool,
         "dedupe_strict_improvement_or_saturated": bool,
         "handoff_strict_improvement_or_saturated": bool,
         "role_strict_improvement_or_saturated": bool,
@@ -515,23 +858,23 @@ def _execute_iteration_locked(
     run_dir = Path(args.mission_root) / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # R4 import-graph audit (first iteration only)
-    audit = {"audited": False, "skipped": True}
-    if args.iter_n <= 1:
-        try:
-            audit = import_graph_audit()
-        except RuntimeError as exc:
-            # Hard fail — emit pass=false with clear error
-            out = {
-                "pass": False,
-                "score": 0.0,
-                "iter": args.iter_n,
-                "request_digest": request_digest,
-                "error": "R4_import_graph_violation",
-                "error_detail": str(exc),
-            }
-            _publish(_evaluation_path(run_dir, args.iter_n), out)
-            return
+    # R4 import-graph audit, every iteration. A violation fails hard here; an
+    # audit that cannot run is gated below (iter >= 1). Iter 0 is the force-pass
+    # baseline calibration, so it only records the audit result.
+    try:
+        audit = import_graph_audit()
+    except RuntimeError as exc:
+        # Hard fail — emit pass=false with clear error
+        out = {
+            "pass": False,
+            "score": 0.0,
+            "iter": args.iter_n,
+            "request_digest": request_digest,
+            "error": "R4_import_graph_violation",
+            "error_detail": str(exc),
+        }
+        _publish(_evaluation_path(run_dir, args.iter_n), out)
+        return
 
     governance_enabled = args.iter_n >= 1
     replay_result = run_replay(
@@ -739,6 +1082,8 @@ def _execute_iteration_locked(
     # is not running live. bodes_violations is a pass-through of
     # role-mode-uncaught traces; demoted to informational field; not gated.
     gates = {
+        # R4: an audit that could not run is a failure, never a skip.
+        "r4_import_graph_audited": audit.get("audited") is True,
         "dedupe_strict_improvement_or_saturated": (cr_dd > bdd) or sat_dd,
         "handoff_strict_improvement_or_saturated": (cr_hf > bhf) or sat_hf,
         "role_strict_improvement_or_saturated": (cr_rl > brl) or sat_rl,
