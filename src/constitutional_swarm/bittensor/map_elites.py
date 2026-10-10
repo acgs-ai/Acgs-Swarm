@@ -13,7 +13,9 @@ Ceiling detection per cell and globally.
 
 from __future__ import annotations
 
+import math
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -98,7 +100,7 @@ class FitnessWeights:
             _validate_finite("reasoning_weight", self.reasoning_weight, maximum=1.0),
             _validate_finite("speed_weight", self.speed_weight, maximum=1.0),
         )
-        if abs(sum(coefficients) - 1.0) > 1e-9:
+        if abs(math.fsum(coefficients) - 1.0) > 1e-9:
             raise ValueError("fitness coefficients must sum to 1.0")
         baseline = _validate_finite("speed_baseline_ms", self.speed_baseline_ms)
         if baseline <= 0.0:
@@ -130,11 +132,14 @@ class MinerQualityGrid:
     ) -> None:
         self._weights = fitness_weights or FitnessWeights()
         self._grid: dict[CellCoordinate, MinerApproach] = {}
-        self._history: dict[CellCoordinate, list[MinerApproach]] = {}
         self._ceiling_window = _validate_count(
             "ceiling_window", ceiling_window, minimum=1
         )
-        self._challenge_log: list[tuple[CellCoordinate, bool, float]] = []
+        # Ceiling detection only ever reads the last ``ceiling_window`` outcomes,
+        # so keep bounded windows (global and per cell) plus a running total.
+        self._challenge_log: deque[bool] = deque(maxlen=self._ceiling_window)
+        self._cell_challenges: dict[CellCoordinate, deque[bool]] = {}
+        self._total_challenges = 0
 
     def compute_fitness(
         self,
@@ -155,8 +160,8 @@ class MinerQualityGrid:
         speed_ms = _validate_finite("speed_ms", speed_ms)
         w = self._weights
         speed_score = max(0.0, 1.0 - speed_ms / w.speed_baseline_ms)
-        coefficient_total = (
-            w.acceptance_weight + w.reasoning_weight + w.speed_weight
+        coefficient_total = math.fsum(
+            (w.acceptance_weight, w.reasoning_weight, w.speed_weight)
         )
         fitness = (
             w.acceptance_weight * acceptance_rate
@@ -201,7 +206,6 @@ class MinerQualityGrid:
             return False
 
         coord = CellCoordinate(domain=canonical.domain, strategy=canonical.strategy)
-        self._history.setdefault(coord, []).append(canonical)
 
         incumbent = self._grid.get(coord)
         replaced = False
@@ -210,7 +214,11 @@ class MinerQualityGrid:
             self._grid[coord] = canonical
             replaced = True
 
-        self._challenge_log.append((coord, replaced, time.time()))
+        self._challenge_log.append(replaced)
+        self._cell_challenges.setdefault(
+            coord, deque(maxlen=self._ceiling_window)
+        ).append(replaced)
+        self._total_challenges += 1
         return replaced
 
     @property
@@ -262,16 +270,14 @@ class MinerQualityGrid:
         """True when last N challenges produced no improvements globally."""
         if len(self._challenge_log) < self._ceiling_window:
             return False
-        recent = self._challenge_log[-self._ceiling_window :]
-        return not any(replaced for _, replaced, _ in recent)
+        return not any(self._challenge_log)
 
     def ceiling_for_cell(self, coord: CellCoordinate) -> bool:
         """True when last N challenges to this specific cell had no improvement."""
-        cell_challenges = [(replaced, ts) for c, replaced, ts in self._challenge_log if c == coord]
-        if len(cell_challenges) < self._ceiling_window:
+        cell_challenges = self._cell_challenges.get(coord)
+        if cell_challenges is None or len(cell_challenges) < self._ceiling_window:
             return False
-        recent = cell_challenges[-self._ceiling_window :]
-        return not any(replaced for replaced, _ in recent)
+        return not any(cell_challenges)
 
     def top_miners(self, n: int = 5) -> list[MinerApproach]:
         """Top N miners by fitness across all cells."""
@@ -286,7 +292,7 @@ class MinerQualityGrid:
             "total_cells": self.TOTAL_CELLS,
             "diversity_score": round(self.diversity_score(), 3),
             "ceiling_detected": self.ceiling_detected(),
-            "total_challenges": len(self._challenge_log),
+            "total_challenges": self._total_challenges,
             "unique_miners": len({a.miner_uid for a in self._grid.values()}),
             "domain_coverage": {d.value: self.domain_coverage(d) for d in GovernanceDomain},
         }

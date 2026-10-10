@@ -241,10 +241,10 @@ class TestCertificateIssuer:
         issuer = CertificateIssuer(
             issuer_id="test",
             prover=ZKPStubProver(),
-            proof_type=ProofType.ZKP_NOIR,
+            allow_insecure_stub=True,
         )
         cert = issuer.issue("e1", _period(), _good_snapshot())
-        assert cert.proof_type == ProofType.ZKP_NOIR
+        assert cert.proof_type == ProofType.ZKP_STUB
         assert cert.proof.startswith("zkp_stub:")
         assert issuer.verify(cert) is True
 

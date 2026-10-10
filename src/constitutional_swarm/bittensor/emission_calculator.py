@@ -38,6 +38,7 @@ from typing import Any
 
 from constitutional_swarm.bittensor._validation import _validate_count, _validate_finite
 from constitutional_swarm.bittensor.protocol import TIER_TAO_MULTIPLIER, MinerTier
+from constitutional_swarm.bittensor.tier_manager import _TIER_ORDER
 
 # ---------------------------------------------------------------------------
 # Formula weights (configurable)
@@ -57,8 +58,8 @@ class EmissionWeights:
     def __post_init__(self) -> None:
         for name in ("manifold_trust", "reputation", "tier", "precedent", "authenticity"):
             _validate_finite(name, getattr(self, name), minimum=0.0, maximum=1.0)
-        total = (
-            self.manifold_trust + self.reputation + self.tier + self.precedent + self.authenticity
+        total = math.fsum(
+            (self.manifold_trust, self.reputation, self.tier, self.precedent, self.authenticity)
         )
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"EmissionWeights must sum to 1.0, got {total:.6f}")
@@ -129,7 +130,7 @@ class EmissionCycle:
 
     @property
     def weight_sum(self) -> float:
-        return sum(e.emission_weight for e in self.emissions)
+        return math.fsum(e.emission_weight for e in self.emissions)
 
     @property
     def max_weight(self) -> float:
@@ -174,6 +175,7 @@ class EmissionCalculator:
             min_weight_fraction=0.01,    # floor: 1% total reserve across eligible miners
             max_weight_fraction=0.40,    # cap:  40% per miner
             minimum_tier=MinerTier.APPRENTICE,
+            registered_miners={"miner-01", "miner-02"},  # Sybil allowlist (required)
         )
 
         inputs = [
@@ -196,6 +198,8 @@ class EmissionCalculator:
         max_weight_fraction: float = 0.40,
         minimum_tier: MinerTier = MinerTier.APPRENTICE,
         registered_miners: set[str] | None = None,
+        *,
+        allow_unregistered: bool = False,
     ) -> None:
         _validate_finite(
             "min_weight_fraction", min_weight_fraction, minimum=0.0, maximum=1.0
@@ -207,14 +211,24 @@ class EmissionCalculator:
             raise ValueError("max_weight_fraction must be greater than 0")
         if not isinstance(minimum_tier, MinerTier):
             raise ValueError("minimum_tier must be a MinerTier")
+        if type(allow_unregistered) is not bool:
+            raise TypeError("allow_unregistered must be a bool")
+        if allow_unregistered and registered_miners is not None:
+            raise ValueError(
+                "registered_miners and allow_unregistered=True are mutually exclusive"
+            )
         self._weights = weights
         self._min_frac = float(min_weight_fraction)
         self._max_frac = float(max_weight_fraction)
         self._min_tier = minimum_tier
         self._min_tier_order = _TIER_ORDER[minimum_tier]
+        # ``None`` is accepted here so owners can configure the allowlist later
+        # (GovernanceCoordinator guards it the same way), but compute() fails
+        # closed unless the caller explicitly opted out of Sybil filtering.
         self._registered: set[str] | None = (
             None if registered_miners is None else set(registered_miners)
         )
+        self._allow_unregistered = allow_unregistered
 
     def compute(self, inputs: list[MinerEmissionInput]) -> EmissionCycle:
         """Compute emission weights for all miners.
@@ -230,7 +244,15 @@ class EmissionCalculator:
           7. Redistribute the remaining mass without violating either bound
 
         Returns EmissionCycle with all MinerEmission records.
+
+        Raises ValueError when no ``registered_miners`` allowlist was supplied
+        and ``allow_unregistered=True`` was not passed (fail-closed Sybil gate).
         """
+        if self._registered is None and not self._allow_unregistered:
+            raise ValueError(
+                "registered_miners allowlist is required to compute emissions; "
+                "pass allow_unregistered=True to disable Sybil filtering explicitly"
+            )
         seen: set[str] = set()
         for inp in inputs:
             _validate_miner_input(inp)
@@ -347,14 +369,6 @@ class EmissionCalculator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-_TIER_ORDER: dict[MinerTier, int] = {
-    MinerTier.APPRENTICE: 0,
-    MinerTier.JOURNEYMAN: 1,
-    MinerTier.MASTER: 2,
-    MinerTier.ELDER: 3,
-}
 
 
 def _validate_miner_input(inp: MinerEmissionInput) -> None:

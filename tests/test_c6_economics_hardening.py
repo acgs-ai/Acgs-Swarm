@@ -226,14 +226,14 @@ def test_c6_tier_elder_requires_specialist_and_precedent() -> None:
     assert before_precedent is not None
     assert before_precedent.current_tier == MinerTier.MASTER
 
-    promotion = manager.record_precedent("elder-candidate")
+    promotion = manager.record_precedent("elder-candidate", "prec-elder")
     assert promotion is not None
     assert promotion.to_tier == MinerTier.ELDER
 
     manager.register_miner("non-specialist")
     for _ in range(200):
         manager.record_judgment("non-specialist", accepted=True, reputation=1.9)
-    manager.record_precedent("non-specialist")
+    manager.record_precedent("non-specialist", "prec-non-specialist")
     non_specialist = manager.get_performance("non-specialist")
     assert non_specialist is not None
     assert non_specialist.current_tier == MinerTier.JOURNEYMAN
@@ -251,7 +251,10 @@ def test_c6_tier_rejects_invalid_acceptance_policy(min_acceptance_rate: float) -
 def test_c6_tier_preserves_explicit_admin_initial_tier_override() -> None:
     manager = TierManager()
 
-    registered = manager.register_miner("trusted-admin", initial_tier=MinerTier.ELDER)
+    # C39: the privileged grant must be explicit (admin_override=True).
+    registered = manager.register_miner(
+        "trusted-admin", initial_tier=MinerTier.ELDER, admin_override=True
+    )
 
     assert registered.current_tier is MinerTier.ELDER
     persisted = manager.get_performance("trusted-admin")
@@ -483,11 +486,11 @@ class TestC6EmissionInputValidation:
         miner.reputation = float("nan")
 
         with pytest.raises(ValueError, match="reputation"):
-            EmissionCalculator().compute([miner])
+            EmissionCalculator(allow_unregistered=True).compute([miner])
 
     def test_c6_compute_rejects_duplicate_uids_before_dict_projection(self) -> None:
         with pytest.raises(ValueError, match="duplicate.*miner-1"):
-            EmissionCalculator().compute(
+            EmissionCalculator(allow_unregistered=True).compute(
                 [MinerEmissionInput("miner-1"), MinerEmissionInput("miner-1", is_active=False)]
             )
 
@@ -508,7 +511,7 @@ class TestC6EmissionInputValidation:
 
 class TestC6EmissionBoundedSimplex:
     def test_c6_infeasible_configured_cap_is_relaxed_and_reported_for_two_miners(self) -> None:
-        cycle = EmissionCalculator(max_weight_fraction=0.40).compute(
+        cycle = EmissionCalculator(max_weight_fraction=0.40, allow_unregistered=True).compute(
             [MinerEmissionInput("strong", reputation=2.0), MinerEmissionInput("weak", reputation=0.0)]
         )
 
@@ -522,7 +525,7 @@ class TestC6EmissionBoundedSimplex:
 
     def test_c6_feasible_cap_and_floor_hold_without_post_normalization_violation(self) -> None:
         cycle = EmissionCalculator(
-            min_weight_fraction=0.20, max_weight_fraction=0.40
+            min_weight_fraction=0.20, max_weight_fraction=0.40, allow_unregistered=True
         ).compute(
             [
                 MinerEmissionInput(
@@ -547,7 +550,7 @@ class TestC6EmissionBoundedSimplex:
 
     def test_c6_full_reserve_and_exact_feasible_cap_produce_uniform_simplex(self) -> None:
         cycle = EmissionCalculator(
-            min_weight_fraction=1.0, max_weight_fraction=0.25
+            min_weight_fraction=1.0, max_weight_fraction=0.25, allow_unregistered=True
         ).compute(
             [
                 MinerEmissionInput("dominant", reputation=2.0),
@@ -1333,6 +1336,7 @@ def test_c6_emission_simultaneous_cap_and_floor_pressure_conserves_mass() -> Non
         weights=EmissionWeights(1.0, 0.0, 0.0, 0.0, 0.0),
         min_weight_fraction=0.96,
         max_weight_fraction=0.30,
+        allow_unregistered=True,
     ).compute([
         MinerEmissionInput(str(i), manifold_trust=trust)
         for i, trust in enumerate((0.5, 0.49, 0.005, 0.005))
@@ -1342,7 +1346,7 @@ def test_c6_emission_simultaneous_cap_and_floor_pressure_conserves_mass() -> Non
 
 
 def test_c6_emission_summary_reports_cap_relaxation() -> None:
-    cycle = EmissionCalculator().compute([MinerEmissionInput("only")])
+    cycle = EmissionCalculator(allow_unregistered=True).compute([MinerEmissionInput("only")])
     summary = cycle.summary()
     assert summary["configured_cap"] == 0.40
     assert summary["effective_cap"] == 1.0

@@ -26,6 +26,7 @@ from constitutional_swarm.bittensor.compliance_certificate import (
     ComplianceSnapshot,
     HashCommitmentProver,
     HMACProver,
+    ProofType,
     ZKPStubProver,
     _certificate_payload,
 )
@@ -588,7 +589,9 @@ def test_verifier_rejects_same_key_certificate_from_different_issuer() -> None:
 
 
 def test_verifier_rechecks_issuer_identity_after_custom_proof_verification() -> None:
-    issuer = CertificateIssuer("issuer", prover=IssuerMutatingProver())
+    issuer = CertificateIssuer(
+        "issuer", prover=IssuerMutatingProver(), proof_type=ProofType.HMAC_SHA256
+    )
     cert = issuer.issue("subject", AuditPeriod(1.0, 2.0), _snapshot(), threshold=0.9)
 
     assert issuer.verify(cert) is False
@@ -623,7 +626,9 @@ def test_builtin_prover_verify_returns_false_for_malformed_certificate_graph(
     [HMACProver("secret"), ZKPStubProver(), HashCommitmentProver("secret")],
 )
 def test_issuer_verify_rejects_non_ascii_proof_text(prover: object) -> None:
-    issuer = CertificateIssuer("issuer", prover=prover)  # type: ignore[arg-type]
+    issuer = CertificateIssuer(
+        "issuer", prover=prover, allow_insecure_stub=True  # type: ignore[arg-type]
+    )
     cert = issuer.issue("subject", AuditPeriod(1.0, 2.0), _snapshot(), threshold=0.9)
     assert issuer.verify(cert) is True
 
@@ -637,7 +642,9 @@ def test_issuer_verify_rejects_non_ascii_proof_text(prover: object) -> None:
     [HMACProver("secret"), ZKPStubProver(), HashCommitmentProver("secret")],
 )
 def test_builtin_certificate_verifier_rejects_non_ascii_proof_text(prover: object) -> None:
-    issuer = CertificateIssuer("issuer", prover=prover)  # type: ignore[arg-type]
+    issuer = CertificateIssuer(
+        "issuer", prover=prover, allow_insecure_stub=True  # type: ignore[arg-type]
+    )
     cert = issuer.issue("subject", AuditPeriod(1.0, 2.0), _snapshot(), threshold=0.9)
     assert prover.verify_certificate(cert) is True  # type: ignore[attr-defined]
 

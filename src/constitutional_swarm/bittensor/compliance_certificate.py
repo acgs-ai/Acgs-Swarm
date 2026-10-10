@@ -40,7 +40,7 @@ import uuid
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 COMPLIANCE_CERTIFICATE_SECRET_ENV_KEY = "CONSTITUTIONAL_SWARM_COMPLIANCE_CERTIFICATE_SECRET"
 
@@ -66,6 +66,7 @@ def _resolve_compliance_certificate_secret(secret_key: str | None) -> str:
 
 class ProofType(Enum):
     HMAC_SHA256 = "hmac_sha256"  # current — HMAC signed, no ZKP
+    ZKP_STUB = "zkp_stub"  # keyless placeholder — forgeable, testing only
     ZKP_NOIR = "zkp_noir"  # future — Noir ZK-SNARK
     ZKP_CIRCOM = "zkp_circom"  # future — circom/snarkjs
 
@@ -384,15 +385,22 @@ def _certificate_payload(cert: ComplianceCertificate) -> bytes:
 class ComplianceProver(Protocol):
     """Protocol for generating compliance proofs.
 
+    ``CertificateIssuer`` only ever uses the certificate-scoped pair
+    (``prove_certificate``/``verify_certificate``), which binds subject, period,
+    issuer, proof type, and status. Provers lacking it are refused at issuer
+    construction; there is no fallback to the snapshot-only legacy pair.
+
+    Implementations should also declare a ``proof_type`` class attribute so the
+    issuer can label certificates truthfully.
+
     Implement for ZKP backends:
         class NoirProver:
-            def prove(self, snapshot, threshold, constitutional_hash) -> str:
-                # generate Noir ZK-SNARK proof
-                return proof_blob
+            proof_type = ProofType.ZKP_NOIR
 
-            def verify(self, proof, snapshot, threshold, constitutional_hash) -> bool:
-                # verify Noir proof
-                ...
+            def prove(self, snapshot, threshold, constitutional_hash) -> str: ...
+            def verify(self, proof, snapshot, threshold, constitutional_hash) -> bool: ...
+            def prove_certificate(self, cert) -> str: ...
+            def verify_certificate(self, cert) -> bool: ...
     """
 
     def prove(
@@ -414,6 +422,14 @@ class ComplianceProver(Protocol):
         """Verify a proof. Returns True if valid."""
         ...
 
+    def prove_certificate(self, cert: ComplianceCertificate) -> str:
+        """Generate a proof bound to every attested certificate field."""
+        ...
+
+    def verify_certificate(self, cert: ComplianceCertificate) -> bool:
+        """Verify a certificate-scoped proof. Returns True if valid."""
+        ...
+
 
 class HMACProver:
     """HMAC-SHA256 prover — production-ready, no ZKP dependency.
@@ -424,6 +440,8 @@ class HMACProver:
     Reveals: compliance_rate and all snapshot counts (included in cert).
     Does NOT reveal: individual decision content (only aggregate counts).
     """
+
+    proof_type: ClassVar[ProofType] = ProofType.HMAC_SHA256
 
     def __init__(self, secret_key: str) -> None:
         self._key = secret_key.encode()
@@ -473,7 +491,13 @@ class ZKPStubProver:
     Generates a deterministic placeholder proof from the circuit inputs.
     NOT cryptographically sound — for API compatibility testing only.
     Replace with NoirProver when Noir SDK is integrated.
+
+    The proof is an unkeyed hash of public fields, so anyone can forge it.
+    ``CertificateIssuer`` refuses it unless ``allow_insecure_stub=True``.
     """
+
+    proof_type: ClassVar[ProofType] = ProofType.ZKP_STUB
+    insecure_stub: ClassVar[bool] = True
 
     def prove(
         self,
@@ -529,6 +553,8 @@ class HashCommitmentProver:
     serves as the production bridge until then.
     """
 
+    proof_type: ClassVar[ProofType] = ProofType.HMAC_SHA256
+
     def __init__(self, secret_key: str | None = None) -> None:
         self._key = _resolve_compliance_certificate_secret(secret_key).encode()
 
@@ -576,6 +602,27 @@ class HashCommitmentProver:
         except (AttributeError, TypeError, ValueError):
             return False
         return _proof_text_matches(cert.proof, expected)
+
+
+def _resolve_proof_type(prover: object, requested: ProofType | None) -> ProofType:
+    """Label certificates from what the prover is, never from a free default."""
+    if requested is not None and not isinstance(requested, ProofType):
+        raise TypeError("proof_type must be a ProofType")
+    declared = getattr(prover, "proof_type", None)
+    if declared is not None and not isinstance(declared, ProofType):
+        raise TypeError("prover.proof_type must be a ProofType")
+    if declared is None:
+        if requested is None:
+            raise TypeError(
+                "prover does not declare proof_type; pass proof_type= explicitly"
+            )
+        return requested
+    if requested is not None and requested is not declared:
+        raise ValueError(
+            f"proof_type {requested.value!r} does not match the prover's "
+            f"declared proof_type {declared.value!r}"
+        )
+    return declared
 
 
 # ---------------------------------------------------------------------------
@@ -626,15 +673,32 @@ class CertificateIssuer:
         issuer_id: str = "acgs-subnet-owner",
         secret_key: str | None = None,
         prover: ComplianceProver | None = None,
-        proof_type: ProofType = ProofType.HMAC_SHA256,
+        proof_type: ProofType | None = None,
+        *,
+        allow_insecure_stub: bool = False,
     ) -> None:
         _non_empty_text(issuer_id, "issuer_id")
+        if type(allow_insecure_stub) is not bool:
+            raise TypeError("allow_insecure_stub must be a bool")
         self._issuer_id = issuer_id
-        self._proof_type = proof_type
-        if prover is not None:
-            self._prover = prover
-        else:
-            self._prover = HMACProver(_resolve_compliance_certificate_secret(secret_key))
+        resolved_prover: ComplianceProver = (
+            prover
+            if prover is not None
+            else HMACProver(_resolve_compliance_certificate_secret(secret_key))
+        )
+        for method in ("prove_certificate", "verify_certificate"):
+            if not callable(getattr(resolved_prover, method, None)):
+                raise TypeError(
+                    f"prover must implement {method}(); snapshot-only legacy proofs "
+                    "do not bind subject, period, or issuer and are not accepted"
+                )
+        self._proof_type = _resolve_proof_type(resolved_prover, proof_type)
+        if getattr(resolved_prover, "insecure_stub", False) is True and not allow_insecure_stub:
+            raise ValueError(
+                "prover is a keyless insecure stub whose proofs anyone can forge; "
+                "pass allow_insecure_stub=True to use it outside production"
+            )
+        self._prover = resolved_prover
         self._issued: dict[str, ComplianceCertificate] = {}
         self._revoked: set[str] = set()
         self._state_lock = threading.RLock()
@@ -677,12 +741,7 @@ class CertificateIssuer:
             proof="",
             threshold=threshold,
         )
-        prove_certificate = getattr(self._prover, "prove_certificate", None)
-        if callable(prove_certificate):
-            proof = prove_certificate(cert)
-        else:
-            proof = self._prover.prove(snapshot, threshold, snapshot.constitutional_hash)
-        cert = replace(cert, proof=proof)
+        cert = replace(cert, proof=self._prover.prove_certificate(cert))
         with self._state_lock:
             self._issued[cert.cert_id] = cert
         return cert
@@ -710,6 +769,8 @@ class CertificateIssuer:
                 return False
             if cert.issuer_id != self._issuer_id:
                 return False
+            if cert.proof_type is not self._proof_type:
+                return False
             if cert.status != CertificateStatus.VALID:
                 return False
             locally_issued = cert.cert_id in self._issued
@@ -721,17 +782,7 @@ class CertificateIssuer:
             if cert.is_expired:
                 return False
 
-        verify_certificate = getattr(self._prover, "verify_certificate", None)
-        if callable(verify_certificate):
-            proof_valid = bool(verify_certificate(cert))
-        else:
-            proof_valid = self._prover.verify(
-                cert.proof,
-                cert.snapshot,
-                cert.threshold,
-                cert.snapshot.constitutional_hash,
-            )
-        if not proof_valid:
+        if self._prover.verify_certificate(cert) is not True:
             return False
 
         with self._state_lock:
@@ -740,6 +791,8 @@ class CertificateIssuer:
             except (AttributeError, TypeError, ValueError):
                 return False
             if cert.issuer_id != self._issuer_id:
+                return False
+            if cert.proof_type is not self._proof_type:
                 return False
             trusted_revocations = self._revoked | (external_revocations or set())
             return (
