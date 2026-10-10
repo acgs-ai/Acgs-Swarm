@@ -280,7 +280,7 @@ def test_chain_anchor_membership_binds_proof_id_and_vote_hashes() -> None:
         constitutional_hash="const",
     )
 
-    assert record.verify_membership(substituted) is False
+    assert record.verify_membership(substituted, expected_root=record.batch_root) is False
 
 
 def _snapshot() -> ComplianceSnapshot:

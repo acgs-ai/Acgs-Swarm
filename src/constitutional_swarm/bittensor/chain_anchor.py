@@ -173,15 +173,22 @@ class AnchorRecord:
     proof_ids: tuple[str, ...]
     leaf_hashes: tuple[str, ...]
 
-    def verify_membership(self, proof: ProofEvidence) -> bool:
-        """Verify that a proof was included in this batch.
+    def verify_membership(self, proof: ProofEvidence, *, expected_root: str) -> bool:
+        """Verify that a proof was included in the batch anchored at ``expected_root``.
 
-        Re-computes the Merkle root from stored leaf hashes, validates all
-        record counts and types, then checks the candidate's constitution,
-        proof ID, and leaf membership.
+        ``expected_root`` is the trusted root the caller obtained independently
+        (e.g. read from chain at ``block_height``); the record's own
+        ``batch_root`` is never trusted on its own. Re-computes the Merkle
+        root from stored leaf hashes, requires it to equal both the pinned and
+        the stored root, validates all record counts and types, then checks
+        the candidate's constitution, proof ID, and leaf membership.
         """
         if type(proof) is not ProofEvidence:
             return False
+        if type(expected_root) is not str or not is_digest(expected_root):
+            return False
+        # is_digest accepts either hex case; computed roots are lowercase.
+        expected_root = expected_root.lower()
         if (
             type(self.proof_count) is not int
             or self.proof_count < 0
@@ -204,7 +211,8 @@ class AnchorRecord:
         except (TypeError, ValueError):
             return False
         return (
-            hmac.compare_digest(recomputed_root, self.batch_root)
+            hmac.compare_digest(recomputed_root, expected_root)
+            and hmac.compare_digest(recomputed_root, self.batch_root)
             and proof.proof_id in set(self.proof_ids)
             and candidate_leaf in set(self.leaf_hashes)
         )
@@ -259,8 +267,8 @@ class ChainAnchor:
         # Force flush (e.g. at epoch end)
         record = anchor.flush()
 
-        # Verify a proof was anchored
-        assert record.verify_membership(proof_evidence)
+        # Verify a proof was anchored, pinning the root read back from chain
+        assert record.verify_membership(proof_evidence, expected_root=onchain_root)
 
         # Full history
         for rec in anchor.anchor_history:
@@ -402,12 +410,22 @@ class ChainAnchor:
     def verify_proof_in_history(self, proof: ProofEvidence) -> AnchorRecord | None:
         """Find and return the AnchorRecord that contains this proof.
 
+        This only checks this process's own in-memory flush log. It does not
+        read the chain, so it cannot detect a reorg, a submitter that lied
+        about inclusion, or a root that never landed on-chain. To verify
+        against chain state, read the root at ``block_height`` and call
+        ``AnchorRecord.verify_membership(proof, expected_root=...)``.
+
         Returns None if the proof is not found in any anchor batch.
         """
         with self._state_lock:
             history = tuple(self._history)
         for record in history:
-            if record.verify_membership(proof):
+            # Self-pinning is safe only because _history is populated solely
+            # by this anchor's own flush(). Any future deserialiser or
+            # importer for _history MUST take the pinned root from the caller
+            # instead of reusing record.batch_root.
+            if record.verify_membership(proof, expected_root=record.batch_root):
                 return record
         return None
 

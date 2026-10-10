@@ -544,17 +544,18 @@ def test_anchor_record_rejects_inconsistent_or_malformed_metadata() -> None:
         proof_ids=(proof.proof_id,),
         leaf_hashes=(leaf,),
     )
-    assert valid.verify_membership(proof)
-    assert not replace(valid, batch_root=_digest("wrong-root")).verify_membership(proof)
-    assert not replace(valid, proof_count=2).verify_membership(proof)
-    assert not replace(valid, leaf_hashes=("not-a-digest",)).verify_membership(proof)
-    assert not replace(valid, proof_ids=None).verify_membership(proof)  # type: ignore[arg-type]
-    assert not replace(valid, leaf_hashes=None).verify_membership(proof)  # type: ignore[arg-type]
-    assert not replace(valid, constitutional_hash="wrong").verify_membership(proof)
-    assert not replace(valid, proof_ids=("other-proof",)).verify_membership(proof)
-    assert not replace(valid, batch_root="é" * 64).verify_membership(proof)
-    assert not valid.verify_membership(replace(proof, proof_id=1))  # type: ignore[arg-type]
-    assert not valid.verify_membership(replace(proof, vote_hashes=None))  # type: ignore[arg-type]
+    pin = valid.batch_root
+    assert valid.verify_membership(proof, expected_root=pin)
+    assert not replace(valid, batch_root=_digest("wrong-root")).verify_membership(proof, expected_root=pin)
+    assert not replace(valid, proof_count=2).verify_membership(proof, expected_root=pin)
+    assert not replace(valid, leaf_hashes=("not-a-digest",)).verify_membership(proof, expected_root=pin)
+    assert not replace(valid, proof_ids=None).verify_membership(proof, expected_root=pin)  # type: ignore[arg-type]
+    assert not replace(valid, leaf_hashes=None).verify_membership(proof, expected_root=pin)  # type: ignore[arg-type]
+    assert not replace(valid, constitutional_hash="wrong").verify_membership(proof, expected_root=pin)
+    assert not replace(valid, proof_ids=("other-proof",)).verify_membership(proof, expected_root=pin)
+    assert not replace(valid, batch_root="é" * 64).verify_membership(proof, expected_root=pin)
+    assert not valid.verify_membership(replace(proof, proof_id=1), expected_root=pin)  # type: ignore[arg-type]
+    assert not valid.verify_membership(replace(proof, vote_hashes=None), expected_root=pin)  # type: ignore[arg-type]
 
 
 def test_anchor_rejects_spoofed_proof_objects() -> None:
@@ -582,7 +583,7 @@ def test_anchor_rejects_spoofed_proof_objects() -> None:
         leaf_hashes=(genuine.membership_leaf(),),
     )
 
-    assert not record.verify_membership(spoofed)
+    assert not record.verify_membership(spoofed, expected_root=record.batch_root)
     with pytest.raises(TypeError, match="ProofEvidence"):
         ChainAnchor(CONST_HASH).add_proof(spoofed)
 

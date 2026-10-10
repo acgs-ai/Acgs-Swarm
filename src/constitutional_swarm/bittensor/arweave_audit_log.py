@@ -42,6 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from collections.abc import Set as AbstractSet
 from typing import Any, Protocol
 
 from constitutional_swarm.strict_json import StrictJSONError, canonical_dumps, loads
@@ -64,6 +65,53 @@ logger = logging.getLogger(__name__)
 _AUDIT_LEAF_VERSION = 2
 _AUDIT_LEAF_DOMAIN = "constitutional_swarm.audit_log_entry"
 _MAX_BATCH_JSON_BYTES = 64 * 1024 * 1024
+
+# Exact key sets emitted by to_dict(); from_dict() accepts nothing else.
+_ENTRY_KEYS = frozenset(
+    {
+        "entry_id",
+        "case_id",
+        "constitutional_hash",
+        "decision_type",
+        "compliance_passed",
+        "impact_score",
+        "escalation_type",
+        "resolution",
+        "miner_uid",
+        "validator_grade",
+        "decision_at",
+        "tags",
+    }
+)
+_BATCH_KEYS = frozenset(
+    {
+        "batch_id",
+        "leaf_version",
+        "merkle_version",
+        "batch_root",
+        "constitutional_hash",
+        "entry_count",
+        "created_at",
+        "entries",
+        "leaf_hashes",
+    }
+)
+
+
+def _key_preview(keys: AbstractSet[Any]) -> str:
+    # Key names may be attacker-controlled: repr() escapes control characters,
+    # and both the number of keys and each key's length are capped.
+    shown = sorted(repr(key)[:32] for key in keys)[:5]
+    return f"{len(keys)} ({', '.join(shown)}{', ...' if len(keys) > 5 else ''})"
+
+
+def _require_exact_keys(d: dict[str, Any], keys: frozenset[str], kind: str) -> None:
+    unknown = d.keys() - keys
+    if unknown:
+        raise ValueError(f"{kind} has unknown keys: {_key_preview(unknown)}")
+    missing = keys - d.keys()
+    if missing:
+        raise ValueError(f"{kind} is missing keys: {_key_preview(missing)}")
 
 # ---------------------------------------------------------------------------
 # Decision type enum (from Q&A §2)
@@ -192,10 +240,11 @@ class AuditLogEntry:
     def from_dict(cls, d: dict[str, Any]) -> AuditLogEntry:
         if type(d) is not dict:
             raise TypeError("audit entry must be an exact dictionary")
-        tags = d.get("tags", {})
+        _require_exact_keys(d, _ENTRY_KEYS, "audit entry")
+        tags = d["tags"]
         if type(tags) is not dict:
             raise TypeError("entry tags must be an exact dictionary")
-        validator_grade = d.get("validator_grade", float("nan"))
+        validator_grade = d["validator_grade"]
         if validator_grade is None:
             validator_grade = float("nan")
         return cls(
@@ -204,12 +253,12 @@ class AuditLogEntry:
             constitutional_hash=d["constitutional_hash"],
             decision_type=AuditDecisionType(d["decision_type"]),
             compliance_passed=d["compliance_passed"],
-            impact_score=d.get("impact_score", 0.0),
-            escalation_type=d.get("escalation_type", ""),
-            resolution=d.get("resolution", ""),
-            miner_uid=d.get("miner_uid", ""),
+            impact_score=d["impact_score"],
+            escalation_type=d["escalation_type"],
+            resolution=d["resolution"],
+            miner_uid=d["miner_uid"],
             validator_grade=validator_grade,
-            decision_at=d.get("decision_at", time.time()),
+            decision_at=d["decision_at"],
             tags=tuple(tags.items()),
         )
 
@@ -474,7 +523,8 @@ class AuditBatch:
             raise ValueError("audit batch has unsupported leaf version")
         if type(d.get("merkle_version")) is not int or d["merkle_version"] != MERKLE_VERSION:
             raise ValueError("audit batch has unsupported Merkle version")
-        raw_entries = d.get("entries")
+        _require_exact_keys(d, _BATCH_KEYS, "audit batch")
+        raw_entries = d["entries"]
         if type(raw_entries) is not list:
             raise ValueError("audit batch entries must be a list")
         entries = [AuditLogEntry.from_dict(e) for e in raw_entries]
@@ -482,14 +532,14 @@ class AuditBatch:
             batch_id=d["batch_id"],
             constitutional_hash=d["constitutional_hash"],
             entries=entries,
-            created_at=d.get("created_at"),
+            created_at=d["created_at"],
         )
-        serialized_leaves = d.get("leaf_hashes")
+        serialized_leaves = d["leaf_hashes"]
         if type(serialized_leaves) is not list or serialized_leaves != batch.leaf_hashes:
             raise ValueError("audit batch leaf hashes do not match entries")
-        if type(d.get("entry_count")) is not int or d["entry_count"] != batch.entry_count:
+        if type(d["entry_count"]) is not int or d["entry_count"] != batch.entry_count:
             raise ValueError("audit batch entry count does not match entries")
-        if type(d.get("batch_root")) is not str or d["batch_root"] != batch.batch_root:
+        if type(d["batch_root"]) is not str or d["batch_root"] != batch.batch_root:
             raise ValueError("audit batch root does not match entries")
         return batch
 
