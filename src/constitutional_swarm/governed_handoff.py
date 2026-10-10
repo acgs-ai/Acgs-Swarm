@@ -164,8 +164,10 @@ DEFAULT_SECRET_COMMAND_PATTERNS: tuple[str, ...] = (
 
 # Child processes see a code-owned search path and a small set of benign locale
 # and home-directory values. In particular, no ACGS signing value or ambient
-# credential is inherited across the process boundary.
-FIXED_SUBPROCESS_PATH = "/usr/local/bin:/usr/bin:/bin"
+# credential is inherited across the process boundary. System directories come
+# first so an operator-writable /usr/local/bin cannot shadow system tools; it
+# stays last because operator-installed agent CLIs commonly live there.
+FIXED_SUBPROCESS_PATH = "/usr/bin:/bin:/usr/local/bin"
 _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {"HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"}
 )
@@ -612,14 +614,15 @@ class ExternalAgentAdapter:
     def propose_actions(self, task: TaskSpec) -> list[Action]:
         if not self._command:
             raise RuntimeError(f"{self.name} adapter is not configured")
-        argv = [*shlex.split(self._command), str(task.path)]
+        env = _scrubbed_env()
+        argv = [*self._resolve_command(), str(task.path)]
         completed = subprocess.run(
             argv,
             check=False,
             capture_output=True,
             text=True,
             timeout=120,
-            env=_scrubbed_env(),
+            env=env,
         )
         if completed.returncode != 0:
             raise RuntimeError(
@@ -627,6 +630,36 @@ class ExternalAgentAdapter:
             )
         synthetic = TaskSpec(task.task_id, task.path, completed.stdout, task.metadata)
         return MockAdapter().propose_actions(synthetic)
+
+    def _resolve_command(self) -> list[str]:
+        """Resolve the operator command's executable on the fixed path.
+
+        A bare name is looked up on ``FIXED_SUBPROCESS_PATH``; a path must be
+        absolute and executable. Relative paths would resolve against the
+        supervisor's working directory, so they are refused.
+        """
+
+        try:
+            argv = shlex.split(self._command or "")
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.name} adapter command is unparseable; fail closed"
+            ) from exc
+        if not argv:
+            raise RuntimeError(f"{self.name} adapter command is empty; fail closed")
+        executable = argv[0]
+        if "/" in executable.replace("\\", "/") and not Path(executable).is_absolute():
+            raise RuntimeError(
+                f"{self.name} adapter executable must be a bare name or an "
+                "absolute path; fail closed"
+            )
+        resolved = shutil.which(executable, path=FIXED_SUBPROCESS_PATH)
+        if resolved is None or not Path(resolved).is_absolute():
+            raise RuntimeError(
+                f"{self.name} adapter executable {executable!r} cannot be resolved "
+                "on the fixed path; fail closed"
+            )
+        return [resolved, *argv[1:]]
 
 
 def build_adapter(name: str, config: dict[str, Any] | None = None) -> ExecutorAdapter:
