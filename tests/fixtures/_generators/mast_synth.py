@@ -72,23 +72,43 @@ def _redundant_trace(rng: random.Random, idx: int) -> dict:
         f=f"src/module_{rng.randint(1, 20)}.py",
         feature=f"feature_{rng.randint(1, 50)}",
     )
-    # Two agents producing the SAME payload — that's the redundancy. The detector
-    # decides whether dedupe catches it.
+    first_agent = f"agent_{rng.choice(['a', 'b', 'c'])}"
+    second_agent = f"agent_{rng.choice(['a', 'b', 'c'])}"
+    trace_id = _stable_id("red", idx)
+    # Distinct completion event IDs prove that the same canonical work completed
+    # twice. Agent identity does not change whether the computation is redundant.
     return {
-        "trace_id": _stable_id("red", idx),
+        "trace_id": trace_id,
         "failure_mode": "redundant_work",
-        "agents": [f"agent_{rng.choice(['a', 'b', 'c'])}", f"agent_{rng.choice(['a', 'b', 'c'])}"],
+        "agents": [first_agent, second_agent],
         "payload": payload,
         "context": {"rounds": 1},
-        "expected_caught_by": "merkle_crdt+content_hash_dedupe",
+        "events": [
+            {
+                "type": "work_completed",
+                "event_id": f"{trace_id}-completion-1",
+                "agent_id": first_agent,
+                "payload": payload,
+            },
+            {
+                "type": "work_completed",
+                "event_id": f"{trace_id}-completion-2",
+                "agent_id": second_agent,
+                "payload": payload,
+            },
+        ],
+        "expected_caught_by": "duplicate_work_completed_evidence",
     }
 
 
 def _handoff_trace(rng: random.Random, idx: int) -> dict:
     base = dict(rng.choice(HANDOFF_TEMPLATES))
     base["artifact"] = base["artifact"].format(n=idx)
+    trace_id = _stable_id("hof", idx)
+    handoff_id = f"{trace_id}-handoff"
+    sent_round = 1
     return {
-        "trace_id": _stable_id("hof", idx),
+        "trace_id": trace_id,
         "failure_mode": "missed_handoff",
         "agents": [base["src"], base["dst"]],
         "payload": json.dumps({"artifact": base["artifact"]}),
@@ -96,10 +116,21 @@ def _handoff_trace(rng: random.Random, idx: int) -> dict:
             "src": base["src"],
             "dst": base["dst"],
             "deadline_rounds": base["deadline_rounds"],
-            # Without governance, the handoff is "dropped" (no replication).
-            # With governance, gossip merges propagate it within deadline.
+            "observation_end_round": sent_round + base["deadline_rounds"],
+            # The observation window extends through the deadline, so the
+            # missing acknowledgement is measurable rather than unavailable.
         },
-        "expected_caught_by": "gossip_merge_within_deadline",
+        "events": [
+            {
+                "type": "handoff_sent",
+                "event_id": f"{trace_id}-sent",
+                "handoff_id": handoff_id,
+                "src": base["src"],
+                "dst": base["dst"],
+                "round": sent_round,
+            }
+        ],
+        "expected_caught_by": "missing_or_late_handoff_ack_evidence",
     }
 
 

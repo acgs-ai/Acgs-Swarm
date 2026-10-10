@@ -11,6 +11,7 @@ Modules covered:
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from unittest.mock import MagicMock
 
@@ -25,11 +26,13 @@ from constitutional_swarm.bittensor.emission_calculator import (
     MinerTier,
 )
 from constitutional_swarm.bittensor.governance_coordinator import (
+    CoordinatorConfig,
     GovernanceCoordinator,
 )
 from constitutional_swarm.debate_resolver import (
     Challenge,
     DebateResolver,
+    DebateRole,
     Proposal,
     VerdictOutcome,
 )
@@ -43,6 +46,8 @@ from constitutional_swarm.mac_acgs_loop import (
     MacAcgsLoop,
     PipelineEventType,
 )
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 try:
     from constitutional_swarm.swarm_ode import DiscreteGaussianSampler
@@ -59,27 +64,49 @@ except ImportError:
 _CONST_HASH = "608508a9bd224290"
 _NOW = time.time()
 
+# C43: debate roles come from a pinned registry, never from debate messages.
+_DEBATE_PARTICIPANTS: dict[str, list[DebateRole]] = {
+    **{cid: [DebateRole.CHALLENGER] for cid in ("validator-1", "v-1", "v1", "v2", "c1")},
+    **{
+        did: [DebateRole.DEFENDER]
+        for did in ("d1", *(f"defender-{i}" for i in range(5)), *(f"def-{i}" for i in range(5)))
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+# C43: credentials are signed by an issuer key pinned per org at bridge
+# construction, and always carry an explicit expiry after issuance.
+_ISSUER = Ed25519PrivateKey.generate()
+_ISSUER_PUBLIC = _ISSUER.public_key().public_bytes(
+    serialization.Encoding.Raw, serialization.PublicFormat.Raw
+)
+
+
 def _make_credential(
     agent_id: str = "agent-test",
     org_id: str = "test-org",
     constitutional_hash: str = _CONST_HASH,
-    expires_at: float = 0.0,
-    domains: tuple[str, ...] = (),
+    expires_at: float = _NOW + 3600,
+    domains: tuple[str, ...] = ("*",),
+    status: CredentialStatus = CredentialStatus.ACTIVE,
 ) -> AgentCredential:
-    return AgentCredential(
+    credential = AgentCredential(
         agent_id=agent_id,
         org_id=org_id,
         pubkey_fingerprint="abcdef123456",
         constitutional_hash=constitutional_hash,
-        issued_at=_NOW - 10,
+        issued_at=_NOW - 1000,
         expires_at=expires_at,
         domains=domains,
+        status=status,
+    )
+    return dataclasses.replace(
+        credential, issuer_signature=_ISSUER.sign(credential.signing_digest())
     )
 
 
@@ -87,6 +114,7 @@ def _make_bridge() -> FederatedConstitutionBridge:
     return FederatedConstitutionBridge(
         local_constitutional_hash=_CONST_HASH,
         require_hash_match=True,
+        issuer_keys={"test-org": [_ISSUER_PUBLIC]},
     )
 
 
@@ -100,7 +128,7 @@ class TestFederatedConstitutionBridge:
 
     def test_gate_rejects_unknown_credential(self) -> None:
         bridge = _make_bridge()
-        decision = bridge.gate("non-existent-agent", domain="privacy")
+        decision = bridge.gate("non-existent-agent", org_id="test-org", domain="privacy")
         assert not decision.allowed
         assert decision.reason == "UNKNOWN_CREDENTIAL"
 
@@ -108,8 +136,8 @@ class TestFederatedConstitutionBridge:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-rev")
         bridge.register_credential(cred)
-        bridge.revoke("agent-rev")
-        decision = bridge.gate("agent-rev", domain="safety")
+        bridge.revoke("agent-rev", org_id=cred.org_id)
+        decision = bridge.gate("agent-rev", org_id=cred.org_id, domain="safety")
         assert not decision.allowed
         assert decision.reason == "REVOKED"
 
@@ -120,7 +148,7 @@ class TestFederatedConstitutionBridge:
             expires_at=_NOW - 100,  # already expired
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-exp", domain="")
+        decision = bridge.gate("agent-exp", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "EXPIRED"
 
@@ -131,7 +159,7 @@ class TestFederatedConstitutionBridge:
             constitutional_hash="WRONG_HASH_1234",
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-hash", domain="")
+        decision = bridge.gate("agent-hash", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "HASH_MISMATCH"
 
@@ -142,7 +170,7 @@ class TestFederatedConstitutionBridge:
             domains=("safety",),  # only safety, not privacy
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-dom", domain="privacy")
+        decision = bridge.gate("agent-dom", org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert decision.reason == "DOMAIN_DENIED"
 
@@ -153,26 +181,27 @@ class TestFederatedConstitutionBridge:
             domains=("privacy",),
         )
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-ok", domain="privacy")
+        decision = bridge.gate("agent-ok", org_id=cred.org_id, domain="privacy")
         assert decision.allowed
         assert decision.reason == "ALLOWED"
 
-    def test_gate_allows_valid_credential_no_domain_restriction(self) -> None:
+    def test_gate_rejects_empty_domain_allowlist(self) -> None:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-open", domains=())
         bridge.register_credential(cred)
-        decision = bridge.gate("agent-open", domain="anything")
-        assert decision.allowed
+        decision = bridge.gate("agent-open", org_id=cred.org_id, domain="anything")
+        assert not decision.allowed
+        assert decision.reason == "DOMAIN_DENIED"
 
     def test_revoke_returns_true_for_known_agent(self) -> None:
         bridge = _make_bridge()
         cred = _make_credential(agent_id="agent-known")
         bridge.register_credential(cred)
-        assert bridge.revoke("agent-known") is True
+        assert bridge.revoke("agent-known", org_id=cred.org_id) is True
 
     def test_revoke_returns_false_for_unknown_agent(self) -> None:
         bridge = _make_bridge()
-        assert bridge.revoke("ghost-agent") is False
+        assert bridge.revoke("ghost-agent", org_id="test-org") is False
 
     def test_summary_returns_correct_counts(self) -> None:
         bridge = _make_bridge()
@@ -181,9 +210,9 @@ class TestFederatedConstitutionBridge:
         bridge.register_credential(cred_ok)
         bridge.register_credential(cred_bad)
 
-        bridge.gate("agent-a", domain="")  # should ALLOW
-        bridge.gate("agent-b", domain="")  # should DENY (hash mismatch)
-        bridge.gate("nobody", domain="")  # should DENY (unknown)
+        bridge.gate("agent-a", org_id=cred_ok.org_id, domain="privacy")  # should ALLOW
+        bridge.gate("agent-b", org_id=cred_bad.org_id, domain="privacy")  # hash mismatch
+        bridge.gate("nobody", org_id="test-org", domain="privacy")  # unknown
 
         s = bridge.summary()
         assert s["registered_credentials"] == 2
@@ -196,8 +225,8 @@ class TestFederatedConstitutionBridge:
         cred = _make_credential(agent_id="agent-log")
         bridge.register_credential(cred)
 
-        bridge.gate("agent-log", domain="privacy")
-        bridge.gate("ghost", domain="safety")
+        bridge.gate("agent-log", org_id=cred.org_id, domain="privacy")
+        bridge.gate("ghost", org_id="test-org", domain="safety")
 
         log = bridge.audit_log()
         assert len(log) == 2
@@ -212,8 +241,8 @@ class TestFederatedConstitutionBridge:
 
         t1 = _NOW + 1
         t2 = _NOW + 2
-        bridge.gate("agent-ts", domain="", now=t1)
-        bridge.gate("agent-ts", domain="", now=t2)
+        bridge.gate("agent-ts", org_id=cred.org_id, domain="privacy", now=t1)
+        bridge.gate("agent-ts", org_id=cred.org_id, domain="privacy", now=t2)
 
         log = bridge.audit_log()
         assert log[0]["timestamp"] <= log[1]["timestamp"]
@@ -228,44 +257,44 @@ class TestDebateResolver:
     """Tests for the adversarial debate resolution protocol."""
 
     def test_propose_creates_proposal(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         prop = resolver.propose("p-001", "miner-1", "privacy", "Content A")
         assert isinstance(prop, Proposal)
         assert prop.proposal_id == "p-001"
         assert prop.proposer_id == "miner-1"
 
     def test_propose_duplicate_raises_value_error(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p-dup", "miner-1", "safety", "Content")
         with pytest.raises(ValueError, match="already exists"):
             resolver.propose("p-dup", "miner-2", "safety", "Content 2")
 
     def test_challenge_invalid_severity_raises_value_error(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p-sev", "miner-1", "safety", "Content")
         with pytest.raises(ValueError, match="severity"):
             resolver.challenge("p-sev", "validator-1", "bad objection", severity=1.5)
 
     def test_challenge_negative_severity_raises_value_error(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p-neg", "miner-1", "safety", "Content")
         with pytest.raises(ValueError, match="severity"):
             resolver.challenge("p-neg", "validator-1", "bad objection", severity=-0.1)
 
     def test_challenge_unknown_proposal_raises_key_error(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         with pytest.raises(KeyError, match="not found"):
             resolver.challenge("ghost-proposal", "validator-1", "objection")
 
     def test_resolve_zero_challenges_min_one_deadlock(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p-dead", "miner-1", "safety", "Content")
         # No challenges submitted
         verdict = resolver.resolve("p-dead")
         assert verdict.outcome == VerdictOutcome.DEADLOCK
 
     def test_resolve_challenge_defense_moderate_severity_approved_or_rejected(self) -> None:
-        resolver = DebateResolver(min_challenges=1, approval_threshold=0.6)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1, approval_threshold=0.6)
         resolver.propose("p-mod", "miner-1", "privacy", "Content")
         resolver.challenge("p-mod", "validator-1", "moderate issue", severity=0.4)
         resolver.defend("p-mod", "miner-1", "strong rebuttal")
@@ -274,14 +303,14 @@ class TestDebateResolver:
         assert 0.0 <= verdict.approval_score <= 1.0
 
     def test_resolve_hash_mismatch_raises_permission_error(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p-hash", "miner-1", "safety", "Content")
         resolver.challenge("p-hash", "validator-1", "objection", severity=0.5)
         with pytest.raises(PermissionError, match="hash"):
             resolver.resolve("p-hash", constitutional_hash="BAD_HASH")
 
     def test_resolve_high_severity_escalated(self) -> None:
-        resolver = DebateResolver(
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, 
             min_challenges=1,
             escalation_threshold=0.85,
         )
@@ -291,7 +320,7 @@ class TestDebateResolver:
         assert verdict.outcome == VerdictOutcome.ESCALATED
 
     def test_get_record_merkle_root_non_empty_after_resolve(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p-mrk", "miner-1", "safety", "Content")
         resolver.challenge("p-mrk", "validator-1", "objection", severity=0.3)
         resolver.resolve("p-mrk")
@@ -300,7 +329,7 @@ class TestDebateResolver:
         assert len(record.merkle_root) > 0
 
     def test_summary_returns_correct_counts(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p-s1", "miner-1", "safety", "Content 1")
         resolver.propose("p-s2", "miner-2", "privacy", "Content 2")
         resolver.challenge("p-s1", "v-1", "objection", severity=0.5)
@@ -314,7 +343,7 @@ class TestDebateResolver:
         assert "avg_approval_score" in s
 
     def test_open_and_resolved_proposals(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p-open", "miner-1", "safety", "Content")
         resolver.propose("p-closed", "miner-2", "privacy", "Content")
         resolver.challenge("p-closed", "v-1", "objection", severity=0.5)
@@ -325,7 +354,7 @@ class TestDebateResolver:
 
     @pytest.mark.parametrize("severity", [0.05, 0.5, 1.0])
     def test_challenge_valid_severity_boundaries(self, severity: float) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose(f"p-sev-{severity}", "miner-1", "safety", "Content")
         c = resolver.challenge(f"p-sev-{severity}", "v-1", "objection", severity=severity)
         assert isinstance(c, Challenge)
@@ -463,7 +492,9 @@ class TestGovernanceCoordinatorNewMethods:
     def test_compute_emissions_without_manifold_returns_emission_cycle(self) -> None:
         from constitutional_swarm.bittensor.emission_calculator import EmissionCycle
 
-        coord = self._make_coordinator()
+        coord = GovernanceCoordinator(
+            CoordinatorConfig(registered_miners={"miner-a", "miner-b"})
+        )
         inputs = [
             MinerEmissionInput("miner-a", tier=MinerTier.APPRENTICE),
             MinerEmissionInput("miner-b", tier=MinerTier.JOURNEYMAN),
@@ -475,7 +506,9 @@ class TestGovernanceCoordinatorNewMethods:
         from constitutional_swarm.bittensor.emission_calculator import EmissionCycle
         from constitutional_swarm.manifold import GovernanceManifold
 
-        coord = self._make_coordinator()
+        coord = GovernanceCoordinator(
+            CoordinatorConfig(registered_miners={"miner-x", "miner-y"})
+        )
         manifold = GovernanceManifold(num_agents=2)
         manifold.update_trust(0, 1, 1.0)
         manifold.update_trust(1, 0, 0.5)
@@ -611,8 +644,25 @@ def _make_came_mock(rules: list[str] | None = None) -> MagicMock:
     return mock
 
 
+def _reviewed_loop(came: MagicMock, config: MacAcgsConfig | None = None) -> MacAcgsLoop:
+    """C43: approval needs a registered external reviewer's challenge.
+
+    Synthetic auto-challenges never count; the reviewer issues one 0.10-severity
+    challenge per proposal and the proposer auto-defends.
+    """
+    loop = MacAcgsLoop(
+        config=config or MacAcgsConfig(auto_defend=True),
+        came=came,
+        challenge_provider=lambda proposal: [
+            ("human-reviewer-1", f"review of {proposal.proposal_id}", 0.10)
+        ],
+    )
+    loop.add_external_challenger("human-reviewer-1")
+    return loop
+
+
 class TestMacAcgsLoopHappyPath:
-    """MacAcgsLoop: default config with auto-challenge + auto-defend."""
+    """MacAcgsLoop: registered external reviewer + auto-defend."""
 
     def test_cycle_with_no_rules_proposed(self) -> None:
         """If CAME proposes nothing, pipeline completes without debate."""
@@ -626,8 +676,8 @@ class TestMacAcgsLoopHappyPath:
         assert len(result.constitution_updates) == 0
 
     def test_cycle_with_rules_approved(self) -> None:
-        """Auto-challenge (severity 0.15) + auto-defend → APPROVED with default threshold 0.6."""
-        loop = MacAcgsLoop(came=_make_came_mock(rules=["Rule A", "Rule B"]))
+        """Reviewer challenge (severity 0.10) + auto-defend → APPROVED at threshold 0.6."""
+        loop = _reviewed_loop(_make_came_mock(rules=["Rule A", "Rule B"]))
         result = loop.run_cycle([])
         # With auto-challenge severity=0.15, auto-defend:
         # score = 0.5 - 0.15*0.3 + 0.15 = 0.605 >= 0.6
@@ -640,9 +690,9 @@ class TestMacAcgsLoopHappyPath:
 
     def test_scoring_math_default_config(self) -> None:
         """Verify the exact approval score math."""
-        loop = MacAcgsLoop(came=_make_came_mock(rules=["test rule"]))
+        loop = _reviewed_loop(_make_came_mock(rules=["test rule"]))
         result = loop.run_cycle([])
-        # score = 0.5 - 0.15*0.3 + 0.15 = 0.605
+        # score = 0.5 - 0.10*0.3 + 0.15*(1 - 0.10) = 0.605
         assert len(result.constitution_updates) == 1
         verdict = result.constitution_updates[0].verdict
         assert abs(verdict.approval_score - 0.605) < 1e-9
@@ -657,7 +707,7 @@ class TestMacAcgsLoopHappyPath:
     def test_constitution_updates_accumulate(self) -> None:
         """Updates from multiple cycles accumulate in constitution_updates()."""
         came = _make_came_mock(rules=["R1"])
-        loop = MacAcgsLoop(came=came)
+        loop = _reviewed_loop(came)
         loop.run_cycle([])
         # Second cycle — need fresh debate for new proposal IDs
         came.evolve_cycle.return_value = CAMECycleResult(
@@ -765,13 +815,13 @@ class TestMacAcgsLoopRuleContent:
     """MacAcgsLoop: actual rule content is used, not synthetic placeholders."""
 
     def test_rule_content_from_came_proposal(self) -> None:
-        loop = MacAcgsLoop(came=_make_came_mock(rules=["Agents must log all decisions"]))
+        loop = _reviewed_loop(_make_came_mock(rules=["Agents must log all decisions"]))
         result = loop.run_cycle([])
         assert len(result.constitution_updates) == 1
         assert result.constitution_updates[0].rule_content == "Agents must log all decisions"
 
     def test_empty_rule_gets_fallback_descriptor(self) -> None:
-        loop = MacAcgsLoop(came=_make_came_mock(rules=["  "]))  # whitespace-only
+        loop = _reviewed_loop(_make_came_mock(rules=["  "]))  # whitespace-only
         result = loop.run_cycle([])
         assert len(result.constitution_updates) == 1
         assert "CAME rule" in result.constitution_updates[0].rule_content
@@ -787,7 +837,7 @@ class TestDebateResolverPostVerdictGuards:
     """Post-verdict mutation must be blocked after Merkle seal."""
 
     def test_challenge_after_resolve_raises(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p1", "m1", "safety", "Content")
         resolver.challenge("p1", "v1", "objection", severity=0.5)
         resolver.resolve("p1")
@@ -795,7 +845,7 @@ class TestDebateResolverPostVerdictGuards:
             resolver.challenge("p1", "v2", "late", severity=0.5)
 
     def test_defend_after_resolve_raises(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p1", "m1", "safety", "Content")
         resolver.challenge("p1", "v1", "objection", severity=0.5)
         resolver.resolve("p1")
@@ -803,7 +853,7 @@ class TestDebateResolverPostVerdictGuards:
             resolver.defend("p1", "m1", "late defense")
 
     def test_double_resolve_raises(self) -> None:
-        resolver = DebateResolver(min_challenges=1)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, min_challenges=1)
         resolver.propose("p1", "m1", "safety", "Content")
         resolver.challenge("p1", "v1", "objection", severity=0.5)
         resolver.resolve("p1")
@@ -815,7 +865,7 @@ class TestDebateResolverMinSeverity:
     """Severity below _MIN_SEVERITY must be rejected."""
 
     def test_severity_below_min_raises(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p1", "m1", "safety", "C")
         with pytest.raises(ValueError, match=r"severity must be >= 0\.05"):
             resolver.challenge("p1", "v1", "trivial", severity=0.01)
@@ -825,7 +875,7 @@ class TestDebateResolverDefenseCap:
     """Per-defender defense count must be capped at _MAX_DEFENSES_PER_DEFENDER."""
 
     def test_exceed_defense_cap_raises(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p1", "m1", "safety", "C")
         for i in range(3):
             resolver.defend("p1", "m1", f"defense-{i}")
@@ -833,7 +883,7 @@ class TestDebateResolverDefenseCap:
             resolver.defend("p1", "m1", "one too many")
 
     def test_different_defenders_not_capped(self) -> None:
-        resolver = DebateResolver()
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS)
         resolver.propose("p1", "m1", "safety", "C")
         for i in range(5):
             resolver.defend("p1", f"defender-{i}", f"defense-{i}")
@@ -845,19 +895,9 @@ class TestFederatedBridgePendingEnforcement:
 
     def test_gate_rejects_pending_credential(self) -> None:
         bridge = _make_bridge()
-        cred = _make_credential(agent_id="pending-agent")
-        cred = AgentCredential(
-            agent_id=cred.agent_id,
-            org_id=cred.org_id,
-            pubkey_fingerprint=cred.pubkey_fingerprint,
-            constitutional_hash=cred.constitutional_hash,
-            issued_at=cred.issued_at,
-            expires_at=cred.expires_at,
-            domains=cred.domains,
-            status=CredentialStatus.PENDING,
-        )
+        cred = _make_credential(agent_id="pending-agent", status=CredentialStatus.PENDING)
         bridge.register_credential(cred)
-        decision = bridge.gate(cred.agent_id)
+        decision = bridge.gate(cred.agent_id, org_id=cred.org_id, domain="privacy")
         assert not decision.allowed
         assert "PENDING" in decision.reason
 
@@ -911,15 +951,14 @@ class TestConstitutionalHashConsolidation:
 
 
 class TestDefenseFloodingMitigation:
-    """Verify defense credit scales inversely with max challenge severity."""
+    """Verify one fixed defense-response credit scales with challenge severity."""
 
     def test_high_severity_limits_defense_value(self) -> None:
         """Many defenses should NOT override a high-severity challenge."""
-        resolver = DebateResolver(approval_threshold=0.6)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, approval_threshold=0.6)
         resolver.propose("p1", "proposer", "domain", "content")
         resolver.challenge("p1", "c1", "critical flaw", severity=0.8)
-        # Use different defender IDs to avoid per-defender cap.
-        # score = 0.5 - 0.24 + 5*0.15*(1-0.8) = 0.5 - 0.24 + 0.15 = 0.41
+        # Asserted defender IDs carry no weight: score = 0.5 - 0.24 + 0.15*0.2 = 0.29.
         for i in range(5):
             resolver.defend("p1", f"def-{i}", f"rebuttal {i}")
         verdict = resolver.resolve("p1")
@@ -928,7 +967,7 @@ class TestDefenseFloodingMitigation:
 
     def test_low_severity_defense_still_effective(self) -> None:
         """A single defense should still clear a low-severity challenge."""
-        resolver = DebateResolver(approval_threshold=0.6)
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, approval_threshold=0.6)
         resolver.propose("p2", "proposer", "domain", "content")
         resolver.challenge("p2", "c1", "minor concern", severity=0.10)
         resolver.defend("p2", "d1", "addressed")
@@ -1041,29 +1080,23 @@ class TestGossipBatchLimits:
             decode_batch(json.dumps(nodes))
 
     def test_valid_batch_accepted(self) -> None:
-        import json
+        from constitutional_swarm.gossip_protocol import decode_batch, encode_batch
+        from constitutional_swarm.merkle_crdt import MerkleCRDT
 
-        from constitutional_swarm.gossip_protocol import decode_batch
+        expected = MerkleCRDT("a").append("p")
+        result = decode_batch(encode_batch([expected]))
 
-        nodes = [
-            {
-                "cid": "c1",
-                "agent_id": "a",
-                "payload": "p",
-                "parent_cids": [],
-                "bodes_passed": False,
-                "constitutional_hash": "",
-            }
-        ]
-        result = decode_batch(json.dumps(nodes))
         assert len(result) == 1
+        assert result[0].cid == expected.cid
+        assert result[0].to_canonical_dict() == expected.to_canonical_dict()
+        assert result[0].verify_cid()
 
 
 class TestResolverHashValidation:
     """DebateResolver.resolve() should validate against instance hash."""
 
     def test_custom_hash_accepted_when_matching(self) -> None:
-        resolver = DebateResolver(constitutional_hash="custom_hash_42")
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, constitutional_hash="custom_hash_42")
         resolver.propose("p1", "proposer", "domain", "content")
         resolver.challenge("p1", "c1", "test", severity=0.1)
         resolver.defend("p1", "d1", "ok")
@@ -1071,7 +1104,7 @@ class TestResolverHashValidation:
         assert verdict.outcome in (VerdictOutcome.APPROVED, VerdictOutcome.REJECTED)
 
     def test_mismatched_hash_raises(self) -> None:
-        resolver = DebateResolver(constitutional_hash="custom_hash_42")
+        resolver = DebateResolver(participants=_DEBATE_PARTICIPANTS, constitutional_hash="custom_hash_42")
         resolver.propose("p1", "proposer", "domain", "content")
         resolver.challenge("p1", "c1", "test", severity=0.1)
         with pytest.raises(PermissionError, match="hash mismatch"):

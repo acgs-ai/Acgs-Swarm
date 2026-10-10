@@ -2,19 +2,31 @@
 
 ``CAMECoordinator`` is deliberately precedent-agnostic. When the MAP-Elites
 grid hits a ceiling it delegates rule codification entirely to its codifier,
-passing an *empty* ``live_approaches`` list — feeding raw, unvalidated
-``MinerApproach`` grid data into rule proposal would bypass validator
-consensus, which is exactly what the coordinator refuses to do (see
+passing an *empty* ``live_approaches`` list — feeding raw, unadmitted
+``MinerApproach`` grid data into rule proposal would bypass canonical
+precedent admission, which is exactly what the coordinator refuses to do (see
 ``CAMECoordinator`` docstring and PR #118). Consequently a plain
 :class:`~constitutional_swarm.bittensor.rule_codifier.RuleCodifier` wired into
 the coordinator always receives an empty precedent list and proposes nothing,
 even at ceiling.
 
 :class:`PrecedentBackedCodifier` is the sanctioned adapter that closes that
-loop. It owns a validated ``PrecedentRecord`` stream — escalated,
-validator-approved cases — and ignores the grid argument entirely, feeding its
-own accumulated precedents into a real ``RuleCodifier``. The coordinator stays
-precedent-agnostic; this codifier is where precedent enters the pipeline.
+loop. It observes exact active snapshots from an explicit
+:class:`~constitutional_swarm.bittensor.precedent_store.PrecedentStore` and
+ignores the grid argument entirely, feeding its accumulated precedents into a
+real ``RuleCodifier``. Store admission verifies at least five distinct authorized
+signed voter envelopes and recomputes the 3/5 outcome from their bound evidence.
+The coordinator stays precedent-agnostic; this codifier is where admitted
+precedent enters the pipeline.
+
+Trust boundary: admission metadata (``impact_vector``, ``escalation_type``,
+``case_id``) is trusted-caller input and is NOT bound by the vote signatures,
+which cover only the task, assignment, producer, artifact, judgment content and
+constitution. Feed ``store.admit`` only records whose metadata comes from an
+owner-held case (e.g. ``SubnetOwner.record_result``), never metadata supplied by
+the precedent submitter. Follow-up: derive ``task_id`` from
+``H(case_id, escalation_type, canonical impact_vector)`` so the signed task binding
+authenticates the metadata.
 
 Usage::
 
@@ -22,11 +34,21 @@ Usage::
         CAMECoordinator,
         PrecedentBackedCodifier,
         PrecedentRecord,
+        PrecedentStore,
     )
+    from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
-    codifier = PrecedentBackedCodifier(min_cluster_size=5)
+    store = PrecedentStore(
+        CONSTITUTIONAL_HASH,
+        vote_registry=provisioned_vote_registry,
+    )
+    codifier = PrecedentBackedCodifier(
+        precedent_store=store,
+        min_cluster_size=5,
+    )
     for record in validated_precedents:
-        codifier.observe(record)
+        canonical = store.admit(record)
+        codifier.observe(canonical)
 
     coordinator = CAMECoordinator(codifier=codifier)
     result = coordinator.evolve_cycle(approaches)
@@ -37,11 +59,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from constitutional_swarm.bittensor.rule_codifier import RuleCodifier
+from constitutional_swarm.bittensor.precedent_store import PrecedentStore
+from constitutional_swarm.bittensor.rule_codifier import _DEFAULT_PROPOSER_ID, RuleCodifier
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
 
@@ -51,10 +74,10 @@ class PrecedentBackedCodifier:
 
     Presents the duck-typed ``find_clusters`` / ``propose_rules`` interface
     that :class:`~constitutional_swarm.bittensor.came_coordinator.CAMECoordinator`
-    expects, but sources clusters from its own validated precedents rather than
-    from the live MAP-Elites grid. This is the loop-closing adapter: the
-    coordinator is intentionally precedent-agnostic, so this class owns the
-    validated ``PrecedentRecord`` stream.
+    expects, but sources clusters from its own store-admitted precedents rather
+    than from the live MAP-Elites grid. This is the loop-closing adapter: the
+    coordinator is intentionally precedent-agnostic, so this class observes an
+    explicit canonical ``PrecedentRecord`` stream.
 
     Parameters
     ----------
@@ -62,8 +85,13 @@ class PrecedentBackedCodifier:
         A pre-built :class:`RuleCodifier` to wrap. If ``None`` (the default), a
         fresh one is constructed from the tuning knobs below.
     precedents:
-        Optional iterable of validated precedents to seed the internal stream
-        at construction; equivalent to calling :meth:`observe_many` afterwards.
+        Optional iterable of records already admitted to ``precedent_store`` to
+        seed the observed stream; equivalent to calling :meth:`observe_many`
+        afterwards.
+    precedent_store:
+        Canonical admission store for records observed by a newly constructed
+        codifier. Populated workflows must admit records to this same instance
+        before observation. Cannot be supplied with ``codifier``.
     constitutional_hash:
         Hash pin for the constructed codifier. Defaults to the package-wide
         :data:`~constitutional_swarm.constants.CONSTITUTIONAL_HASH`. Ignored
@@ -77,6 +105,12 @@ class PrecedentBackedCodifier:
     similarity_threshold:
         Cosine-similarity threshold for agglomerative precedent clustering.
         Ignored when ``codifier`` is supplied.
+    governors:
+        Governor roster allowed to approve/activate proposed rules (empty means
+        no one can). Ignored when ``codifier`` is supplied.
+    proposer_id:
+        Identity recorded as the proposer; it may never act as a governor.
+        Ignored when ``codifier`` is supplied.
     """
 
     def __init__(
@@ -84,26 +118,54 @@ class PrecedentBackedCodifier:
         codifier: RuleCodifier | None = None,
         *,
         precedents: Iterable[PrecedentRecord] | None = None,
+        precedent_store: PrecedentStore | None = None,
         constitutional_hash: str = CONSTITUTIONAL_HASH,
         min_cluster_size: int = 5,
         min_validator_agreement: float = 0.85,
         similarity_threshold: float = 0.80,
+        governors: Collection[str] = (),
+        proposer_id: str = _DEFAULT_PROPOSER_ID,
     ) -> None:
+        if codifier is not None and precedent_store is not None:
+            raise ValueError("precedent_store cannot be supplied with a pre-built codifier")
         self.inner: RuleCodifier = codifier or RuleCodifier(
             constitutional_hash=constitutional_hash,
             min_cluster_size=min_cluster_size,
             min_validator_agreement=min_validator_agreement,
             similarity_threshold=similarity_threshold,
+            precedent_store=precedent_store,
+            governors=governors,
+            proposer_id=proposer_id,
         )
-        self.precedents: list[PrecedentRecord] = list(precedents) if precedents else []
+        self._precedent_ids: list[str] = []  # observation order
+        self._seen_precedent_ids: set[str] = set()  # O(1) membership
+        if precedents:
+            self.observe_many(precedents)
+
+    @property
+    def precedent_store(self) -> PrecedentStore:
+        """Return the explicit admission store or fail before evidence use."""
+        return self.inner.precedent_store
+
+    @property
+    def precedents(self) -> list[PrecedentRecord]:
+        """Defensive snapshots of observed records that remain active."""
+        if not self._precedent_ids:
+            return []
+        active = {record.precedent_id: record for record in self.precedent_store.active_records()}
+        return [active[precedent_id] for precedent_id in self._precedent_ids if precedent_id in active]
 
     def observe(self, precedent: PrecedentRecord) -> None:
-        """Append a validated precedent to the internal stream."""
-        self.precedents.append(precedent)
+        """Observe an exact record already admitted to the configured store."""
+        [canonical] = self.precedent_store.require_canonical_records([precedent])
+        if canonical.precedent_id not in self._seen_precedent_ids:
+            self._seen_precedent_ids.add(canonical.precedent_id)
+            self._precedent_ids.append(canonical.precedent_id)
 
     def observe_many(self, precedents: Iterable[PrecedentRecord]) -> None:
         """Append several validated precedents to the internal stream."""
-        self.precedents.extend(precedents)
+        for precedent in precedents:
+            self.observe(precedent)
 
     def find_clusters(self, _live_approaches: list) -> list:
         """Cluster the accumulated precedents, ignoring the live grid argument.

@@ -33,9 +33,9 @@ _TASK = {
 
 
 def _fake_codex(diff: str, returncode: int = 0):
-    """Build a fake subprocess.run that writes ``diff`` to the last-message file."""
+    """Build a fake shared runner that writes ``diff`` to the last-message file."""
 
-    def _run(cmd, input=None, capture_output=False, text=False, timeout=None, check=False):
+    def _run(cmd, *, input_text=None, timeout_s=None, cwd=None, env=None):
         # The agent passes --output-last-message <path>; find it and write the diff there.
         idx = cmd.index("--output-last-message")
         last_path = Path(cmd[idx + 1])
@@ -72,7 +72,10 @@ def test_agent_requires_codex_binary() -> None:
 def test_agent_returns_patch_on_success() -> None:
     with patch("shutil.which", return_value="/usr/bin/codex"):
         agent = CodexSWEBenchAgent(model="gpt-5.4", timeout_s=30.0)
-    with patch("subprocess.run", side_effect=_fake_codex(_FAKE_DIFF)):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        side_effect=_fake_codex(_FAKE_DIFF),
+    ):
         result = agent.solve(_TASK)
     assert result.success is True
     assert "--- a/src/foo.py" in result.patch
@@ -85,7 +88,7 @@ def test_agent_returns_empty_on_non_diff_reply() -> None:
     with patch("shutil.which", return_value="/usr/bin/codex"):
         agent = CodexSWEBenchAgent(timeout_s=30.0)
     with patch(
-        "subprocess.run",
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
         side_effect=_fake_codex("I'm sorry, I don't know how to fix this."),
     ):
         result = agent.solve(_TASK)
@@ -96,7 +99,10 @@ def test_agent_returns_empty_on_non_diff_reply() -> None:
 def test_agent_handles_nonzero_exit() -> None:
     with patch("shutil.which", return_value="/usr/bin/codex"):
         agent = CodexSWEBenchAgent(timeout_s=30.0)
-    with patch("subprocess.run", side_effect=_fake_codex("", returncode=1)):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        side_effect=_fake_codex("", returncode=1),
+    ):
         result = agent.solve(_TASK)
     assert result.success is False
     assert result.metadata["exit_code"] == 1
@@ -109,7 +115,10 @@ def test_agent_handles_timeout() -> None:
     def _boom(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(cmd="codex", timeout=1.0)
 
-    with patch("subprocess.run", side_effect=_boom):
+    with patch(
+        "constitutional_swarm.swe_bench.codex_agent._run_process",
+        side_effect=_boom,
+    ):
         result = agent.solve(_TASK)
     assert result.success is False
     assert result.metadata.get("error") == "timeout"

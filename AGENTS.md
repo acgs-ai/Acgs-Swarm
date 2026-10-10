@@ -55,7 +55,7 @@ WebSocket gossip tests require `pip install -e ".[transport]"`.
 - Constitutional hash: `608508a9bd224290`
 - Precedent quorum: 3/5 super-majority (`min_total_validators=5, min_votes_for_precedent=3`)
 - `EvolutionLog` enforces strict monotonicity + acceleration at write time (declarative, SQLite-backed, append-only)
-- Manifold peer selection is wired in `mesh.py:_select_peers()` (trust-weighted sampling + one exploration slot)
+- Manifold peer selection is wired in `mesh/core.py:_select_peers_unlocked()` (called from `_request_validation_once`; trust-weighted sampling + one exploration slot)
 
 <!-- MANUAL: Notes added below this line are preserved on regeneration. -->
 

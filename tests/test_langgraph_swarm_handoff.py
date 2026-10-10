@@ -56,6 +56,10 @@ def _valid_constitution() -> dict:
     return {"hash": CONSTITUTIONAL_HASH, "principles": ["P1"], "domains": ["D1"]}
 
 
+class _DNA:
+    hash = CONSTITUTIONAL_HASH
+
+
 def test_build_handoff_swarm_compiles_with_matching_hash():
     """A matching constitution hash + well-formed agents must compile."""
     alice = _make_agent("alice")
@@ -65,6 +69,7 @@ def test_build_handoff_swarm_compiles_with_matching_hash():
         agents=[alice, bob],
         agent_names=["alice", "bob"],
         constitution=_valid_constitution(),
+        dna=_DNA(),
     )
 
     # Verify a compiled langgraph object — supports invoke + get_graph
@@ -84,6 +89,7 @@ def test_build_handoff_swarm_rejects_mismatched_hash():
             agents=[alice, bob],
             agent_names=["alice", "bob"],
             constitution=bad_constitution,
+            dna=_DNA(),
         )
 
 
@@ -97,6 +103,7 @@ def test_compiled_graph_has_agents_addressable_by_name():
         agents=[alice, bob, carol],
         agent_names=["alice", "bob", "carol"],
         constitution=_valid_constitution(),
+        dna=_DNA(),
         default_agent="alice",
     )
 
@@ -125,6 +132,7 @@ def test_import_path_raises_when_langgraph_swarm_missing(monkeypatch):
             agents=[alice, bob],
             agent_names=["alice", "bob"],
             constitution=_valid_constitution(),
+            dna=_DNA(),
         )
 
 
@@ -138,6 +146,7 @@ def test_build_handoff_swarm_rejects_name_drift():
             agents=[alice, bob],
             agent_names=["alice", "robert"],  # declared name != agent.name
             constitution=_valid_constitution(),
+            dna=_DNA(),
         )
 
 
@@ -150,6 +159,7 @@ def test_build_handoff_swarm_rejects_length_mismatch():
             agents=[alice],
             agent_names=["alice", "bob"],
             constitution=_valid_constitution(),
+            dna=_DNA(),
         )
 
 

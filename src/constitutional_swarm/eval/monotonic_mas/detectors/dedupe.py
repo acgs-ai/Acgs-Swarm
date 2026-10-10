@@ -1,50 +1,49 @@
-"""Dedupe detector for redundant_work traces.
-
-HONEST CONTRACT NOTE: MerkleCRDT.append() does NOT natively dedupe by content.
-CIDs are computed from (agent_id, payload, parent_cids, ...), so two distinct
-agents producing the same payload yield DIFFERENT CIDs. The "set-union dedupe"
-property of MerkleCRDT.merge() acts on CID equality, not content equality.
-
-For this mission's "catch redundant work" claim, the detector implements a
-governance LAYER on top of MerkleCRDT: a content-hash filter that rejects
-appends whose normalized-payload-hash already exists in the local replica.
-This is a real governance pattern (workflow dedupe in ACGS) but it is NOT a
-native MerkleCRDT feature. The decision log records this clarification so the
-final report does not over-claim.
-"""
+"""Evidence-based detector for independently completed duplicate work."""
 
 from __future__ import annotations
 
 import hashlib
 
-from constitutional_swarm.merkle_crdt import MerkleCRDT
+
+def _canonical_payload(payload: str) -> str:
+    """Return the identity used for completed-work duplicate detection."""
+    return " ".join(payload.casefold().split())
 
 
 def _content_hash(payload: str) -> str:
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_canonical_payload(payload).encode("utf-8")).hexdigest()
 
 
 def detect_dedupe(trace: dict, governance_enabled: bool) -> tuple[bool, dict]:
-    """Replay a redundant_work trace; return (caught, debug_info).
+    """Inspect recorded completion events without manufacturing observations.
 
-    The trace contains two agents producing the same payload. We append both,
-    optionally with a content-hash dedupe wrapper. caught=True iff the second
-    append is rejected as a content duplicate.
+    A repeated canonical payload is redundant completed work even when both
+    completion events belong to the same agent. Event identity is validated by
+    the trace schema; distinct event IDs represent distinct completion records.
     """
-    crdt = MerkleCRDT(agent_id="replay-coord", reject_unverified=True)
-    payload = trace["payload"]
+    completions = [
+        event for event in trace.get("events", []) if event.get("type") == "work_completed"
+    ]
+    if not completions:
+        return False, {
+            "status": "unavailable",
+            "unavailable_reason": "trace has no independent work_completed events",
+            "duplicate_policy": "repeated canonical payload",
+            "completion_events": 0,
+            "duplicate_events": 0,
+        }
+
     seen_hashes: set[str] = set()
-    rejections = 0
+    duplicates = 0
+    for event in completions:
+        payload_hash = _content_hash(event["payload"])
+        if payload_hash in seen_hashes:
+            duplicates += 1
+        seen_hashes.add(payload_hash)
 
-    for agent_id in trace["agents"]:
-        ph = _content_hash(payload)
-        if governance_enabled and ph in seen_hashes:
-            rejections += 1
-            continue
-        # Rebind crdt.agent_id per write to mimic the agent producing this node.
-        crdt.agent_id = agent_id
-        crdt.append(payload=payload, payload_type="patch", bodes_passed=True)
-        seen_hashes.add(ph)
-
-    caught = rejections >= 1  # at least one duplicate was filtered
-    return caught, {"rejections": rejections, "crdt_size": len(crdt._nodes)}
+    return governance_enabled and duplicates > 0, {
+        "status": "available",
+        "duplicate_policy": "repeated canonical payload",
+        "completion_events": len(completions),
+        "duplicate_events": duplicates,
+    }

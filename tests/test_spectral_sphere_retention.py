@@ -217,7 +217,7 @@ def test_smoothing_default_tracks_sustained_trust() -> None:
     Regression (spectral_sphere.py default ``smoothing``): an over-damped EMA
     default (0.999) accumulated trust at ~0.1% per cycle, so the production
     manifold — built with defaults in ``mesh/core.py`` and consumed by
-    ``_select_peers`` — stayed near zero across the O(10)-cycle window it exists
+    ``_select_peers_unlocked`` — stayed near zero across the O(10)-cycle window it exists
     to win against Birkhoff uniformity collapse. Mirrors the production pattern
     (``update_trust(+0.1)`` then ``project()`` once per settlement).
     """

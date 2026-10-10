@@ -34,11 +34,84 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
+from collections.abc import Set as AbstractSet
 from typing import Any, Protocol
+
+from constitutional_swarm.strict_json import StrictJSONError, canonical_dumps, loads
+
+from ._merkle import (
+    MERKLE_VERSION,
+    build_merkle_layers,
+    compute_merkle_root,
+    is_digest,
+    merkle_path_for_index,
+    merkle_root_from_layers,
+    verify_merkle_path as _verify_merkle_path,
+)
+from ._staging import _StagedBatch
+from .chain_anchor import ChainSubmitter
+
+
+logger = logging.getLogger(__name__)
+
+_AUDIT_LEAF_VERSION = 2
+_AUDIT_LEAF_DOMAIN = "constitutional_swarm.audit_log_entry"
+_MAX_BATCH_JSON_BYTES = 64 * 1024 * 1024
+
+# Exact key sets emitted by to_dict(); from_dict() accepts nothing else.
+_ENTRY_KEYS = frozenset(
+    {
+        "entry_id",
+        "case_id",
+        "constitutional_hash",
+        "decision_type",
+        "compliance_passed",
+        "impact_score",
+        "escalation_type",
+        "resolution",
+        "miner_uid",
+        "validator_grade",
+        "decision_at",
+        "tags",
+    }
+)
+_BATCH_KEYS = frozenset(
+    {
+        "batch_id",
+        "leaf_version",
+        "merkle_version",
+        "batch_root",
+        "constitutional_hash",
+        "entry_count",
+        "created_at",
+        "entries",
+        "leaf_hashes",
+    }
+)
+
+
+def _key_preview(keys: AbstractSet[Any]) -> str:
+    # Key names may be attacker-controlled: repr() escapes control characters,
+    # and both the number of keys and each key's length are capped.
+    shown = sorted(repr(key)[:32] for key in keys)[:5]
+    return f"{len(keys)} ({', '.join(shown)}{', ...' if len(keys) > 5 else ''})"
+
+
+def _require_exact_keys(d: dict[str, Any], keys: frozenset[str], kind: str) -> None:
+    unknown = d.keys() - keys
+    if unknown:
+        raise ValueError(f"{kind} has unknown keys: {_key_preview(unknown)}")
+    missing = keys - d.keys()
+    if missing:
+        raise ValueError(f"{kind} is missing keys: {_key_preview(missing)}")
 
 # ---------------------------------------------------------------------------
 # Decision type enum (from Q&A §2)
@@ -93,19 +166,59 @@ class AuditLogEntry:
     decision_at: float = field(default_factory=time.time)
     tags: tuple[tuple[str, str], ...] = ()  # frozen-compatible key-value pairs
 
+    def __post_init__(self) -> None:
+        for name in (
+            "entry_id",
+            "case_id",
+            "constitutional_hash",
+            "escalation_type",
+            "resolution",
+            "miner_uid",
+        ):
+            if type(getattr(self, name)) is not str:
+                raise TypeError(f"{name} must be an exact string")
+        if type(self.decision_type) is not AuditDecisionType:
+            raise TypeError("decision_type must be an exact AuditDecisionType")
+        if type(self.compliance_passed) is not bool:
+            raise TypeError("compliance_passed must be an exact boolean")
+        for name in ("impact_score", "decision_at"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a finite number")
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if isinstance(self.validator_grade, bool) or not isinstance(
+            self.validator_grade, (int, float)
+        ):
+            raise TypeError("validator_grade must be a finite number or NaN")
+        if math.isinf(self.validator_grade):
+            raise ValueError("validator_grade must be finite or NaN")
+
+        seen_tags: set[str] = set()
+        if type(self.tags) is not tuple:
+            raise TypeError("tags must be a tuple of string pairs")
+        for pair in self.tags:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise TypeError("tags must contain exact two-item tuples")
+            key, value = pair
+            if type(key) is not str or type(value) is not str:
+                raise TypeError("tag keys and values must be exact strings")
+            if key in seen_tags:
+                raise ValueError(f"duplicate tag key: {key!r}")
+            seen_tags.add(key)
+
     def leaf_hash(self) -> str:
         """SHA-256 hash of the canonical entry representation.
 
         Used as the Merkle leaf for batch inclusion proofs.
         Deterministic: same entry always produces the same leaf hash.
         """
-        payload = (
-            f"{self.entry_id}:{self.case_id}:{self.constitutional_hash}:"
-            f"{self.decision_type.value}:{self.compliance_passed}:"
-            f"{self.impact_score:.6f}:{self.escalation_type}:{self.resolution}:"
-            f"{self.miner_uid}:{self.validator_grade:.4f}:{self.decision_at:.3f}"
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()
+        payload = {
+            "domain": _AUDIT_LEAF_DOMAIN,
+            "version": _AUDIT_LEAF_VERSION,
+            "entry": self.to_dict(),
+        }
+        return hashlib.sha256(canonical_dumps(payload).encode()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,30 +227,39 @@ class AuditLogEntry:
             "constitutional_hash": self.constitutional_hash,
             "decision_type": self.decision_type.value,
             "compliance_passed": self.compliance_passed,
-            "impact_score": round(self.impact_score, 6),
+            "impact_score": self.impact_score,
             "escalation_type": self.escalation_type,
             "resolution": self.resolution,
             "miner_uid": self.miner_uid,
-            "validator_grade": self.validator_grade,
+            "validator_grade": (None if math.isnan(self.validator_grade) else self.validator_grade),
             "decision_at": self.decision_at,
             "tags": dict(self.tags),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AuditLogEntry:
+        if type(d) is not dict:
+            raise TypeError("audit entry must be an exact dictionary")
+        _require_exact_keys(d, _ENTRY_KEYS, "audit entry")
+        tags = d["tags"]
+        if type(tags) is not dict:
+            raise TypeError("entry tags must be an exact dictionary")
+        validator_grade = d["validator_grade"]
+        if validator_grade is None:
+            validator_grade = float("nan")
         return cls(
             entry_id=d["entry_id"],
             case_id=d["case_id"],
             constitutional_hash=d["constitutional_hash"],
             decision_type=AuditDecisionType(d["decision_type"]),
             compliance_passed=d["compliance_passed"],
-            impact_score=d.get("impact_score", 0.0),
-            escalation_type=d.get("escalation_type", ""),
-            resolution=d.get("resolution", ""),
-            miner_uid=d.get("miner_uid", ""),
-            validator_grade=d.get("validator_grade", float("nan")),
-            decision_at=d.get("decision_at", time.time()),
-            tags=tuple((k, v) for k, v in d.get("tags", {}).items()),
+            impact_score=d["impact_score"],
+            escalation_type=d["escalation_type"],
+            resolution=d["resolution"],
+            miner_uid=d["miner_uid"],
+            validator_grade=validator_grade,
+            decision_at=d["decision_at"],
+            tags=tuple(tags.items()),
         )
 
 
@@ -207,21 +329,7 @@ class InMemoryArweaveClient:
 # ---------------------------------------------------------------------------
 
 
-class AuditChainSubmitter(Protocol):
-    """Protocol for anchoring an audit batch root on-chain.
-
-    Re-declares the same interface as ChainSubmitter in chain_anchor.py.
-    Either can be used interchangeably — no import required.
-    """
-
-    def submit(
-        self,
-        batch_root: str,
-        constitutional_hash: str,
-        proof_count: int,
-    ) -> int:
-        """Anchor batch_root on-chain. Returns block height."""
-        ...
+AuditChainSubmitter = ChainSubmitter
 
 
 # ---------------------------------------------------------------------------
@@ -232,12 +340,36 @@ class AuditChainSubmitter(Protocol):
 class AuditBatch:
     """Finalized audit log batch, ready for Arweave upload + chain anchoring.
 
-    Not frozen — it's a processing artifact, not an audit record itself.
-    Computes Merkle paths on demand for auditor verification.
+    Metadata and cached tree state are immutable after construction. Paths are
+    derived from the cached layers for auditor verification.
 
     The batch_root is anchored on-chain via ChainSubmitter.
     The full batch JSON is stored on Arweave.
     """
+
+    __slots__ = (
+        "_batch_id",
+        "_batch_root",
+        "_constitutional_hash",
+        "_created_at",
+        "_entries",
+        "_entry_by_id",
+        "_entry_count",
+        "_entry_index",
+        "_frozen",
+        "_leaf_hashes",
+        "_merkle_layers",
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError("AuditBatch is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError("AuditBatch is immutable")
+        object.__delattr__(self, name)
 
     def __init__(
         self,
@@ -246,13 +378,57 @@ class AuditBatch:
         entries: list[AuditLogEntry],
         created_at: float | None = None,
     ) -> None:
-        self.batch_id = batch_id
-        self.constitutional_hash = constitutional_hash
-        self._entries: list[AuditLogEntry] = list(entries)
-        self._leaf_hashes: list[str] = [e.leaf_hash() for e in self._entries]
-        self.batch_root: str = _compute_merkle_root(self._leaf_hashes)
-        self.entry_count: int = len(self._entries)
-        self.created_at: float = created_at or time.time()
+        if type(batch_id) is not str:
+            raise TypeError("batch_id must be an exact string")
+        if type(constitutional_hash) is not str:
+            raise TypeError("constitutional_hash must be an exact string")
+        if type(entries) is not list:
+            raise TypeError("entries must be an exact list")
+        if created_at is not None:
+            if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
+                raise TypeError("created_at must be a finite number")
+            if not math.isfinite(created_at):
+                raise ValueError("created_at must be finite")
+        if any(type(entry) is not AuditLogEntry for entry in entries):
+            raise TypeError("entries must contain exact AuditLogEntry instances")
+        detached_entries = tuple(entries)
+        entry_ids = [entry.entry_id for entry in detached_entries]
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ValueError("duplicate entry_id in audit batch")
+
+        self._batch_id = batch_id
+        self._constitutional_hash = constitutional_hash
+        self._entries: tuple[AuditLogEntry, ...] = detached_entries
+        self._entry_by_id = MappingProxyType(dict(zip(entry_ids, detached_entries, strict=True)))
+        self._entry_index = MappingProxyType(
+            {entry_id: index for index, entry_id in enumerate(entry_ids)}
+        )
+        self._leaf_hashes: tuple[str, ...] = tuple(entry.leaf_hash() for entry in detached_entries)
+        self._merkle_layers = build_merkle_layers(self._leaf_hashes)
+        self._batch_root = merkle_root_from_layers(self._merkle_layers, len(self._leaf_hashes))
+        self._entry_count = len(self._entries)
+        self._created_at = time.time() if created_at is None else created_at
+        self._frozen = True
+
+    @property
+    def batch_id(self) -> str:
+        return self._batch_id
+
+    @property
+    def constitutional_hash(self) -> str:
+        return self._constitutional_hash
+
+    @property
+    def batch_root(self) -> str:
+        return self._batch_root
+
+    @property
+    def entry_count(self) -> int:
+        return self._entry_count
+
+    @property
+    def created_at(self) -> float:
+        return self._created_at
 
     @property
     def entries(self) -> list[AuditLogEntry]:
@@ -263,62 +439,108 @@ class AuditBatch:
         return list(self._leaf_hashes)
 
     def find_entry(self, entry_id: str) -> AuditLogEntry | None:
-        for e in self._entries:
-            if e.entry_id == entry_id:
-                return e
-        return None
+        return self._entry_by_id.get(entry_id)
 
     def merkle_path_for(self, entry_id: str) -> list[tuple[str, str]]:
         """Return the Merkle path proving entry_id is in this batch.
 
-        Each step is (sibling_hash, "left"|"right").
+        Each step is (sibling_hash, "left"|"right"|"promote").
         Raises KeyError if entry_id not found.
 
         Verification::
 
             entry = batch.find_entry(entry_id)
             path  = batch.merkle_path_for(entry_id)
-            assert verify_merkle_path(entry.leaf_hash(), path, batch.batch_root)
+            assert verify_merkle_path(
+                entry.leaf_hash(),
+                path,
+                receipt.batch_root,
+                leaf_count=receipt.entry_count,
+                leaf_index=batch.entries.index(entry),
+                batch_id=batch.batch_id,
+                expected_batch_id=receipt.batch_id,
+            )
         """
-        for idx, entry in enumerate(self._entries):
-            if entry.entry_id == entry_id:
-                return _merkle_path_for_index(self._leaf_hashes, idx)
-        raise KeyError(f"Entry not found in batch: {entry_id}")
-
-    def verify_entry(self, entry: AuditLogEntry) -> bool:
-        """Verify that entry is included in this batch."""
         try:
+            index = self._entry_index[entry_id]
+        except KeyError:
+            raise KeyError(f"Entry not found in batch: {entry_id}") from None
+        return list(merkle_path_for_index(self._merkle_layers, index))
+
+    def verify_entry(
+        self,
+        entry: AuditLogEntry,
+        *,
+        expected_root: str,
+        expected_batch_id: str,
+    ) -> bool:
+        """Verify an exact entry against caller-pinned receipt values."""
+        if type(entry) is not AuditLogEntry:
+            return False
+        if type(expected_root) is not str or type(expected_batch_id) is not str:
+            return False
+        if expected_root != self.batch_root or expected_batch_id != self.batch_id:
+            return False
+        try:
+            index = self._entry_index[entry.entry_id]
             path = self.merkle_path_for(entry.entry_id)
         except KeyError:
             return False
-        return verify_merkle_path(entry.leaf_hash(), path, self.batch_root)
+        return verify_merkle_path(
+            entry.leaf_hash(),
+            path,
+            expected_root,
+            leaf_count=self.entry_count,
+            leaf_index=index,
+            batch_id=self.batch_id,
+            expected_batch_id=expected_batch_id,
+        )
 
     def compliance_rate(self) -> float:
         if not self._entries:
-            return 1.0
+            raise ValueError("compliance rate requires at least one entry")
         passed = sum(1 for e in self._entries if e.compliance_passed)
         return passed / len(self._entries)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_id": self.batch_id,
+            "leaf_version": _AUDIT_LEAF_VERSION,
+            "merkle_version": MERKLE_VERSION,
             "batch_root": self.batch_root,
             "constitutional_hash": self.constitutional_hash,
             "entry_count": self.entry_count,
             "created_at": self.created_at,
             "entries": [e.to_dict() for e in self._entries],
-            "leaf_hashes": self._leaf_hashes,
+            "leaf_hashes": list(self._leaf_hashes),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AuditBatch:
-        entries = [AuditLogEntry.from_dict(e) for e in d["entries"]]
+        if type(d) is not dict:
+            raise TypeError("audit batch must be an exact dictionary")
+        if type(d.get("leaf_version")) is not int or d["leaf_version"] != _AUDIT_LEAF_VERSION:
+            raise ValueError("audit batch has unsupported leaf version")
+        if type(d.get("merkle_version")) is not int or d["merkle_version"] != MERKLE_VERSION:
+            raise ValueError("audit batch has unsupported Merkle version")
+        _require_exact_keys(d, _BATCH_KEYS, "audit batch")
+        raw_entries = d["entries"]
+        if type(raw_entries) is not list:
+            raise ValueError("audit batch entries must be a list")
+        entries = [AuditLogEntry.from_dict(e) for e in raw_entries]
         batch = cls(
             batch_id=d["batch_id"],
             constitutional_hash=d["constitutional_hash"],
             entries=entries,
-            created_at=d.get("created_at"),
+            created_at=d["created_at"],
         )
+        serialized_leaves = d["leaf_hashes"]
+        if type(serialized_leaves) is not list or serialized_leaves != batch.leaf_hashes:
+            raise ValueError("audit batch leaf hashes do not match entries")
+        if type(d["entry_count"]) is not int or d["entry_count"] != batch.entry_count:
+            raise ValueError("audit batch entry count does not match entries")
+        if type(d["batch_root"]) is not str or d["batch_root"] != batch.batch_root:
+            raise ValueError("audit batch root does not match entries")
         return batch
 
 
@@ -396,10 +618,12 @@ class ArweaveAuditLogger:
         receipt = logger.flush()   # → AuditLogReceipt
 
         # Auditor verification:
-        batch_bytes = arweave.fetch(receipt.arweave_tx_id)
-        batch = AuditBatch.from_dict(json.loads(batch_bytes))
-        assert batch.batch_root == receipt.batch_root
-        assert batch.verify_entry(entry)
+        batch = logger.fetch_batch(receipt)
+        assert batch.verify_entry(
+            entry,
+            expected_root=receipt.batch_root,
+            expected_batch_id=receipt.batch_id,
+        )
     """
 
     def __init__(
@@ -409,39 +633,62 @@ class ArweaveAuditLogger:
         chain_submitter: AuditChainSubmitter | None = None,
         batch_size: int = 100,
     ) -> None:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
         self._constitutional_hash = constitutional_hash
         self._arweave = arweave_client
         self._chain_submitter = chain_submitter
         self._batch_size = batch_size
-        self._pending: list[AuditLogEntry] = []
+        self._pending: _StagedBatch[AuditLogEntry] = _StagedBatch()
         self._receipts: list[AuditLogReceipt] = []
+        self._state_lock = threading.RLock()
+        self._flush_guard = threading.Lock()
         # Retry state: if Phase 1 (Arweave upload) succeeded but Phase 2
         # (chain submit) failed, we cache the batch + tx_id to reuse on
         # retry instead of creating a ghost orphaned upload on Arweave.
         self._retry_state: tuple[AuditBatch, str] | None = None
+        self._staged_batch: AuditBatch | None = None
+        self._last_flush_error: Exception | None = None
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return self._pending.pending_count
 
     @property
     def receipts(self) -> list[AuditLogReceipt]:
-        return list(self._receipts)
+        with self._state_lock:
+            return list(self._receipts)
+
+    @property
+    def last_flush_error(self) -> Exception | None:
+        """Most recent external auto/explicit flush error, cleared on success."""
+        with self._state_lock:
+            return self._last_flush_error
 
     def add_entry(self, entry: AuditLogEntry) -> AuditLogReceipt | None:
         """Add an audit log entry. Auto-flushes when batch is full.
 
         Raises ValueError if entry's constitutional_hash doesn't match.
         Returns AuditLogReceipt if a flush occurred, else None.
+
+        The entry is accepted once appended. If an automatic external upload
+        or submit fails, this method logs the failure, leaves the stable batch
+        pending, records it in ``last_flush_error``, and returns None. A later
+        explicit ``flush()`` retries and propagates any external failure.
         """
+        if type(entry) is not AuditLogEntry:
+            raise TypeError("entry must be an exact AuditLogEntry instance")
         if entry.constitutional_hash != self._constitutional_hash:
             raise ValueError(
                 f"Entry constitutional hash mismatch: "
                 f"expected={self._constitutional_hash} got={entry.constitutional_hash}"
             )
-        self._pending.append(entry)
-        if len(self._pending) >= self._batch_size:
-            return self.flush()
+        with self._state_lock:
+            self._pending.append(entry)
+            should_flush = self._pending.pending_count >= self._batch_size
+        if should_flush:
+            return self._flush(auto=True)
         return None
 
     def flush(self) -> AuditLogReceipt | None:
@@ -451,83 +698,150 @@ class ArweaveAuditLogger:
         Arweave upload AND chain submission succeed.  If either fails,
         entries remain in ``_pending`` so the caller can retry.
 
+        One call processes exactly the stable prefix staged at its start.
+        Entries appended during external I/O remain queued, even if that suffix
+        reaches ``batch_size``; call ``flush()`` again (or add another entry)
+        to process the suffix.
+
         Returns AuditLogReceipt, or None if no pending entries.
         """
-        if not self._pending:
-            return None
+        return self._flush(auto=False)
 
-        # Reuse a previous successful Arweave upload when retrying after
-        # a chain submission failure.  This prevents ghost orphaned uploads
-        # accumulating on Arweave with no corresponding chain anchor.
-        if self._retry_state is not None:
-            batch, tx_id = self._retry_state
-        else:
-            batch = AuditBatch(
-                batch_id=uuid.uuid4().hex[:12],
-                constitutional_hash=self._constitutional_hash,
-                entries=list(self._pending),
-            )
+    def _flush(self, *, auto: bool) -> AuditLogReceipt | None:
+        if not self._flush_guard.acquire(blocking=False):
+            if auto:
+                return None
+            raise RuntimeError("flush already in progress")
+        try:
+            with self._state_lock:
+                entries = self._pending.stage()
+                if not entries:
+                    return None
+                if self._staged_batch is None:
+                    self._staged_batch = AuditBatch(
+                        batch_id=uuid.uuid4().hex[:12],
+                        constitutional_hash=self._constitutional_hash,
+                        entries=list(entries),
+                    )
+                batch = self._staged_batch
+                retry_state = self._retry_state
 
-            # Phase 1: Upload full batch JSON to Arweave.
-            # On failure the entries stay in _pending for retry.
-            batch_json = json.dumps(batch.to_dict()).encode()
-            tx_id = self._arweave.upload(
-                batch_json,
-                tags={
-                    "constitutional_hash": self._constitutional_hash,
-                    "batch_id": batch.batch_id,
-                    "batch_root": batch.batch_root,
-                    "App-Name": "ACGS-constitutional-swarm",
-                },
-            )
-            # Phase 1 succeeded — cache for potential Phase 2 retry.
-            self._retry_state = (batch, tx_id)
+            if retry_state is not None:
+                batch, tx_id = retry_state
+            else:
+                batch_json = json.dumps(batch.to_dict()).encode()
+                try:
+                    tx_id = self._arweave.upload(
+                        batch_json,
+                        tags={
+                            "constitutional_hash": self._constitutional_hash,
+                            "batch_id": batch.batch_id,
+                            "batch_root": batch.batch_root,
+                            "App-Name": "ACGS-constitutional-swarm",
+                        },
+                    )
+                except Exception as exc:
+                    with self._state_lock:
+                        self._last_flush_error = exc
+                    if auto:
+                        logger.exception(
+                            "automatic audit-log upload failed; entry remains pending"
+                        )
+                        return None
+                    raise
+                with self._state_lock:
+                    self._retry_state = (batch, tx_id)
 
-        # Phase 2: Anchor batch_root on-chain (optional).
-        # On failure the entries stay in _pending and _retry_state is
-        # preserved so the next flush() reuses the same batch + tx_id.
-        block_height: int | None = None
-        if self._chain_submitter is not None:
-            block_height = self._chain_submitter.submit(
+            block_height: int | None = None
+            if self._chain_submitter is not None:
+                try:
+                    block_height = self._chain_submitter.submit(
+                        batch_root=batch.batch_root,
+                        constitutional_hash=self._constitutional_hash,
+                        proof_count=batch.entry_count,
+                    )
+                except Exception as exc:
+                    with self._state_lock:
+                        self._last_flush_error = exc
+                    if auto:
+                        logger.exception(
+                            "automatic audit-log chain submit failed; entry remains pending"
+                        )
+                        return None
+                    raise
+
+            receipt = AuditLogReceipt(
+                receipt_id=uuid.uuid4().hex[:8],
+                batch_id=batch.batch_id,
                 batch_root=batch.batch_root,
+                arweave_tx_id=tx_id,
+                entry_count=batch.entry_count,
                 constitutional_hash=self._constitutional_hash,
-                proof_count=batch.entry_count,
+                created_at=time.time(),
+                block_height=block_height,
             )
-
-        # Both phases succeeded — clear pending entries and retry state.
-        self._pending = []
-        self._retry_state = None
-
-        receipt = AuditLogReceipt(
-            receipt_id=uuid.uuid4().hex[:8],
-            batch_id=batch.batch_id,
-            batch_root=batch.batch_root,
-            arweave_tx_id=tx_id,
-            entry_count=batch.entry_count,
-            constitutional_hash=self._constitutional_hash,
-            created_at=time.time(),
-            block_height=block_height,
-        )
-        self._receipts.append(receipt)
-        return receipt
+            with self._state_lock:
+                self._receipts.append(receipt)
+                self._pending.commit()
+                self._retry_state = None
+                self._staged_batch = None
+                self._last_flush_error = None
+            return receipt
+        finally:
+            self._flush_guard.release()
 
     def fetch_batch(self, receipt: AuditLogReceipt) -> AuditBatch:
-        """Reconstruct an AuditBatch from Arweave using a receipt."""
+        """Reconstruct and authenticate an Arweave batch against its receipt."""
+        if type(receipt) is not AuditLogReceipt:
+            raise TypeError("receipt must be an exact AuditLogReceipt instance")
+        string_fields = (
+            receipt.receipt_id,
+            receipt.batch_id,
+            receipt.arweave_tx_id,
+            receipt.constitutional_hash,
+        )
+        if any(type(value) is not str or not value for value in string_fields):
+            raise TypeError("receipt identifiers must be non-empty plain strings")
+        if type(receipt.batch_root) is not str:
+            raise TypeError("receipt batch root must be a plain string")
+        if not is_digest(receipt.batch_root):
+            raise ValueError("receipt batch root must be a hexadecimal digest")
+        if type(receipt.entry_count) is not int or receipt.entry_count < 0:
+            raise TypeError("receipt entry count must be a non-negative integer")
+        if type(receipt.created_at) not in (int, float) or not math.isfinite(receipt.created_at):
+            raise ValueError("receipt creation time must be finite")
+        if receipt.block_height is not None and (
+            type(receipt.block_height) is not int or receipt.block_height < 0
+        ):
+            raise TypeError("receipt block height must be a non-negative integer or None")
+        if receipt.constitutional_hash != self._constitutional_hash:
+            raise ValueError("receipt constitutional hash does not match logger")
         raw = self._arweave.fetch(receipt.arweave_tx_id)
-        return AuditBatch.from_dict(json.loads(raw))
+        try:
+            decoded = loads(raw, max_bytes=_MAX_BATCH_JSON_BYTES)
+            batch = AuditBatch.from_dict(decoded)
+        except (KeyError, StrictJSONError, TypeError, ValueError) as exc:
+            raise ValueError("invalid audit batch payload") from exc
+
+        if (
+            batch.batch_root != receipt.batch_root
+            or batch.batch_id != receipt.batch_id
+            or batch.entry_count != receipt.entry_count
+            or batch.constitutional_hash != receipt.constitutional_hash
+        ):
+            raise ValueError("audit batch does not match receipt")
+        return batch
 
     def summary(self) -> dict[str, Any]:
-        return {
-            "constitutional_hash": self._constitutional_hash,
-            "batch_size": self._batch_size,
-            "pending": self._pending_count_safe(),
-            "total_flushed": sum(r.entry_count for r in self._receipts),
-            "batches_stored": len(self._receipts),
-            "latest_block": (self._receipts[-1].block_height if self._receipts else None),
-        }
-
-    def _pending_count_safe(self) -> int:
-        return len(self._pending)
+        with self._state_lock:
+            return {
+                "constitutional_hash": self._constitutional_hash,
+                "batch_size": self._batch_size,
+                "pending": self._pending.pending_count,
+                "total_flushed": sum(r.entry_count for r in self._receipts),
+                "batches_stored": len(self._receipts),
+                "latest_block": (self._receipts[-1].block_height if self._receipts else None),
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -536,69 +850,17 @@ class ArweaveAuditLogger:
 
 
 def _compute_merkle_root(leaves: list[str]) -> str:
-    """Binary Merkle root over leaf hashes (insertion order, not sorted).
-
-    Insertion order is preserved for AuditBatch (unlike ChainAnchor which
-    sorts for determinism). The batch stores the leaf order, so verification
-    only requires the path + root, not a canonical sort.
-    """
-    if not leaves:
-        return hashlib.sha256(b"").hexdigest()
-
-    layer = list(leaves)
-    while len(layer) > 1:
-        if len(layer) % 2 == 1:
-            layer.append(layer[-1])  # duplicate last (Bitcoin-style padding)
-        next_layer: list[str] = []
-        for i in range(0, len(layer), 2):
-            combined = layer[i] + layer[i + 1]
-            next_layer.append(hashlib.sha256(combined.encode()).hexdigest())
-        layer = next_layer
-    return layer[0]
+    """Return the shared count-committed Merkle root in insertion order."""
+    return compute_merkle_root(leaves)
 
 
 def _merkle_path_for_index(
     leaves: list[str],
     target_idx: int,
 ) -> list[tuple[str, str]]:
-    """Compute Merkle path for the leaf at target_idx.
-
-    Returns a list of (sibling_hash, position) where position is:
-      "right" — sibling is to the right (current node is left child)
-      "left"  — sibling is to the left  (current node is right child)
-
-    To verify: start from leaf_hash, at each step combine with sibling
-    in the correct order, hash the result, repeat to the root.
-    """
-    if len(leaves) <= 1:
-        return []
-
-    layer = list(leaves)
-    idx = target_idx
-    path: list[tuple[str, str]] = []
-
-    while len(layer) > 1:
-        if len(layer) % 2 == 1:
-            layer.append(layer[-1])
-
-        if idx % 2 == 0:
-            # current is left child — sibling is to the right
-            sibling = layer[idx + 1]
-            path.append((sibling, "right"))
-        else:
-            # current is right child — sibling is to the left
-            sibling = layer[idx - 1]
-            path.append((sibling, "left"))
-
-        # Build next layer
-        next_layer: list[str] = []
-        for i in range(0, len(layer), 2):
-            combined = layer[i] + layer[i + 1]
-            next_layer.append(hashlib.sha256(combined.encode()).hexdigest())
-        layer = next_layer
-        idx = idx // 2
-
-    return path
+    """Return the shared exact-shape path for one leaf index."""
+    layers = build_merkle_layers(leaves)
+    return list(merkle_path_for_index(layers, target_idx))
 
 
 def verify_merkle_path(
@@ -606,36 +868,23 @@ def verify_merkle_path(
     path: list[tuple[str, str]],
     expected_root: str,
     *,
+    leaf_count: int,
+    leaf_index: int,
     batch_id: str | None = None,
     expected_batch_id: str | None = None,
 ) -> bool:
-    """Verify a Merkle path against an expected root.
-
-    Args:
-        leaf_hash:         SHA-256 hash of the entry (AuditLogEntry.leaf_hash())
-        path:              proof path from _merkle_path_for_index()
-        expected_root:     the batch_root anchored on-chain
-        batch_id:          batch_id from the proof source (replay protection)
-        expected_batch_id: batch_id from the on-chain anchor record
-
-    When both ``batch_id`` and ``expected_batch_id`` are provided the
-    function rejects proofs replayed from a different batch — even if
-    the Merkle root happens to match.
-
-    Returns True if the path proves leaf_hash is included in expected_root.
-    """
-    # Replay protection: reject proof from a different batch.
-    if batch_id is not None and expected_batch_id is not None:
+    """Verify an exact-shape path and optional paired batch identifier."""
+    if (batch_id is None) != (expected_batch_id is None):
+        return False
+    if batch_id is not None:
+        if type(batch_id) is not str or type(expected_batch_id) is not str:
+            return False
         if batch_id != expected_batch_id:
             return False
-
-    current = leaf_hash
-    for sibling_hash, position in path:
-        if position == "right":
-            # sibling is right → current is left
-            combined = current + sibling_hash
-        else:
-            # sibling is left → current is right
-            combined = sibling_hash + current
-        current = hashlib.sha256(combined.encode()).hexdigest()
-    return current == expected_root
+    return _verify_merkle_path(
+        leaf_hash,
+        path,
+        expected_root,
+        leaf_count=leaf_count,
+        leaf_index=leaf_index,
+    )

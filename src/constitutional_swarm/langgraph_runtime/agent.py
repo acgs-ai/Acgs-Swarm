@@ -13,12 +13,12 @@ of the in-flight guard nodes inside the graph.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
+from constitutional_swarm.langgraph_runtime.guards import has_completed_acceptance
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 if TYPE_CHECKING:
-    from constitutional_swarm.langgraph_runtime.state import SwarmGraphState
     from constitutional_swarm.latent_dna import LatentDNAWrapper
 
 
@@ -30,8 +30,13 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
     graph_factory:
         Callable returning a CompiledStateGraph for this agent. Called once
         per task (so the graph can be parameterised by task metadata). The
-        graph's ``invoke(state)`` must return a state dict with keys
-        ``patch``, ``intervention_rate``, and optionally ``violations``.
+        graph's ``invoke(state)`` must return a state dict with ``patch``,
+        ``intervention_rate``, ``governed=True``, a finite ``risk_score`` below
+        the runtime threshold, an empty concrete ``violations`` sequence, the
+        exact pinned ``constitutional_hash``, and
+        ``governance_status="accepted"`` emitted only after completion.
+        ``settled`` is optional peer-quorum evidence and does not authorize
+        patch release.
     llm:
         Optional ``langchain_core.language_models.BaseChatModel`` used by the
         graph's internal nodes. The ``graph_factory`` is responsible for
@@ -47,6 +52,9 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         Optional :class:`LatentDNAWrapper` mirrored on the base class. The
         graph factory typically reads this off the agent instance to wire in
         BODES steering inside graph nodes.
+    constitutional_hash:
+        Caller-validated constitution hash placed in initial graph state.
+        When omitted, :func:`init_state` preserves a hash carried by the task.
     """
 
     def __init__(
@@ -58,6 +66,7 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         max_new_tokens: int = 512,
         timeout_s: float = 60.0,
         wrapper: LatentDNAWrapper | None = None,
+        constitutional_hash: str | None = None,
     ) -> None:
         super().__init__(
             wrapper=wrapper,
@@ -67,6 +76,7 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         )
         self._graph_factory = graph_factory
         self._llm = llm
+        self._constitutional_hash = constitutional_hash
 
     def _generate_patch(self, task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Run the compiled graph for one task and unpack patch + stats.
@@ -75,41 +85,44 @@ class LangGraphSWEBenchAgent(SWEBenchAgent):
         -------
         (patch_str, stats_dict)
             ``stats_dict`` always contains ``intervention_rate`` (float),
-            ``violations`` (list), ``constitutional_hash`` (str), and
-            ``settled`` (bool). Additional graph-emitted keys are merged in.
+            validation evidence, ``constitutional_hash`` (str), and
+            ``settled`` (bool). A patch is returned only for explicit completed
+            acceptance; additional graph-emitted keys are merged in.
         """
-        try:
-            from constitutional_swarm.langgraph_runtime.state import init_state
-        except ImportError:
-            # Local fallback if Unit 2 (state module) hasn't merged yet.
-            def init_state(task: dict[str, Any]) -> SwarmGraphState:
-                return cast(
-                    "SwarmGraphState",
-                    {
-                        "task_id": task.get("instance_id", "unknown"),
-                        "problem_statement": task.get("problem_statement", ""),
-                        "messages": [],
-                        "patch": "",
-                        "violations": [],
-                        "risk_score": 0.0,
-                        "intervention_rate": 0.0,
-                        "constitutional_hash": "",
-                    },
-                )
+        from constitutional_swarm.langgraph_runtime.state import init_state
 
         graph = self._graph_factory()
-        initial = init_state(task)
+        initial = init_state(task, constitutional_hash=self._constitutional_hash)
 
         config = {"configurable": {"thread_id": initial.get("task_id", "unknown")}}
         result = graph.invoke(initial, config=config)
 
         stats: dict[str, Any] = {
             "intervention_rate": float(result.get("intervention_rate", 0.0)),
-            "violations": list(result.get("violations") or []),
+            "violations": result.get("violations"),
+            "risk_score": result.get("risk_score"),
+            "governed": result.get("governed"),
             "constitutional_hash": result.get("constitutional_hash", "") or "",
             "settled": bool(result.get("settled", False)),
         }
-        return result.get("patch", "") or "", stats
+        governance_status = result.get("governance_status")
+        if governance_status is not None:
+            stats["governance_status"] = governance_status
+        if not has_completed_acceptance(result):
+            # Only terminal verdicts keep their own label; anything else
+            # (including "accepted" without complete evidence) is incomplete.
+            if type(governance_status) is str and governance_status in {"rejected", "halted"}:
+                stats["error"] = f"governance_{governance_status}"
+            else:
+                stats["error"] = "governance_incomplete"
+            return "", stats
+        patch = result.get("patch", "")
+        if type(patch) is not str:
+            stats["governance_status"] = "rejected"
+            stats["error"] = "invalid_patch"
+            return "", stats
+        stats["violations"] = list(result["violations"])
+        return patch, stats
 
 
 __all__ = ["LangGraphSWEBenchAgent"]

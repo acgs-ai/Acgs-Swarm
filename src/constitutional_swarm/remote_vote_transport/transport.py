@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -23,16 +24,36 @@ from constitutional_swarm.remote_vote_transport.protocol import (
 )
 
 
+def _require_websockets() -> Any:
+    try:
+        import websockets  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "Remote vote transport requires 'websockets>=12.0'. "
+            "Install with: pip install 'constitutional-swarm[transport]'"
+        ) from exc
+    return websockets
+
+
+def _require_verifying_client_context(context: ssl.SSLContext) -> None:
+    """Refuse client contexts that would accept an unauthenticated server."""
+    if context.verify_mode != ssl.CERT_REQUIRED or context.check_hostname is not True:
+        raise ValueError(
+            "client ssl_context must verify peers: verify_mode=CERT_REQUIRED "
+            "and check_hostname=True"
+        )
+
+
 class RemoteVoteClient:
     """WebSocket client for one-shot remote vote requests.
 
-    ``ssl_context`` is derived from ``transport_security`` rather than passed
-    per request. ``transport_security="plaintext"`` always uses ``ws://`` with
-    no SSL context, ``"tls"`` always uses ``wss://`` with an internally created
-    SSL context, and ``"auto"`` derives the scheme from a ``ws://`` or
-    ``wss://`` endpoint when present and otherwise defaults to plaintext for
-    loopback hosts and TLS for non-loopback hosts. Passing both
-    ``transport_security`` and ``ssl_context`` raises ``ValueError``.
+    ``transport_security="plaintext"`` always uses ``ws://`` with no SSL
+    context. ``"tls"`` uses ``wss://`` with the supplied context or a default
+    client context. ``"auto"`` derives the scheme from the endpoint, otherwise
+    defaulting to plaintext for loopback hosts and TLS for non-loopback hosts;
+    explicit contexts therefore require ``transport_security="tls"`` and must
+    verify the server (``CERT_REQUIRED`` and ``check_hostname``); this is checked
+    at construction and again before every connection.
     """
 
     def __init__(
@@ -41,9 +62,19 @@ class RemoteVoteClient:
         transport_security: TransportSecurity = "auto",
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
-        if ssl_context is not None:
-            raise ValueError("cannot specify both transport_security and ssl_context")
         self.transport_security = transport_security
+        if ssl_context is None:
+            self.ssl_context = None
+        elif transport_security == "auto":
+            raise ValueError("auto transport cannot use an explicit SSL context")
+        else:
+            self.ssl_context = _build_ssl_context(
+                transport_security,
+                server_side=False,
+                ssl_context=ssl_context,
+            )
+            if self.ssl_context is not None:
+                _require_verifying_client_context(self.ssl_context)
 
     async def request_vote(
         self,
@@ -53,13 +84,7 @@ class RemoteVoteClient:
         *,
         timeout: float = 5.0,
     ) -> RemoteVoteResponse:
-        try:
-            import websockets  # type: ignore[import]
-        except ImportError as exc:
-            raise ImportError(
-                "Remote vote transport requires 'websockets>=12.0'. "
-                "Install with: pip install 'constitutional-swarm[transport]'"
-            ) from exc
+        websockets = _require_websockets()
 
         scheme, parsed_host, parsed_port = _parse_ws_endpoint(host)
         resolved_port = parsed_port or port
@@ -68,7 +93,13 @@ class RemoteVoteClient:
             scheme=scheme,
             host=parsed_host,
         )
-        ssl_context = _build_ssl_context(resolved_mode)
+        ssl_context = _build_ssl_context(
+            resolved_mode,
+            server_side=False,
+            ssl_context=self.ssl_context,
+        )
+        if ssl_context is not None:
+            _require_verifying_client_context(ssl_context)
         uri = f"{'wss' if resolved_mode == 'tls' else 'ws'}://{_format_uri_host(parsed_host)}:{resolved_port}"
         async with asyncio.timeout(timeout):
             async with websockets.connect(uri, ssl=ssl_context) as ws:
@@ -80,13 +111,10 @@ class RemoteVoteClient:
 class RemoteVoteServer:
     """WebSocket server that handles one request-response remote vote RPCs.
 
-    ``ssl_context`` is derived from ``transport_security`` rather than accepted
-    separately. ``transport_security="plaintext"`` binds a ``ws://`` server with
-    no SSL context, ``"tls"`` creates a server SSL context automatically, and
-    ``"auto"`` derives from a ``ws://`` or ``wss://`` scheme embedded in
-    ``host`` and otherwise defaults to plaintext for loopback hosts and TLS for
-    non-loopback hosts. Passing both ``transport_security`` and ``ssl_context``
-    raises ``ValueError``.
+    ``transport_security="plaintext"`` binds a ``ws://`` server without TLS.
+    TLS mode requires either a caller-provided server ``ssl_context`` or a
+    ``certfile`` (and optional separate ``keyfile``). ``"auto"`` derives from a
+    host URL scheme, otherwise using plaintext only for loopback hosts.
     """
 
     def __init__(
@@ -97,9 +125,9 @@ class RemoteVoteServer:
         port: int = 0,
         transport_security: TransportSecurity = "auto",
         ssl_context: ssl.SSLContext | None = None,
+        certfile: str | os.PathLike[str] | None = None,
+        keyfile: str | os.PathLike[str] | None = None,
     ) -> None:
-        if ssl_context is not None:
-            raise ValueError("cannot specify both transport_security and ssl_context")
         scheme, parsed_host, parsed_port = _parse_ws_endpoint(host)
         resolved_mode = _resolve_transport_security(
             transport_security=transport_security,
@@ -110,18 +138,18 @@ class RemoteVoteServer:
         self.host = parsed_host
         self.port = parsed_port or port
         self.transport_security = transport_security
-        self.ssl_context = _build_ssl_context(resolved_mode, server_side=True)
+        self.ssl_context = _build_ssl_context(
+            resolved_mode,
+            server_side=True,
+            ssl_context=ssl_context,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
         self._server: Any = None
         self._actual_port: int = self.port
 
     async def start(self) -> None:
-        try:
-            import websockets  # type: ignore[import]
-        except ImportError as exc:
-            raise ImportError(
-                "Remote vote transport requires 'websockets>=12.0'. "
-                "Install with: pip install 'constitutional-swarm[transport]'"
-            ) from exc
+        websockets = _require_websockets()
         self._server = await websockets.serve(
             self._handle_connection,
             self.host,

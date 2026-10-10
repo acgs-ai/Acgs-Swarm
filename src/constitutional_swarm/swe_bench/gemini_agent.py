@@ -26,14 +26,16 @@ Requirements
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
-from constitutional_swarm.swe_bench.agent import SWEBenchAgent
-from constitutional_swarm.swe_bench.claude_agent import (
-    _PROMPT_TEMPLATE,
-    _extract_diff,
+from constitutional_swarm.swe_bench._diff import extract_unified_diff
+from constitutional_swarm.swe_bench._messages_agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    build_swe_bench_prompt,
 )
+from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 _log = logging.getLogger(__name__)
 
@@ -43,11 +45,7 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
 
     _DEFAULT_MODEL = "gemini-2.5-pro"
     _DEFAULT_REGION = "global"
-    _DEFAULT_SYSTEM = (
-        "You are an expert software engineer. "
-        "When asked to fix a bug, output only the unified diff — "
-        "no explanation, no code fences, no markdown."
-    )
+    _DEFAULT_SYSTEM = DEFAULT_SYSTEM_PROMPT
 
     def __init__(
         self,
@@ -81,8 +79,11 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
+        if extra_config and "http_options" in extra_config:
+            raise ValueError("extra_config cannot override http_options")
         try:
             from google import genai
+            from google.genai import types as genai_types
         except ImportError as exc:
             raise ImportError(
                 "google-genai is required. Install with "
@@ -92,6 +93,10 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
             vertexai=True,
             project=self._project_id,
             location=self._region,
+            http_options=genai_types.HttpOptions(
+                timeout=max(1, math.ceil(self.timeout_s * 1000)),
+                retry_options=genai_types.HttpRetryOptions(attempts=1),
+            ),
         )
         self._system = system_prompt or self._DEFAULT_SYSTEM
         self._extra_config: dict[str, Any] = dict(extra_config or {})
@@ -105,19 +110,7 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
         self._thinking_budget = thinking_budget
 
     def _build_prompt(self, task: dict[str, Any]) -> str:
-        fail_to_pass = task.get("FAIL_TO_PASS") or []
-        if isinstance(fail_to_pass, str):
-            fail_to_pass = [fail_to_pass]
-        hints = task.get("hints_text") or ""
-        hints_section = f"Hints:\n{hints.strip()}\n\n" if hints.strip() else ""
-        return _PROMPT_TEMPLATE.format(
-            instance_id=task.get("instance_id", "unknown"),
-            repo=task.get("repo", "unknown"),
-            base_commit=task.get("base_commit", "unknown"),
-            fail_to_pass="\n".join(f"- {t}" for t in fail_to_pass) or "(none listed)",
-            problem_statement=(task.get("problem_statement") or "").strip(),
-            hints_section=hints_section,
-        )
+        return build_swe_bench_prompt(task)
 
     def _generate_patch(self, task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         prompt = self._build_prompt(task)
@@ -171,7 +164,7 @@ class GeminiSWEBenchAgent(SWEBenchAgent):
             finish_reason = getattr(fr, "name", None) or (str(fr) if fr is not None else None)
         stats["stop_reason"] = finish_reason
 
-        patch = _extract_diff(raw)
+        patch = extract_unified_diff(raw)
         stats["raw_length"] = len(raw)
         stats["patch_length"] = len(patch)
         return patch, stats

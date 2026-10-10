@@ -6,6 +6,12 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from constitutional_swarm.mesh.vote_envelope import (
+    SignedAssignment,
+    VoteEnvelope,
+    compute_vote_envelope_root_from_hashes,
+)
+
 
 def _compute_merkle_root(
     assignment_id: str,
@@ -40,16 +46,39 @@ class MeshProof:
     root_hash: str
     accepted: bool
     timestamp: float
+    task_id: str = ""
+    producer_id: str = ""
+    artifact_id: str = ""
+    protocol_version: int = 2
 
-    def verify(self) -> bool:
-        """Independently verify the proof chain."""
-        recomputed = _compute_merkle_root(
-            self.assignment_id,
-            self.content_hash,
-            self.constitutional_hash,
-            self.vote_hashes,
-            self.accepted,
-        )
+    def verify(self, *, allow_legacy_v1: bool = False) -> bool:
+        """Independently verify the proof chain.
+
+        Legacy v1 roots are colon-joined, not domain-separated, and truncated to
+        128 bits, so they verify only when the caller passes
+        ``allow_legacy_v1=True`` (historical fixture generation).
+        """
+        if self.protocol_version == 2:
+            recomputed = compute_vote_envelope_root_from_hashes(
+                task_id=self.task_id,
+                assignment_id=self.assignment_id,
+                producer_id=self.producer_id,
+                artifact_id=self.artifact_id,
+                content_hash=self.content_hash,
+                constitutional_hash=self.constitutional_hash,
+                accepted=self.accepted,
+                envelope_hashes=self.vote_hashes,
+            )
+        elif self.protocol_version == 1 and allow_legacy_v1 is True:
+            recomputed = _compute_merkle_root(
+                self.assignment_id,
+                self.content_hash,
+                self.constitutional_hash,
+                self.vote_hashes,
+                self.accepted,
+            )
+        else:
+            return False
         return recomputed == self.root_hash
 
 
@@ -67,6 +96,8 @@ class MeshResult:
     proof: MeshProof | None
     settled: bool = False
     settled_at: float | None = None
+    vote_envelopes: tuple[VoteEnvelope, ...] = ()
+    signed_assignment: SignedAssignment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +109,7 @@ class ReconciliationReport:
     skipped_recovered: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
+    skipped_constitution: int = 0
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return a structured log payload for this reconciliation pass."""
@@ -85,6 +117,7 @@ class ReconciliationReport:
             "attempted": self.attempted,
             "settled": self.settled,
             "skipped_recovered": self.skipped_recovered,
+            "skipped_constitution": self.skipped_constitution,
             "failed": self.failed,
             "errors": list(self.errors),
         }

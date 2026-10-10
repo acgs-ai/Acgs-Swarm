@@ -1,4 +1,4 @@
-"""MAC-ACGS autonomous research loop — runnable end-to-end example.
+"""MAC-ACGS autonomous research loop with externally supplied evidence.
 
 Demonstrates the full auto-constitution pipeline with real components only:
 
@@ -10,11 +10,12 @@ Demonstrates the full auto-constitution pipeline with real components only:
 Why the precedent-backed codifier exists: post-#118 ``CAMECoordinator`` is
 deliberately precedent-agnostic — at ceiling it passes the codifier an empty
 ``live_approaches`` list (feeding raw grid approaches into rule proposal would
-bypass validator consensus), so a plain ``RuleCodifier`` receives nothing and
-can never propose a rule. ``PrecedentBackedCodifier`` closes the loop by owning
-its own explicit precedent stream — escalated, validator-approved cases. Run:
-
-    python examples/mac_acgs_autonomous_research.py
+bypass precedent admission), so a plain ``RuleCodifier`` receives nothing and
+can never propose a rule. ``PrecedentBackedCodifier`` closes the loop by
+observing an explicit store-backed stream of escalated cases. Precedents and
+their public-key-only trust registry must be supplied by an external voter
+collection path. Embed this module and call ``run_with_precedents``. Direct
+execution fails closed because it has no authenticated external evidence input.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import sys
+from collections.abc import Sequence
 
 from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
 from constitutional_swarm.bittensor.map_elites import (
@@ -30,9 +33,9 @@ from constitutional_swarm.bittensor.map_elites import (
     MinerApproach,
 )
 from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
-from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
-from constitutional_swarm.bittensor.protocol import EscalationType
-from constitutional_swarm.mac_acgs_loop import MacAcgsLoop
+from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
+from constitutional_swarm.mac_acgs_loop import ChallengeProvider, MacAcgsConfig, MacAcgsLoop
+from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
 
 CONSTITUTIONAL_HASH = "608508a9bd224290"
 
@@ -56,41 +59,37 @@ def synth_approaches(rng: random.Random, cycle: int, n: int = 24) -> list[MinerA
     ]
 
 
-def synth_precedent(rng: random.Random, idx: int) -> PrecedentRecord:
-    """An escalated safety/security case with high validator consensus."""
-    return PrecedentRecord.create(
-        case_id=f"case-{idx}",
-        task_id=f"task-{idx}",
-        miner_uid=f"miner-{idx % 12}",
-        judgment="deny: irreversible side effect without receipt",
-        reasoning="Side-effectful action lacked a valid decision receipt.",
-        votes_for=9,
-        votes_against=1,
-        proof_root_hash=f"{idx:064x}",
-        escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
-        impact_vector={
-            "safety": 0.9 + rng.uniform(-0.05, 0.05),
-            "security": 0.8 + rng.uniform(-0.05, 0.05),
-            "privacy": 0.1,
-            "fairness": 0.1,
-            "reliability": 0.2,
-            "transparency": 0.1,
-            "efficiency": 0.1,
-        },
-        constitutional_hash=CONSTITUTIONAL_HASH,
-        ambiguous_dimensions=("safety", "security"),
-    )
+def run_with_precedents(
+    precedents: Sequence[PrecedentRecord],
+    vote_registry: VoteSignerRegistry,
+    *,
+    reviewer_id: str,
+    challenge_provider: ChallengeProvider,
+) -> tuple[MacAcgsLoop, PrecedentStore, PrecedentBackedCodifier]:
+    """Run using evidence collected and signed by external voters.
 
-
-def main() -> int:
+    ``challenge_provider`` is the embedding application's review queue: it
+    returns ``(reviewer_id, objection, severity)`` challenges for each
+    proposal. Synthetic auto-challenges never count toward debate quorum.
+    """
+    if len(precedents) < 16:
+        raise ValueError("at least 16 externally signed precedents are required")
     rng = random.Random(42)
-    codifier = PrecedentBackedCodifier()
-    loop = MacAcgsLoop(came=CAMECoordinator(codifier=codifier))
-    loop.add_external_challenger("human-reviewer-1")
+    store = PrecedentStore(
+        CONSTITUTIONAL_HASH,
+        vote_registry=vote_registry.frozen_copy(),
+    )
+    codifier = PrecedentBackedCodifier(precedent_store=store)
+    loop = MacAcgsLoop(
+        config=MacAcgsConfig(auto_defend=True),
+        came=CAMECoordinator(codifier=codifier),
+        challenge_provider=challenge_provider,
+    )
+    loop.add_external_challenger(reviewer_id)
 
     for cycle in range(1, 9):
-        codifier.observe(synth_precedent(rng, 2 * cycle))
-        codifier.observe(synth_precedent(rng, 2 * cycle + 1))
+        codifier.observe(store.admit(precedents[2 * cycle - 2]))
+        codifier.observe(store.admit(precedents[2 * cycle - 1]))
         result = loop.run_cycle(synth_approaches(rng, cycle))
         print(
             json.dumps(
@@ -104,12 +103,17 @@ def main() -> int:
                 }
             )
         )
+    return loop, store, codifier
 
-    updates = loop.constitution_updates()
-    print(f"constitutional updates committed: {len(updates)}")
-    for upd in updates:
-        print(json.dumps(upd if isinstance(upd, dict) else upd.__dict__, default=str))
-    return 0 if updates else 1
+
+def main() -> int:
+    """Fail closed until the embedding application supplies external evidence."""
+    print(
+        "external signed precedents and a public-key trust registry are required; "
+        "call run_with_precedents()",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":

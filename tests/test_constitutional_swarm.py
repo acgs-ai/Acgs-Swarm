@@ -923,12 +923,13 @@ class TestByzantineMajorityReject:
 
         constitution = Constitution.default()
         # 5 agents, producer excluded → 4 peers assigned.
-        # quorum=2 means rejection triggers at votes_against > (4-2) = >2, i.e. 3 rejects.
+        # quorum=3 is a strict majority of 4 assigned peers.
         mesh = ConstitutionalMesh(
             constitution,
             peers_per_validation=4,
-            quorum=2,
+            quorum=3,
             seed=42,
+            evidence_mode="single_operator_dev",
         )
 
         # Register 5 agents
@@ -943,9 +944,8 @@ class TestByzantineMajorityReject:
         )
 
         # 3 of the 4 assigned peers vote to reject (Byzantine majority).
-        # After 3 rejects the mesh auto-settles (quorum reached), so
-        # we submit exactly 3 votes — the 4th would raise AssignmentSettledError.
-        for peer_id in assignment.peers[:3]:
+        # Complete evidence includes every assigned peer.
+        for peer_id in assignment.peers:
             _signed_mesh_vote(
                 mesh,
                 assignment.assignment_id,
@@ -974,6 +974,7 @@ class TestByzantineMajorityReject:
             peers_per_validation=6,
             quorum=4,
             seed=7,
+            evidence_mode="single_operator_dev",
         )
 
         for name in (

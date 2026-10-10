@@ -7,8 +7,8 @@ Implements the structured adversarial debate resolution protocol:
     Defender → issues a Defense (proposer rebuttal)
     Resolver → aggregates all three into a FinalVerdict
 
-The transcript is Merkle-hashed to prevent tampering (MACI receipt-freeness
-property at the debate layer). Final verdict requires constitutional hash
+The transcript receives a canonical, schema-versioned digest to make omitted
+or modified fields detectable. Final verdict requires constitutional hash
 validation before recording.
 
 Research basis:
@@ -24,8 +24,13 @@ Research basis:
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import math
+import threading
 import time
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -51,6 +56,12 @@ class DebateRole(Enum):
     PROPOSER = "proposer"
     CHALLENGER = "challenger"
     DEFENDER = "defender"
+
+
+# Fixed identity for pipeline-generated (synthetic) challenges. It can never be
+# registered, so synthetic challenges are recorded in the transcript but never
+# count toward quorum, score, or escalation.
+AUTO_CHALLENGER_ID = "auto-challenger"
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +130,7 @@ class Defense:
     timestamp: float = field(default_factory=time.time)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class DebateRecord:
     """Full structured debate transcript for a single proposal.
 
@@ -128,32 +139,90 @@ class DebateRecord:
         challenges: All challenges received.
         defenses:   All defenses issued.
         verdict:    Final verdict (set after resolve()).
-        merkle_root: Tamper-evident hash of the full transcript.
+        merkle_root: Compatibility name for the canonical transcript digest.
         constitutional_hash: Hash validated at verdict time.
     """
 
     proposal: Proposal
-    challenges: list[Challenge] = field(default_factory=list)
-    defenses: list[Defense] = field(default_factory=list)
+    challenges: tuple[Challenge, ...] = ()
+    defenses: tuple[Defense, ...] = ()
     verdict: FinalVerdict | None = None
     merkle_root: str = ""
     constitutional_hash: str = _CONSTITUTIONAL_HASH
 
-    def compute_merkle_root(self) -> str:
-        """Compute a tamper-evident hash of the debate transcript.
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "challenges", tuple(self.challenges))
+        object.__setattr__(self, "defenses", tuple(self.defenses))
 
-        Hashes proposal + all challenges + all defenses in insertion order.
-        Any tampering with any message changes the root.
+    def compute_merkle_root(self) -> str:
+        """Compute a versioned flat digest of the full debate transcript.
+
+        The public field retains its historical ``merkle_root`` name, but this
+        is a canonical transcript digest rather than a Merkle tree: there is no
+        inclusion-proof API. Challenge and defense insertion order is bound.
         """
-        parts = [
-            f"proposal:{self.proposal.proposal_id}:{self.proposal.content}",
-        ]
-        for c in self.challenges:
-            parts.append(f"challenge:{c.challenger_id}:{c.objection}:{c.severity}")
-        for d in self.defenses:
-            parts.append(f"defense:{d.defender_id}:{d.rebuttal}")
-        combined = "|".join(parts)
-        return hashlib.sha256(combined.encode()).hexdigest()[:32]
+        payload = {
+            "schema": "constitutional_swarm.debate_transcript.v2",
+            "constitutional_hash": self.constitutional_hash,
+            "proposal": {
+                "proposal_id": self.proposal.proposal_id,
+                "proposer_id": self.proposal.proposer_id,
+                "domain": self.proposal.domain,
+                "content": self.proposal.content,
+                "evidence": self.proposal.evidence,
+                "timestamp": self.proposal.timestamp,
+            },
+            "challenges": [
+                {
+                    "proposal_id": challenge.proposal_id,
+                    "challenger_id": challenge.challenger_id,
+                    "objection": challenge.objection,
+                    "alternative": challenge.alternative,
+                    "severity": challenge.severity,
+                    "timestamp": challenge.timestamp,
+                }
+                for challenge in self.challenges
+            ],
+            "defenses": [
+                {
+                    "proposal_id": defense.proposal_id,
+                    "defender_id": defense.defender_id,
+                    "rebuttal": defense.rebuttal,
+                    "concession": defense.concession,
+                    "timestamp": defense.timestamp,
+                }
+                for defense in self.defenses
+            ],
+            "verdict": (
+                {
+                    "proposal_id": self.verdict.proposal_id,
+                    "outcome": self.verdict.outcome.value,
+                    "approval_score": self.verdict.approval_score,
+                    "reasoning": self.verdict.reasoning,
+                    "constitutional_hash": self.verdict.constitutional_hash,
+                    "timestamp": self.verdict.timestamp,
+                }
+                if self.verdict is not None
+                else None
+            ),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:32]
+
+    def verify_integrity(self) -> bool:
+        """Verify the current record against its sealed transcript digest."""
+        if not self.merkle_root:
+            return False
+        try:
+            current_digest = self.compute_merkle_root()
+            return hmac.compare_digest(current_digest, self.merkle_root)
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,7 +238,7 @@ class DebateRecord:
         }
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class FinalVerdict:
     """Outcome of a resolved debate.
 
@@ -220,13 +289,20 @@ class DebateResolver:
 
     The resolver enforces:
     - Constitutional hash gate: verdict only recorded if hash matches
-    - Quorum: minimum number of challenges before resolution
+    - Participant registry: roles come from the operator (constructor or
+      ``register_participant``), never from a debate message. Challenges are
+      accepted only from registered CHALLENGERs other than the proposer;
+      defenses only from the proposer or a registered DEFENDER. Without a
+      registry no challenger counts, so every debate deadlocks (fail-closed).
+    - Quorum: minimum number of distinct registered challengers before resolution
     - Severity weighting: high-severity challenges reduce approval score
     - Deadlock detection: if no quorum, outcome = DEADLOCK
 
     Usage::
 
-        resolver = DebateResolver()
+        resolver = DebateResolver(
+            participants={"validator-3": [DebateRole.CHALLENGER]},
+        )
 
         proposal = resolver.propose(
             proposal_id="p-001",
@@ -257,6 +333,7 @@ class DebateResolver:
         min_challenges:       Minimum challenges required for resolution (default 1).
         escalation_threshold: Avg challenge severity above which verdict is ESCALATED.
         constitutional_hash:  Hash validated at verdict time.
+        participants:         Pinned registry ``{agent_id: roles}``.
     """
 
     # Minimum allowed challenge severity — prevents trivially-scored challenges.
@@ -265,18 +342,67 @@ class DebateResolver:
     # Maximum defenses any single defender may submit per proposal.
     _MAX_DEFENSES_PER_DEFENDER: int = 3
 
+    # Any defense response earns one fixed credit; asserted IDs do not add weight.
+    _DEFENSE_RESPONSE_CREDIT: float = 0.15
+
     def __init__(
         self,
         approval_threshold: float = 0.6,
         min_challenges: int = 1,
         escalation_threshold: float = 0.85,
         constitutional_hash: str = _CONSTITUTIONAL_HASH,
+        *,
+        participants: Mapping[str, Iterable[DebateRole]] | None = None,
     ) -> None:
-        self._approval_threshold = approval_threshold
+        if isinstance(min_challenges, bool) or not isinstance(min_challenges, int):
+            raise ValueError("min_challenges must be an integer >= 1")
+        if min_challenges < 1:
+            raise ValueError("min_challenges must be an integer >= 1")
+        for name, value in (
+            ("approval_threshold", approval_threshold),
+            ("escalation_threshold", escalation_threshold),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0.0 <= value <= 1.0
+            ):
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+        if not isinstance(constitutional_hash, str) or not constitutional_hash:
+            raise ValueError("constitutional_hash must be a non-empty string")
+
+        self._approval_threshold = float(approval_threshold)
         self._min_challenges = min_challenges
-        self._escalation_threshold = escalation_threshold
+        self._escalation_threshold = float(escalation_threshold)
         self._constitutional_hash = constitutional_hash
         self._records: dict[str, DebateRecord] = {}
+        self._lock = threading.RLock()
+        self._roles: dict[str, frozenset[DebateRole]] = {}
+        if participants is not None:
+            if not isinstance(participants, Mapping):
+                raise ValueError("participants must be a mapping of agent_id to roles")
+            for agent_id, roles in participants.items():
+                self.register_participant(agent_id, *roles)
+
+    @property
+    def constitutional_hash(self) -> str:
+        """The constitutional hash this resolver enforces at verdict time."""
+        return self._constitutional_hash
+
+    def register_participant(self, agent_id: str, *roles: DebateRole) -> None:
+        """Grant debate roles to an agent (operator call; roles only accumulate)."""
+        if not isinstance(agent_id, str) or not agent_id or agent_id != agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string without surrounding space")
+        if agent_id == AUTO_CHALLENGER_ID:
+            raise ValueError(f"{AUTO_CHALLENGER_ID!r} is reserved for synthetic challenges")
+        if not roles or any(not isinstance(role, DebateRole) for role in roles):
+            raise ValueError("roles must be one or more DebateRole values")
+        with self._lock:
+            self._roles[agent_id] = self._roles.get(agent_id, frozenset()) | frozenset(roles)
+
+    def _has_role(self, agent_id: str, role: DebateRole) -> bool:
+        return role in self._roles.get(agent_id, frozenset())
 
     # ── Debate lifecycle ─────────────────────────────────────────────────
 
@@ -298,17 +424,21 @@ class DebateResolver:
         Raises:
             ValueError: if proposal_id already exists.
         """
-        if proposal_id in self._records:
-            raise ValueError(f"Proposal {proposal_id!r} already exists")
-        proposal = Proposal(
-            proposal_id=proposal_id,
-            proposer_id=proposer_id,
-            domain=domain,
-            content=content,
-            evidence=evidence,
-        )
-        self._records[proposal_id] = DebateRecord(proposal=proposal)
-        return proposal
+        with self._lock:
+            if proposal_id in self._records:
+                raise ValueError(f"Proposal {proposal_id!r} already exists")
+            proposal = Proposal(
+                proposal_id=proposal_id,
+                proposer_id=proposer_id,
+                domain=domain,
+                content=content,
+                evidence=evidence,
+            )
+            self._records[proposal_id] = DebateRecord(
+                proposal=proposal,
+                constitutional_hash=self._constitutional_hash,
+            )
+            return proposal
 
     def challenge(
         self,
@@ -326,27 +456,48 @@ class DebateResolver:
         Raises:
             KeyError: if proposal_id not found.
             ValueError: if severity not in [0.0, 1.0].
+            PermissionError: if the challenger is the proposer, or is neither a
+                registered CHALLENGER nor ``AUTO_CHALLENGER_ID`` (never counted).
         """
-        if proposal_id not in self._records:
-            raise KeyError(f"Proposal {proposal_id!r} not found")
-        record = self._records[proposal_id]
-        if record.verdict is not None:
-            raise RuntimeError(
-                f"Proposal {proposal_id!r} is already resolved; cannot add challenges"
+        with self._lock:
+            if proposal_id not in self._records:
+                raise KeyError(f"Proposal {proposal_id!r} not found")
+            record = self._records[proposal_id]
+            if record.verdict is not None:
+                raise RuntimeError(
+                    f"Proposal {proposal_id!r} is already resolved; cannot add challenges"
+                )
+            if challenger_id == record.proposal.proposer_id:
+                raise PermissionError(
+                    f"Challenger {challenger_id!r} is the proposer of {proposal_id!r}"
+                )
+            if challenger_id != AUTO_CHALLENGER_ID and not self._has_role(
+                challenger_id, DebateRole.CHALLENGER
+            ):
+                raise PermissionError(
+                    f"Challenger {challenger_id!r} is not a registered challenger"
+                )
+            if (
+                isinstance(severity, bool)
+                or not isinstance(severity, (int, float))
+                or not math.isfinite(severity)
+                or not 0.0 <= severity <= 1.0
+            ):
+                raise ValueError(f"severity must be finite and in [0, 1], got {severity}")
+            if severity < self._MIN_SEVERITY:
+                raise ValueError(f"severity must be >= {self._MIN_SEVERITY}, got {severity}")
+            challenge = Challenge(
+                proposal_id=proposal_id,
+                challenger_id=challenger_id,
+                objection=objection,
+                alternative=alternative,
+                severity=severity,
             )
-        if not 0.0 <= severity <= 1.0:
-            raise ValueError(f"severity must be in [0, 1], got {severity}")
-        if severity < self._MIN_SEVERITY:
-            raise ValueError(f"severity must be >= {self._MIN_SEVERITY}, got {severity}")
-        c = Challenge(
-            proposal_id=proposal_id,
-            challenger_id=challenger_id,
-            objection=objection,
-            alternative=alternative,
-            severity=severity,
-        )
-        self._records[proposal_id].challenges.append(c)
-        return c
+            self._records[proposal_id] = replace(
+                record,
+                challenges=(*record.challenges, challenge),
+            )
+            return challenge
 
     def defend(
         self,
@@ -362,26 +513,43 @@ class DebateResolver:
 
         Raises:
             KeyError: if proposal_id not found.
+            PermissionError: if the defender is neither the proposer nor a
+                registered DEFENDER.
         """
-        if proposal_id not in self._records:
-            raise KeyError(f"Proposal {proposal_id!r} not found")
-        record = self._records[proposal_id]
-        if record.verdict is not None:
-            raise RuntimeError(f"Proposal {proposal_id!r} is already resolved; cannot add defenses")
-        existing = sum(1 for d in record.defenses if d.defender_id == defender_id)
-        if existing >= self._MAX_DEFENSES_PER_DEFENDER:
-            raise PermissionError(
-                f"Defender {defender_id!r} has reached the defense limit "
-                f"({self._MAX_DEFENSES_PER_DEFENDER}) for proposal {proposal_id!r}"
+        with self._lock:
+            if proposal_id not in self._records:
+                raise KeyError(f"Proposal {proposal_id!r} not found")
+            record = self._records[proposal_id]
+            if record.verdict is not None:
+                raise RuntimeError(
+                    f"Proposal {proposal_id!r} is already resolved; cannot add defenses"
+                )
+            if defender_id != record.proposal.proposer_id and not self._has_role(
+                defender_id, DebateRole.DEFENDER
+            ):
+                raise PermissionError(
+                    f"Defender {defender_id!r} may not defend {proposal_id!r}: "
+                    "only the proposer or a registered defender may defend"
+                )
+            existing = sum(
+                1 for defense in record.defenses if defense.defender_id == defender_id
             )
-        d = Defense(
-            proposal_id=proposal_id,
-            defender_id=defender_id,
-            rebuttal=rebuttal,
-            concession=concession,
-        )
-        self._records[proposal_id].defenses.append(d)
-        return d
+            if existing >= self._MAX_DEFENSES_PER_DEFENDER:
+                raise PermissionError(
+                    f"Defender {defender_id!r} has reached the defense limit "
+                    f"({self._MAX_DEFENSES_PER_DEFENDER}) for proposal {proposal_id!r}"
+                )
+            defense = Defense(
+                proposal_id=proposal_id,
+                defender_id=defender_id,
+                rebuttal=rebuttal,
+                concession=concession,
+            )
+            self._records[proposal_id] = replace(
+                record,
+                defenses=(*record.defenses, defense),
+            )
+            return defense
 
     def resolve(
         self,
@@ -393,11 +561,12 @@ class DebateResolver:
 
         Algorithm:
             1. Validate constitutional hash (fail-closed on mismatch)
-            2. Check quorum (min_challenges met)
+            2. Check quorum using distinct registered challenger IDs
+               (``AUTO_CHALLENGER_ID`` is recorded but never counted)
             3. Compute approval score:
                base = 0.5 (neutral)
-               - Each challenge reduces score by severity * 0.3
-               - Each defense increases score by 0.15
+               - Each counted challenger's strongest severity reduces score
+               - Any defense response earns one fixed bounded credit
                - Score is clamped to [0.0, 1.0]
             4. Check escalation: if avg severity > threshold → ESCALATED
             5. Apply threshold → APPROVED or REJECTED
@@ -414,107 +583,173 @@ class DebateResolver:
             KeyError: if proposal_id not found.
             PermissionError: if constitutional hash mismatch (fail-closed).
         """
-        if proposal_id not in self._records:
-            raise KeyError(f"Proposal {proposal_id!r} not found")
-        record = self._records[proposal_id]
-        if record.verdict is not None:
-            raise RuntimeError(f"Proposal {proposal_id!r} is already resolved; verdict is sealed")
+        with self._lock:
+            if proposal_id not in self._records:
+                raise KeyError(f"Proposal {proposal_id!r} not found")
+            record = self._records[proposal_id]
+            if record.verdict is not None:
+                raise RuntimeError(
+                    f"Proposal {proposal_id!r} is already resolved; verdict is sealed"
+                )
 
-        # Constitutional hash gate — validate against instance-level hash.
-        effective_hash = constitutional_hash or self._constitutional_hash
-        if effective_hash != self._constitutional_hash:
-            raise PermissionError(
-                f"Constitutional hash mismatch: expected {self._constitutional_hash!r}, "
-                f"got {effective_hash!r}"
+            # Only omission selects the configured hash. Explicit blanks fail closed.
+            effective_hash = (
+                self._constitutional_hash
+                if constitutional_hash is None
+                else constitutional_hash
             )
+            if effective_hash != self._constitutional_hash:
+                raise PermissionError(
+                    f"Constitutional hash mismatch: expected {self._constitutional_hash!r}, "
+                    f"got {effective_hash!r}"
+                )
 
-        # Quorum check
-        if len(record.challenges) < self._min_challenges:
+            # Only registered challengers count (roles are re-checked at resolve
+            # time). The strongest message per challenger prevents repeated
+            # low-severity messages from diluting both quorum and escalation.
+            severity_by_challenger: dict[str, float] = {}
+            for challenge in record.challenges:
+                if challenge.challenger_id == record.proposal.proposer_id or not (
+                    self._has_role(challenge.challenger_id, DebateRole.CHALLENGER)
+                ):
+                    continue
+                severity_by_challenger[challenge.challenger_id] = max(
+                    challenge.severity,
+                    severity_by_challenger.get(challenge.challenger_id, 0.0),
+                )
+            distinct_challenger_count = len(severity_by_challenger)
+
+            if distinct_challenger_count < self._min_challenges:
+                verdict = FinalVerdict(
+                    proposal_id=proposal_id,
+                    outcome=VerdictOutcome.DEADLOCK,
+                    approval_score=0.0,
+                    reasoning=(
+                        f"Quorum not met: {distinct_challenger_count} distinct challengers, "
+                        f"need {self._min_challenges}"
+                    ),
+                    constitutional_hash=effective_hash,
+                )
+                self._records[proposal_id] = self._seal_record(record, verdict)
+                return verdict
+
+            strongest_severities = tuple(severity_by_challenger.values())
+            max_severity = max(strongest_severities)
+            score = 0.5 - sum(
+                severity * 0.3 for severity in strongest_severities
+            )
+            distinct_defender_count = len(
+                {defense.defender_id for defense in record.defenses}
+            )
+            # One fixed, capped credit regardless of how many defenses or ids.
+            defense_credit = (
+                self._DEFENSE_RESPONSE_CREDIT * (1.0 - max_severity)
+                if record.defenses
+                else 0.0
+            )
+            score = max(0.0, min(1.0, score + defense_credit))
+
+            avg_severity = sum(strongest_severities) / distinct_challenger_count
+            if avg_severity >= self._escalation_threshold:
+                outcome = VerdictOutcome.ESCALATED
+            elif score >= self._approval_threshold:
+                outcome = VerdictOutcome.APPROVED
+            else:
+                outcome = VerdictOutcome.REJECTED
+
+            reasoning_parts = [
+                (
+                    f"Challenges: {len(record.challenges)} messages from "
+                    f"{distinct_challenger_count} distinct registered challengers, "
+                    f"avg strongest severity: {avg_severity:.2f}."
+                ),
+                (
+                    f"Defenses: {len(record.defenses)} messages from "
+                    f"{distinct_defender_count} distinct defenders."
+                ),
+                f"Approval score: {score:.3f} (threshold: {self._approval_threshold}).",
+            ]
+            if record.defenses and record.defenses[-1].concession:
+                reasoning_parts.append(
+                    f"Proposer concession: {record.defenses[-1].concession}"
+                )
+
             verdict = FinalVerdict(
                 proposal_id=proposal_id,
-                outcome=VerdictOutcome.DEADLOCK,
-                approval_score=0.0,
-                reasoning=(
-                    f"Quorum not met: {len(record.challenges)} challenges, "
-                    f"need {self._min_challenges}"
-                ),
+                outcome=outcome,
+                approval_score=score,
+                reasoning=" ".join(reasoning_parts),
                 constitutional_hash=effective_hash,
             )
-            record.verdict = verdict
-            record.merkle_root = record.compute_merkle_root()
+            self._records[proposal_id] = self._seal_record(record, verdict)
             return verdict
 
-        # Approval score computation
-        score = 0.5  # neutral base
-        max_severity = max(c.severity for c in record.challenges) if record.challenges else 0.0
-        for c in record.challenges:
-            score -= c.severity * 0.3
-        for _d in record.defenses:
-            # Scale defense credit inversely with max severity to prevent
-            # puppet-identity flooding from overriding high-severity challenges.
-            score += 0.15 * (1.0 - max_severity)
-        score = max(0.0, min(1.0, score))
-
-        # Escalation check
-        avg_severity = sum(c.severity for c in record.challenges) / len(record.challenges)
-        if avg_severity >= self._escalation_threshold:
-            outcome = VerdictOutcome.ESCALATED
-        elif score >= self._approval_threshold:
-            outcome = VerdictOutcome.APPROVED
-        else:
-            outcome = VerdictOutcome.REJECTED
-
-        # Build reasoning narrative
-        reasoning_parts = [
-            f"Challenges: {len(record.challenges)}, avg severity: {avg_severity:.2f}.",
-            f"Defenses: {len(record.defenses)}.",
-            f"Approval score: {score:.3f} (threshold: {self._approval_threshold}).",
-        ]
-        if record.defenses and record.defenses[-1].concession:
-            reasoning_parts.append(f"Proposer concession: {record.defenses[-1].concession}")
-
-        verdict = FinalVerdict(
-            proposal_id=proposal_id,
-            outcome=outcome,
-            approval_score=score,
-            reasoning=" ".join(reasoning_parts),
-            constitutional_hash=effective_hash,
-        )
-        record.verdict = verdict
-        record.merkle_root = record.compute_merkle_root()
-        return verdict
+    @staticmethod
+    def _seal_record(record: DebateRecord, verdict: FinalVerdict) -> DebateRecord:
+        """Return one immutable record binding a verdict and transcript digest."""
+        resolved = replace(record, verdict=verdict)
+        return replace(resolved, merkle_root=resolved.compute_merkle_root())
 
     # ── Queries ──────────────────────────────────────────────────────────
 
     def get_record(self, proposal_id: str) -> DebateRecord | None:
         """Get the full DebateRecord for a proposal."""
-        return self._records.get(proposal_id)
+        with self._lock:
+            return self._records.get(proposal_id)
+
+    def verify_transcript(self, proposal_id: str) -> bool:
+        """True iff the proposal is resolved and its sealed digest still matches.
+
+        Raises:
+            KeyError: if proposal_id not found.
+        """
+        with self._lock:
+            if proposal_id not in self._records:
+                raise KeyError(f"Proposal {proposal_id!r} not found")
+            record = self._records[proposal_id]
+        return record.verdict is not None and record.verify_integrity()
 
     def open_proposals(self) -> list[str]:
         """Proposal IDs with no verdict yet."""
-        return [pid for pid, rec in self._records.items() if rec.verdict is None]
+        with self._lock:
+            return [pid for pid, rec in self._records.items() if rec.verdict is None]
 
     def resolved_proposals(self) -> list[str]:
         """Proposal IDs with a verdict."""
-        return [pid for pid, rec in self._records.items() if rec.verdict is not None]
+        with self._lock:
+            return [pid for pid, rec in self._records.items() if rec.verdict is not None]
 
     def summary(self) -> dict[str, Any]:
         """Summary of all debates managed by this resolver."""
-        total = len(self._records)
-        resolved = len(self.resolved_proposals())
-        verdicts = [rec.verdict for rec in self._records.values() if rec.verdict is not None]
-        outcome_counts = {o.value: 0 for o in VerdictOutcome}
-        for v in verdicts:
-            outcome_counts[v.outcome.value] += 1
-        avg_score = sum(v.approval_score for v in verdicts) / len(verdicts) if verdicts else 0.0
-        return {
-            "total_proposals": total,
-            "open": total - resolved,
-            "resolved": resolved,
-            "outcome_counts": outcome_counts,
-            "avg_approval_score": round(avg_score, 4),
-            "constitutional_hash": self._constitutional_hash,
-        }
+        with self._lock:
+            total = len(self._records)
+            verdicts = tuple(
+                record.verdict
+                for record in self._records.values()
+                if record.verdict is not None
+            )
+            resolved = len(verdicts)
+            outcome_counts = {outcome.value: 0 for outcome in VerdictOutcome}
+            for verdict in verdicts:
+                outcome_counts[verdict.outcome.value] += 1
+            avg_score = (
+                sum(verdict.approval_score for verdict in verdicts) / resolved
+                if verdicts
+                else 0.0
+            )
+            return {
+                "total_proposals": total,
+                "open": total - resolved,
+                "resolved": resolved,
+                "outcome_counts": outcome_counts,
+                "avg_approval_score": round(avg_score, 4),
+                "constitutional_hash": self._constitutional_hash,
+            }
 
     def __repr__(self) -> str:
-        return f"DebateResolver(proposals={len(self._records)}, open={len(self.open_proposals())})"
+        with self._lock:
+            total = len(self._records)
+            open_count = sum(
+                record.verdict is None for record in self._records.values()
+            )
+            return f"DebateResolver(proposals={total}, open={open_count})"

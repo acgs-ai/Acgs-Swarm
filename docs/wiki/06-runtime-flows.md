@@ -64,7 +64,8 @@ This is the flow the quickstart in `README.md` demonstrates.
 2. **Request validation:**
    `assignment = mesh.request_validation(producer_id, output, artifact_id)`
    → `PeerAssignment` listing the selected peers. Peer selection is
-   **trust-weighted** (`_select_peers`: weighted sampling + one exploration slot),
+   **trust-weighted** (`mesh/core.py:_select_peers_unlocked`: weighted sampling +
+   one exploration slot),
    so Flow 6's trust matrix steers who validates.
 3. **Each peer signs and votes:**
    ```python
@@ -111,8 +112,11 @@ Replicas converge to the same head set without a coordinator
    `SignatureRecord`s.
 3. Bundle receipts → `GovernanceReceiptBundle`; serialize with `bundle_to_json`.
 4. **Independent verification:** `verify_bundle(bundle)` re-derives every digest
-   and checks signatures with **no trust in the producer** → `VerificationVerdict`.
-   CLI: `acgs-verify-receipts bundle.json`.
+   and checks signatures against caller-supplied trusted keys with **no trust in
+   the producer** → `VerificationVerdict`. Report mode retains all diagnostics
+   but remains fail-closed, so unsigned or unverifiable bundles have
+   `valid: false`. Validator IDs are stripped and case-folded before blank and
+   duplicate checks. CLI: `acgs-verify-receipts bundle.json`.
 5. **Supply-chain projection (optional):** `to_dsse_envelope(receipt, DsseSigner)`
    / `to_in_toto_statement(...)` for DSSE / in-toto consumers;
    `verify_dsse_envelope` checks them.
@@ -127,7 +131,8 @@ Replicas converge to the same head set without a coordinator
    `spectral_norm()` report health.
 3. **Continuous-time (research):** `swarm_ode.integrate(...)` advances `H` with
    `projected_rk4_step` (re-projecting each step); `add_dp_noise` for DP gossip.
-4. The updated trust weights flow back into `mesh._select_peers` (Flow 3 step 2),
+4. The updated trust weights flow back into `mesh/core.py:_select_peers_unlocked`
+   (Flow 3 step 2),
    closing the loop — better-trusted peers are sampled more, with one exploration
    slot for discovery.
 
@@ -144,33 +149,49 @@ The productized, hardened flow (`governed_handoff.py`).
 1. `acgs-swarm run` → `_intake` loads the task + constitution and **fails closed**
    if a declared constitution version/hash ≠ pinned `608508a9bd224290`.
 2. An adapter (`MockAdapter` / `ExternalAgentAdapter` for Codex/Claude) proposes
-   `Action`s.
+   `Action`s. The external adapter's command is resolved on
+   `FIXED_SUBPROCESS_PATH` (`/usr/bin:/bin:/usr/local/bin`) or must be
+   absolute. A relative, blank or unresolvable command fails before spawn.
 3. `PolicyEngine.decide(action)` → `PolicyDecision`. The `tool_call` gate is
-   **default-DENY** against `DEFAULT_COMMAND_ALLOWLIST = (python, python3, pytest)`;
-   the constitution may extend, never weaken it.
+   **default-DENY** against the closed, code-owned `SAFE_COMMANDS` table
+   (`true` with no arguments, `echo` with plain-word arguments).
+   `command_allowlist` may only select from that table and can never add an
+   executable, flag, or argument shape. A list, tuple or set narrows the
+   table, a non-sequence value (for example a string) enables nothing, and an
+   absent or null value enables the whole table.
 4. Approved actions execute; each step is hash-linked into an audit chain
    (`AuditLogger`, `replay_hashes`).
-5. `build_bundle(signer=BundleSigner, constitutional_version=...)` Ed25519-signs a
-   domain-separated attestation (`BUNDLE_SIG_DOMAIN`) binding chain_hash +
-   constitution_hash + version pin + final_state + task identity.
+5. Schema v2 `build_bundle(signer=BundleSigner, constitutional_version=...)`
+   Ed25519-signs a domain-separated canonical attestation (`BUNDLE_SIG_DOMAIN`)
+   over every bundle payload field except the `signature` block.
 6. `acgs-swarm verify --trusted-key KEYID=HEX` →
-   `verify_bundle(..., trusted_public_keys=...)` **requires** a valid signature for
-   `ok`; trust derives only from the out-of-band key, never the embedded one.
-   With no anchor, it still returns `ok` on chain-consistency and reports
-   `signed: false` honestly.
+   `verify_bundle(..., trusted_public_keys=...)` replays the embedded
+   `audit_events`, re-derives all verifier-facing summaries, and compares them
+   with the signed payload. It treats `audit_path` only as signed provenance and
+   never opens it during verification. `ok` requires a valid signature under an
+   out-of-band trust anchor; unsigned, unanchored, and schema v1 bundles return
+   `ok: false` with diagnostic status.
 
 ---
 
 ## Flow 8 — Constitutional amendment (joint consensus)
 
-1. Propose: `AmendmentProposal(prior, proposed, to_epoch)`; `drift = .drift` is the
+1. Propose: `AmendmentProposal(prior, proposed, binding_digest=...)`; `proposed`
+   carries the next epoch and parent digest, while `.drift` is the
    symmetric-difference rule count (`evaluate_drift`).
-2. Gate drift: must fit the declared `DriftBudget` else `DriftBudgetExceeded`.
-3. Ratify under **joint consensus**: a `TransitionCertificate` needs *both* the
-   old and new validator sets to ratify; `verify_transition(...)` enforces epoch
-   match (`EpochMismatchError`) and joint quorum (`JointQuorumNotMetError`).
-4. On success, the new `ConstitutionVersion` (`.digest`) becomes active; the
-   bittensor layer distributes it via `constitution_sync.py`.
+2. Gate drift with the verifier-owned
+   `TransitionVerificationPolicy.max_rule_delta`; proposal-carried
+   `DriftBudget` is compatibility metadata and cannot authorize a larger change.
+3. Ratify under **joint consensus**: `TransitionCertificate` carries signed
+   `QuorumCertificate`s from both the old and new validator sets over the same
+   canonical, length-prefixed v2 transition subject.
+4. `verify_transition(...)` checks the proposal against the verifier's trusted
+   current `ConstitutionVersion`, validator registries, and certificate policy,
+   then enforces the drift limit and both quorums. A predecessor mismatch raises
+   `EpochMismatchError`; an invalid side raises `JointQuorumNotMetError`.
+5. Governed bittensor sync (`constitution_sync.py`) additionally requires the
+   proposal's `binding_digest` to match the complete canonical sync-message
+   commitment before activating and pinning the new version.
 - **Formal model:** `specs/constitution_reconfig.tla` (checked by `tla-check` CI).
 
 ---

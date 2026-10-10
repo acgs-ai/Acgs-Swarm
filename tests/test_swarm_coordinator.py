@@ -58,8 +58,11 @@ def test_run_in_memory_returns_expected_keys() -> None:
     assert set(result.keys()) >= {
         "patches",
         "total",
+        "patch_generated",
+        "patch_rate",
         "resolved",
         "resolve_rate",
+        "evaluation_mode",
         "crdt_size",
         "governed_count",
         "mean_intervention",
@@ -102,6 +105,8 @@ def test_run_in_memory_empty_tasks() -> None:
 def test_run_in_memory_resolve_rate_with_success_agent() -> None:
     coord = SwarmCoordinator([_SuccessAgent()])
     result = coord.run_in_memory(_make_tasks(4))
+    assert result["patch_generated"] == 4
+    assert result["patch_rate"] == pytest.approx(1.0)
     assert result["resolved"] == 4
     assert result["resolve_rate"] == pytest.approx(1.0)
 
@@ -109,6 +114,8 @@ def test_run_in_memory_resolve_rate_with_success_agent() -> None:
 def test_run_in_memory_resolve_rate_with_stub_agent() -> None:
     coord = SwarmCoordinator([SWEBenchAgent()])
     result = coord.run_in_memory(_make_tasks(4))
+    assert result["patch_generated"] == 0
+    assert result["patch_rate"] == pytest.approx(0.0)
     assert result["resolved"] == 0
     assert result["resolve_rate"] == pytest.approx(0.0)
 

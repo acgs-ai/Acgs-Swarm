@@ -60,8 +60,11 @@ def _make_fixed_graph(
             "patch": patch,
             "intervention_rate": intervention_rate,
             "violations": list(violations or []),
+            "risk_score": 0.0,
+            "governed": True,
             "constitutional_hash": constitutional_hash,
             "settled": settled,
+            "governance_status": "accepted",
         }
 
     builder = StateGraph(dict)

@@ -3,24 +3,24 @@
 from __future__ import annotations
 
 import json
-import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-from .crypto import b64u_decode, b64u_encode, sha256_digest
+from ..strict_json import loads as _strict_loads
+from .codec import _DECIMAL, _IDENTIFIER
+from .codec import MAX_SAFE_INTEGER as _MAX_SAFE_INTEGER
+from .crypto import (
+    AUTHORITY_OBSERVATION_DOMAIN,
+    CONTROLLER_LAUNCH_DOMAIN,
+    b64u_decode,
+    b64u_encode,
+    sha256_digest,
+    verify_detached,
+)
 from .model import LogicalNodeState, Signature
 
-
-AUTHORITY_OBSERVATION_DOMAIN = b"APCC-B6-AUTHORITY-OBSERVATION-V1"
-CONTROLLER_LAUNCH_DOMAIN = b"APCC-B6-CONTROLLER-LAUNCH-V1"
-_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-_DECIMAL = re.compile(r"(?:0|[1-9][0-9]{0,15})\Z")
-_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _MAX_DEPTH = 8
 _MAX_OBJECT_BYTES = 1_048_576
 _MAX_OUTBOX_RECORD_BYTES = 8192
@@ -76,22 +76,20 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _strict_json(raw: bytes, *, maximum_bytes: int, name: str) -> object:
+def _bounded_json(raw: bytes, *, maximum_bytes: int, name: str) -> object:
+    """Parse via H1: duplicate keys, floats, constants and depth fail as ValueError."""
     if type(raw) is not bytes or not raw or len(raw) > maximum_bytes:
         raise ValueError(f"{name} exceeds size limit")
-
-    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"{name} contains duplicate keys")
-            result[key] = item
-        return result
-
     try:
-        value = json.loads(raw, object_pairs_hook=object_pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return _strict_loads(
+            raw, max_bytes=maximum_bytes, max_depth=_MAX_DEPTH, allow_float=False
+        )
+    except ValueError as error:
         raise ValueError(f"malformed {name}") from error
+
+
+def _strict_json(raw: bytes, *, maximum_bytes: int, name: str) -> object:
+    value = _bounded_json(raw, maximum_bytes=maximum_bytes, name=name)
 
     def validate_tree(item: object, depth: int = 1) -> None:
         if depth > _MAX_DEPTH:
@@ -170,38 +168,10 @@ _OUTBOX_NULLABLE_FIELDS = frozenset(
 
 def _nullable_outbox_record(raw: bytes) -> dict[str, str | None]:
     """Decode the one frozen carrier that permits narrowly scoped JSON nulls."""
-    if type(raw) is not bytes or not raw or len(raw) > _MAX_OUTBOX_RECORD_BYTES:
-        raise ValueError("outbox record exceeds size limit")
-
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in items:
-            if key in result:
-                raise ValueError("outbox record contains duplicate keys")
-            result[key] = item
-        return result
-
-    def number(_: str) -> object:
-        raise ValueError("outbox record contains a non-string scalar")
-
-    try:
-        text = raw.decode("utf-8", errors="strict")
-        if text.startswith("\ufeff"):
-            raise ValueError("outbox record contains a BOM")
-        decoder = json.JSONDecoder(
-            object_pairs_hook=pairs,
-            parse_int=number,
-            parse_float=number,
-            parse_constant=number,
-        )
-        value, end = decoder.raw_decode(text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("malformed outbox record") from error
-    if (
-        end != len(text)
-        or not isinstance(value, dict)
-        or set(value) != _OUTBOX_RECORD_KEYS
-    ):
+    value = _bounded_json(
+        raw, maximum_bytes=_MAX_OUTBOX_RECORD_BYTES, name="outbox record"
+    )
+    if not isinstance(value, dict) or set(value) != _OUTBOX_RECORD_KEYS:
         raise ValueError("outbox record has invalid fields")
     for key, item in value.items():
         if not key.isascii() or (
@@ -681,21 +651,19 @@ def verify_signed_authority_observation(
         or value.sequence != expected_sequence
     ):
         raise ValueError("observation response binding mismatch")
-    try:
-        Ed25519PublicKey.from_public_bytes(pinned_public_key).verify(
-            b64u_decode(value.signature.signature_b64u, expected_length=64),
-            AUTHORITY_OBSERVATION_DOMAIN
-            + b"\x00"
-            + encode_authority_observation_body(
-                value.snapshot,
-                launch_attestation_digest=value.launch_attestation_digest,
-                session_id=value.session_id,
-                sequence=value.sequence,
-                request_digest=value.request_digest,
-            ),
-        )
-    except (InvalidSignature, ValueError) as error:
-        raise ValueError("observation response signature mismatch") from error
+    if not verify_detached(
+        pinned_public_key,
+        AUTHORITY_OBSERVATION_DOMAIN,
+        encode_authority_observation_body(
+            value.snapshot,
+            launch_attestation_digest=value.launch_attestation_digest,
+            session_id=value.session_id,
+            sequence=value.sequence,
+            request_digest=value.request_digest,
+        ),
+        value.signature.signature_b64u,
+    ):
+        raise ValueError("observation response signature mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,8 +712,6 @@ class ObserverLaunchAttestationV1:
     controller_signature: str
 
     def __post_init__(self) -> None:
-        from .crypto import b64u_decode, sha256_digest
-
         if self.protocol_version != "APCC-1.0-draft":
             raise ValueError("unsupported observer launch protocol")
         if self.statement_type != "apcc.observer-launch-attestation":
@@ -806,7 +772,6 @@ class ObserverLaunchAttestationV1:
         now_ms: int,
     ) -> None:
         from .codec import encode_payload
-        from .crypto import b64u_decode, sha256_digest
 
         if (
             self.controller_key_id != sha256_digest(pinned_controller_public_key)
@@ -817,15 +782,13 @@ class ObserverLaunchAttestationV1:
             or not int(self.not_before_ms) <= now_ms <= int(self.not_after_ms)
         ):
             raise ValueError("observer launch trust binding mismatch")
-        try:
-            Ed25519PublicKey.from_public_bytes(pinned_controller_public_key).verify(
-                b64u_decode(self.controller_signature, expected_length=64),
-                CONTROLLER_LAUNCH_DOMAIN
-                + b"\x00"
-                + encode_payload(self.unsigned_object()),
-            )
-        except (InvalidSignature, ValueError) as error:
-            raise ValueError("observer launch controller signature mismatch") from error
+        if not verify_detached(
+            pinned_controller_public_key,
+            CONTROLLER_LAUNCH_DOMAIN,
+            encode_payload(self.unsigned_object()),
+            self.controller_signature,
+        ):
+            raise ValueError("observer launch controller signature mismatch")
 
 
 def encode_observer_launch_attestation(value: ObserverLaunchAttestationV1) -> bytes:
@@ -890,6 +853,8 @@ class VerifiedAuthorityObservation:
     outbox_authority_proof: ObservationAuthorityProof | None = None
     logical_pointer_provenance: ObservationEvidenceProvenance | None = None
     logical_pointer_authority_proof: ObservationAuthorityProof | None = None
+    request_digest: str = field(kw_only=True)
+    """Canonical digest of the caller-pinned request this verdict answers."""
 
 
 @dataclass(slots=True)
@@ -906,6 +871,7 @@ class AuthorityObservationVerificationStream:
         self,
         value: SignedAuthorityObservation,
         *,
+        expected_request: AuthorityObservationRequest,
         launch: ObserverLaunchAttestationV1,
         pinned_controller_public_key: bytes,
         expected_experiment_id: str,
@@ -933,6 +899,7 @@ class AuthorityObservationVerificationStream:
             highest_head = launch.initial_trust_head
         result = verify_authority_observation(
             value,
+            expected_request=expected_request,
             launch=launch,
             pinned_controller_public_key=pinned_controller_public_key,
             expected_experiment_id=expected_experiment_id,
@@ -959,34 +926,9 @@ class AuthorityObservationVerificationStream:
 
 def _operation_object(raw: bytes) -> dict[str, object]:
     """Decode the frozen store wrapper and strictly validate its CJ1 request."""
-    if type(raw) is not bytes or not raw or len(raw) > _MAX_OBJECT_BYTES:
-        raise ValueError("operation exceeds size limit")
-
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in items:
-            if key in result:
-                raise ValueError("operation contains duplicate keys")
-            result[key] = item
-        return result
-
-    def number(_: str) -> object:
-        raise ValueError("operation contains a non-string scalar")
-
-    try:
-        decoder = json.JSONDecoder(
-            object_pairs_hook=pairs,
-            parse_int=number,
-            parse_float=number,
-            parse_constant=number,
-        )
-        text = raw.decode("utf-8", errors="strict")
-        value, end = decoder.raw_decode(text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("malformed operation") from error
+    value = _bounded_json(raw, maximum_bytes=_MAX_OBJECT_BYTES, name="operation")
     if (
-        end != len(text)
-        or not isinstance(value, dict)
+        not isinstance(value, dict)
         or set(value) != {"operation_kind", "old_certificate_digest", "request"}
         or _canonical_json(value) != raw
     ):
@@ -1075,6 +1017,7 @@ def _validate_outbox_semantics(
 def verify_authority_observation(
     value: SignedAuthorityObservation,
     *,
+    expected_request: AuthorityObservationRequest,
     launch: ObserverLaunchAttestationV1,
     pinned_controller_public_key: bytes,
     expected_experiment_id: str,
@@ -1086,17 +1029,24 @@ def verify_authority_observation(
     highest_trust_log_sequence: str,
     highest_trust_log_head: str,
 ) -> VerifiedAuthorityObservation:
-    """Verify controller, observer transport, and the complete frozen authority tuple."""
-    from .codec import (
-        canonical_statement,
-        decode_authority_status,
-        decode_certificate,
-        decode_envelope,
-    )
-    from .crypto import b64u_decode, sha256_digest
-    from .model import FailureCode
-    from .verifier import TrustRole, verify_current, verify_historical
+    """Verify controller, observer transport, and the complete frozen authority tuple.
 
+    ``expected_request`` is the caller's own request. It is never taken from
+    ``value``: an observation answering any other request is rejected before
+    any signature or authority evidence is examined.
+    """
+    from .codec import canonical_statement, decode_authority_status
+    from .model import FailureCode
+    from .verifier import (
+        TrustRole,
+        _verify_current_status,
+        _verify_historical_detached,
+    )
+
+    if type(expected_request) is not AuthorityObservationRequest:
+        raise TypeError("expected observation request has the wrong type")
+    if value.snapshot.request != expected_request:
+        raise ValueError("observation request does not match the expected request")
     if (
         expected_experiment_id != expected_launch.experiment_id
         or expected_run_id != expected_launch.run_id
@@ -1107,7 +1057,8 @@ def verify_authority_observation(
         expected=expected_launch,
         now_ms=now_ms,
     )
-    request = value.snapshot.request
+    request = expected_request
+    request_digest = expected_request.canonical_digest
     status_trust = trust.resolve(TrustRole.STATUS, (request.authority_store_id,))
     if (
         request.authority_store_id != launch.authority_store_id
@@ -1128,7 +1079,9 @@ def verify_authority_observation(
     )
     snapshot = value.snapshot
     if snapshot.state is AuthorityObservationState.ABSENT:
-        return VerifiedAuthorityObservation("ABSENT", False, None, None, None)
+        return VerifiedAuthorityObservation(
+            "ABSENT", False, None, None, None, request_digest=request_digest
+        )
     if snapshot.persisted_operation_bytes is None:
         raise ValueError("observation lacks persisted operation")
     operation = _operation_object(snapshot.persisted_operation_bytes)
@@ -1187,7 +1140,9 @@ def verify_authority_observation(
         )
         if snapshot.audit_event_id != expected_audit:
             raise ValueError("denied audit identity mismatch")
-        return VerifiedAuthorityObservation("DENIED", False, None, None, None)
+        return VerifiedAuthorityObservation(
+            "DENIED", False, None, None, None, request_digest=request_digest
+        )
     if snapshot.state is AuthorityObservationState.CONFLICTED:
         if (
             snapshot.conflict_claim_bytes is None
@@ -1250,7 +1205,9 @@ def verify_authority_observation(
         )
         if snapshot.audit_event_id != expected_audit:
             raise ValueError("conflict audit identity mismatch")
-        return VerifiedAuthorityObservation("CONFLICTED", False, None, None, None)
+        return VerifiedAuthorityObservation(
+            "CONFLICTED", False, None, None, None, request_digest=request_digest
+        )
     if (
         sha256_digest(snapshot.persisted_operation_bytes)
         != request.expected_operation_digest
@@ -1302,14 +1259,16 @@ def verify_authority_observation(
     assert snapshot.certificate_payload_bytes is not None
     assert snapshot.certificate_envelope_bytes is not None
     assert snapshot.certificate_digest is not None
-    detached = decode_envelope(snapshot.certificate_envelope_bytes)
-    certificate = decode_certificate(snapshot.certificate_payload_bytes)
-    historical = verify_historical(snapshot.certificate_envelope_bytes, trust=trust)
+    historical, detached = _verify_historical_detached(
+        snapshot.certificate_envelope_bytes, trust=trust
+    )
+    certificate = historical.certificate
     if (
         not historical.ok
+        or detached is None
+        or certificate is None
         or detached.payload != snapshot.certificate_payload_bytes
-        or detached.payload_sha256 != snapshot.certificate_digest
-        or certificate.canonical_digest != snapshot.certificate_digest
+        or historical.certificate_digest != snapshot.certificate_digest
         or certificate.header.authority_store_id != request.authority_store_id
         or certificate.decision.commit_id != request.expected_commit_id
         or certificate.decision.outcome != "committed"
@@ -1354,8 +1313,8 @@ def verify_authority_observation(
     _validate_outbox_semantics(outbox, status_trust_sequence=status.trust_log_sequence)
     if int(status.trust_log_sequence) < int(launch.initial_trust_sequence):
         raise ValueError("authority status predates observer launch trust head")
-    current = verify_current(
-        snapshot.certificate_envelope_bytes,
+    current = _verify_current_status(
+        lambda: historical,
         trust=trust,
         authority_status=status,
         request_nonce=request.request_nonce,
@@ -1395,4 +1354,5 @@ def verify_authority_observation(
         ObservationAuthorityProof.NO_AUTHORITY_PROOF,
         ObservationEvidenceProvenance.OBSERVER_ATTESTED_NONAUTHORITATIVE,
         ObservationAuthorityProof.NO_AUTHORITY_PROOF,
+        request_digest=request_digest,
     )

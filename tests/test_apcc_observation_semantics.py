@@ -62,6 +62,7 @@ def _verify(snapshot: AuthorityObservationSnapshot):
     )
     return verify_authority_observation(
         signed,
+        expected_request=snapshot.request,
         launch=launch,
         pinned_controller_public_key=controller_public,
         expected_experiment_id=launch.experiment_id,
@@ -348,6 +349,7 @@ def test_stream_anchors_only_after_verified_launch() -> None:
     with pytest.raises(ValueError, match="signature"):
         stream.consume(
             forged,
+            expected_request=snapshot.request,
             launch=forged_launch,
             pinned_controller_public_key=controller_public,
             expected_experiment_id=forged_launch.experiment_id,
@@ -365,6 +367,7 @@ def test_stream_anchors_only_after_verified_launch() -> None:
     valid, _ = _sign_snapshot(snapshot, observer, launch_digest=launch.canonical_digest)
     stream.consume(
         valid,
+        expected_request=snapshot.request,
         launch=launch,
         pinned_controller_public_key=controller_public,
         expected_experiment_id=launch.experiment_id,
@@ -401,6 +404,7 @@ def test_stream_rejects_same_sequence_with_different_trust_head(tmp_path) -> Non
     first, _ = _sign_snapshot(snapshot, observer, launch_digest=launch.canonical_digest)
     stream.consume(
         first,
+        expected_request=snapshot.request,
         launch=launch,
         pinned_controller_public_key=controller_public,
         expected_experiment_id=launch.experiment_id,
@@ -427,6 +431,7 @@ def test_stream_rejects_same_sequence_with_different_trust_head(tmp_path) -> Non
     with pytest.raises(ValueError, match="ROLLBACK"):
         stream.consume(
             forged,
+            expected_request=snapshot.request,
             launch=launch,
             pinned_controller_public_key=controller_public,
             expected_experiment_id=launch.experiment_id,

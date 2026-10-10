@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NoReturn
 
+from constitutional_swarm import strict_json
+
 
 MATRIX_REVISION = "apcc-1.matrix.v1"
 RAW_RESULT_SCHEMA_VERSION = "apcc-1.raw-result.v1"
@@ -593,12 +595,11 @@ def _fail(message: str) -> NoReturn:
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            _fail(f"duplicate key: {key}")
-        result[key] = value
-    return result
+    """Apply the shared H1 object-member policy (duplicates, non-UTF-8 keys)."""
+    try:
+        return strict_json.reject_duplicate_keys(pairs)
+    except strict_json.StrictJSONError as error:
+        raise ContractViolation(f"duplicate key or invalid key: {error}") from error
 
 
 def _reject_constant(value: str) -> NoReturn:
@@ -614,6 +615,13 @@ def _load_canonical(path: Path, *, reject_integral_floats: bool = False) -> obje
             raw = stream.read(_MAX_JSON_BYTES + 1)
     except OSError as error:
         raise ContractViolation("cannot read JSON input") from error
+    return _parse_canonical(raw, reject_integral_floats=reject_integral_floats)
+
+
+def _parse_canonical(raw: bytes, *, reject_integral_floats: bool = False) -> object:
+    """Parse one bounded empirical-profile JSON document from exact bytes."""
+    if type(raw) is not bytes:
+        raise TypeError("canonical JSON input must be exact bytes")
     if len(raw) > _MAX_JSON_BYTES:
         _fail("JSON input exceeds maximum size")
     try:
@@ -1131,6 +1139,11 @@ def _validate_workloads(workloads: tuple[Workload, ...]) -> None:
 
 def load_matrix(path: str | Path) -> ExperimentMatrix:
     return validate_matrix(_load_canonical(Path(path)))
+
+
+def load_matrix_bytes(raw: bytes) -> ExperimentMatrix:
+    """Validate an in-memory canonical matrix without touching the filesystem."""
+    return validate_matrix(_parse_canonical(raw))
 
 
 def _b64u(value: bytes) -> str:
@@ -1671,6 +1684,16 @@ _RAW_RESULT_KEYS = {
 
 def load_raw_result(path: str | Path, *, matrix: ExperimentMatrix) -> dict[str, Any]:
     value = _load_canonical(Path(path), reject_integral_floats=True)
+    return _validated_raw_result(value, matrix)
+
+
+def load_raw_result_bytes(raw: bytes, *, matrix: ExperimentMatrix) -> dict[str, Any]:
+    """Validate one in-memory canonical raw-result record (including its LF)."""
+    value = _parse_canonical(raw, reject_integral_floats=True)
+    return _validated_raw_result(value, matrix)
+
+
+def _validated_raw_result(value: object, matrix: ExperimentMatrix) -> dict[str, Any]:
     record = _mapping(value, where="raw result", keys=_RAW_RESULT_KEYS)
     try:
         _validate_raw_result(record, matrix)
@@ -2430,7 +2453,9 @@ __all__ = [
     "canonical_json_bytes",
     "derive_attack_trial",
     "load_matrix",
+    "load_matrix_bytes",
     "load_raw_result",
+    "load_raw_result_bytes",
     "planned_parser_trials",
     "planned_ablation_trials",
     "planned_ablation_performance_runs",

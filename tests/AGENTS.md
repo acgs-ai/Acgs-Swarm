@@ -30,7 +30,7 @@ Pytest suite covering every module in `src/constitutional_swarm`. Do not hardcod
 | `test_cross_package_contracts.py`, `test_integration_acgs_lite.py` | Cross-package interaction with `acgs-lite` |
 | `test_import_boundaries.py`, `test_import_boundaries_acgs_lite.py` | Enforces that core imports don't pull optional extras |
 | `test_full_stack_integration.py`, `test_dag_coordinator_deep.py` | End-to-end integration scenarios |
-| `test_trust_manifold_decision.py` | Manifold peer selection in `mesh.py:_select_peers()` |
+| `test_trust_manifold_decision.py` | Manifold peer selection in `mesh/core.py:_select_peers_unlocked()` |
 | `test_rule_consistency.py`, `test_rule_codifier.py` | Rule codification invariants |
 | `test_bittensor_*.py` | Bittensor subnet integration (skip without `.[bittensor]`) |
 | `test_swe_bench_agent.py`, `test_swarm_coordinator.py` | SWE-Bench evaluation scaffold |

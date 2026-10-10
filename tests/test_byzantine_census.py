@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from constitutional_swarm.byzantine_census import (
-    TamperCensus,
     census_from_decisions,
     estimate_tampered_fraction,
 )

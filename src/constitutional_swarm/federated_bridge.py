@@ -8,6 +8,10 @@ Architecture:
     - FederatedConstitutionBridge — enforces fail-closed cross-org rule gates
 
 Security contract:
+    - Credentials must carry an Ed25519 issuer signature that verifies against
+      a key pinned for their ``org_id`` at bridge construction; anything else
+      is refused at registration/renewal (no pinned keys ⇒ no trusted issuer)
+    - Every credential carries an explicit expiry after its issuance time
     - Unknown credentials → REJECT (fail-closed, never fail-open)
     - Constitutional hash mismatch → REJECT
     - Revoked credentials → REJECT
@@ -24,12 +28,25 @@ Research basis:
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import threading
 import time
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
+from constitutional_swarm.framing import framed_digest
+
+ALL_DOMAINS = "*"
+
+# Domain separator for the digest an org issuer signs over a credential.
+CREDENTIAL_SIGNATURE_DOMAIN = b"constitutional-swarm.federated-credential.v1"
+_ED25519_PUBLIC_KEY_BYTES = 32
+_ED25519_SIGNATURE_BYTES = 64
 
 
 class CredentialStatus(Enum):
@@ -51,9 +68,13 @@ class AgentCredential:
         pubkey_fingerprint: Hex fingerprint of the agent's public key.
         constitutional_hash: Hash of the constitution this agent operates under.
         issued_at:          Unix timestamp of issuance.
-        expires_at:         Unix timestamp of expiry (0 = never expires).
+        expires_at:         Unix timestamp of expiry; required and > issued_at.
         domains:            Governance domains this agent is authorised for.
-        metadata:           Arbitrary issuer metadata.
+                            Empty denies all; ``ALL_DOMAINS`` is explicit
+                            unrestricted access.
+        metadata:           Arbitrary issuer metadata (not signed, not trusted).
+        issuer_signature:   Ed25519 signature by the org issuer over
+                            ``signing_digest()``.
 
     Example::
 
@@ -62,7 +83,12 @@ class AgentCredential:
             org_id="acme-corp",
             pubkey_fingerprint="deadbeef1234",
             constitutional_hash="608508a9bd224290",
-            issued_at=int(time.time()),
+            issued_at=now,
+            expires_at=now + 3600,
+            domains=("privacy",),
+        )
+        cred = dataclasses.replace(
+            cred, issuer_signature=org_issuer_key.sign(cred.signing_digest())
         )
     """
 
@@ -71,30 +97,90 @@ class AgentCredential:
     pubkey_fingerprint: str
     constitutional_hash: str
     issued_at: float
-    expires_at: float = 0.0
+    expires_at: float
     domains: tuple[str, ...] = ()
     status: CredentialStatus = CredentialStatus.ACTIVE
     metadata: dict[str, Any] = field(default_factory=dict)
+    issuer_signature: bytes = b""
+
+    def __post_init__(self) -> None:
+        """Validate and canonicalise security-relevant credential fields."""
+        for field_name in (
+            "agent_id",
+            "org_id",
+            "pubkey_fingerprint",
+            "constitutional_hash",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        # Fingerprints are hex: canonicalise so case/whitespace variants of a
+        # revoked key cannot be re-registered as a "new" key.
+        object.__setattr__(
+            self, "pubkey_fingerprint", self.pubkey_fingerprint.strip().lower()
+        )
+        if not isinstance(self.status, CredentialStatus):
+            raise ValueError("status must be a CredentialStatus")
+        for field_name in ("issued_at", "expires_at"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{field_name} must be a finite number")
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite")
+            object.__setattr__(self, field_name, float(value))
+        if self.expires_at <= self.issued_at:
+            raise ValueError("expires_at must be later than issued_at (expiry is required)")
+        if not isinstance(self.issuer_signature, bytes):
+            raise ValueError("issuer_signature must be bytes")
+        if any(not isinstance(domain, str) or not domain.strip() for domain in self.domains):
+            raise ValueError("domains must contain only non-empty strings")
+        object.__setattr__(self, "domains", tuple(sorted(set(self.domains))))
 
     @property
     def fingerprint(self) -> str:
-        """Stable credential fingerprint (sha256 of key fields)."""
-        raw = f"{self.agent_id}:{self.org_id}:{self.pubkey_fingerprint}:{self.constitutional_hash}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        """Full SHA-256 digest of the canonical authorisation fields."""
+        payload = {
+            "agent_id": self.agent_id,
+            "constitutional_hash": self.constitutional_hash,
+            "domains": self.domains,
+            "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
+            "org_id": self.org_id,
+            "pubkey_fingerprint": self.pubkey_fingerprint,
+            "status": self.status.value,
+        }
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def signing_digest(self) -> bytes:
+        """Domain-separated digest an org issuer signs (binds every auth field)."""
+        return framed_digest(CREDENTIAL_SIGNATURE_DOMAIN, self.fingerprint)
 
     def is_expired(self, now: float | None = None) -> bool:
         """True if the credential has passed its expiry timestamp."""
-        if self.expires_at == 0.0:
-            return False
         _now = time.time() if now is None else now
-        return _now > self.expires_at
+        if isinstance(_now, bool) or not isinstance(_now, (int, float)) or not math.isfinite(_now):
+            raise ValueError("now must be finite")
+        return _now >= self.expires_at
+
+    def is_not_yet_valid(self, now: float | None = None) -> bool:
+        """True if the credential's issuance time is still in the future."""
+        _now = time.time() if now is None else now
+        if isinstance(_now, bool) or not isinstance(_now, (int, float)) or not math.isfinite(_now):
+            raise ValueError("now must be finite")
+        return _now < self.issued_at
 
     def authorised_for(self, domain: str) -> bool:
         """True if this credential covers the requested domain."""
-        return not self.domains or domain in self.domains
+        return ALL_DOMAINS in self.domains or domain in self.domains
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class FederationDecision:
     """Record of a single bridge access decision.
 
@@ -138,6 +224,7 @@ class FederatedConstitutionBridge:
 
         bridge = FederatedConstitutionBridge(
             local_constitutional_hash="608508a9bd224290",
+            issuer_keys={"partner-corp": [partner_issuer_public_key_raw32]},
         )
 
         cred = AgentCredential(
@@ -145,18 +232,34 @@ class FederatedConstitutionBridge:
             org_id="partner-corp",
             pubkey_fingerprint="abcdef",
             constitutional_hash="608509bd224290",  # WRONG HASH
-            issued_at=time.time(),
+            issued_at=now,
+            expires_at=now + 3600,
+            domains=("privacy",),
+        )
+        cred = dataclasses.replace(
+            cred, issuer_signature=partner_issuer_key.sign(cred.signing_digest())
         )
         bridge.register_credential(cred)
 
-        decision = bridge.gate(cred.agent_id, domain="privacy")
+        decision = bridge.gate(
+            cred.agent_id,
+            org_id=cred.org_id,
+            domain="privacy",
+        )
         assert not decision.allowed   # hash mismatch → fail-closed
 
     Args:
         local_constitutional_hash: The constitutional hash this bridge enforces.
+        issuer_keys: Pinned trust root ``{org_id: [raw 32-byte Ed25519 public
+            keys]}``. Credentials are accepted only with a valid signature from
+            a key pinned for their ``org_id``. ``None`` trusts no issuer.
         require_hash_match: If True (default), cross-org agents must present
             the same constitutional hash (strict federation mode).
-        audit_log_size: Maximum decision audit log entries.
+        audit_log_size: Maximum retained decisions. Defaults to 1000;
+            ``None`` retains all.
+        audit_overflow_sink: Optional callback receiving each evicted immutable
+            decision. The callback runs after the gate lock is released. Sink
+            failures are counted and re-raised as ``RuntimeError``.
     """
 
     def __init__(
@@ -164,15 +267,37 @@ class FederatedConstitutionBridge:
         local_constitutional_hash: str = _CONSTITUTIONAL_HASH,
         *,
         require_hash_match: bool = True,
-        audit_log_size: int = 1000,
+        audit_log_size: int | None = 1000,
+        audit_overflow_sink: Callable[[FederationDecision], None] | None = None,
+        issuer_keys: Mapping[str, Iterable[bytes]] | None = None,
     ) -> None:
+        if not isinstance(local_constitutional_hash, str) or not local_constitutional_hash.strip():
+            raise ValueError("local_constitutional_hash must be a non-empty string")
+        self._issuer_keys = _pin_issuer_keys(issuer_keys)
+        if audit_log_size is not None and (
+            isinstance(audit_log_size, bool)
+            or not isinstance(audit_log_size, int)
+            or audit_log_size <= 0
+        ):
+            raise ValueError("audit_log_size must be None or a positive integer")
+        if audit_overflow_sink is not None and not callable(audit_overflow_sink):
+            raise ValueError("audit_overflow_sink must be callable or None")
         self._local_hash = local_constitutional_hash
         self._require_hash = require_hash_match
         self._audit_log_size = audit_log_size
+        self._audit_overflow_sink = audit_overflow_sink
 
-        self._credentials: dict[str, AgentCredential] = {}
-        self._revoked: set[str] = set()
-        self._audit_log: list[FederationDecision] = []
+        self._credentials: dict[tuple[str, str], AgentCredential] = {}
+        self._revoked: set[tuple[str, str]] = set()
+        self._revoked_fingerprints: set[tuple[str, str, str]] = set()
+        self._audit_log: deque[FederationDecision] = deque(maxlen=audit_log_size)
+        self._total_decisions = 0
+        self._dropped_decisions = 0
+        self._allowed_decisions = 0
+        self._denied_decisions = 0
+        self._audit_sink_failures = 0
+        self._last_audit_sink_error: str | None = None
+        self._lock = threading.RLock()
 
     # ── Credential management ────────────────────────────────────────────
 
@@ -184,20 +309,87 @@ class FederatedConstitutionBridge:
 
         Args:
             cred: Agent credential issued by a federated organisation.
-        """
-        self._credentials[cred.agent_id] = cred
 
-    def revoke(self, agent_id: str) -> bool:
+        Raises:
+            PermissionError: if the issuer signature does not verify against a
+                key pinned for ``cred.org_id``.
+        """
+        self._verify_issuer(cred)
+        key = (cred.org_id, cred.agent_id)
+        with self._lock:
+            if key in self._credentials:
+                raise ValueError(
+                    f"credential already registered for org_id={cred.org_id!r}, "
+                    f"agent_id={cred.agent_id!r}"
+                )
+            self._credentials[key] = cred
+            if cred.status is CredentialStatus.REVOKED:
+                self._revoked.add(key)
+                self._revoked_fingerprints.add(
+                    (cred.org_id, cred.agent_id, cred.pubkey_fingerprint)
+                )
+
+    def renew_credential(self, cred: AgentCredential) -> None:
+        """Replace a credential through an explicit, strictly newer renewal.
+
+        Revocation remains sticky for each public-key fingerprint. Rotation to
+        never-revoked key material can reinstate an identity, but rotating back
+        to any historically revoked fingerprint cannot.
+
+        Raises:
+            PermissionError: if the issuer signature does not verify against a
+                key pinned for ``cred.org_id``.
+        """
+        self._verify_issuer(cred)
+        key = (cred.org_id, cred.agent_id)
+        with self._lock:
+            current = self._credentials.get(key)
+            if current is None:
+                raise ValueError("cannot renew an unregistered credential")
+            if cred.issued_at <= current.issued_at:
+                raise ValueError("renewed credential must have a newer issued_at")
+            was_revoked = (
+                key in self._revoked or current.status is CredentialStatus.REVOKED
+            )
+            key_rotated = cred.pubkey_fingerprint != current.pubkey_fingerprint
+            fingerprint_key = (
+                cred.org_id,
+                cred.agent_id,
+                cred.pubkey_fingerprint,
+            )
+            fingerprint_was_revoked = fingerprint_key in self._revoked_fingerprints
+            self._credentials[key] = cred
+            if cred.status is CredentialStatus.REVOKED:
+                self._revoked_fingerprints.add(fingerprint_key)
+            if (
+                cred.status is CredentialStatus.REVOKED
+                or fingerprint_was_revoked
+                or (was_revoked and not key_rotated)
+            ):
+                self._revoked.add(key)
+            elif key_rotated:
+                self._revoked.discard(key)
+
+    def revoke(self, agent_id: str, *, org_id: str) -> bool:
         """Revoke a credential immediately.
 
         Returns True if the credential was known, False otherwise.
         """
-        self._revoked.add(agent_id)
-        return agent_id in self._credentials
+        key = (org_id, agent_id)
+        with self._lock:
+            credential = self._credentials.get(key)
+            if credential is None:
+                return False
+            self._revoked.add(key)
+            self._revoked_fingerprints.add(
+                (org_id, agent_id, credential.pubkey_fingerprint)
+            )
+            return True
 
     def registered_agents(self) -> list[str]:
         """List all registered agent IDs (including revoked)."""
-        return list(self._credentials)
+        with self._lock:
+            return list(dict.fromkeys(agent_id for _, agent_id in self._credentials))
 
     # ── Gate ─────────────────────────────────────────────────────────────
 
@@ -205,7 +397,8 @@ class FederatedConstitutionBridge:
         self,
         agent_id: str,
         *,
-        domain: str = "",
+        org_id: str,
+        domain: str,
         now: float | None = None,
     ) -> FederationDecision:
         """Evaluate cross-org access for an agent.
@@ -221,6 +414,7 @@ class FederatedConstitutionBridge:
 
         Args:
             agent_id: Agent requesting cross-org access.
+            org_id:   Organisation that issued the credential.
             domain:   Governance domain for the operation.
             now:      Override current time (for testing).
 
@@ -228,63 +422,131 @@ class FederatedConstitutionBridge:
             FederationDecision with allowed flag and reason.
         """
         _now = time.time() if now is None else now
-        cred = self._credentials.get(agent_id)
+        if isinstance(_now, bool) or not isinstance(_now, (int, float)) or not math.isfinite(_now):
+            raise ValueError("now must be finite")
+        _now = float(_now)
 
-        # 1. Unknown credential
-        if cred is None:
-            return self._deny(agent_id, "", domain, "UNKNOWN_CREDENTIAL", _now)
+        with self._lock:
+            if not isinstance(org_id, str) or not org_id.strip():
+                result = self._deny(agent_id, "", domain, "ORG_REQUIRED", _now)
+            elif not isinstance(domain, str) or not domain.strip():
+                result = self._deny(agent_id, org_id, "", "DOMAIN_REQUIRED", _now)
+            else:
+                key = (org_id, agent_id)
+                cred = self._credentials.get(key)
+                status_reasons = {
+                    CredentialStatus.PENDING: "CREDENTIAL_PENDING",
+                    CredentialStatus.REVOKED: "CREDENTIAL_REVOKED",
+                    CredentialStatus.EXPIRED: "CREDENTIAL_EXPIRED",
+                }
+                if cred is None:
+                    result = self._deny(
+                        agent_id, org_id, domain, "UNKNOWN_CREDENTIAL", _now
+                    )
+                elif cred.status is not CredentialStatus.ACTIVE:
+                    result = self._deny(
+                        agent_id,
+                        org_id,
+                        domain,
+                        status_reasons.get(cred.status, "CREDENTIAL_NOT_ACTIVE"),
+                        _now,
+                    )
+                elif key in self._revoked:
+                    result = self._deny(agent_id, org_id, domain, "REVOKED", _now)
+                elif cred.is_not_yet_valid(now=_now):
+                    result = self._deny(
+                        agent_id, org_id, domain, "NOT_YET_VALID", _now
+                    )
+                elif cred.is_expired(now=_now):
+                    result = self._deny(agent_id, org_id, domain, "EXPIRED", _now)
+                elif self._require_hash and cred.constitutional_hash != self._local_hash:
+                    result = self._deny(
+                        agent_id, org_id, domain, "HASH_MISMATCH", _now
+                    )
+                elif not cred.authorised_for(domain):
+                    result = self._deny(
+                        agent_id, org_id, domain, "DOMAIN_DENIED", _now
+                    )
+                else:
+                    result = self._allow(agent_id, org_id, domain, _now)
 
-        # 2. Pending (awaiting approval) — fail-closed
-        if cred.status == CredentialStatus.PENDING:
-            return self._deny(agent_id, cred.org_id, domain, "CREDENTIAL_PENDING", _now)
-
-        # 3. Revoked
-        if agent_id in self._revoked:
-            return self._deny(agent_id, cred.org_id, domain, "REVOKED", _now)
-
-        # 4. Expired
-        if cred.is_expired(now=_now):
-            return self._deny(agent_id, cred.org_id, domain, "EXPIRED", _now)
-
-        # 5. Constitutional hash mismatch
-        if self._require_hash and cred.constitutional_hash != self._local_hash:
-            return self._deny(agent_id, cred.org_id, domain, "HASH_MISMATCH", _now)
-
-        # 6. Domain authorisation
-        if domain and not cred.authorised_for(domain):
-            return self._deny(agent_id, cred.org_id, domain, "DOMAIN_DENIED", _now)
-
-        return self._allow(agent_id, cred.org_id, domain, _now)
+        decision, evicted = result
+        self._emit_audit_overflow(evicted)
+        return decision
 
     # ── Audit ─────────────────────────────────────────────────────────────
 
-    def audit_log(self) -> list[dict[str, Any]]:
-        """Full decision audit log (most recent last)."""
-        return [d.to_dict() for d in self._audit_log]
+    def audit_log(self, *, require_complete: bool = True) -> list[dict[str, Any]]:
+        """Return decision snapshots, rejecting an incomplete log by default."""
+        with self._lock:
+            if require_complete and self._dropped_decisions:
+                raise RuntimeError(
+                    "audit log was truncated; pass require_complete=False "
+                    "to retrieve the retained suffix"
+                )
+            return [d.to_dict() for d in self._audit_log]
 
     def denied_count(self) -> int:
         """Number of denied gate decisions."""
-        return sum(1 for d in self._audit_log if not d.allowed)
+        with self._lock:
+            return self._denied_decisions
 
     def allowed_count(self) -> int:
         """Number of allowed gate decisions."""
-        return sum(1 for d in self._audit_log if d.allowed)
+        with self._lock:
+            return self._allowed_decisions
 
     def summary(self) -> dict[str, Any]:
         """Bridge status summary."""
-        return {
-            "local_constitutional_hash": self._local_hash,
-            "registered_credentials": len(self._credentials),
-            "revoked_credentials": len(self._revoked),
-            "total_decisions": len(self._audit_log),
-            "allowed": self.allowed_count(),
-            "denied": self.denied_count(),
-            "require_hash_match": self._require_hash,
-        }
+        with self._lock:
+            return {
+                "local_constitutional_hash": self._local_hash,
+                "registered_credentials": len(self._credentials),
+                "revoked_credentials": len(self._revoked),
+                "total_decisions": self._total_decisions,
+                "retained_decisions": len(self._audit_log),
+                "dropped_decisions": self._dropped_decisions,
+                "audit_overflow_count": self._dropped_decisions,
+                "audit_truncated": self._dropped_decisions > 0,
+                "audit_sink_failures": self._audit_sink_failures,
+                "last_audit_sink_error": self._last_audit_sink_error,
+                "allowed": self._allowed_decisions,
+                "denied": self._denied_decisions,
+                "require_hash_match": self._require_hash,
+            }
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _allow(self, agent_id: str, org_id: str, domain: str, now: float) -> FederationDecision:
+    def _verify_issuer(self, cred: AgentCredential) -> None:
+        """Fail closed unless a key pinned for the org signed this credential."""
+        if not isinstance(cred, AgentCredential):
+            raise TypeError("cred must be an AgentCredential")
+        pinned = self._issuer_keys.get(cred.org_id, ())
+        if not pinned:
+            raise PermissionError(
+                f"issuer signature rejected: no pinned issuer key for org_id={cred.org_id!r}"
+            )
+        signature = cred.issuer_signature
+        if len(signature) != _ED25519_SIGNATURE_BYTES:
+            raise PermissionError("issuer signature rejected: missing or malformed signature")
+
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        digest = cred.signing_digest()
+        for public_key in pinned:
+            try:
+                Ed25519PublicKey.from_public_bytes(public_key).verify(signature, digest)
+            except (InvalidSignature, ValueError):
+                continue
+            return
+        raise PermissionError(
+            f"issuer signature rejected: no pinned key for org_id={cred.org_id!r} verifies"
+        )
+
+    def _allow(
+        self, agent_id: str, org_id: str, domain: str, now: float
+    ) -> tuple[FederationDecision, tuple[FederationDecision, ...]]:
         decision = FederationDecision(
             agent_id=agent_id,
             org_id=org_id,
@@ -294,12 +556,11 @@ class FederatedConstitutionBridge:
             timestamp=now,
             rule_hash=self._local_hash,
         )
-        self._record(decision)
-        return decision
+        return decision, self._record(decision)
 
     def _deny(
         self, agent_id: str, org_id: str, domain: str, reason: str, now: float
-    ) -> FederationDecision:
+    ) -> tuple[FederationDecision, tuple[FederationDecision, ...]]:
         decision = FederationDecision(
             agent_id=agent_id,
             org_id=org_id,
@@ -309,18 +570,71 @@ class FederatedConstitutionBridge:
             timestamp=now,
             rule_hash=self._local_hash,
         )
-        self._record(decision)
-        return decision
+        return decision, self._record(decision)
 
-    def _record(self, decision: FederationDecision) -> None:
-        """Append decision to audit log, pruning when over capacity."""
-        self._audit_log.append(decision)
-        if len(self._audit_log) > self._audit_log_size:
-            self._audit_log = self._audit_log[-self._audit_log_size :]
+    def _record(self, decision: FederationDecision) -> tuple[FederationDecision, ...]:
+        """Append a decision atomically, including lifetime counters."""
+        with self._lock:
+            evicted = (
+                (self._audit_log[0],)
+                if self._audit_log.maxlen is not None
+                and len(self._audit_log) == self._audit_log.maxlen
+                else ()
+            )
+            self._audit_log.append(decision)
+            self._total_decisions += 1
+            if decision.allowed:
+                self._allowed_decisions += 1
+            else:
+                self._denied_decisions += 1
+            self._dropped_decisions += len(evicted)
+            return evicted
+
+    def _emit_audit_overflow(
+        self, evicted: tuple[FederationDecision, ...]
+    ) -> None:
+        """Deliver evicted decisions after releasing the gate's state lock."""
+        sink = self._audit_overflow_sink
+        if sink is None:
+            return
+        for decision in evicted:
+            try:
+                sink(decision)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self._audit_sink_failures += 1
+                    self._last_audit_sink_error = error
+                raise RuntimeError(f"audit overflow sink failed: {error}") from exc
 
     def __repr__(self) -> str:
-        return (
-            f"FederatedConstitutionBridge("
-            f"credentials={len(self._credentials)}, "
-            f"decisions={len(self._audit_log)})"
-        )
+        with self._lock:
+            return (
+                f"FederatedConstitutionBridge("
+                f"credentials={len(self._credentials)}, "
+                f"decisions={self._total_decisions})"
+            )
+
+
+def _pin_issuer_keys(
+    issuer_keys: Mapping[str, Iterable[bytes]] | None,
+) -> dict[str, tuple[bytes, ...]]:
+    """Copy and validate the pinned issuer trust root at construction."""
+    if issuer_keys is None:
+        return {}
+    if not isinstance(issuer_keys, Mapping):
+        raise ValueError("issuer_keys must be a mapping of org_id to public keys")
+    pinned: dict[str, tuple[bytes, ...]] = {}
+    for org_id, keys in issuer_keys.items():
+        if not isinstance(org_id, str) or not org_id.strip():
+            raise ValueError("issuer_keys org_id must be a non-empty string")
+        if isinstance(keys, (str, bytes)) or not isinstance(keys, Iterable):
+            raise ValueError("issuer_keys values must be iterables of raw public keys")
+        org_keys = tuple(keys)
+        if not org_keys or any(
+            not isinstance(key, bytes) or len(key) != _ED25519_PUBLIC_KEY_BYTES
+            for key in org_keys
+        ):
+            raise ValueError("issuer keys must be raw 32-byte Ed25519 public keys")
+        pinned[org_id] = org_keys
+    return pinned

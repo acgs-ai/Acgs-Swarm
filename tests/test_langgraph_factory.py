@@ -24,7 +24,10 @@ def _clean_generator(_state):
 class _CleanDNA:
     """DNA validator stub that reports no violations and low risk."""
 
+    hash = CONSTITUTIONAL_HASH
+
     class _Result:
+        valid = True
         violations = ()
         risk_score = 0.0
 
@@ -35,7 +38,10 @@ class _CleanDNA:
 class _RiskyDNA:
     """DNA validator stub that reports risk_score >= 0.3 -> reject."""
 
+    hash = CONSTITUTIONAL_HASH
+
     class _Result:
+        valid = True
         violations = ()
         risk_score = 0.5
 
@@ -49,7 +55,8 @@ class _CRDT:
     def __init__(self):
         self.calls = 0
 
-    def append(self, *, payload, bodes_passed):
+    def append(self, *, payload, bodes_passed, constitutional_hash):
+        assert constitutional_hash == CONSTITUTIONAL_HASH
         self.calls += 1
         return f"cid-{self.calls}"
 
@@ -64,6 +71,7 @@ def test_hash_mismatch_raises():
         build_swarm_graph(
             {"hash": "deadbeefdeadbeef"},
             generator=_clean_generator,
+            dna=_CleanDNA(),
         )
 
 
@@ -81,6 +89,7 @@ def test_happy_path_runs_end_to_end():
         "violations": [],
         "risk_score": 0.0,
         "quorum_reached": True,
+        "constitutional_hash": CONSTITUTIONAL_HASH,
     }
     final = graph.invoke(
         initial,
@@ -91,6 +100,7 @@ def test_happy_path_runs_end_to_end():
     assert final.get("cid")
     assert final.get("cid") != ""
     assert final.get("constitutional_hash") == CONSTITUTIONAL_HASH
+    assert final.get("governance_status") == "accepted"
     assert crdt.calls == 1
 
 
@@ -108,6 +118,7 @@ def test_reject_branch_when_risk_too_high():
         "violations": [],
         "risk_score": 0.0,
         "quorum_reached": True,
+        "constitutional_hash": CONSTITUTIONAL_HASH,
     }
     final = graph.invoke(
         initial,
@@ -118,6 +129,8 @@ def test_reject_branch_when_risk_too_high():
     assert final.get("cid", "") == ""
     assert crdt.calls == 0
     assert float(final.get("risk_score", 0.0)) >= 0.3
+    assert final.get("governance_status") == "rejected"
+    assert final.get("patch") == ""
 
 
 def test_compiles_with_interrupt_before():

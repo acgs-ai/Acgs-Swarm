@@ -330,7 +330,9 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        return MinerAxonServer(miner, allow_unauthenticated=True)
+        return MinerAxonServer(
+            miner, allow_unauthenticated=True, allow_unsigned_responses=True
+        )
 
     @pytest.mark.asyncio
     async def test_forward_fn_fills_response(self, axon_server):
@@ -448,7 +450,7 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        server = MinerAxonServer(miner)
+        server = MinerAxonServer(miner, allow_unsigned_responses=True)
         dendrite_client.register_local_miner(server)
 
         delib = DeliberationSynapse(
@@ -480,7 +482,7 @@ rules:
                 ),
                 deliberation_handler=handler,
             )
-            dendrite_client.register_local_miner(MinerAxonServer(miner))
+            dendrite_client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         delib = DeliberationSynapse(
             task_id="multi-test",
@@ -511,7 +513,7 @@ rules:
             ),
             deliberation_handler=handler,
         )
-        dendrite_client.register_local_miner(MinerAxonServer(miner))
+        dendrite_client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         # Send with wrong hash — miner should fail, result filtered
         delib = DeliberationSynapse(
@@ -576,9 +578,11 @@ rules:
         from constitutional_swarm.bittensor.protocol import MinerConfig, ValidatorConfig
         from constitutional_swarm.bittensor.subnet_owner import SubnetOwner
         from constitutional_swarm.bittensor.validator import ConstitutionalValidator
+        from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+        from tests.test_c14_protocol_hardening import c14_trust_validator_voters
 
         # Setup
-        owner = SubnetOwner(constitution_path)
+        owner_registry = VoteSignerRegistry()
         client = ValidatorDendriteClient(constitution_path=constitution_path)
 
         async def deliberate(task, ctx, meta):
@@ -595,14 +599,27 @@ rules:
                 ),
                 deliberation_handler=deliberate,
             )
-            client.register_local_miner(MinerAxonServer(miner))
+            client.register_local_miner(MinerAxonServer(miner, allow_unsigned_responses=True))
 
         validator = ConstitutionalValidator(
-            config=ValidatorConfig(constitution_path=constitution_path),
+            config=ValidatorConfig(
+                constitution_path=constitution_path,
+                peers_per_validation=5,
+                quorum=5,
+                single_operator_dev=True,
+            ),
         )
         for i in range(3):
             validator.register_miner(f"e2e-miner-{i}", domain="privacy")
-        validator.register_miner("extra-peer")
+        for i in range(3):
+            validator.register_miner(f"extra-peer-{i}")
+        c14_trust_validator_voters(
+            owner_registry,
+            validator,
+            tuple(f"e2e-miner-{i}" for i in range(3))
+            + tuple(f"extra-peer-{i}" for i in range(3)),
+        )
+        owner = SubnetOwner(constitution_path, vote_registry=owner_registry)
 
         # Step 1: Package case
         case = owner.package_case(
@@ -618,11 +635,11 @@ rules:
         # Step 3: Validate first judgment
         validation = validator.validate(judgments[0])
         assert validation.accepted is True
+        assert validation.votes_for + validation.votes_against == 5
 
         # Step 4: Record result
-        precedent = owner.record_result(case, judgments[0], validation)
-        assert precedent is not None
-        assert precedent.validation_accepted is True
+        with pytest.raises(ValueError, match="independent vote evidence"):
+            owner.record_result(case, judgments[0], validation)
 
 
 # ---------------------------------------------------------------------------

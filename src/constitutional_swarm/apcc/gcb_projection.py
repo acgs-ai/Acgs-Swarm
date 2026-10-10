@@ -12,6 +12,7 @@ from enum import Enum
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from ..strict_json import loads as _strict_loads
 from .crypto import b64u_decode
 from .ports import APCCAuthorityConfig, AtomicCommitRequest
 
@@ -149,23 +150,12 @@ def _canonical_json(value: object) -> str:
 
 
 def _gcb_material_object(value: str, *, label: str) -> dict[str, object]:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > 1_048_576:
+    """Parse GCB material via H1: no duplicate keys, floats, constants or deep nesting."""
+    if not isinstance(value, str):
         raise _GCBProjectionDenied(f"invalid_{label}_material")
-
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in items:
-            if key in result:
-                raise _GCBProjectionDenied(f"invalid_{label}_material")
-            result[key] = item
-        return result
-
-    def number(_: str) -> object:
-        raise _GCBProjectionDenied(f"invalid_{label}_material")
-
     try:
-        parsed = json.loads(value, object_pairs_hook=pairs, parse_constant=number)
-    except (json.JSONDecodeError, UnicodeError) as error:
+        parsed = _strict_loads(value, max_bytes=1_048_576, allow_float=False)
+    except (TypeError, ValueError) as error:
         raise _GCBProjectionDenied(f"invalid_{label}_material") from error
     if not isinstance(parsed, dict) or _canonical_json(parsed) != value:
         raise _GCBProjectionDenied(f"invalid_{label}_material")
@@ -410,7 +400,10 @@ def _validate_gcb_projection_material(
         "commit_id": plan.commit_id,
     }
     receipt_body = _gcb_material_object(plan.receipt_material, label="receipt")
-    if receipt_body != {"payload": receipt_payload, "signature": receipt_signature}:
+    # Canonical bytes, not dict equality: ``True == 1`` and ``1.0 == 1`` in Python.
+    if _canonical_json(receipt_body) != _canonical_json(
+        {"payload": receipt_payload, "signature": receipt_signature}
+    ):
         raise _GCBProjectionDenied("projection_receipt_mismatch")
     if (
         hashlib.sha256(plan.receipt_material.encode()).hexdigest()
@@ -482,7 +475,10 @@ def _validate_gcb_projection_material(
         ),
         "workflow_generation": int(request.context.workflow_epoch),
     }
-    if any(verdict.get(key) != value for key, value in expected_verdict.items()):
+    if any(
+        _canonical_json(verdict.get(key)) != _canonical_json(value)
+        for key, value in expected_verdict.items()
+    ):
         raise _GCBProjectionDenied("projection_verdict_mismatch")
     signature = verdict["signature"]
     if (

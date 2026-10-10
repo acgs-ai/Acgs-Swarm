@@ -10,12 +10,14 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import logging
+import math
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, overload
 
 from acgs_lite import (
     Z3_RISK_THRESHOLD,
@@ -31,6 +33,13 @@ from acgs_lite import (
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+logger = logging.getLogger(__name__)
+
+_MAX_GOVERNED_DEPTH = 64
+_MAX_GOVERNED_NODES = 10_000
+_MAX_GOVERNED_CONTAINER_ITEMS = 10_000
+_MAX_GOVERNED_TEXT_CHARS = 1_000_000
 
 
 class DNADisabledError(RuntimeError):
@@ -52,6 +61,10 @@ class DNAValidationResult:
     # acgs-lite ships no py.typed, so some builds expose Z3* as runtime variables
     # rather than types; tolerate that here (warn_unused_ignores is off).
     z3_result: Z3VerifyResult | None = None  # type: ignore[valid-type]
+    # Rules the engine matched but the constitution marks non-blocking (WARN
+    # workflow action; surfaced with ``valid=True``). ``govern`` logs and counts
+    # them, and raises only when ``block_on_warnings=True``.
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -70,9 +83,13 @@ class AgentDNA:
         # Validate explicitly
         result = dna.validate("some action")
 
-        # Or use as decorator
+        # Or use as decorator (blocks on any violation by default)
         @dna.govern
         def my_agent(input: str) -> str: ...
+
+        # A DNA with a MACI role must name the governed action type
+        @dna.govern(action_type="propose")
+        def my_proposer(input: str) -> str: ...
     """
 
     constitution: Constitution
@@ -84,10 +101,13 @@ class AgentDNA:
     z3_verify: bool = False
     _engine: GovernanceEngine = field(init=False, repr=False)
     _maci: MACIEnforcer | None = field(init=False, repr=False, default=None)
-    _scorer: ConstitutionalImpactScorer | None = field(init=False, repr=False, default=None)
+    _scorer: ConstitutionalImpactScorer | None = field(
+        init=False, repr=False, default=None
+    )
     _z3: Z3ConstraintVerifier | None = field(init=False, repr=False, default=None)  # type: ignore[valid-type]
     _call_count: int = field(init=False, repr=False, default=0)
     _violation_count: int = field(init=False, repr=False, default=0)
+    _warning_count: int = field(init=False, repr=False, default=0)
     _total_latency_ns: int = field(init=False, repr=False, default=0)
     _disabled: bool = field(init=False, repr=False, default=False)
     # Per-instance lock protecting the mutable counter fields (_call_count,
@@ -97,7 +117,9 @@ class AgentDNA:
     _stats_lock: threading.Lock = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_engine", GovernanceEngine(self.constitution, strict=self.strict))
+        object.__setattr__(
+            self, "_engine", GovernanceEngine(self.constitution, strict=self.strict)
+        )
         object.__setattr__(self, "_stats_lock", threading.Lock())
         if self.maci_role is not None:
             enforcer = MACIEnforcer()
@@ -206,6 +228,7 @@ class AgentDNA:
         with self._stats_lock:
             calls = self._call_count
             violations = self._violation_count
+            warning_calls = self._warning_count
             total_latency = self._total_latency_ns
         return {
             "agent_id": self.agent_id,
@@ -213,6 +236,7 @@ class AgentDNA:
             "maci_role": self.maci_role.value if self.maci_role else None,
             "calls": calls,
             "violations": violations,
+            "warnings": warning_calls,
             "avg_latency_ns": (total_latency // calls if calls > 0 else 0),
         }
 
@@ -250,14 +274,23 @@ class AgentDNA:
             result = self._engine.validate(action)
             elapsed = time.perf_counter_ns() - start
             violations = tuple(f"{v.rule_id}: {v.rule_text}" for v in result.violations)
+            warnings = tuple(
+                f"{w.rule_id}: {w.rule_text}" for w in getattr(result, "warnings", ())
+            )
             has_violations = bool(violations)
 
             # Atomically update counters under the lock.
             with self._stats_lock:
                 object.__setattr__(self, "_call_count", self._call_count + 1)
-                object.__setattr__(self, "_total_latency_ns", self._total_latency_ns + elapsed)
+                object.__setattr__(
+                    self, "_total_latency_ns", self._total_latency_ns + elapsed
+                )
                 if has_violations:
-                    object.__setattr__(self, "_violation_count", self._violation_count + 1)
+                    object.__setattr__(
+                        self, "_violation_count", self._violation_count + 1
+                    )
+                if warnings:
+                    object.__setattr__(self, "_warning_count", self._warning_count + 1)
 
             # Layer 3: Z3 formal verification (opt-in, ~50-500ms).
             # Only invoked for critical-risk actions to keep cost proportional.
@@ -275,13 +308,16 @@ class AgentDNA:
                 risk_level=risk_lv,
                 scoring_method=scoring_method,
                 z3_result=z3_result,
+                warnings=warnings,
             )
         except ConstitutionalViolationError:
             elapsed = time.perf_counter_ns() - start
             with self._stats_lock:
                 object.__setattr__(self, "_call_count", self._call_count + 1)
                 object.__setattr__(self, "_violation_count", self._violation_count + 1)
-                object.__setattr__(self, "_total_latency_ns", self._total_latency_ns + elapsed)
+                object.__setattr__(
+                    self, "_total_latency_ns", self._total_latency_ns + elapsed
+                )
             raise
 
     def check_maci(self, action_type: str) -> None:
@@ -292,38 +328,222 @@ class AgentDNA:
         if self._maci is not None:
             self._maci.check(self.agent_id, action_type)
 
-    def govern(self, fn: F) -> F:
+    @overload
+    def govern(self, fn: F) -> F: ...
+
+    @overload
+    def govern(
+        self,
+        fn: None = None,
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> Callable[[F], F]: ...
+
+    def govern(
+        self,
+        fn: F | None = None,
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> F | Callable[[F], F]:
         """Decorator that wraps a function with constitutional DNA validation.
 
-        Validates input before execution and output after.
+        Checks the MACI role (when ``action_type`` is given), then validates
+        input before execution and output after. A failed check (an invalid
+        result, including non-strict mode, or a verified Z3 counterexample)
+        raises ``ConstitutionalViolationError`` unless ``block_on_violation=False``
+        is passed explicitly. Rules the constitution marks WARN never fail the
+        check: they are logged and counted in ``stats["warnings"]``, and raise
+        only with ``block_on_warnings=True`` (strict mode).
+
+        Raises:
+            ValueError: at decoration time when this DNA has a ``maci_role`` but
+                no ``action_type`` is given (the role would not be enforced).
         """
-        if inspect.iscoroutinefunction(fn):
+        if action_type is not None and (
+            not isinstance(action_type, str) or not action_type.strip()
+        ):
+            raise ValueError("action_type must be a non-empty string")
+        if self.maci_role is not None and action_type is None:
+            raise ValueError(
+                f"AgentDNA {self.agent_id!r} has maci_role={self.maci_role.value!r}; "
+                "govern() requires action_type so the role is enforced"
+            )
+        if not isinstance(block_on_violation, bool):
+            raise ValueError("block_on_violation must be a bool")
+        if not isinstance(block_on_warnings, bool):
+            raise ValueError("block_on_warnings must be a bool")
 
-            @functools.wraps(fn)
-            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                input_str = _extract_input(args, kwargs)
-                self.validate(input_str)
-                result = await fn(*args, **kwargs)
-                if self.validate_output:
-                    output_str = _extract_output(result)
-                    if output_str:
-                        self.validate(output_str)
-                return result
+        def decorator(f: F) -> F:
+            return _GovernedCallable(  # type: ignore[return-value]
+                self,
+                f,
+                action_type=action_type,
+                block_on_violation=block_on_violation,
+                block_on_warnings=block_on_warnings,
+            )
 
-            return async_wrapper  # type: ignore[return-value]
+        if fn is not None:
+            return decorator(fn)
+        return decorator
 
-        @functools.wraps(fn)
-        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-            input_str = _extract_input(args, kwargs)
-            self.validate(input_str)
-            result = fn(*args, **kwargs)
-            if self.validate_output:
-                output_str = _extract_output(result)
-                if output_str:
-                    self.validate(output_str)
-            return result
 
-        return sync_wrapper  # type: ignore[return-value]
+def _enforce_result(
+    result: DNAValidationResult,
+    *,
+    block_on_violation: bool,
+    block_on_warnings: bool,
+) -> None:
+    """Raise for a failed check; log (and optionally raise for) WARN matches."""
+    if block_on_violation:
+        z3 = result.z3_result
+        if z3 is not None and z3.verified and not z3.satisfiable:
+            raise ConstitutionalViolationError(
+                "Z3 verification found a constitutional counterexample",
+                rule_id="Z3",
+                action=result.action,
+            )
+        if not result.valid:
+            first = result.violations[0] if result.violations else "DNA"
+            raise ConstitutionalViolationError(
+                "Constitutional DNA validation failed: " + "; ".join(result.violations),
+                rule_id=first.split(": ", 1)[0] or "DNA",
+                action=result.action,
+            )
+    if result.warnings:
+        logger.warning(
+            "constitutional DNA warning-tier rule match: %s", "; ".join(result.warnings)
+        )
+        if block_on_warnings:
+            raise ConstitutionalViolationError(
+                "Constitutional DNA warning-tier rule matched (block_on_warnings): "
+                + "; ".join(result.warnings),
+                rule_id=result.warnings[0].split(": ", 1)[0] or "DNA",
+                action=result.action,
+            )
+
+
+class _GovernedCallable:
+    """Callable descriptor that distinguishes Python binding from direct calls."""
+
+    def __init__(
+        self,
+        dna: AgentDNA,
+        fn: Callable[..., Any],
+        *,
+        action_type: str | None = None,
+        block_on_violation: bool = True,
+        block_on_warnings: bool = False,
+    ) -> None:
+        self._dna = dna
+        self._fn = fn
+        self._action_type = action_type
+        self._block_on_violation = block_on_violation
+        self._block_on_warnings = block_on_warnings
+        self._signature = inspect.signature(fn)
+        self._is_async = inspect.iscoroutinefunction(fn)
+        functools.update_wrapper(self, fn)
+        if self._is_async:
+            # Python 3.11's inspect.iscoroutinefunction() recognizes callable
+            # function-like objects from these standard metadata attributes.
+            self.__code__ = fn.__code__  # type: ignore[attr-defined]
+            self.__defaults__ = getattr(fn, "__defaults__", None)
+            self.__kwdefaults__ = getattr(fn, "__kwdefaults__", None)
+            if hasattr(inspect, "markcoroutinefunction"):
+                inspect.markcoroutinefunction(self)
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        if instance is None:
+            return self
+        parameters = tuple(self._signature.parameters.values())
+        bound_signature = self._signature.replace(parameters=parameters[1:])
+        if self._is_async:
+
+            @functools.wraps(self._fn)
+            async def async_bound(*args: Any, **kwargs: Any) -> Any:
+                return await self._invoke_async(
+                    (instance, *args), kwargs, receiver_bound=True
+                )
+
+            async_bound.__signature__ = bound_signature  # type: ignore[attr-defined]
+            return async_bound
+
+        @functools.wraps(self._fn)
+        def sync_bound(*args: Any, **kwargs: Any) -> Any:
+            return self._invoke_sync((instance, *args), kwargs, receiver_bound=True)
+
+        sync_bound.__signature__ = bound_signature  # type: ignore[attr-defined]
+        return sync_bound
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._is_async:
+            return self._invoke_async(args, kwargs, receiver_bound=False)
+        return self._invoke_sync(args, kwargs, receiver_bound=False)
+
+    def _input_text(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        receiver_bound: bool,
+    ) -> str:
+        bound = self._signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = dict(bound.arguments)
+        if receiver_bound:
+            first = next(iter(self._signature.parameters), None)
+            if first is not None:
+                values.pop(first, None)
+        if len(values) == 1:
+            return _extract_output(next(iter(values.values())))
+        return _extract_output(values) if values else ""
+
+    def _check(self, text: str) -> None:
+        _enforce_result(
+            self._dna.validate(text),
+            block_on_violation=self._block_on_violation,
+            block_on_warnings=self._block_on_warnings,
+        )
+
+    def _pre_call(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        receiver_bound: bool,
+    ) -> None:
+        if self._action_type is not None:
+            self._dna.check_maci(self._action_type)
+        self._check(self._input_text(args, kwargs, receiver_bound=receiver_bound))
+
+    def _invoke_sync(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        receiver_bound: bool,
+    ) -> Any:
+        self._pre_call(args, kwargs, receiver_bound=receiver_bound)
+        result = self._fn(*args, **kwargs)
+        if self._dna.validate_output and result is not None:
+            self._check(_extract_output(result))
+        return result
+
+    async def _invoke_async(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        receiver_bound: bool,
+    ) -> Any:
+        self._pre_call(args, kwargs, receiver_bound=receiver_bound)
+        result = await self._fn(*args, **kwargs)
+        if self._dna.validate_output and result is not None:
+            self._check(_extract_output(result))
+        return result
 
 
 def constitutional_dna(
@@ -336,8 +556,15 @@ def constitutional_dna(
     maci_role: MACIRole | None = None,
     strict: bool = True,
     validate_output: bool = True,
+    action_type: str | None = None,
+    block_on_violation: bool = True,
+    block_on_warnings: bool = False,
 ) -> F | Callable[[F], F]:
     """Decorator that embeds constitutional DNA into any callable.
+
+    Blocks on any invalid validation result unless ``block_on_violation=False``;
+    WARN-tier matches are logged and raise only with ``block_on_warnings=True``.
+    ``action_type`` is required when ``maci_role`` is set.
 
     Usage:
         @constitutional_dna
@@ -383,7 +610,11 @@ def constitutional_dna(
 
     def decorator(f: F) -> F:
         dna = _build_dna()
-        governed = dna.govern(f)
+        governed = dna.govern(
+            action_type=action_type,
+            block_on_violation=block_on_violation,
+            block_on_warnings=block_on_warnings,
+        )(f)
         governed._dna = dna  # type: ignore[attr-defined]
         return governed
 
@@ -392,31 +623,139 @@ def constitutional_dna(
     return decorator
 
 
-def _extract_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    """Extract the input string from function arguments."""
-    if "input" in kwargs:
-        return str(kwargs["input"])
-    if "prompt" in kwargs:
-        return str(kwargs["prompt"])
-    if args:
-        return str(args[0])
-    return ""
+@dataclass
+class _GovernanceTraversal:
+    active: set[int] = field(default_factory=set)
+    nodes: int = 0
+
+    def visit(self, depth: int) -> None:
+        if depth > _MAX_GOVERNED_DEPTH:
+            raise ValueError("governed value exceeds maximum depth")
+        self.nodes += 1
+        if self.nodes > _MAX_GOVERNED_NODES:
+            raise ValueError("governed value exceeds maximum node count")
+
+
+def _check_governed_container_size(size: int) -> None:
+    if size > _MAX_GOVERNED_CONTAINER_ITEMS:
+        raise ValueError("governed container exceeds maximum item count")
+
+
+def _governed_json_value(
+    value: Any,
+    traversal: _GovernanceTraversal | None = None,
+    *,
+    depth: int = 0,
+) -> Any:
+    """Build a JSON-safe governance view without invoking object copy hooks."""
+    traversal = _GovernanceTraversal() if traversal is None else traversal
+    traversal.visit(depth)
+    if value is None or isinstance(value, (str, bool, int)):
+        if isinstance(value, str) and len(value) > _MAX_GOVERNED_TEXT_CHARS:
+            raise ValueError("governed text exceeds maximum character count")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("governed JSON numbers must be finite")
+        return value
+
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in traversal.active:
+            raise ValueError("cyclic governed value")
+        _check_governed_container_size(dict.__len__(value))
+        if any(type(key) is not str for key in dict.__iter__(value)):
+            raise TypeError("governed mappings require string keys")
+        if any(
+            len(key) > _MAX_GOVERNED_TEXT_CHARS for key in dict.__iter__(value)
+        ):
+            raise ValueError("governed mapping key exceeds maximum character count")
+        traversal.active.add(identity)
+        try:
+            return {
+                key: _governed_json_value(nested, traversal, depth=depth + 1)
+                for key, nested in dict.items(value)
+            }
+        finally:
+            traversal.active.remove(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in traversal.active:
+            raise ValueError("cyclic governed value")
+        if isinstance(value, list):
+            size = list.__len__(value)
+            iterator = list.__iter__(value)
+        else:
+            size = tuple.__len__(value)
+            iterator = tuple.__iter__(value)
+        _check_governed_container_size(size)
+        traversal.active.add(identity)
+        try:
+            return [
+                _governed_json_value(nested, traversal, depth=depth + 1)
+                for nested in iterator
+            ]
+        finally:
+            traversal.active.remove(identity)
+
+    if is_dataclass(value) and not isinstance(value, type):
+        identity = id(value)
+        if identity in traversal.active:
+            raise ValueError("cyclic governed value")
+        dataclass_fields = fields(value)
+        _check_governed_container_size(len(dataclass_fields))
+        traversal.active.add(identity)
+        try:
+            return {
+                item.name: _governed_json_value(
+                    object.__getattribute__(value, item.name),
+                    traversal,
+                    depth=depth + 1,
+                )
+                for item in dataclass_fields
+            }
+        finally:
+            traversal.active.remove(identity)
+
+    if (
+        type(value).__repr__ is object.__repr__
+        and type(value).__str__ is object.__str__
+    ):
+        raise TypeError(f"unsupported governed value type: {type(value).__name__}")
+
+    representation = repr(value)
+    if len(representation) > _MAX_GOVERNED_TEXT_CHARS:
+        raise ValueError("governed representation exceeds maximum character count")
+    if type(value).__str__ is not object.__str__:
+        custom_text = str(value)
+        if len(custom_text) > _MAX_GOVERNED_TEXT_CHARS:
+            raise ValueError("governed string exceeds maximum character count")
+        if custom_text and custom_text != representation:
+            representation = (
+                f"{representation}\n{custom_text}" if representation else custom_text
+            )
+    if not representation:
+        raise ValueError("governed value has no representation")
+    return representation
 
 
 def _extract_output(result: Any) -> str:
     """Extract validatable string from any output type.
 
-    Handles str, dict, list, and objects with custom __str__.
-    Prevents C1: non-string outputs bypassing validation.
+    The same representation governs bound inputs and returned values. Serialization
+    errors propagate: an unrepresentable value must never silently bypass governance.
     """
     if isinstance(result, str):
         return result
-    if isinstance(result, dict):
-        return json.dumps(result, default=str)
-    if isinstance(result, (list, tuple)):
-        return json.dumps(result, default=str)
     if result is None:
         return ""
-    if type(result).__str__ is not object.__str__:
-        return str(result)
-    return ""
+    governed = _governed_json_value(result)
+    if isinstance(governed, str):
+        return governed
+    return json.dumps(
+        governed,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )

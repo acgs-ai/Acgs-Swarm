@@ -15,6 +15,11 @@ from constitutional_swarm.mesh import (
 )
 
 
+def _dev_mesh(*args, **kwargs) -> ConstitutionalMesh:
+    kwargs.setdefault("evidence_mode", "single_operator_dev")
+    return ConstitutionalMesh(*args, **kwargs)
+
+
 def _vote_signature(
     mesh: ConstitutionalMesh,
     assignment_id: str,
@@ -94,7 +99,7 @@ class TestDNAKillSwitch:
 class TestMeshKillSwitch:
     @pytest.fixture
     def mesh(self) -> ConstitutionalMesh:
-        m = ConstitutionalMesh(Constitution.default(), seed=42)
+        m = _dev_mesh(Constitution.default(), seed=42)
         for i in range(5):
             m.register_local_signer(f"agent-{i:02d}")
         return m
@@ -173,7 +178,7 @@ class TestMeshKillSwitch:
 class TestMeshThreadSafety:
     def test_concurrent_registrations(self) -> None:
         """Multiple threads registering agents concurrently."""
-        mesh = ConstitutionalMesh(Constitution.default(), seed=1)
+        mesh = _dev_mesh(Constitution.default(), seed=1)
         errors: list[Exception] = []
 
         def register_batch(start: int, count: int) -> None:
@@ -201,7 +206,7 @@ class TestMeshThreadSafety:
         Retry ``MeshSnapshotStaleError`` per assignment so this test still
         proves thread safety without requiring zero snapshot invalidations.
         """
-        mesh = ConstitutionalMesh(Constitution.default(), seed=7)
+        mesh = _dev_mesh(Constitution.default(), seed=7)
         for i in range(20):
             mesh.register_local_signer(f"agent-{i:02d}")
 
@@ -249,7 +254,7 @@ class TestMeshThreadSafety:
         assert all(results)
 
     def test_concurrent_duplicate_vote_same_voter(self) -> None:
-        mesh = ConstitutionalMesh(Constitution.default(), seed=11)
+        mesh = _dev_mesh(Constitution.default(), seed=11)
         for i in range(5):
             mesh.register_local_signer(f"agent-{i:02d}")
 
@@ -300,7 +305,7 @@ class TestManifoldPeerSelection:
     def test_manifold_enabled_selects_peers(self):
         """With use_manifold=True, peer selection still works and returns correct count."""
         constitution = Constitution.default()
-        mesh = ConstitutionalMesh(
+        mesh = _dev_mesh(
             constitution,
             peers_per_validation=3,
             quorum=2,
@@ -318,10 +323,10 @@ class TestManifoldPeerSelection:
     def test_manifold_biases_toward_trusted_peers(self):
         """Peers with higher manifold trust appear more frequently over many draws."""
         constitution = Constitution.default()
-        mesh = ConstitutionalMesh(
+        mesh = _dev_mesh(
             constitution,
             peers_per_validation=2,
-            quorum=1,
+            quorum=2,
             seed=42,
             use_manifold=True,
         )
@@ -331,7 +336,7 @@ class TestManifoldPeerSelection:
 
         # Create an initial validation so manifold gets trust data
         a1 = mesh.request_validation("a-0", content="first output", artifact_id="v1")
-        # Submit only 1 vote (quorum=1) to build trust without settling early
+        # Submit only 1 vote to build trust without settling early.
         mesh.submit_vote(
             a1.assignment_id,
             a1.peers[0],
@@ -359,10 +364,10 @@ class TestManifoldPeerSelection:
     def test_manifold_disabled_uses_uniform_random(self):
         """With use_manifold=False (default), selection is uniform random."""
         constitution = Constitution.default()
-        mesh = ConstitutionalMesh(
+        mesh = _dev_mesh(
             constitution,
             peers_per_validation=2,
-            quorum=1,
+            quorum=2,
             seed=42,
         )
         for i in range(4):

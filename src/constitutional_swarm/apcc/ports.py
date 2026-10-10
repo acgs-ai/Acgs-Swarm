@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
+from ..framing import require_plain_id
 from .crypto import b64u_decode
 from .model import (
     AuthorityStatus,
@@ -172,6 +173,28 @@ class APCCAuthorityConfig:
         )
 
 
+def validate_runtime_signers(
+    config: APCCAuthorityConfig, runtime: AuthorityRuntime
+) -> None:
+    """Require the runtime signers to hold exactly the configured public keys."""
+    for role, binding in (
+        (AuthoritySigningRole.COMMIT, config.commit_trust),
+        (AuthoritySigningRole.STATUS, config.status_trust),
+    ):
+        try:
+            public_key = runtime.key_provider.public_key(role, binding.key_id)
+        except Exception as error:
+            raise ValueError("APCC runtime signer is unavailable") from error
+        if bytes(public_key) != binding.public_key:
+            raise ValueError("APCC runtime signer does not match public configuration")
+
+
+def _require_plain_ids(*values: str) -> None:
+    """Reject identifiers outside the shared ASCII plain-ID grammar (H2)."""
+    for value in values:
+        require_plain_id(value)
+
+
 class RevocationScope(StrEnum):
     CERTIFICATE = "CERTIFICATE"
     ACTOR = "ACTOR"
@@ -183,6 +206,14 @@ class StageResultRequest:
     subject: CertificateSubject
     expected_node_version: str
     result_bytes: bytes
+
+    def __post_init__(self) -> None:
+        _require_plain_ids(
+            self.subject.workflow_id,
+            self.subject.node_id,
+            self.subject.attempt_id,
+            self.subject.agent_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +250,11 @@ class CommitContextRequest:
     node_id: str
     attempt_id: str
     agent_id: str
+
+    def __post_init__(self) -> None:
+        _require_plain_ids(
+            self.workflow_id, self.node_id, self.attempt_id, self.agent_id
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +362,9 @@ class RevocationRequest:
         object.__setattr__(self, "scope", RevocationScope(self.scope))
         if not self.workflow_id or not self.target_id:
             raise ValueError("revocation workflow and target cannot be empty")
+        _require_plain_ids(self.workflow_id)
+        if self.scope is not RevocationScope.CERTIFICATE:
+            _require_plain_ids(self.target_id)
         if self.scope is RevocationScope.CERTIFICATE:
             try:
                 b64u_decode(self.target_id, expected_length=32)

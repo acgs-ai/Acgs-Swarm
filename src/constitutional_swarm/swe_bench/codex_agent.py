@@ -2,7 +2,8 @@
 
 Wires :class:`SWEBenchAgent._generate_patch()` to ``codex exec`` so a real
 LM produces unified diffs for SWE-bench-shaped tasks. Patch shape is
-validated (non-empty, ``diff``/``---``/``+++`` markers) but **not** applied
+validated (a ``diff --git``/``--- a/``/``+++ b/`` file header is required;
+prose before it is cut) but **not** applied
 or tested — full benchmark scoring still requires a Docker harness with the
 instance repo checked out.
 
@@ -18,39 +19,21 @@ logged-in ChatGPT/OpenAI account (``codex login``).
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from constitutional_swarm.swe_bench._diff import extract_unified_diff
+from constitutional_swarm.swe_bench._messages_agent import build_swe_bench_prompt
+from constitutional_swarm.swe_bench._subprocess import _run_process
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent
 
 _log = logging.getLogger(__name__)
 
-_DIFF_MARKER = re.compile(r"(?m)^(?:diff --git |--- [ab]?/|\+\+\+ [ab]?/|@@ )")
-
-_PROMPT_TEMPLATE = """\
-You are solving a SWE-bench task. Produce a unified diff that fixes the bug.
-
-Output rules:
-- Reply with ONLY the unified diff, no prose, no code fences, no explanation.
-- Use standard ``--- a/<path>`` and ``+++ b/<path>`` headers.
-- Paths must be relative to the repository root.
-- Do not modify tests unless the task explicitly requires it.
-
-Instance: {instance_id}
-Repository: {repo}
-Base commit: {base_commit}
-
-Tests that should flip from FAIL to PASS:
-{fail_to_pass}
-
-Problem statement:
-{problem_statement}
-
-{hints_section}Produce the patch now."""
+# Backward-compatible private name; the single implementation lives in _diff.
+_extract_diff = extract_unified_diff
 
 
 class CodexSWEBenchAgent(SWEBenchAgent):
@@ -103,19 +86,7 @@ class CodexSWEBenchAgent(SWEBenchAgent):
     # ------------------------------------------------------------------
 
     def _build_prompt(self, task: dict[str, Any]) -> str:
-        fail_to_pass = task.get("FAIL_TO_PASS") or []
-        if isinstance(fail_to_pass, str):
-            fail_to_pass = [fail_to_pass]
-        hints = task.get("hints_text") or ""
-        hints_section = f"Hints:\n{hints.strip()}\n\n" if hints.strip() else ""
-        return _PROMPT_TEMPLATE.format(
-            instance_id=task.get("instance_id", "unknown"),
-            repo=task.get("repo", "unknown"),
-            base_commit=task.get("base_commit", "unknown"),
-            fail_to_pass="\n".join(f"- {t}" for t in fail_to_pass) or "(none listed)",
-            problem_statement=(task.get("problem_statement") or "").strip(),
-            hints_section=hints_section,
-        )
+        return build_swe_bench_prompt(task)
 
     def _generate_patch(self, task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         prompt = self._build_prompt(task)
@@ -136,13 +107,10 @@ class CodexSWEBenchAgent(SWEBenchAgent):
             cmd.extend(self.extra_args)
 
             try:
-                proc = subprocess.run(
+                proc = _run_process(
                     cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_s,
-                    check=False,
+                    input_text=prompt,
+                    timeout_s=self.timeout_s,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(f"codex exec timed out after {self.timeout_s}s") from exc
@@ -155,6 +123,7 @@ class CodexSWEBenchAgent(SWEBenchAgent):
             }
             if proc.returncode != 0:
                 _log.warning("codex exec failed (%s): %s", proc.returncode, proc.stderr[-500:])
+                stats["error"] = "codex_exit_nonzero"
                 stats["stderr_tail"] = proc.stderr[-500:]
                 return "", stats
 
@@ -162,7 +131,7 @@ class CodexSWEBenchAgent(SWEBenchAgent):
                 last_message = last_path.read_text(encoding="utf-8")
             except OSError:
                 last_message = ""
-            patch = _extract_diff(last_message) or _extract_diff(proc.stdout)
+            patch = extract_unified_diff(last_message) or extract_unified_diff(proc.stdout)
             stats["raw_length"] = len(last_message)
             stats["patch_length"] = len(patch)
             return patch, stats
@@ -171,29 +140,6 @@ class CodexSWEBenchAgent(SWEBenchAgent):
                 last_path.unlink()
             except OSError:
                 pass
-
-
-def _extract_diff(text: str) -> str:
-    """Extract a unified diff from ``text``.
-
-    Strips markdown code fences and requires at least one diff marker
-    (``diff --git``, ``---``, ``+++``, or ``@@``). Returns empty string if no
-    diff-shaped content is present.
-    """
-    if not text:
-        return ""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        # Remove leading/trailing code fence lines
-        lines = stripped.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    if not _DIFF_MARKER.search(stripped):
-        return ""
-    return stripped + ("\n" if not stripped.endswith("\n") else "")
 
 
 __all__ = ["CodexSWEBenchAgent"]

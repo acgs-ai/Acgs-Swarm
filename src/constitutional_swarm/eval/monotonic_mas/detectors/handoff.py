@@ -1,49 +1,55 @@
-"""Missed-handoff detector.
-
-Simulates a handoff via two MerkleCRDT replicas + a synchronous merge() loop.
-Without governance: the destination replica never merges (handoff dropped).
-With governance: gossip-style merges happen each round; we check whether the
-artifact arrives at the destination within the trace's deadline_rounds.
-
-We use the synchronous MerkleCRDT.merge() rather than the async
-gossip_protocol.SwarmNode because the trace replay is in-process and
-deterministic. The catch criterion is the structural property gossip
-provides — eventual delivery — not the WebSocket transport itself.
-"""
+"""Evidence-based detector for missing and late handoff acknowledgements."""
 
 from __future__ import annotations
 
-from constitutional_swarm.merkle_crdt import MerkleCRDT
-
-
 def detect_handoff(trace: dict, governance_enabled: bool) -> tuple[bool, dict]:
-    """Replay a missed_handoff trace; return (caught, debug_info).
-
-    caught=True iff the artifact is present in the dst replica within
-    deadline_rounds.
-    """
+    """Inspect recorded handoff events after a complete observation window."""
     src_id = trace["context"]["src"]
     dst_id = trace["context"]["dst"]
     deadline = int(trace["context"]["deadline_rounds"])
+    events = trace.get("events", [])
+    sent = [
+        event
+        for event in events
+        if event.get("type") == "handoff_sent"
+        and event.get("src") == src_id
+        and event.get("dst") == dst_id
+    ]
+    if not sent:
+        return False, {
+            "status": "unavailable",
+            "unavailable_reason": "trace has no matching handoff_sent events",
+            "handoffs_observed": 0,
+        }
 
-    src = MerkleCRDT(agent_id=src_id, reject_unverified=True)
-    dst = MerkleCRDT(agent_id=dst_id, reject_unverified=True)
+    observation_end = trace["context"].get("observation_end_round")
+    required_end = max(int(event["round"]) + deadline for event in sent)
+    if observation_end is None or int(observation_end) < required_end:
+        return False, {
+            "status": "unavailable",
+            "unavailable_reason": "trace observation window does not cover every deadline",
+            "required_observation_end_round": required_end,
+            "observation_end_round": observation_end,
+        }
 
-    # src produces the artifact
-    src.append(payload=trace["payload"], payload_type="handoff", bodes_passed=True)
+    acknowledgements = [event for event in events if event.get("type") == "handoff_ack"]
+    failed_ids: list[str] = []
+    for handoff in sent:
+        matching = [
+            event
+            for event in acknowledgements
+            if event.get("handoff_id") == handoff["handoff_id"]
+            and event.get("src") == src_id
+            and event.get("dst") == dst_id
+            and int(event["round"]) >= int(handoff["round"])
+        ]
+        deadline_round = int(handoff["round"]) + deadline
+        if not matching or min(int(event["round"]) for event in matching) > deadline_round:
+            failed_ids.append(handoff["handoff_id"])
 
-    delivered_round = None
-    if governance_enabled:
-        for r in range(1, deadline + 1):
-            new = dst.merge(src)
-            if new > 0:
-                delivered_round = r
-                break
-    # else: handoff dropped — no merge attempted, dst stays empty
-
-    caught = delivered_round is not None and delivered_round <= deadline
-    return caught, {
-        "delivered_round": delivered_round,
+    return governance_enabled and bool(failed_ids), {
+        "status": "available",
         "deadline_rounds": deadline,
-        "dst_size": len(dst._nodes),
+        "handoffs_observed": len(sent),
+        "missed_or_late_handoff_ids": failed_ids,
     }

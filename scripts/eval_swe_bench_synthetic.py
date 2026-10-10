@@ -106,8 +106,9 @@ def _warmup_trust(
 
     Each agent solves a handful of tasks from each domain; per-domain success
     rates are accumulated into the raw trust matrix (agent i vs ``task_domain``
-    pseudo-agent j := domain index). We then project onto the spectral sphere.
+    pseudo-agent j := domain index) and committed as one observation batch.
     """
+    observations: list[tuple[int, int, float]] = []
     for i, agent in enumerate(agents):
         for d_idx, domain in enumerate(_DOMAINS):
             if d_idx >= manifold.num_agents or i >= manifold.num_agents:
@@ -124,8 +125,8 @@ def _warmup_trust(
                 if result[0].strip():
                     successes += 1
             rate = successes / warmup_tasks_per_agent
-            manifold.update_trust(i, d_idx, rate)
-    _ = manifold.project()
+            observations.append((i, d_idx, rate))
+    manifold.update_trust_batch(observations)
 
 
 def _trust_to_routing_weights(

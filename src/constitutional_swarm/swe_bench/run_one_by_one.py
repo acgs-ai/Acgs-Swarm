@@ -12,7 +12,9 @@ Each invocation:
      OAuth session — no API key needed; never hands the token to anything
      external).
   3. Appends a single JSONL line to
-     ``.omc/swe_bench_runs/<run-id>/results.jsonl``.
+     ``<run-root>/<run-id>/results.jsonl`` (CLI default run root:
+     ``.omc/swe_bench_runs``; library calls without ``run_root`` use a
+     private per-process temp directory and never write under the cwd).
   4. Recomputes ``summary.json`` (totals, succeeded, tokens, est. cost).
   5. Prints a running tally to stdout.
 
@@ -29,12 +31,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import fcntl
 import json
 import logging
+import re
 import sys
+import tempfile
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -58,12 +64,26 @@ _PRICING_PER_1M: dict[str, tuple[float, float]] = {
     "gemini-3-flash-preview": (0.30, 2.50),
 }
 
-_DEFAULT_RUN_ROOT = Path(".omc/swe_bench_runs")
+# Documented CLI default (relative to the invoking cwd, resumable across runs).
+_CLI_RUN_ROOT = Path(".omc/swe_bench_runs")
+# Library-level default. ``None`` means "no root configured": run state goes
+# to a private (0700) per-process temp directory instead of a cwd-relative
+# path, so importing callers (and tests) never litter their working tree.
+_DEFAULT_RUN_ROOT: Path | None = None
+_PROCESS_RUN_ROOT: Path | None = None
+_PROCESS_RUN_ROOT_LOCK = threading.Lock()
+_RUN_ROOT_OVERRIDE: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "constitutional_swarm_swe_bench_run_root", default=None
+)
 
 
 def _safe_path_component(value: str, *, field_name: str) -> str:
-    if not value or value in {".", ".."}:
+    if not value or value in {".", ".."} or "\x00" in value:
         raise ValueError(f"{field_name} must be a non-empty path component")
+    if value.startswith("-"):
+        # Components also travel as argv values (official harness -id / -i);
+        # a leading dash would be parsed as an option.
+        raise ValueError(f"{field_name} must not start with '-'")
     candidate = Path(value)
     if candidate.is_absolute() or len(candidate.parts) != 1:
         raise ValueError(f"{field_name} must be a single relative path component")
@@ -72,8 +92,51 @@ def _safe_path_component(value: str, *, field_name: str) -> str:
     return value
 
 
+# SWE-bench ids look like "astropy__astropy-12907": start alphanumeric, then
+# only [A-Za-z0-9._-]. Anything else is rejected before it reaches a path or argv.
+_INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _safe_instance_id(value: object) -> str:
+    if not isinstance(value, str) or _INSTANCE_ID_RE.fullmatch(value) is None:
+        raise ValueError("instance_id must match [A-Za-z0-9][A-Za-z0-9._-]*")
+    return _safe_path_component(value, field_name="instance_id")
+
+
+def _run_root() -> Path:
+    """Resolve the run root: per-call override > configured default > private temp."""
+    global _PROCESS_RUN_ROOT
+    override = _RUN_ROOT_OVERRIDE.get()
+    if override is not None:
+        return override
+    if _DEFAULT_RUN_ROOT is not None:
+        return Path(_DEFAULT_RUN_ROOT)
+    with _PROCESS_RUN_ROOT_LOCK:
+        if _PROCESS_RUN_ROOT is None:
+            _PROCESS_RUN_ROOT = Path(tempfile.mkdtemp(prefix="swe-bench-runs-"))
+            log.warning(
+                "No run_root configured; run state is written to the private "
+                "temporary directory %s (pass run_root= to persist/resume)",
+                _PROCESS_RUN_ROOT,
+            )
+        return _PROCESS_RUN_ROOT
+
+
+@contextlib.contextmanager
+def _using_run_root(run_root: Path | str | None) -> Iterator[None]:
+    """Scope an explicit run root to the current call (and context)."""
+    if run_root is None:
+        yield
+        return
+    token = _RUN_ROOT_OVERRIDE.set(Path(run_root))
+    try:
+        yield
+    finally:
+        _RUN_ROOT_OVERRIDE.reset(token)
+
+
 def _run_dir(run_id: str) -> Path:
-    return _DEFAULT_RUN_ROOT / _safe_path_component(run_id, field_name="run_id")
+    return _run_root() / _safe_path_component(run_id, field_name="run_id")
 
 
 def _results_path(run_id: str) -> Path:
@@ -112,12 +175,14 @@ def _run_lock(run_id: str) -> Iterator[None]:
         fp.close()
 
 
-def _attempted_ids(run_id: str) -> set[str]:
-    """Return the set of instance_ids already attempted in this run."""
+def _iter_records(run_id: str) -> Iterator[dict[str, Any]]:
+    """Yield the JSON-object records of ``results.jsonl``.
+
+    Blank, malformed and non-object lines (bare scalars, arrays) are skipped.
+    """
     p = _results_path(run_id)
     if not p.exists():
-        return set()
-    ids: set[str] = set()
+        return
     with p.open() as f:
         for line in f:
             line = line.strip()
@@ -127,9 +192,28 @@ def _attempted_ids(run_id: str) -> set[str]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "instance_id" in rec:
-                ids.add(rec["instance_id"])
-    return ids
+            if isinstance(rec, dict):
+                yield rec
+
+
+def _is_logical_attempt(rec: dict[str, Any]) -> bool:
+    """Single-mode rows and best-of-K winners; drops only explicit candidates.
+
+    Best-of-K writes k+1 rows per task: k candidate audit rows
+    (is_winner=False) plus 1 winner row duplicating the chosen candidate.
+    Single-mode rows have no is_winner field.
+    """
+    return rec.get("is_winner") is not False
+
+
+def _is_winner_record(rec: dict[str, Any]) -> bool:
+    """Winner rows, or legacy rows without ``is_winner`` (treated as winners)."""
+    return bool(rec.get("is_winner", True))
+
+
+def _attempted_ids(run_id: str) -> set[str]:
+    """Return the set of instance_ids already attempted in this run."""
+    return {rec["instance_id"] for rec in _iter_records(run_id) if "instance_id" in rec}
 
 
 def _load_next_task(run_id: str, *, dataset: str, split: str) -> dict[str, Any] | None:
@@ -155,7 +239,11 @@ def _load_specific_task(instance_id: str, *, dataset: str, split: str) -> dict[s
 
 
 def _normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
-    """Coerce SWE-bench Lite's str-encoded list fields back into Python lists."""
+    """Validate task identity and normalize str-encoded list fields."""
+    instance_id = raw.get("instance_id")
+    if not isinstance(instance_id, str):
+        raise ValueError("instance_id must be a string path component")
+    _safe_instance_id(instance_id)
     ftp = raw.get("FAIL_TO_PASS", "[]")
     if isinstance(ftp, str):
         try:
@@ -169,13 +257,14 @@ def _normalize_task(raw: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             ptp = []
     return {
-        "instance_id": raw["instance_id"],
+        "instance_id": instance_id,
         "repo": raw["repo"],
         "base_commit": raw["base_commit"],
         "problem_statement": raw["problem_statement"],
         "hints_text": raw.get("hints_text", ""),
         "FAIL_TO_PASS": ftp,
         "PASS_TO_PASS": ptp,
+        "test_patch": raw.get("test_patch", ""),
     }
 
 
@@ -195,35 +284,23 @@ def _append_result(run_id: str, record: dict[str, Any]) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> dict[str, Any]:
-    """Recompute the running-tally summary.json from results.jsonl (idempotent)."""
-    p = _results_path(run_id)
-    if not p.exists():
-        return {"total": 0}
-    records: list[dict[str, Any]] = []
-    with p.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
-    # Filter to logical attempts only. Best-of-K writes k+1 rows per task:
-    # k candidate audit rows (is_winner=False) plus 1 winner row (is_winner=True
-    # — duplicates the chosen candidate's content). Single-mode rows have no
-    # is_winner field. Counting raw rows would inflate totals/cost on mixed-
-    # mode reuse; filter is_winner=False so summary reflects logical attempts.
-    logical = [r for r in records if r.get("is_winner") is not False]
-    total = len(logical)
-    succeeded = sum(1 for r in logical if r.get("success"))
-    errored = sum(1 for r in logical if r.get("error"))
-    in_tok = sum(r.get("input_tokens", 0) or 0 for r in logical)
-    out_tok = sum(r.get("output_tokens", 0) or 0 for r in logical)
-    cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in logical)
-    durations = [d for r in logical if (d := r.get("elapsed_s")) is not None]
+def _summarize(
+    run_id: str,
+    *,
+    predicate: Callable[[dict[str, Any]], bool],
+    model: str,
+    dataset: str,
+    split: str,
+) -> dict[str, Any]:
+    """Aggregate the records selected by ``predicate`` and write summary.json."""
+    selected = [rec for rec in _iter_records(run_id) if predicate(rec)]
+    total = len(selected)
+    succeeded = sum(1 for r in selected if r.get("success"))
+    errored = sum(1 for r in selected if r.get("error"))
+    in_tok = sum(r.get("input_tokens", 0) or 0 for r in selected)
+    out_tok = sum(r.get("output_tokens", 0) or 0 for r in selected)
+    cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in selected)
+    durations = [d for r in selected if (d := r.get("elapsed_s")) is not None]
 
     summary = {
         "run_id": run_id,
@@ -238,10 +315,27 @@ def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> 
         "output_tokens_total": out_tok,
         "est_cost_usd_total": round(cost, 6),
         "mean_duration_s": (sum(durations) / len(durations)) if durations else 0.0,
-        "instance_ids": [r.get("instance_id") for r in logical],
+        "instance_ids": [r.get("instance_id") for r in selected],
     }
     _summary_path(run_id).write_text(json.dumps(summary, indent=2))
     return summary
+
+
+def _recompute_summary(run_id: str, *, model: str, dataset: str, split: str) -> dict[str, Any]:
+    """Recompute the running-tally summary.json from results.jsonl (idempotent).
+
+    Counts logical attempts only (see :func:`_is_logical_attempt`) so mixed-mode
+    reuse does not inflate totals/cost with best-of-K candidate rows.
+    """
+    if not _results_path(run_id).exists():
+        return {"total": 0}
+    return _summarize(
+        run_id,
+        predicate=_is_logical_attempt,
+        model=model,
+        dataset=dataset,
+        split=split,
+    )
 
 
 def _record_from_solve(
@@ -280,10 +374,26 @@ def _record_from_solve(
 
 
 def _save_patch(run_id: str, instance_id: str, patch: str) -> None:
-    safe_instance_id = _safe_path_component(instance_id, field_name="instance_id")
+    safe_instance_id = _safe_instance_id(instance_id)
     patch_dir = _run_dir(run_id) / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = (patch_dir / f"{safe_instance_id}.diff").resolve()
+    if not patch_path.is_relative_to(patch_dir.resolve()):
+        raise ValueError("instance_id escapes patch directory")
+    patch_path.write_text(patch)
+
+
+def _save_candidate_patch(
+    run_id: str,
+    instance_id: str,
+    agent_index: int,
+    patch: str,
+) -> None:
+    """Persist one best-of-K candidate beneath the run's patch directory."""
+    safe_instance_id = _safe_instance_id(instance_id)
+    patch_dir = _run_dir(run_id) / "patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = (patch_dir / f"{safe_instance_id}.agent{agent_index}.diff").resolve()
     if not patch_path.is_relative_to(patch_dir.resolve()):
         raise ValueError("instance_id escapes patch directory")
     patch_path.write_text(patch)
@@ -352,9 +462,14 @@ def run_one(
     timeout_s: float = 180.0,
     max_new_tokens: int = 4096,
     governed: bool = False,
+    run_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Run exactly one instance and return the per-instance record."""
-    with _run_lock(run_id):
+    """Run exactly one instance and return the per-instance record.
+
+    ``run_root`` selects where ``<run-id>/`` lives for this call; when omitted
+    the module default applies (a private temp dir unless configured).
+    """
+    with _using_run_root(run_root), _run_lock(run_id):
         if instance_id:
             task = _load_specific_task(instance_id, dataset=dataset, split=split)
             if task is None:
@@ -404,6 +519,7 @@ def run_swarm_batch(
     max_new_tokens: int = 4096,
     models: list[str] | None = None,
     governed: bool = False,
+    run_root: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """Run a single k-agent swarm batch over k next-un-attempted instances.
 
@@ -420,7 +536,7 @@ def run_swarm_batch(
     if k < 1:
         raise ValueError("--swarm-k must be >= 1")
 
-    with _run_lock(run_id):
+    with _using_run_root(run_root), _run_lock(run_id):
         attempted = _attempted_ids(run_id)
         from datasets import load_dataset
 
@@ -516,8 +632,8 @@ def run_swarm_batch(
         print(f"Swarm batch {batch_id} ({k} agents, model={model}, dataset={dataset}):")
         print(
             f"  CRDT size: {aggregate['crdt_size']}"
-            f"  resolved: {aggregate['resolved']}/{aggregate['total']}"
-            f"  resolve_rate: {aggregate['resolve_rate']:.3f}"
+            f"  patch_generated: {aggregate['patch_generated']}/{aggregate['total']}"
+            f"  patch_rate: {aggregate['patch_rate']:.3f}"
         )
         print(
             f"  governed_count: {aggregate['governed_count']}"
@@ -554,18 +670,20 @@ def run_best_of_k_batch(
     max_new_tokens: int = 4096,
     models: list[str] | None = None,
     governed: bool = False,
+    run_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Best-of-K: run k agents on the SAME task, picker selects the winner.
 
-    Storage layout (one task per invocation):
-      .omc/swe_bench_runs/<run-id>/results.jsonl
+    Storage layout (one task per invocation; ``<run-root>`` is ``run_root``,
+    the CLI's ``.omc/swe_bench_runs`` by default):
+      <run-root>/<run-id>/results.jsonl
         — k+1 lines per call: k candidate records + 1 winner record
         — candidates have is_winner=False; winner has is_winner=True
         — the winner duplicates the chosen candidate's content (so summary
           aggregates can filter by is_winner=True without rejoining)
-      .omc/swe_bench_runs/<run-id>/patches/<instance_id>.diff
+      <run-root>/<run-id>/patches/<instance_id>.diff
         — the WINNER's patch
-      .omc/swe_bench_runs/<run-id>/patches/<instance_id>.agent<N>.diff
+      <run-root>/<run-id>/patches/<instance_id>.agent<N>.diff
         — per-candidate patches (kept for audit)
 
     The picker name and reason are recorded on the winner record.
@@ -577,7 +695,7 @@ def run_best_of_k_batch(
     if picker not in PICKERS:
         raise ValueError(f"Unknown picker {picker!r}; choose from {sorted(PICKERS)}")
 
-    with _run_lock(run_id):
+    with _using_run_root(run_root), _run_lock(run_id):
         # Pull ONE next-un-attempted task. We compare against the WINNER records
         # (is_winner=True) so a previous best-of-K invocation on the same instance
         # marks it as attempted.
@@ -595,6 +713,7 @@ def run_best_of_k_batch(
             raise RuntimeError(
                 f"No more un-attempted instances in {dataset}/{split} for run {run_id!r}"
             )
+        _safe_instance_id(task["instance_id"])
 
         # Build agent roster (heterogeneous if --models given).
         if models:
@@ -623,11 +742,35 @@ def run_best_of_k_batch(
         batch_id = f"bok-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-k{k}-{picker}"
         candidates: list[Any] = []
         elapsed_per_agent: list[float] = []
-        for _, agent in enumerate(agents):
+        cand_records: list[dict[str, Any]] = []
+        for i, agent in enumerate(agents):
             t0 = time.time()
             result = agent.solve(task)
-            elapsed_per_agent.append(time.time() - t0)
+            elapsed = time.time() - t0
+            elapsed_per_agent.append(elapsed)
             candidates.append(result)
+            rec = _record_from_solve(
+                task=task,
+                result=result,
+                model=roster[i],
+                elapsed_s=elapsed,
+                batch_id=batch_id,
+                agent_index=i,
+            )
+            rec["provider"] = provider
+            rec["mode"] = "best-of-k"
+            rec["picker"] = picker
+            rec["is_winner"] = False
+            rec["candidate_count"] = k
+            cand_records.append(rec)
+            _append_result(run_id, rec)
+            if result.patch:
+                _save_candidate_patch(
+                    run_id,
+                    task["instance_id"],
+                    i,
+                    result.patch,
+                )
 
         # Picker selection.
         picker_fn = PICKERS[picker]
@@ -645,30 +788,6 @@ def run_best_of_k_batch(
             winner_idx, picker_reason = picker_fn(candidates, dna)
         else:
             winner_idx, picker_reason = picker_fn(candidates)
-
-        # Persist k candidate records.
-        cand_records: list[dict[str, Any]] = []
-        for i, result in enumerate(candidates):
-            rec = _record_from_solve(
-                task=task,
-                result=result,
-                model=roster[i],
-                elapsed_s=elapsed_per_agent[i],
-                batch_id=batch_id,
-                agent_index=i,
-            )
-            rec["provider"] = provider
-            rec["mode"] = "best-of-k"
-            rec["picker"] = picker
-            rec["is_winner"] = False
-            rec["candidate_count"] = k
-            cand_records.append(rec)
-            _append_result(run_id, rec)
-            # Per-candidate patch file for audit.
-            if result.patch:
-                patch_dir = _run_dir(run_id) / "patches"
-                patch_dir.mkdir(parents=True, exist_ok=True)
-                (patch_dir / f"{task['instance_id']}.agent{i}.diff").write_text(result.patch)
 
         # Build winner record.
         if winner_idx < 0:
@@ -750,26 +869,15 @@ def _attempted_winner_ids(run_id: str) -> set[str]:
 
     For best-of-K runs we want a subsequent invocation to skip an instance
     only if a winner was already chosen for it. Pure-candidate records
-    (is_winner=False) shouldn't block re-attempts.
+    (is_winner=False) shouldn't block re-attempts. Legacy records (no
+    ``is_winner`` field) count as winners so prior round-robin batches are
+    still treated as attempted.
     """
-    p = _results_path(run_id)
-    if not p.exists():
-        return set()
-    ids: set[str] = set()
-    with p.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            # Backwards compat: legacy records (no `mode` field) count as winners
-            # so prior round-robin batches are still treated as attempted.
-            if rec.get("is_winner", True) and "instance_id" in rec:
-                ids.add(rec["instance_id"])
-    return ids
+    return {
+        rec["instance_id"]
+        for rec in _iter_records(run_id)
+        if _is_winner_record(rec) and "instance_id" in rec
+    }
 
 
 def _recompute_summary_winners(
@@ -779,56 +887,22 @@ def _recompute_summary_winners(
 
     Keeps the headline metrics interpretable (one row per instance) and
     counts the full k-call cost via the winner record's rolled-up cost.
-    Falls back to the legacy summary if no winner records exist (e.g.,
-    pre-best-of-k runs).
+    Legacy records without ``is_winner`` count as winners.
     """
-    p = _results_path(run_id)
-    if not p.exists():
+    if not _results_path(run_id).exists():
         return {"total": 0, "run_id": run_id, "model": model,
                 "dataset": dataset, "split": split,
                 "succeeded": 0, "errored": 0, "success_rate": 0.0,
                 "input_tokens_total": 0, "output_tokens_total": 0,
                 "est_cost_usd_total": 0.0, "mean_duration_s": 0.0,
                 "instance_ids": []}
-    winners: list[dict[str, Any]] = []
-    with p.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            # Only count is_winner=True (or legacy records without is_winner).
-            if rec.get("is_winner", True):
-                winners.append(rec)
-
-    total = len(winners)
-    succeeded = sum(1 for r in winners if r.get("success"))
-    errored = sum(1 for r in winners if r.get("error"))
-    in_tok = sum(r.get("input_tokens", 0) or 0 for r in winners)
-    out_tok = sum(r.get("output_tokens", 0) or 0 for r in winners)
-    cost = sum(r.get("est_cost_usd", 0.0) or 0.0 for r in winners)
-    durations = [d for r in winners if (d := r.get("elapsed_s")) is not None]
-
-    summary = {
-        "run_id": run_id,
-        "model": model,
-        "dataset": dataset,
-        "split": split,
-        "total": total,
-        "succeeded": succeeded,
-        "errored": errored,
-        "success_rate": (succeeded / total) if total else 0.0,
-        "input_tokens_total": in_tok,
-        "output_tokens_total": out_tok,
-        "est_cost_usd_total": round(cost, 6),
-        "mean_duration_s": (sum(durations) / len(durations)) if durations else 0.0,
-        "instance_ids": [r.get("instance_id") for r in winners],
-    }
-    _summary_path(run_id).write_text(json.dumps(summary, indent=2))
-    return summary
+    return _summarize(
+        run_id,
+        predicate=_is_winner_record,
+        model=model,
+        dataset=dataset,
+        split=split,
+    )
 
 
 def _print_tally(record: dict[str, Any], summary: dict[str, Any]) -> None:
@@ -856,7 +930,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--run-id",
         required=True,
-        help="Run identifier; results aggregate under .omc/swe_bench_runs/<run-id>/",
+        help="Run identifier; results aggregate under <run-root>/<run-id>/",
+    )
+    p.add_argument(
+        "--run-root",
+        type=Path,
+        default=_CLI_RUN_ROOT,
+        help=f"Directory holding per-run state (default: {_CLI_RUN_ROOT}).",
     )
     p.add_argument(
         "--model",
@@ -980,6 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 max_new_tokens=args.max_new_tokens,
                 governed=args.governed,
+                run_root=args.run_root,
             )
         elif args.swarm_k >= 2:
             run_swarm_batch(
@@ -995,6 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 max_new_tokens=args.max_new_tokens,
                 governed=args.governed,
+                run_root=args.run_root,
             )
         else:
             run_one(
@@ -1009,6 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 max_new_tokens=args.max_new_tokens,
                 governed=args.governed,
+                run_root=args.run_root,
             )
     except Exception as exc:
         log.error("run failed: %s: %s", type(exc).__name__, exc)

@@ -171,7 +171,9 @@ def test_peer_selection_deterministic_for_same_seed() -> None:
 
 
 def test_dna_cache_invalidates_on_rotation() -> None:
-    mesh = ConstitutionalMesh(Constitution.default(), seed=42)
+    mesh = ConstitutionalMesh(
+        Constitution.default(), seed=42, evidence_mode="single_operator_dev"
+    )
     for index in range(4):
         mesh.register_local_signer(f"agent-{index:02d}")
     assignment = mesh.request_validation("agent-00", "summarize notes", "a1")
@@ -359,7 +361,9 @@ def test_custom_policy_replacement_during_projection_fails_closed() -> None:
 
 
 def test_mutated_cached_dna_is_not_reused() -> None:
-    mesh = ConstitutionalMesh(Constitution.default(), seed=42)
+    mesh = ConstitutionalMesh(
+        Constitution.default(), seed=42, evidence_mode="single_operator_dev"
+    )
     for index in range(4):
         mesh.register_local_signer(f"agent-{index:02d}")
     assignment = mesh.request_validation("agent-00", "summarize notes", "a1")

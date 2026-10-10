@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 
@@ -18,6 +19,10 @@ from constitutional_swarm.bittensor.arweave_audit_log import (
 )
 
 CONST_HASH = "608508a9bd224290"
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -100,55 +105,65 @@ class TestAuditLogEntry:
 
 class TestMerkleUtilities:
     def test_single_leaf(self):
-        leaves = ["abc"]
+        leaves = [_digest("abc")]
         root = _compute_merkle_root(leaves)
         path = _merkle_path_for_index(leaves, 0)
         assert path == []
-        assert verify_merkle_path("abc", path, root)
+        assert verify_merkle_path(leaves[0], path, root, leaf_count=1, leaf_index=0)
 
     def test_two_leaves(self):
-        leaves = ["leaf0", "leaf1"]
+        leaves = [_digest("leaf0"), _digest("leaf1")]
         root = _compute_merkle_root(leaves)
         path0 = _merkle_path_for_index(leaves, 0)
         path1 = _merkle_path_for_index(leaves, 1)
-        assert verify_merkle_path("leaf0", path0, root)
-        assert verify_merkle_path("leaf1", path1, root)
+        assert verify_merkle_path(leaves[0], path0, root, leaf_count=2, leaf_index=0)
+        assert verify_merkle_path(leaves[1], path1, root, leaf_count=2, leaf_index=1)
 
     def test_four_leaves(self):
-        leaves = ["L0", "L1", "L2", "L3"]
+        leaves = [_digest(f"L{i}") for i in range(4)]
         root = _compute_merkle_root(leaves)
         for i, leaf in enumerate(leaves):
             path = _merkle_path_for_index(leaves, i)
-            assert verify_merkle_path(leaf, path, root), f"failed at index {i}"
+            assert verify_merkle_path(
+                leaf, path, root, leaf_count=len(leaves), leaf_index=i
+            ), f"failed at index {i}"
 
     def test_odd_leaves(self):
-        leaves = ["L0", "L1", "L2"]  # odd — last is duplicated
+        leaves = [_digest(f"L{i}") for i in range(3)]  # odd — last is promoted
         root = _compute_merkle_root(leaves)
         for i, leaf in enumerate(leaves):
             path = _merkle_path_for_index(leaves, i)
-            assert verify_merkle_path(leaf, path, root), f"failed at index {i}"
+            assert verify_merkle_path(
+                leaf, path, root, leaf_count=len(leaves), leaf_index=i
+            ), f"failed at index {i}"
 
     def test_wrong_leaf_fails(self):
-        leaves = ["L0", "L1", "L2", "L3"]
+        leaves = [_digest(f"L{i}") for i in range(4)]
         root = _compute_merkle_root(leaves)
         path = _merkle_path_for_index(leaves, 0)
         # Use wrong leaf hash
-        assert not verify_merkle_path("WRONG", path, root)
+        assert not verify_merkle_path(
+            _digest("WRONG"), path, root, leaf_count=len(leaves), leaf_index=0
+        )
 
     def test_tampered_root_fails(self):
-        leaves = ["L0", "L1"]
+        leaves = [_digest("L0"), _digest("L1")]
         path = _merkle_path_for_index(leaves, 0)
-        assert not verify_merkle_path("L0", path, "tampered-root")
+        assert not verify_merkle_path(
+            leaves[0], path, _digest("tampered-root"), leaf_count=2, leaf_index=0
+        )
 
     def test_large_batch(self):
-        leaves = [f"leaf-{i:04d}" for i in range(100)]
+        leaves = [_digest(f"leaf-{i:04d}") for i in range(100)]
         root = _compute_merkle_root(leaves)
         for i in [0, 1, 33, 49, 99]:
             path = _merkle_path_for_index(leaves, i)
-            assert verify_merkle_path(leaves[i], path, root), f"failed at {i}"
+            assert verify_merkle_path(
+                leaves[i], path, root, leaf_count=len(leaves), leaf_index=i
+            ), f"failed at {i}"
 
     def test_deterministic_root(self):
-        leaves = ["a", "b", "c", "d"]
+        leaves = [_digest(value) for value in ("a", "b", "c", "d")]
         r1 = _compute_merkle_root(leaves)
         r2 = _compute_merkle_root(leaves)
         assert r1 == r2
@@ -172,15 +187,25 @@ class TestAuditBatch:
     def test_merkle_path_verify(self):
         entries = [_entry(f"id-{i}") for i in range(4)]
         batch = AuditBatch("b1", CONST_HASH, entries)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             path = batch.merkle_path_for(entry.entry_id)
-            assert verify_merkle_path(entry.leaf_hash(), path, batch.batch_root)
+            assert verify_merkle_path(
+                entry.leaf_hash(),
+                path,
+                batch.batch_root,
+                leaf_count=batch.entry_count,
+                leaf_index=i,
+            )
 
     def test_verify_entry_method(self):
         entries = [_entry(f"id-{i}") for i in range(3)]
         batch = AuditBatch("b1", CONST_HASH, entries)
         for entry in entries:
-            assert batch.verify_entry(entry)
+            assert batch.verify_entry(
+                entry,
+                expected_root=batch.batch_root,
+                expected_batch_id=batch.batch_id,
+            )
 
     def test_unknown_entry_id_raises(self):
         batch = AuditBatch("b1", CONST_HASH, [_entry("real")])
@@ -190,7 +215,11 @@ class TestAuditBatch:
     def test_unknown_entry_verify_false(self):
         batch = AuditBatch("b1", CONST_HASH, [_entry("real")])
         unknown = _entry("other")
-        assert not batch.verify_entry(unknown)
+        assert not batch.verify_entry(
+            unknown,
+            expected_root=batch.batch_root,
+            expected_batch_id=batch.batch_id,
+        )
 
     def test_find_entry(self):
         entries = [_entry(f"id-{i}") for i in range(3)]
@@ -208,7 +237,11 @@ class TestAuditBatch:
     def test_single_entry_batch(self):
         e = _entry("solo")
         batch = AuditBatch("b1", CONST_HASH, [e])
-        assert batch.verify_entry(e)
+        assert batch.verify_entry(
+            e,
+            expected_root=batch.batch_root,
+            expected_batch_id=batch.batch_id,
+        )
 
     def test_roundtrip_json(self):
         entries = [_entry(f"id-{i}") for i in range(3)]
@@ -217,7 +250,11 @@ class TestAuditBatch:
         assert b2.batch_root == batch.batch_root
         assert b2.entry_count == batch.entry_count
         for e in entries:
-            assert b2.verify_entry(e)
+            assert b2.verify_entry(
+                e,
+                expected_root=batch.batch_root,
+                expected_batch_id=batch.batch_id,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +334,11 @@ class TestArweaveAuditLogger:
         raw = arweave.fetch(receipt.arweave_tx_id)
         batch = AuditBatch.from_dict(json.loads(raw))
         assert batch.batch_root == receipt.batch_root
-        assert batch.verify_entry(e)
+        assert batch.verify_entry(
+            e,
+            expected_root=receipt.batch_root,
+            expected_batch_id=receipt.batch_id,
+        )
 
     def test_constitutional_hash_mismatch_raises(self):
         logger, _ = _logger()
@@ -454,13 +495,21 @@ class TestArweaveAuditLogger:
         # Valid proof within batch A
         path = batch_a.merkle_path_for("a-0")
         leaf = entries_a[0].leaf_hash()
-        assert verify_merkle_path(leaf, path, batch_a.batch_root)
+        assert verify_merkle_path(
+            leaf,
+            path,
+            batch_a.batch_root,
+            leaf_count=batch_a.entry_count,
+            leaf_index=0,
+        )
 
         # Same proof + root but claimed against batch B's ID → rejected
         assert not verify_merkle_path(
             leaf,
             path,
             batch_a.batch_root,
+            leaf_count=batch_a.entry_count,
+            leaf_index=0,
             batch_id="batch-AAA",
             expected_batch_id="batch-BBB",
         )
@@ -475,6 +524,8 @@ class TestArweaveAuditLogger:
             leaf,
             path,
             batch.batch_root,
+            leaf_count=batch.entry_count,
+            leaf_index=1,
             batch_id="batch-OK",
             expected_batch_id="batch-OK",
         )
@@ -502,12 +553,19 @@ class TestArweaveAuditLogger:
         assert receipt.block_height is not None  # anchored
 
         # 2. Auditor fetches batch from Arweave
-        raw = arweave.fetch(receipt.arweave_tx_id)
-        batch = AuditBatch.from_dict(json.loads(raw))
+        batch = logger.fetch_batch(receipt)
 
         # 3. Verify batch root matches chain anchor
         assert batch.batch_root == receipt.batch_root
 
         # 4. Verify target entry is in batch via Merkle proof
         path = batch.merkle_path_for(target.entry_id)
-        assert verify_merkle_path(target.leaf_hash(), path, batch.batch_root)
+        assert verify_merkle_path(
+            target.leaf_hash(),
+            path,
+            receipt.batch_root,
+            leaf_count=receipt.entry_count,
+            leaf_index=4,
+            batch_id=batch.batch_id,
+            expected_batch_id=receipt.batch_id,
+        )

@@ -29,6 +29,7 @@ from constitutional_swarm.langgraph_runtime.nodes import (
 
 def test_validate_node_empty_patch_short_circuits() -> None:
     dna = MagicMock()
+    dna.hash = CONSTITUTIONAL_HASH
     out = validate_node({"patch": ""}, dna=dna)
 
     assert out == {"violations": [], "risk_score": 0.0, "governed": True}
@@ -37,6 +38,7 @@ def test_validate_node_empty_patch_short_circuits() -> None:
 
 def test_validate_node_missing_patch_key_short_circuits() -> None:
     dna = MagicMock()
+    dna.hash = CONSTITUTIONAL_HASH
     out = validate_node({}, dna=dna)
 
     assert out == {"violations": [], "risk_score": 0.0, "governed": True}
@@ -46,8 +48,9 @@ def test_validate_node_missing_patch_key_short_circuits() -> None:
 def test_validate_node_extracts_rule_ids_from_objects() -> None:
     """Mirrors stub-shaped violations exposing ``.rule_id`` attributes."""
     violation = SimpleNamespace(rule_id="R-001", rule_text="No raw SQL")
-    result = SimpleNamespace(violations=(violation,), risk_score=0.42)
+    result = SimpleNamespace(valid=False, violations=(violation,), risk_score=0.42)
     dna = MagicMock()
+    dna.hash = CONSTITUTIONAL_HASH
     dna.validate.return_value = result
 
     out = validate_node({"patch": "DROP TABLE users;"}, dna=dna)
@@ -55,7 +58,7 @@ def test_validate_node_extracts_rule_ids_from_objects() -> None:
     dna.validate.assert_called_once_with("DROP TABLE users;")
     assert out["violations"] == ["R-001"]
     assert out["risk_score"] == pytest.approx(0.42)
-    assert out["governed"] is True
+    assert out["governed"] is False
 
 
 def test_validate_node_handles_string_violations() -> None:
@@ -64,28 +67,29 @@ def test_validate_node_handles_string_violations() -> None:
     The fallback ``str(v)`` in the node must round-trip those strings.
     """
     result = SimpleNamespace(
+        valid=False,
         violations=("R-002: pii-leak", "R-003: unsafe-eval"),
         risk_score=0.91,
     )
     dna = MagicMock()
+    dna.hash = CONSTITUTIONAL_HASH
     dna.validate.return_value = result
 
     out = validate_node({"patch": "exec(input())"}, dna=dna)
 
     assert out["violations"] == ["R-002: pii-leak", "R-003: unsafe-eval"]
     assert out["risk_score"] == pytest.approx(0.91)
-    assert out["governed"] is True
+    assert out["governed"] is False
 
 
-def test_validate_node_handles_none_risk_score() -> None:
-    result = SimpleNamespace(violations=(), risk_score=None)
+def test_validate_node_rejects_none_risk_score() -> None:
+    result = SimpleNamespace(valid=True, violations=(), risk_score=None)
     dna = MagicMock()
+    dna.hash = CONSTITUTIONAL_HASH
     dna.validate.return_value = result
 
-    out = validate_node({"patch": "noop"}, dna=dna)
-
-    assert out["risk_score"] == 0.0
-    assert out["violations"] == []
+    with pytest.raises(ValueError, match="risk_score"):
+        validate_node({"patch": "noop"}, dna=dna)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +97,7 @@ def test_validate_node_handles_none_risk_score() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_generate_node_returns_patch_and_constitutional_hash() -> None:
+def test_generate_node_returns_patch_without_rewriting_constitutional_hash() -> None:
     generator = MagicMock(
         return_value=("--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n", {"intervention_rate": 0.25})
     )
@@ -104,7 +108,7 @@ def test_generate_node_returns_patch_and_constitutional_hash() -> None:
     generator.assert_called_once_with(state)
     assert out["patch"].startswith("--- a")
     assert out["intervention_rate"] == pytest.approx(0.25)
-    assert out["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in out
 
 
 def test_generate_node_defaults_intervention_rate_to_zero() -> None:
@@ -113,7 +117,7 @@ def test_generate_node_defaults_intervention_rate_to_zero() -> None:
     out = generate_node({}, generator=generator)
 
     assert out["intervention_rate"] == 0.0
-    assert out["constitutional_hash"] == CONSTITUTIONAL_HASH
+    assert "constitutional_hash" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +129,14 @@ def test_append_crdt_node_serializes_state_and_returns_cid() -> None:
     crdt = MagicMock()
     crdt.append.return_value = SimpleNamespace(cid="bafy-cid-001")
 
-    state = {"patch": "P", "governed": True, "_h_next": "private"}
+    state = {
+        "patch": "P",
+        "governed": True,
+        "risk_score": 0.0,
+        "violations": [],
+        "constitutional_hash": CONSTITUTIONAL_HASH,
+        "_h_next": "private",
+    }
     out = append_crdt_node(state, crdt=crdt)
 
     crdt.append.assert_called_once()
@@ -136,18 +147,20 @@ def test_append_crdt_node_serializes_state_and_returns_cid() -> None:
     assert decoded["patch"] == "P"
     assert decoded["governed"] is True
     assert kwargs["bodes_passed"] is True
+    assert kwargs["constitutional_hash"] == CONSTITUTIONAL_HASH
     assert out == {"cid": "bafy-cid-001"}
 
 
-def test_append_crdt_node_defaults_governed_flag_to_false() -> None:
+def test_append_crdt_node_rejects_state_without_validation_evidence() -> None:
     crdt = MagicMock()
     crdt.append.return_value = SimpleNamespace(cid="bafy-cid-002")
 
-    out = append_crdt_node({"patch": "P"}, crdt=crdt)
-
-    kwargs = crdt.append.call_args.kwargs
-    assert kwargs["bodes_passed"] is False
-    assert out["cid"] == "bafy-cid-002"
+    with pytest.raises(ValueError, match="validation evidence"):
+        append_crdt_node(
+            {"patch": "P", "constitutional_hash": CONSTITUTIONAL_HASH},
+            crdt=crdt,
+        )
+    crdt.append.assert_not_called()
 
 
 def test_append_crdt_node_accepts_string_cid_return() -> None:
@@ -156,7 +169,16 @@ def test_append_crdt_node_accepts_string_cid_return() -> None:
     crdt = MagicMock()
     crdt.append.return_value = "raw-cid-string"
 
-    out = append_crdt_node({"patch": "P"}, crdt=crdt)
+    out = append_crdt_node(
+        {
+            "patch": "P",
+            "constitutional_hash": CONSTITUTIONAL_HASH,
+            "governed": True,
+            "risk_score": 0.0,
+            "violations": [],
+        },
+        crdt=crdt,
+    )
 
     assert out == {"cid": "raw-cid-string"}
 
@@ -193,13 +215,40 @@ def test_evolve_trust_node_default_dt() -> None:
 
 
 def test_settle_node_true_when_quorum_reached() -> None:
-    assert settle_node({"quorum_reached": True}) == {"settled": True}
+    assert settle_node(
+        {
+            "quorum_reached": True,
+            "constitutional_hash": CONSTITUTIONAL_HASH,
+            "governed": True,
+            "risk_score": 0.0,
+            "violations": [],
+        }
+    ) == {"settled": True, "governance_status": "accepted"}
 
 
 def test_settle_node_false_when_quorum_missing() -> None:
-    assert settle_node({}) == {"settled": False}
+    assert settle_node(
+        {
+            "constitutional_hash": CONSTITUTIONAL_HASH,
+            "governed": True,
+            "risk_score": 0.0,
+            "violations": [],
+        }
+    ) == {"settled": False, "governance_status": "accepted"}
 
 
 def test_settle_node_false_when_quorum_falsy() -> None:
-    assert settle_node({"quorum_reached": False}) == {"settled": False}
-    assert settle_node({"quorum_reached": 0}) == {"settled": False}
+    base = {
+        "constitutional_hash": CONSTITUTIONAL_HASH,
+        "governed": True,
+        "risk_score": 0.0,
+        "violations": [],
+    }
+    assert settle_node({**base, "quorum_reached": False}) == {
+        "settled": False,
+        "governance_status": "accepted",
+    }
+    assert settle_node({**base, "quorum_reached": 0}) == {
+        "settled": False,
+        "governance_status": "accepted",
+    }

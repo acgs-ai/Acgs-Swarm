@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from typing import Any
 
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from constitutional_swarm.apcc.codec import encode_payload
@@ -67,9 +65,9 @@ def _decode_controller_key(
     key = Ed25519PrivateKey.from_private_bytes(
         b64u_decode(bytes(raw).decode("ascii").strip(), expected_length=32)
     )
-    public = key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    from constitutional_swarm.authority_ipc import raw_public_bytes
+
+    public = raw_public_bytes(key.public_key())
     if public != reference.expected_public_key:
         raise PermissionError("observer controller identity mismatch")
     return key
@@ -106,7 +104,7 @@ def controller_signer_child_main(
         erase_secret,
         harden_current_process,
     )
-    from constitutional_swarm.authority_ipc import canonical_json
+    from constitutional_swarm.authority_ipc import canonical_json, strict_loads
 
     try:
         harden_current_process()
@@ -124,7 +122,7 @@ def controller_signer_child_main(
             }
         )
         raw_candidate = channel.recv_bytes(16_385)
-        candidate = json.loads(raw_candidate, object_pairs_hook=_reject_duplicate_keys)
+        candidate = strict_loads(raw_candidate, max_bytes=16_385)
         if (
             type(candidate) is not dict
             or set(candidate) != _LAUNCH_CANDIDATE_FIELDS
@@ -147,15 +145,6 @@ def controller_signer_child_main(
         raise
     finally:
         channel.close()
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate controller launch candidate key")
-        result[key] = value
-    return result
 
 
 def sign_launch_candidate(

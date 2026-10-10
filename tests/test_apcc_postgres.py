@@ -5316,6 +5316,7 @@ def test_postgres_full_catalog_and_fk_checks_run_once_per_authority_transaction(
         commit_id="attestation-query-count-stage",
         attempt_id="attempt-query-count-stage",
         nonce_byte=126,
+        expected_node_version="1",
     )
     operations: tuple[Callable[[], object], ...] = (
         lambda: store.stage_result(

@@ -31,28 +31,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from constitutional_swarm.bittensor.map_elites import MinerQualityGrid
+from constitutional_swarm.bittensor.rule_codifier import RuleCodifier
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
+from constitutional_swarm.evolution_log import EvolutionLog
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Lazy imports — be robust to API variations and partial installations
-# ---------------------------------------------------------------------------
-
-try:
-    from constitutional_swarm.bittensor.map_elites import MinerQualityGrid
-except ImportError:  # pragma: no cover
-    MinerQualityGrid = None  # type: ignore[assignment,misc]
-
-try:
-    from constitutional_swarm.bittensor.rule_codifier import RuleCodifier
-except ImportError:  # pragma: no cover
-    RuleCodifier = None  # type: ignore[assignment,misc]
-
-try:
-    from constitutional_swarm.evolution_log import EvolutionLog
-except ImportError:  # pragma: no cover
-    EvolutionLog = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Public result / config dataclasses
@@ -118,11 +102,13 @@ class CAMECoordinator:
         Optional :class:`CAMECoordinatorConfig`; defaults are used if *None*.
     grid:
         A :class:`~constitutional_swarm.bittensor.map_elites.MinerQualityGrid`
-        instance.  A default grid is created if not provided.
+        (or duck-typed grid) instance.  A default grid is created if not
+        provided.
     codifier:
         A :class:`~constitutional_swarm.bittensor.rule_codifier.RuleCodifier`
-        instance.  If *None* and ``RuleCodifier`` is available, a default
-        instance is constructed with a placeholder constitutional hash.
+        or any object exposing ``find_clusters``/``propose_rules`` (or
+        ``propose_rules`` / ``codify`` alone).  If *None*, a default
+        ``RuleCodifier`` pinned to the package constitutional hash is used.
 
         The default composition is intentionally non-generative: the
         coordinator never extracts approaches from the grid to feed rule
@@ -130,13 +116,12 @@ class CAMECoordinator:
         ``RuleCodifier`` always receives an empty precedent list and
         proposes nothing, even at ceiling. To close the loop, pass a
         codifier that manages its own validated ``PrecedentRecord``
-        stream — see ``PrecedentBackedCodifier`` in
-        ``examples/mac_acgs_autonomous_research.py`` for the sanctioned
-        pattern.
+        stream — see
+        :class:`~constitutional_swarm.bittensor.precedent_backed_codifier.PrecedentBackedCodifier`
+        for the sanctioned pattern.
     evolution_log:
         An already-*opened* :class:`~constitutional_swarm.evolution_log.EvolutionLog`
-        instance.  If *None* and ``EvolutionLog`` is available, an in-memory
-        database is opened automatically.
+        instance.  If *None*, an in-memory database is opened automatically.
     """
 
     def __init__(
@@ -150,33 +135,24 @@ class CAMECoordinator:
         self._config: CAMECoordinatorConfig = config or CAMECoordinatorConfig()
 
         # ---- quality grid ------------------------------------------------
-        if grid is not None:
-            self._grid = grid
-        elif MinerQualityGrid is not None:
-            self._grid = MinerQualityGrid()
-        else:
-            self._grid = None  # type: ignore[assignment]
+        self._grid: Any = grid if grid is not None else MinerQualityGrid()
 
         # ---- rule codifier -----------------------------------------------
-        self._codifier: Any
-        if codifier is not None:
-            self._codifier = codifier
-        elif RuleCodifier is not None:
-            self._codifier = RuleCodifier(constitutional_hash=_CONSTITUTIONAL_HASH)
-        else:
-            self._codifier = None
+        self._codifier: Any = (
+            codifier
+            if codifier is not None
+            else RuleCodifier(constitutional_hash=_CONSTITUTIONAL_HASH)
+        )
 
         # ---- evolution log -----------------------------------------------
+        self._log: Any
         if evolution_log is not None:
             self._log = evolution_log
             self._owns_log = False
-        elif EvolutionLog is not None:
+        else:
             self._log = EvolutionLog(":memory:")
             self._log.open()
             self._owns_log = True
-        else:
-            self._log = None
-            self._owns_log = False
 
         # ---- internal state ----------------------------------------------
         self._cycle: int = 0
@@ -269,10 +245,9 @@ class CAMECoordinator:
                 # rule proposal would bypass validator consensus. Codification is
                 # delegated entirely to the codifier: a plain RuleCodifier receives
                 # an empty list and proposes nothing; a precedent-backed codifier
-                # (see PrecedentBackedCodifier in
-                # examples/mac_acgs_autonomous_research.py) manages its own
-                # validated PrecedentRecord stream internally and ignores this
-                # argument.
+                # (constitutional_swarm.bittensor.precedent_backed_codifier.
+                # PrecedentBackedCodifier) manages its own validated
+                # PrecedentRecord stream internally and ignores this argument.
                 live_approaches: list[Any] = []
                 if hasattr(self._codifier, "find_clusters") and hasattr(
                     self._codifier, "propose_rules"

@@ -30,7 +30,7 @@ def test_integrate_records_ode_snapshots_to_crdt() -> None:
 
     nodes = crdt.topological_order()
     assert [node.payload_type for node in nodes] == ["ode_snapshot"] * 3
-    assert all(node.bodes_passed for node in nodes)
+    assert not any(node.bodes_passed for node in nodes)  # no BODES check runs on ODE snapshots
     assert all(node.constitutional_hash == "608508a9bd224290" for node in nodes)
     assert all(node.verify_cid() for node in nodes)
 

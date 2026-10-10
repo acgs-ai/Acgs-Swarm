@@ -31,8 +31,10 @@ may down-weight rather than exclude.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -123,25 +125,97 @@ def _select_with_exclusions(
     threshold_fraction: float,
     max_retries: int,
 ) -> CommitteeSelection:
-    """Select a committee with the decision's rejected ids unioned into ``exclude``.
-
-    A flagged node can never be sampled into the committee. With
-    ``require_independent`` the fault-domain-aware
-    :meth:`CommitteeSelector.select_until_independent` is used.
-    """
-    full_exclude = tuple(frozenset(exclude) | decision.rejected_set)
+    """Select exclusively from validators explicitly admitted by screening."""
+    all_validator_ids = frozenset(identity.agent_id for identity in selector._set)
+    admitted = frozenset(decision.admitted)
+    full_exclude = tuple(
+        frozenset(exclude) | (all_validator_ids - admitted) | decision.rejected_set
+    )
     if require_independent:
-        return selector.select_until_independent(
+        selection = selector.select_until_independent(
             seed,
             committee_size,
             exclude=full_exclude,
             threshold_fraction=threshold_fraction,
             max_retries=max_retries,
         )
-    return selector.select(seed, committee_size, exclude=full_exclude)
+    else:
+        selection = selector.select(seed, committee_size, exclude=full_exclude)
+    if not set(selection.members) <= admitted:
+        raise RuntimeError(
+            "committee selector returned a validator not explicitly admitted"
+        )
+    return selection
 
 
-class AbliterationAdmissionGate:
+class _GateBase(ABC, Generic[_Candidate, _ReportT]):
+    """Shared screen-then-select path for every admission gate.
+
+    Subclasses implement :meth:`screen`; each public ``select_admissible`` keeps
+    its own typed signature (its candidate keyword name is public API) and
+    delegates here, so the fail-closed selection logic exists exactly once.
+    """
+
+    @abstractmethod
+    def screen(
+        self, candidates: Mapping[str, _Candidate]
+    ) -> AdmissionDecision[_ReportT]:
+        """Partition candidates into admitted / rejected."""
+
+    def _screen_and_select(
+        self,
+        selector: CommitteeSelector,
+        seed: str,
+        committee_size: int,
+        candidates: Mapping[str, _Candidate],
+        *,
+        exclude: Sequence[str],
+        require_independent: bool,
+        threshold_fraction: float,
+        max_retries: int,
+    ) -> tuple[CommitteeSelection, AdmissionDecision[_ReportT]]:
+        decision = self.screen(candidates)
+        selection = _select_with_exclusions(
+            selector,
+            seed,
+            committee_size,
+            decision,
+            exclude=exclude,
+            require_independent=require_independent,
+            threshold_fraction=threshold_fraction,
+            max_retries=max_retries,
+        )
+        return selection, decision
+
+
+def _snapshot_reference(
+    reference: Mapping[str, np.ndarray] | None,
+) -> Mapping[str, np.ndarray] | None:
+    """Deep-copy trusted reference matrices into an immutable mapping.
+
+    Each matrix is copied to a read-only float64 array and the mapping is wrapped
+    in :class:`~types.MappingProxyType`, so neither the caller's dict nor its
+    arrays (nor a later write through the gate) can change a verdict.
+    """
+    if reference is None:
+        return None
+    if not reference:
+        msg = "reference is empty; coverage cannot be verified"
+        raise ValueError(msg)
+    snapshot: dict[str, np.ndarray] = {}
+    for name, matrix in reference.items():
+        if not isinstance(name, str):
+            msg = f"reference matrix names must be str, got {type(name).__name__}"
+            raise TypeError(msg)
+        copied = np.array(matrix, dtype=np.float64, copy=True)
+        copied.flags.writeable = False
+        snapshot[name] = copied
+    return MappingProxyType(snapshot)
+
+
+class AbliterationAdmissionGate(
+    _GateBase[Mapping[str, np.ndarray], AbliterationReport]
+):
     """Screen candidate validators by abliteration before quorum admission.
 
     Parameters
@@ -172,9 +246,11 @@ class AbliterationAdmissionGate:
         quantile: float = 0.25,
     ) -> None:
         # Validated downstream by detect_from_weights / _unit; copy the direction
-        # so a caller mutating their array can't change the gate's verdict.
+        # and snapshot the reference so a caller mutating their arrays or mapping
+        # can't change the gate's verdict.
         self._direction = np.array(direction, dtype=np.float64)
-        self._reference = reference
+        self._direction.flags.writeable = False
+        self._reference = _snapshot_reference(reference)
         self._aggregate = aggregate
         self._ratio_threshold = ratio_threshold
         self._abs_floor = abs_floor
@@ -227,18 +303,16 @@ class AbliterationAdmissionGate:
         Returns the :class:`CommitteeSelection` and the :class:`AdmissionDecision`
         so the caller can audit which candidates were screened out and why.
         """
-        decision = self.screen(candidate_write_matrices)
-        selection = _select_with_exclusions(
+        return self._screen_and_select(
             selector,
             seed,
             committee_size,
-            decision,
+            candidate_write_matrices,
             exclude=exclude,
             require_independent=require_independent,
             threshold_fraction=threshold_fraction,
             max_retries=max_retries,
         )
-        return selection, decision
 
 
 @dataclass(frozen=True)
@@ -254,7 +328,7 @@ class ActivationProbe:
     harmless: np.ndarray
 
 
-class ActivationAdmissionGate:
+class ActivationAdmissionGate(_GateBase[ActivationProbe, AbliterationReport]):
     """Screen candidate validators by harmful/benign separation collapse.
 
     The activation-path counterpart to :class:`AbliterationAdmissionGate`, for
@@ -330,18 +404,16 @@ class ActivationAdmissionGate:
         flagged node can never be sampled into the committee. Returns the
         :class:`CommitteeSelection` and the :class:`AdmissionDecision`.
         """
-        decision = self.screen(candidate_activations)
-        selection = _select_with_exclusions(
+        return self._screen_and_select(
             selector,
             seed,
             committee_size,
-            decision,
+            candidate_activations,
             exclude=exclude,
             require_independent=require_independent,
             threshold_fraction=threshold_fraction,
             max_retries=max_retries,
         )
-        return selection, decision
 
 
 @dataclass(frozen=True)
@@ -388,7 +460,9 @@ class RefusalDirectionProbe:
     write_matrices: Mapping[str, np.ndarray] | None = None
 
 
-class RefusalDistributionGate:
+class RefusalDistributionGate(
+    _GateBase[RefusalDirectionProbe, RefusalDistributionReport]
+):
     """Admit by refusal *distribution*: prefer hardened nodes, flag fragile ones.
 
     The trust-hardening counterpart to the abliteration gates. Where they flag a
@@ -470,15 +544,13 @@ class RefusalDistributionGate:
         that prefers to down-weight rather than exclude should call :meth:`screen`
         and read the per-agent scores instead.
         """
-        decision = self.screen(candidate_directions)
-        selection = _select_with_exclusions(
+        return self._screen_and_select(
             selector,
             seed,
             committee_size,
-            decision,
+            candidate_directions,
             exclude=exclude,
             require_independent=require_independent,
             threshold_fraction=threshold_fraction,
             max_retries=max_retries,
         )
-        return selection, decision

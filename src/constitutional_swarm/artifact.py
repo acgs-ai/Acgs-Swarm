@@ -8,10 +8,12 @@ agents coordinate through published artifacts.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -19,24 +21,72 @@ from typing import Any
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
 
 
+_CANONICAL_VALUE_ERROR = (
+    "Artifact metadata and canonical fields must be finite JSON values"
+)
+
+
+def _validate_json_value(value: Any, active_containers: set[int] | None = None) -> None:
+    """Reject values that cannot be represented by lossless canonical JSON."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ValueError(_CANONICAL_VALUE_ERROR)
+
+    active = set() if active_containers is None else active_containers
+    if isinstance(value, Mapping):
+        container_id = id(value)
+        if container_id in active:
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        active.add(container_id)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(_CANONICAL_VALUE_ERROR)
+                _validate_json_value(item, active)
+        finally:
+            active.remove(container_id)
+        return
+    if isinstance(value, (list, tuple)):
+        container_id = id(value)
+        if container_id in active:
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        active.add(container_id)
+        try:
+            for item in value:
+                _validate_json_value(item, active)
+        finally:
+            active.remove(container_id)
+        return
+    raise ValueError(_CANONICAL_VALUE_ERROR)
+
+
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze(item) for key, item in value.items()}
-        )
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    if isinstance(value, set):
-        return tuple(sorted((_freeze(item) for item in value), key=repr))
     return value
 
 
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
+        return {key: _thaw(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
     return value
+
+
+def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    """Encode a mapping deterministically for content-addressed integrity."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +111,9 @@ class Artifact:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError(_CANONICAL_VALUE_ERROR)
+        _validate_json_value(self.metadata)
         object.__setattr__(self, "tags", tuple(self.tags))
         object.__setattr__(self, "parent_artifacts", tuple(self.parent_artifacts))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
@@ -83,11 +136,7 @@ class Artifact:
     @property
     def content_hash(self) -> str:
         """SHA-256 hash of the content for integrity verification."""
-        return hashlib.sha256(
-            json.dumps(
-                self.canonical_dict(), sort_keys=True, separators=(",", ":")
-            ).encode()
-        ).hexdigest()[:32]
+        return hashlib.sha256(_canonical_bytes(self.canonical_dict())).hexdigest()[:32]
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary."""
@@ -125,6 +174,8 @@ class ArtifactStore:
 
     def __init__(self) -> None:
         self._artifacts: dict[tuple[str, str], Artifact] = {}
+        self._by_id: dict[str, list[tuple[str, str]]] = {}
+        self._sealed_digests: dict[tuple[str, str], str] = {}
         self._revoked: set[tuple[str, str]] = set()
         self._by_task: dict[tuple[str, str], list[tuple[str, str]]] = {}
         self._by_domain: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -157,17 +208,40 @@ class ArtifactStore:
                 capability, _prior_guard = self._governed_guards[workflow_id]
         return _GovernedProjectionPort(self, workflow_id, seal_id, capability)
 
+    def _visibility_snapshot_unlocked(
+        self, keys: Iterable[tuple[str, str]]
+    ) -> list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]]:
+        """Collect stored, unrevoked keys with their guards; caller holds the lock."""
+        snapshot: list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]] = []
+        for key in keys:
+            artifact = self._artifacts.get(key)
+            if artifact is None or key in self._revoked:
+                continue
+            guarded = self._governed_guards.get(key[0])
+            snapshot.append((key, artifact, None if guarded is None else guarded[1]))
+        return snapshot
+
+    @staticmethod
+    def _resolve_visible(
+        snapshot: list[tuple[tuple[str, str], Artifact, Callable[[str], bool] | None]],
+    ) -> list[tuple[tuple[str, str], Artifact]]:
+        """Evaluate guards outside the store lock; guards may re-enter the store."""
+        visible: list[tuple[tuple[str, str], Artifact]] = []
+        for key, artifact, guard in snapshot:
+            if guard is not None:
+                try:
+                    allowed = bool(guard(key[1]))
+                except BaseException:
+                    allowed = False
+                if not allowed:
+                    continue
+            visible.append((key, artifact))
+        return visible
+
     def _is_visible(self, key: tuple[str, str]) -> bool:
         with self._lock:
-            if key in self._revoked or key not in self._artifacts:
-                return False
-            guarded = self._governed_guards.get(key[0])
-        if guarded is None:
-            return True
-        try:
-            return bool(guarded[1](key[1]))
-        except BaseException:
-            return False
+            snapshot = self._visibility_snapshot_unlocked((key,))
+        return bool(self._resolve_visible(snapshot))
 
     def publish(self, artifact: Artifact) -> str:
         """Publish an artifact to the store.
@@ -218,7 +292,13 @@ class ArtifactStore:
             if key in self._artifacts:
                 raise ValueError(f"Artifact {artifact.artifact_id} already exists")
             immutable = Artifact(**artifact.canonical_dict())
+            try:
+                sealed_digest = immutable.content_hash
+            except (TypeError, ValueError) as exc:
+                raise ValueError(_CANONICAL_VALUE_ERROR) from exc
             self._artifacts[key] = immutable
+            self._sealed_digests[key] = sealed_digest
+            self._by_id.setdefault(immutable.artifact_id, []).append(key)
             self._by_task.setdefault((workflow_id, immutable.task_id), []).append(key)
             self._by_domain.setdefault((workflow_id, immutable.domain), []).append(key)
             self._by_agent.setdefault((workflow_id, immutable.agent_id), []).append(key)
@@ -257,7 +337,7 @@ class ArtifactStore:
             if workflow_id is not None:
                 key = (workflow_id, artifact_id)
             else:
-                matches = [key for key in self._artifacts if key[1] == artifact_id]
+                matches = list(self._by_id.get(artifact_id, ()))
                 if any(key[0] in self._governed_guards for key in matches):
                     raise GovernanceBypassDenied(
                         "workflow_id_required_for_governed_read"
@@ -289,35 +369,26 @@ class ArtifactStore:
     def get_by_task(self, task_id: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts for a task."""
         with self._lock:
-            ids = list(self._by_task.get((workflow_id, task_id), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_task.get((workflow_id, task_id), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def get_by_domain(self, domain: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts in a domain."""
         with self._lock:
-            ids = list(self._by_domain.get((workflow_id, domain), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_domain.get((workflow_id, domain), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def get_by_agent(self, agent_id: str, *, workflow_id: str = "") -> list[Artifact]:
         """Get all artifacts produced by an agent."""
         with self._lock:
-            ids = list(self._by_agent.get((workflow_id, agent_id), []))
-            artifacts = {key: self._artifacts.get(key) for key in ids}
-        return [
-            artifact
-            for key, artifact in artifacts.items()
-            if artifact is not None and self._is_visible(key)
-        ]
+            snapshot = self._visibility_snapshot_unlocked(
+                self._by_agent.get((workflow_id, agent_id), ())
+            )
+        return [artifact for _key, artifact in self._resolve_visible(snapshot)]
 
     def watch(self, key: str, callback: Any, *, workflow_id: str | None = None) -> None:
         """Register a watcher for a task_id or domain.
@@ -344,29 +415,31 @@ class ArtifactStore:
         )
 
     def verify_integrity(self, artifact_id: str, *, workflow_id: str = "") -> bool:
-        """Verify an artifact's content hash hasn't been tampered with."""
+        """Compare current artifact bytes with the digest sealed at publication."""
         with self._lock:
             key = (workflow_id, artifact_id)
             artifact = self._artifacts.get(key)
-        if artifact is None or not self._is_visible(key):
+            sealed_digest = self._sealed_digests.get(key)
+        if artifact is None or sealed_digest is None or not self._is_visible(key):
             return False
-        expected = Artifact(**artifact.canonical_dict()).content_hash
-        return artifact.content_hash == expected
+        try:
+            current_digest = artifact.content_hash
+        except (TypeError, ValueError):
+            return False
+        return hmac.compare_digest(current_digest, sealed_digest)
 
     @property
     def count(self) -> int:
         """Number of currently visible artifacts."""
         with self._lock:
-            keys = list(self._artifacts)
-        return sum(self._is_visible(key) for key in keys)
+            snapshot = self._visibility_snapshot_unlocked(self._artifacts)
+        return len(self._resolve_visible(snapshot))
 
     def summary(self) -> dict[str, Any]:
         """Store summary statistics."""
         with self._lock:
-            keys = list(self._artifacts)
-            artifacts = dict(self._artifacts)
-        visible_keys = [key for key in keys if self._is_visible(key)]
-        visible = [artifacts[key] for key in visible_keys]
+            snapshot = self._visibility_snapshot_unlocked(self._artifacts)
+        visible = [artifact for _key, artifact in self._resolve_visible(snapshot)]
         return {
             "total_artifacts": len(visible),
             "domains": len({artifact.domain for artifact in visible}),

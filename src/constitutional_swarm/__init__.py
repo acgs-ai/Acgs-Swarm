@@ -111,6 +111,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "AmendmentProposal": ("constitutional_swarm.epoch_reconfig", "AmendmentProposal"),
     "BallotChoice": ("constitutional_swarm.private_vote", "BallotChoice"),
     "BenchmarkResult": ("constitutional_swarm.bench", "BenchmarkResult"),
+    "CertificateVerificationPolicy": (
+        "constitutional_swarm.quorum_certificate",
+        "CertificateVerificationPolicy",
+    ),
     "CommitRecord": ("constitutional_swarm.private_vote", "CommitRecord"),
     "CommitteeSelection": ("constitutional_swarm.validator_set", "CommitteeSelection"),
     "CommitteeSelector": ("constitutional_swarm.validator_set", "CommitteeSelector"),
@@ -258,6 +262,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "constitutional_swarm.epoch_reconfig",
         "TransitionCertificate",
     ),
+    "TransitionVerificationPolicy": (
+        "constitutional_swarm.epoch_reconfig",
+        "TransitionVerificationPolicy",
+    ),
     "ValidatorIdentity": ("constitutional_swarm.validator_set", "ValidatorIdentity"),
     "ValidatorSet": ("constitutional_swarm.validator_set", "ValidatorSet"),
     "VerdictOutcome": ("constitutional_swarm.debate_resolver", "VerdictOutcome"),
@@ -278,6 +286,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "build_vote_message": (
         "constitutional_swarm.quorum_certificate",
         "build_vote_message",
+    ),
+    "build_vote_message_v2": (
+        "constitutional_swarm.quorum_certificate",
+        "build_vote_message_v2",
     ),
     "compute_nullifier": ("constitutional_swarm.private_vote", "compute_nullifier"),
     "compute_version_digest": (

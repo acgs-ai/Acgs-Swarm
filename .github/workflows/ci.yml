@@ -124,7 +124,7 @@ jobs:
       - name: Install with PostgreSQL support
         run: pip install -e ".[dev,postgres]"
       # Production postgres_store.py only. tests/test_apcc_postgres.py is in the
-      # frozen B2 pair (content dff15b7f…); its test-local Protocols omit
+      # frozen B2 pair (test content 177d3137… since C32; was dff15b7f…); its test-local Protocols omit
       # psycopg.errors / Cursor.rowcount and fail mypy 2.x attr-defined/misc.
       # Default [tool.mypy] files already exclude tests/; do not type-check the
       # frozen pair here.

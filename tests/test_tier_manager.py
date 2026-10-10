@@ -146,18 +146,16 @@ class TestTierPromotion:
     def test_promote_to_elder(self):
         mgr = TierManager()
         mgr.register_miner("m1", domains={"finance"})
-        promotion = None
         for _i in range(200):
-            result = mgr.record_judgment("m1", accepted=True, reputation=1.9)
-            if result is not None and result.to_tier == MinerTier.ELDER:
-                promotion = result
+            mgr.record_judgment("m1", accepted=True, reputation=1.9)
+        promotion = mgr.record_precedent("m1", "prec-1")
         assert promotion is not None
         assert promotion.to_tier == MinerTier.ELDER
 
     def test_record_precedent_contributes(self):
         mgr = TierManager()
         mgr.register_miner("m1")
-        mgr.record_precedent("m1")
+        mgr.record_precedent("m1", "prec-1")
         perf = mgr.get_performance("m1")
         assert perf.precedents_contributed == 1
 
@@ -300,16 +298,17 @@ class TestThreadSafety:
 
         mgr = TierManager()
         mgr.register_miner("miner-01", domains={"finance"})
-        # Set reputation high enough for JOURNEYMAN (>=1.2)
-        perf = mgr.get_performance("miner-01")
-        assert perf is not None
-        perf.reputation = 1.5
 
         promotions: list = []
         lock = threading.Lock()
 
         def _record_one():
-            p = mgr.record_judgment("miner-01", accepted=True, domain="finance")
+            p = mgr.record_judgment(
+                "miner-01",
+                accepted=True,
+                domain="finance",
+                reputation=1.5,
+            )
             if p is not None:
                 with lock:
                     promotions.append(p)

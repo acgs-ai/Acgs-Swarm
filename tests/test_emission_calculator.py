@@ -78,12 +78,12 @@ class TestUtilities:
 
 class TestEmissionCalculatorBasic:
     def test_empty_inputs_returns_empty_active(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         cycle = calc.compute([])
         assert cycle.active_miners == 0
 
     def test_single_miner_gets_full_weight(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 "m1",
@@ -98,7 +98,7 @@ class TestEmissionCalculatorBasic:
         assert cycle.emissions[0].emission_weight == pytest.approx(1.0)
 
     def test_weights_sum_to_one(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 f"m{i}",
@@ -116,7 +116,7 @@ class TestEmissionCalculatorBasic:
         assert abs(active_weights - 1.0) < 1e-6
 
     def test_inactive_miner_gets_zero_weight(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 "active", tier=MinerTier.JOURNEYMAN, manifold_trust=0.8, is_active=True
@@ -130,7 +130,7 @@ class TestEmissionCalculatorBasic:
         assert inactive.emission_weight == 0.0
 
     def test_below_min_tier_gets_zero_weight(self):
-        calc = EmissionCalculator(minimum_tier=MinerTier.JOURNEYMAN)
+        calc = EmissionCalculator(minimum_tier=MinerTier.JOURNEYMAN, allow_unregistered=True)
         inputs = [
             MinerEmissionInput("apprentice", tier=MinerTier.APPRENTICE, manifold_trust=0.9),
             MinerEmissionInput("journeyman", tier=MinerTier.JOURNEYMAN, manifold_trust=0.5),
@@ -154,7 +154,7 @@ class TestEmissionOrdering:
         Need ≥3 miners so the 40% cap doesn't force equality between the two
         extreme tiers (master can hold ~40%, apprentice gets much less).
         """
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 "master",
@@ -193,7 +193,7 @@ class TestEmissionOrdering:
 
     def test_more_precedents_more_weight(self):
         """More precedents = higher weight (other signals equal)."""
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 "high",
@@ -218,7 +218,7 @@ class TestEmissionOrdering:
         assert high_w >= low_w
 
     def test_tier_multiplier_recorded(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [MinerEmissionInput("m", tier=MinerTier.ELDER)]
         cycle = calc.compute(inputs)
         assert cycle.emissions[0].tier_multiplier == 4.0
@@ -231,7 +231,7 @@ class TestEmissionOrdering:
 
 class TestFloorAndCap:
     def test_max_weight_cap_respected(self):
-        calc = EmissionCalculator(max_weight_fraction=0.40)
+        calc = EmissionCalculator(max_weight_fraction=0.40, allow_unregistered=True)
         # One dominant miner with all signals maxed
         inputs = [
             MinerEmissionInput(
@@ -253,7 +253,7 @@ class TestFloorAndCap:
         assert dominant.emission_weight <= 0.40 + 1e-9
 
     def test_floor_applied_to_small_miners(self):
-        calc = EmissionCalculator(min_weight_fraction=0.10)
+        calc = EmissionCalculator(min_weight_fraction=0.10, allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 "big",
@@ -279,7 +279,7 @@ class TestFloorAndCap:
 
 class TestEmissionCycle:
     def _cycle(self) -> EmissionCycle:
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput(
                 f"m{i}", tier=MinerTier.JOURNEYMAN, manifold_trust=float(i) * 0.2, reputation=1.2
@@ -309,7 +309,7 @@ class TestEmissionCycle:
         assert abs(s["weight_sum"] - 1.0) < 1e-6
 
     def test_max_weight(self):
-        calc = EmissionCalculator()
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [MinerEmissionInput("m", tier=MinerTier.MASTER)]
         cycle = calc.compute(inputs)
         assert cycle.max_weight == pytest.approx(1.0)
@@ -335,9 +335,19 @@ class TestSybilResistance:
         assert weights["miner-01"] > 0.0
         assert weights["miner-02"] > 0.0
 
-    def test_registered_none_disables_gate(self):
-        """When registered_miners is None (default), all miners are eligible."""
+    def test_registered_none_fails_closed(self):
+        """C39: without an allowlist (default), compute() refuses to run."""
         calc = EmissionCalculator()
+        inputs = [
+            MinerEmissionInput("miner-01", tier=MinerTier.MASTER, reputation=1.5),
+            MinerEmissionInput("miner-02", tier=MinerTier.JOURNEYMAN, reputation=1.2),
+        ]
+        with pytest.raises(ValueError, match="registered_miners"):
+            calc.compute(inputs)
+
+    def test_explicit_allow_unregistered_disables_gate(self):
+        """Only an explicit opt-in makes every miner eligible."""
+        calc = EmissionCalculator(allow_unregistered=True)
         inputs = [
             MinerEmissionInput("miner-01", tier=MinerTier.MASTER, reputation=1.5),
             MinerEmissionInput("miner-02", tier=MinerTier.JOURNEYMAN, reputation=1.2),

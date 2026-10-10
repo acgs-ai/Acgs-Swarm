@@ -6,6 +6,7 @@ requirements to capabilities without broadcasting to all agents.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,40 +39,52 @@ class CapabilityRegistry:
 
     Agents register capabilities. Tasks are routed to the best-matching
     agent without broadcasting to all N agents.
+
+    Thread-safe: every index read and write happens under one re-entrant
+    lock, so the three indexes always describe the same registrations.
+    Lookups return copies, never live internals.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._by_agent: dict[str, list[Capability]] = {}
         self._by_domain: dict[str, list[tuple[str, Capability]]] = {}
         self._by_name: dict[str, list[tuple[str, Capability]]] = {}
 
     def register(self, agent_id: str, capabilities: list[Capability]) -> None:
-        """Register an agent's capabilities."""
-        if agent_id in self._by_agent:
-            self.unregister(agent_id)
-        self._by_agent[agent_id] = list(capabilities)
-        for cap in capabilities:
-            domain_list = self._by_domain.setdefault(cap.domain, [])
-            domain_list.append((agent_id, cap))
-            name_list = self._by_name.setdefault(cap.name.lower(), [])
-            name_list.append((agent_id, cap))
+        """Register an agent's capabilities, replacing any prior registration."""
+        caps = list(capabilities)
+        with self._lock:
+            self._unregister_locked(agent_id)
+            self._by_agent[agent_id] = caps
+            for cap in caps:
+                self._by_domain.setdefault(cap.domain, []).append((agent_id, cap))
+                self._by_name.setdefault(cap.name.lower(), []).append((agent_id, cap))
 
     def unregister(self, agent_id: str) -> None:
         """Remove an agent's capabilities."""
+        with self._lock:
+            self._unregister_locked(agent_id)
+
+    def _unregister_locked(self, agent_id: str) -> None:
         caps = self._by_agent.pop(agent_id, [])
         for cap in caps:
-            domain_list = self._by_domain.get(cap.domain, [])
-            self._by_domain[cap.domain] = [(aid, c) for aid, c in domain_list if aid != agent_id]
-            name_list = self._by_name.get(cap.name.lower(), [])
-            self._by_name[cap.name.lower()] = [(aid, c) for aid, c in name_list if aid != agent_id]
+            for index, key in ((self._by_domain, cap.domain), (self._by_name, cap.name.lower())):
+                remaining = [(aid, c) for aid, c in index.get(key, []) if aid != agent_id]
+                if remaining:
+                    index[key] = remaining
+                else:
+                    index.pop(key, None)
 
     def find_by_domain(self, domain: str) -> list[tuple[str, Capability]]:
         """Find all agents with capabilities in a domain. O(1) lookup."""
-        return list(self._by_domain.get(domain, []))
+        with self._lock:
+            return list(self._by_domain.get(domain, []))
 
     def find_by_name(self, name: str) -> list[tuple[str, Capability]]:
         """Find agents offering a specific capability. O(1) lookup."""
-        return list(self._by_name.get(name.lower(), []))
+        with self._lock:
+            return list(self._by_name.get(name.lower(), []))
 
     def find_best(
         self,
@@ -86,23 +99,20 @@ class CapabilityRegistry:
         Searches by domain first (O(1)), then scores by match quality,
         cost, and latency.
         """
-        candidates: list[tuple[str, Capability]]
-        if domain:
-            candidates = self.find_by_domain(domain)
-        else:
-            candidates = [
-                (aid, cap)
-                for aid, caps in self._by_agent.items()
-                for cap in caps
-                if cap.matches(requirement)
-            ]
+        pool: list[tuple[str, Capability]]
+        with self._lock:
+            if domain:
+                pool = list(self._by_domain.get(domain, []))
+            else:
+                pool = [(aid, cap) for aid, caps in self._by_agent.items() for cap in caps]
+        candidates = [(aid, cap) for aid, cap in pool if cap.matches(requirement)]
 
         if not candidates:
             return None
 
         def _score(entry: tuple[str, Capability]) -> float:
             _, cap = entry
-            score = 1.0 if cap.matches(requirement) else 0.0
+            score = 1.0
             if prefer_cheap and cap.cost_per_task > 0:
                 score += 1.0 / cap.cost_per_task
             if prefer_fast and cap.avg_latency_ms > 0:
@@ -113,23 +123,29 @@ class CapabilityRegistry:
 
     def get_agent_capabilities(self, agent_id: str) -> list[Capability]:
         """Get all capabilities registered for an agent."""
-        return list(self._by_agent.get(agent_id, []))
+        with self._lock:
+            return list(self._by_agent.get(agent_id, []))
 
     @property
     def agents(self) -> list[str]:
         """List all registered agent IDs."""
-        return list(self._by_agent)
+        with self._lock:
+            return list(self._by_agent)
 
     @property
     def domains(self) -> list[str]:
         """List all registered domains."""
-        return list(self._by_domain)
+        with self._lock:
+            return list(self._by_domain)
 
     def summary(self) -> dict[str, Any]:
         """Registry summary statistics."""
-        return {
-            "agents": len(self._by_agent),
-            "domains": len(self._by_domain),
-            "capabilities": sum(len(caps) for caps in self._by_agent.values()),
-            "domain_distribution": {d: len(entries) for d, entries in self._by_domain.items()},
-        }
+        with self._lock:
+            return {
+                "agents": len(self._by_agent),
+                "domains": len(self._by_domain),
+                "capabilities": sum(len(caps) for caps in self._by_agent.values()),
+                "domain_distribution": {
+                    d: len(entries) for d, entries in self._by_domain.items()
+                },
+            }

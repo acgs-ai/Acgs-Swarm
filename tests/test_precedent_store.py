@@ -5,11 +5,14 @@ from __future__ import annotations
 import pytest
 from constitutional_swarm.bittensor.precedent_store import (
     PrecedentRecord,
-    PrecedentStore,
     _cosine_similarity,
     _euclidean_distance,
 )
 from constitutional_swarm.bittensor.protocol import EscalationType
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store as PrecedentStore,
+)
 
 CONST_HASH = "608508a9bd224290"
 
@@ -114,22 +117,21 @@ def _make_record(
     miner_uid: str = "miner-01",
     judgment: str = "Privacy takes precedence",
     reasoning: str = "ECHR Article 8 applies",
-    votes_for: int = 2,
-    votes_against: int = 0,
+    votes_for: int = 3,
+    votes_against: int = 2,
     escalation_type: EscalationType = EscalationType.CONSTITUTIONAL_CONFLICT,
     impact_vector: dict | None = None,
     constitutional_hash: str = CONST_HASH,
     case_id: str = "case-001",
 ) -> PrecedentRecord:
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=case_id,
-        task_id="task-001",
+        task_id=f"task-{case_id}",
         miner_uid=miner_uid,
         judgment=judgment,
         reasoning=reasoning,
         votes_for=votes_for,
         votes_against=votes_against,
-        proof_root_hash="abc123",
         escalation_type=escalation_type,
         impact_vector=impact_vector or PRIVACY_HEAVY,
         constitutional_hash=constitutional_hash,
@@ -187,18 +189,18 @@ class TestPrecedentStoreBasicOps:
         assert store.total_stored == 0
 
     def test_add_and_size(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         store.add(_make_record())
         assert store.size == 1
 
     def test_add_wrong_hash_rejected(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         bad = _make_record(constitutional_hash="wrong")
         with pytest.raises(ValueError, match="mismatch"):
             store.add(bad)
 
     def test_add_not_accepted_rejected(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         # Create a record with validation_accepted=False — must bypass create()
         import dataclasses
 
@@ -214,14 +216,14 @@ class TestPrecedentStoreBasicOps:
             store.add(r)
 
     def test_add_duplicate_rejected(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         r = _make_record()
         store.add(r)
         with pytest.raises(ValueError, match="already stored"):
             store.add(r)
 
     def test_revoke(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         r = _make_record()
         store.add(r)
         store.revoke(r.precedent_id, reason="contradicts new rule")
@@ -234,7 +236,7 @@ class TestPrecedentStoreBasicOps:
             store.revoke("nonexistent-id")
 
     def test_revoke_excluded_from_retrieval(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1, auto_resolve_threshold=0.5)
+        store = PrecedentStore(CONST_HASH, auto_resolve_threshold=0.5)
         r = _make_record()
         store.add(r)
         store.revoke(r.precedent_id)
@@ -254,7 +256,6 @@ class TestPrecedentStoreRetrieval:
         """Store with 3 precedents of different escalation types."""
         store = PrecedentStore(
             CONST_HASH,
-            min_votes_for_precedent=1,
             auto_resolve_threshold=0.9,
         )
         store.add(
@@ -346,7 +347,6 @@ class TestPrecedentStoreAutoResolution:
     def test_auto_resolve_high_similarity(self):
         store = PrecedentStore(
             CONST_HASH,
-            min_votes_for_precedent=1,
             auto_resolve_threshold=0.8,
         )
         r = _make_record(judgment="Privacy wins", impact_vector=PRIVACY_HEAVY)
@@ -363,7 +363,6 @@ class TestPrecedentStoreAutoResolution:
     def test_no_auto_resolve_low_similarity(self):
         store = PrecedentStore(
             CONST_HASH,
-            min_votes_for_precedent=1,
             auto_resolve_threshold=0.99,  # very high threshold
         )
         r = _make_record(impact_vector=PRIVACY_HEAVY)
@@ -376,7 +375,6 @@ class TestPrecedentStoreAutoResolution:
     def test_auto_resolve_source_tracks_precedent_id(self):
         store = PrecedentStore(
             CONST_HASH,
-            min_votes_for_precedent=1,
             auto_resolve_threshold=0.5,
         )
         r = _make_record(impact_vector=PRIVACY_HEAVY)
@@ -392,7 +390,7 @@ class TestPrecedentStoreAutoResolution:
 
 class TestPrecedentStoreStatistics:
     def test_escalation_distribution(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         for i in range(3):
             store.add(
                 _make_record(
@@ -411,7 +409,7 @@ class TestPrecedentStoreStatistics:
         assert dist["context_sensitivity"] == 1
 
     def test_miner_contribution_counts(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         for i in range(3):
             store.add(_make_record(case_id=f"m1c{i}", miner_uid="miner-alpha"))
         store.add(_make_record(case_id="m2c1", miner_uid="miner-beta"))
@@ -420,7 +418,7 @@ class TestPrecedentStoreStatistics:
         assert counts["miner-beta"] == 1
 
     def test_escalation_rate_decreases_with_precedents(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         rate_empty = store.escalation_rate_projection()
 
         # Add 1000 precedents (simulated)
@@ -431,7 +429,7 @@ class TestPrecedentStoreStatistics:
         assert rate_1k < rate_empty
 
     def test_escalation_rate_floor(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         # Even with many precedents, floor should be 0.5%
         for _i in range(100_000):
             # We can't actually add 100k records but we can set a huge count
@@ -440,7 +438,7 @@ class TestPrecedentStoreStatistics:
         assert rate >= 0.005
 
     def test_summary(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         store.add(_make_record())
         s = store.summary()
         assert s["active_precedents"] == 1
@@ -450,7 +448,7 @@ class TestPrecedentStoreStatistics:
         assert s["constitutional_hash"] == CONST_HASH
 
     def test_revocation_tracked_in_summary(self):
-        store = PrecedentStore(CONST_HASH, min_votes_for_precedent=1)
+        store = PrecedentStore(CONST_HASH)
         r = _make_record()
         store.add(r)
         store.revoke(r.precedent_id, reason="test")
@@ -513,12 +511,12 @@ class TestSuperMajorityValidation:
         store.add(r)
         assert store.size == 1
 
-    def test_default_no_total_validator_check(self):
-        """Default min_total_validators=0 means no total validator check."""
+    def test_default_enforces_total_validator_floor(self):
+        """Default admission rejects records with fewer than five validators."""
         store = PrecedentStore(CONST_HASH)
         r = _make_record(votes_for=2, votes_against=0)  # only 2 total
-        store.add(r)
-        assert store.size == 1
+        with pytest.raises(ValueError, match="validator"):
+            store.add(r)
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +532,8 @@ class TestConcurrentPrecedentStore:
 
         store = PrecedentStore(
             CONST_HASH,
-            min_votes_for_precedent=1,
-            min_total_validators=0,
+            min_votes_for_precedent=3,
+            min_total_validators=5,
         )
 
         errors: list[Exception] = []
@@ -591,32 +589,26 @@ class TestPrecedentStoreScale:
 
         store = PrecedentStore(
             constitutional_hash=CONST_HASH,
-            min_votes_for_precedent=1,
-            min_total_validators=0,
+            min_votes_for_precedent=3,
+            min_total_validators=5,
             auto_resolve_threshold=0.99,  # high to avoid auto-resolve noise
         )
 
         # Generate and insert 10,000 precedents with random 7-vectors
         for i in range(10_000):
             vec = {d: random.random() for d in dims}
-            rec = PrecedentRecord(
-                precedent_id=f"scale-{i:05d}",
+            rec = c14_precedent_signed_record(
                 case_id=f"case-{i:05d}",
                 task_id=f"task-{i:05d}",
                 miner_uid=f"miner-{i % 100:03d}",
                 judgment=f"Judgment for case {i}",
                 reasoning=f"Reasoning {i}",
-                validation_accepted=True,
-                votes_for=2,
-                votes_against=0,
-                proof_root_hash=f"hash-{i}",
-                validator_grade=1.0,
+                votes_for=3,
+                votes_against=2,
                 escalation_type=esc_types[i % len(esc_types)],
                 impact_vector=vec,
-                ambiguous_dimensions=(),
                 constitutional_hash=CONST_HASH,
-                recorded_at=_time.time(),
-                is_active=True,
+                ambiguous_dimensions=(),
             )
             store.add(rec)
 

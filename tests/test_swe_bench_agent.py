@@ -209,13 +209,18 @@ def test_harness_iter_results_yields_patches() -> None:
 def test_summary_empty() -> None:
     s = SWEBenchHarness.summary([])
     assert s["total"] == 0
+    assert s["patch_generated"] == 0
+    assert s["patch_rate"] == 0.0
     assert s["resolve_rate"] == 0.0
+    assert s["evaluation_mode"] == "patch_generation_only"
 
 
 def test_summary_all_failed() -> None:
     results = [SWEPatch(task_id=f"t{i}", patch="", success=False) for i in range(5)]
     s = SWEBenchHarness.summary(results)
     assert s["total"] == 5
+    assert s["patch_generated"] == 0
+    assert s["patch_rate"] == pytest.approx(0.0)
     assert s["resolved"] == 0
     assert s["resolve_rate"] == pytest.approx(0.0)
 
@@ -228,8 +233,12 @@ def test_summary_partial_success() -> None:
         SWEPatch(task_id="t3", patch="", success=False),
     ]
     s = SWEBenchHarness.summary(results)
+    assert s["patch_generated"] == 2
+    assert s["patch_rate"] == pytest.approx(0.5)
     assert s["resolved"] == 2
     assert s["resolve_rate"] == pytest.approx(0.5)
+    assert s["resolved"] == s["patch_generated"]
+    assert s["resolve_rate"] == s["patch_rate"]
 
 
 def test_summary_governed_mean_intervention() -> None:

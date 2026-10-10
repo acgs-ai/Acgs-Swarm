@@ -28,7 +28,11 @@ from constitutional_swarm.bittensor.constitution_sync import (
     ConstitutionReceiver,
     ConstitutionSyncMessage,
 )
-from constitutional_swarm.bittensor.nmc_protocol import NMCSession, SynthesisMethod
+from constitutional_swarm.bittensor.nmc_protocol import (
+    NMCSession,
+    SynthesisMethod,
+    compute_commitment_hash,
+)
 from constitutional_swarm.gossip_protocol import GossipServer
 from constitutional_swarm.governed_handoff import DENY, PolicyEngine
 from constitutional_swarm.merkle_crdt import MerkleCRDT
@@ -37,7 +41,7 @@ from constitutional_swarm.quorum_certificate import (
     InvalidCertificateError,
     QuorumCertificate,
     SignedVote,
-    build_vote_message,
+    build_vote_message_v2,
     verify_certificate,
 )
 from constitutional_swarm.swe_bench import run_one_by_one
@@ -56,7 +60,7 @@ def test_quorum_certificate_rejects_embedded_attacker_public_key() -> None:
     registered_sk = Ed25519PrivateKey.generate()
     attacker_sk = Ed25519PrivateKey.generate()
     attacker_pk = _pubkey_bytes(attacker_sk)
-    msg = build_vote_message("assignment", "artifact", 1)
+    msg = build_vote_message_v2("assignment", "artifact", 1, "validator-1")
     forged_vote = SignedVote(
         voter_id="validator-1",
         assignment_id="assignment",
@@ -95,7 +99,7 @@ def test_quorum_certificate_rejects_under_threshold_serialized_certificate() -> 
         assignment_id="assignment",
         artifact_hash="artifact",
         epoch=1,
-        signature=sk.sign(build_vote_message("assignment", "artifact", 1)),
+        signature=sk.sign(build_vote_message_v2("assignment", "artifact", 1, "validator-1")),
         public_key_bytes=pk,
     )
     qc = QuorumCertificate(
@@ -176,20 +180,26 @@ def test_governed_handoff_denies_interpreter_aliases_even_if_allowlisted(
     assert "interpreter" in decision.reason
 
 
-def _commitment(judgment: str, nonce: str) -> str:
-    return hashlib.sha256(f"{judgment}:{nonce}".encode()).hexdigest()
+def _commitment(session: NMCSession, miner_uid: str, judgment: str, nonce: str) -> str:
+    return compute_commitment_hash(
+        judgment,
+        nonce,
+        session_id=session.session_id,
+        case_id=session.case_id,
+        miner_uid=miner_uid,
+    )
 
 
 def test_nmc_rejects_commitments_from_miners_outside_required_set() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"})
     with pytest.raises(ValueError, match="not required"):
-        session.accept_commitment("outsider", _commitment("deny", "n"))
+        session.accept_commitment("outsider", _commitment(session, "outsider", "deny", "n"))
 
 
 def test_nmc_rejects_untrusted_reveal_weight() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"}, miner_weights={"m1": 1.0, "m2": 2.0})
-    session.accept_commitment("m1", _commitment("allow", "n1"))
-    session.accept_commitment("m2", _commitment("deny", "n2"))
+    session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
+    session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
     session.accept_reveal("m1", "allow", "n1", weight=999.0)
     session.accept_reveal("m2", "deny", "n2", weight=1.0)
 
@@ -200,8 +210,8 @@ def test_nmc_rejects_untrusted_reveal_weight() -> None:
 
 def test_nmc_defaults_to_equal_weights_when_no_trusted_weight_map() -> None:
     session = NMCSession("case", required_miners={"m1", "m2"})
-    session.accept_commitment("m1", _commitment("allow", "n1"))
-    session.accept_commitment("m2", _commitment("deny", "n2"))
+    session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
+    session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
     session.accept_reveal("m1", "allow", "n1", weight=999.0)
     session.accept_reveal("m2", "deny", "n2", weight=1.0)
 
@@ -214,6 +224,7 @@ def test_axon_blacklist_and_priority_fail_closed_without_trusted_hotkey() -> Non
     server = MinerAxonServer(
         SimpleNamespace(constitution_hash="const"),
         trusted_validator_hotkeys={"validator-good"},
+        allow_unsigned_responses=True,
     )
     attacker = SimpleNamespace(
         impact_score=999.0,
@@ -232,11 +243,14 @@ def test_axon_blacklist_and_priority_fail_closed_without_trusted_hotkey() -> Non
 
 def test_constitution_sync_rejects_unsigned_message_by_default() -> None:
     yaml_content = "constitutional_hash: attacker\n"
+    content_digest = hashlib.sha256(yaml_content.encode()).digest()
     msg = ConstitutionSyncMessage(
         version_id="v-attacker",
-        expected_hash=hashlib.sha256(yaml_content.encode()).hexdigest()[:16],
+        version=1,
+        expected_hash=content_digest.hex()[:16],
+        content_digest=content_digest,
         yaml_content=yaml_content,
-        issued_at=time.time(),
+        issued_at=time.time_ns(),
         issuer_id="attacker",
     )
     receiver = ConstitutionReceiver("miner-1")
@@ -266,7 +280,7 @@ def test_chain_anchor_membership_binds_proof_id_and_vote_hashes() -> None:
         constitutional_hash="const",
     )
 
-    assert record.verify_membership(substituted) is False
+    assert record.verify_membership(substituted, expected_root=record.batch_root) is False
 
 
 def _snapshot() -> ComplianceSnapshot:
@@ -321,7 +335,14 @@ def test_private_vote_rejects_same_voter_key_with_rotated_nullifier() -> None:
         choice=BallotChoice.YEA,
     )
 
-    result = tally([c1, c2], [r1, r2], epoch=b"epoch", subject=b"subject")
+    result = tally(
+        [c1, c2],
+        [r1, r2],
+        epoch=b"epoch",
+        subject=b"subject",
+        eligible_voters=frozenset({_pubkey_bytes(sk)}),
+        strict_v2=False,
+    )
 
     assert len(result.accepted) == 1
     assert any(reason == "duplicate voter" for _, reason in result.rejected)

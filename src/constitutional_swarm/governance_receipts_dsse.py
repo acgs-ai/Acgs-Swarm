@@ -87,6 +87,21 @@ def _digest_set(raw_digest: str) -> dict[str, str]:
     return {EVIDENCE_DIGEST_ALG: raw_digest}
 
 
+def _strict_b64decode(value: object) -> bytes:
+    """Decode canonical standard base64 only: str input, strict alphabet, exact round trip."""
+
+    if type(value) is not str:
+        raise TypeError("base64 field must be a string")
+    decoded = base64.b64decode(value, validate=True)
+    if base64.standard_b64encode(decoded).decode("ascii") != value:
+        raise ValueError("base64 field is not canonically encoded")
+    return decoded
+
+
+def _invalid(reason: str, key_ids: list[str] | None = None) -> dict:
+    return {"status": "invalid", "valid": False, "reason": reason, "key_ids": key_ids or []}
+
+
 def to_in_toto_statement(receipt: GovernanceReceipt) -> dict:
     """Project a governance receipt onto an in-toto Statement v1 dict.
 
@@ -175,7 +190,7 @@ def to_dsse_envelope(receipt: GovernanceReceipt, *, signer: DsseSigner | None = 
 
 
 def verify_dsse_envelope(
-    envelope: Mapping,
+    envelope: object,
     *,
     trusted_public_keys: Mapping[str, str],
 ) -> dict:
@@ -199,7 +214,14 @@ def verify_dsse_envelope(
     ``receipt_id`` against the receipt they expected before trusting it.
     """
 
-    signatures = list(envelope.get("signatures") or [])
+    if not isinstance(envelope, Mapping):
+        return _invalid("malformed envelope: envelope must be a mapping")
+    raw_signatures = envelope.get("signatures")
+    if raw_signatures is not None and type(raw_signatures) is not list:
+        return _invalid("malformed envelope: signatures must be a list")
+    signatures: list = raw_signatures or []
+    if any(not isinstance(entry, Mapping) for entry in signatures):
+        return _invalid("malformed signature entry")
     if not signatures:
         return {
             "status": "unsigned_projection",
@@ -208,26 +230,21 @@ def verify_dsse_envelope(
             "key_ids": [],
         }
 
+    payload_type = envelope.get("payloadType")
+    if type(payload_type) is not str or payload_type != DSSE_PAYLOAD_TYPE:
+        return _invalid(f"malformed envelope: payloadType must be {DSSE_PAYLOAD_TYPE!r}")
     try:
-        body = base64.standard_b64decode(str(envelope["payload"]))
-        message = pae(str(envelope["payloadType"]), body)
+        body = _strict_b64decode(envelope["payload"])
     except (KeyError, ValueError, TypeError) as exc:
-        return {
-            "status": "invalid",
-            "valid": False,
-            "reason": f"malformed envelope: {exc}",
-            "key_ids": [],
-        }
+        return _invalid(f"malformed envelope: {exc}")
+    message = pae(payload_type, body)
 
+    key_ids: list[str] = []
     for entry in signatures:
-        if not isinstance(entry, Mapping):
-            return {
-                "status": "invalid",
-                "valid": False,
-                "reason": "malformed signature entry",
-                "key_ids": [],
-            }
-        key_id = entry.get("keyid", "")
+        key_id = entry.get("keyid")
+        if type(key_id) is not str or not key_id:
+            return _invalid("malformed signature entry: keyid must be a non-empty string")
+        key_ids.append(key_id)
         public_hex = trusted_public_keys.get(key_id)
         if public_hex is None:
             return {
@@ -238,20 +255,15 @@ def verify_dsse_envelope(
             }
         try:
             public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
-            public_key.verify(base64.standard_b64decode(str(entry["sig"])), message)
-        except (InvalidSignature, ValueError, KeyError) as exc:
-            return {
-                "status": "invalid",
-                "valid": False,
-                "reason": str(exc),
-                "key_ids": [key_id],
-            }
+            public_key.verify(_strict_b64decode(entry["sig"]), message)
+        except (InvalidSignature, ValueError, KeyError, TypeError) as exc:
+            return _invalid(str(exc) or "signature verification failed", [key_id])
 
     return {
         "status": "valid",
         "valid": True,
         "reason": "",
-        "key_ids": [e.get("keyid", "") for e in signatures],
+        "key_ids": key_ids,
     }
 
 

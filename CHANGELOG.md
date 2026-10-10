@@ -6,6 +6,443 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+Security-fix campaign (batches C1–C48, C25b, C35b, C42b, C51a, C51b). Verifiers now take
+their trust anchors (keys, roots, rosters, thresholds) from their own
+configuration rather than from the object they verify, and insecure modes need
+an explicit opt-in. Many changes are breaking: read **Migration** first.
+Rationale for each batch is in `DECISIONS.md`. These notes cover the campaign
+only. They do not cover the APCC-1 / GCB feature work that also landed after
+1.1.0.
+
+> **Breaking, data: APCC SQLite and PostgreSQL authority stores written before
+> C32 may not reopen.** C32 changed how non-decision audit and event ids are
+> encoded (stage, candidate, `EVIDENCE_ASSEMBLED`/`COMMIT_PENDING`, revoke,
+> replace, outbox, outbox-delivered, missing, recovery-missing) to a framed,
+> length-prefixed digest. The PostgreSQL store imports the same id function and
+> semantic validator from the SQLite store. C32 did **not** bump the authority
+> schema version, which both backends still write as `3`. A v3 store containing
+> such rows written by pre-C32 code fails to open with a generic error, not
+> with the explicit "schema version is incompatible" error:
+> - SQLite: `ValueError: APCC SQLite store semantic validation failed`
+> - PostgreSQL: `ValueError: APCC authority store semantic validation failed`
+>
+> There is no in-place migration. Rebuild affected stores, or wait for the deferred schema
+> v4 bump, which needs the PostgreSQL 17 GCB catalog fingerprint
+> (`_POSTGRES_GCB_CATALOG_FINGERPRINT`) regenerated in the same change. Until
+> v4 lands, do not run mixed-version writers against one store.
+
+### Security
+- **Consensus and certificates.** `quorum_certificate`, `epoch_reconfig` and
+  `bittensor/constitution_sync` verify against verifier-owned policy and
+  registry-pinned keys. Certificates can no longer choose their own threshold,
+  drift budget or registry. QC vote signatures bind `voter_id`, so one key can
+  no longer vouch for every ID that shares it. `ValidatorSet` refuses silent
+  re-keying, and node admission is fail-closed for validators that were not
+  admitted.
+- **Mesh and vote evidence.** Vote envelopes sign the assigned electorate and,
+  from protocol v3, the digest of a signed assignment issued by a trusted
+  assigner. Consumers require every assigned vote and recompute the outcome.
+  Assigner, voter, producer and settlement-signer roles must be distinct. Trust
+  objects are rebuilt from raw bytes, and registry subclasses are rejected.
+  Malformed or legacy persisted settlements are quarantined rather than
+  trusted. The signed-envelope cache holds only assigned voters on open
+  assignments.
+- **Assignment authority (C48).** Settlement recovery,
+  `ConstitutionalValidator` and `PrecedentCascade` (when it holds a mesh)
+  verify assignments only against `ConstitutionalMesh.assigner_trust_root`
+  plus the pinned assigner id and key, never against the live
+  `vote_registry`. `assigner_trust_root` now holds only the pinned assigner
+  grant rather than a snapshot of the live registry. A mesh built by
+  `rotate_constitution` therefore cannot inherit a late-registered assigner,
+  and `receipt_trust_registry()` exports only the pinned assigner as its
+  assigner grant (validator and settlement-key grants are still exported).
+- **Remote-vote replay window (C29, C48).** In both the mesh core and
+  `LocalRemotePeer`, a nonce is checked and recorded only after the request
+  signature verifies, expires at `max(now, timestamp) + W`, and is swept from
+  the whole cache. Eviction uses `expires_at < now`, so a replay at exactly
+  `timestamp + W` is still rejected and a badly signed request cannot probe
+  the cache.
+- **Transport.** Gossip and remote voting require TLS off loopback, never send
+  the shared token in plaintext, compare tokens in constant time, and bound
+  anti-entropy. `RemoteVoteClient` rejects TLS contexts without
+  `CERT_REQUIRED` and `check_hostname`.
+- **Governed handoff.** The `tool_call` gate is a closed, code-owned
+  `SAFE_COMMANDS` table. Signing keys come from a private key file and are
+  never inherited by child processes, and the supervisor is made non-dumpable
+  on every launch, with a read-back check. Evidence files are created
+  exclusively, and handoff v2 bundles need an external trust anchor. The
+  external agent command is resolved on the fixed PATH (C51a), and system
+  directories come before `/usr/local/bin`.
+- **Governance receipts and settlement.** Contradictory tallies, duplicate
+  identities, role downgrades and unsigned report-mode results fail closed.
+  DSSE accepts only the in-toto payload type and canonical base64. Fixture or
+  publicly derivable keys are labelled `development`, never `proof_grade`.
+  Settlement file locking fails closed.
+- **Governance gates.** `govern` enforces its result. Federated credentials
+  must be signed by issuer keys pinned at bridge construction. Debate roles
+  come from a pinned registry. The MAC-ACGS loop cannot approve its own rules.
+  The constitution-transition and evolution-log write paths cannot be bypassed.
+- **Bittensor.**
+  - Miner responses are authenticated and bound to all 11 request fields
+    (response protocol v2), and the axon runs bittensor's own `default_verify`.
+  - Precedent admission requires at least 3 approvals out of at least 5 votes,
+    plus a strict majority.
+  - NMC commitments are bound to `(session_id, case_id, miner_uid)`.
+  - Rule codification separates proposer and governor duties.
+  - Emissions, tiers, certificates and audit batches fail closed.
+  - Audit logs and chain anchors use a count-committed RFC 6962-style Merkle
+    tree with caller-pinned roots.
+- **APCC.**
+  - Observations are verified against the caller's own request.
+  - The strict JSON parser is used throughout, and GCB numeric fields are
+    compared by canonical bytes.
+  - Stores refuse version-mismatched stages and foreign-workflow certificate
+    revocations, and enforce a plain-ID grammar on request ids.
+  - B4/B5 empirical adapters pin their trust roots, and the B5 journal MAC
+    uses a dedicated secret.
+  - The authority supervisor pins observer-launch expectations, and the
+    privileged child sends only stable error codes.
+- **Privacy and DP.**
+  - Private ballots are voter-bound, need an enrolled key, and default to
+    strict proof checking.
+  - DP sensitivity is corrected to `2·r·√n` with RDP-inverted sigma.
+  - Unseeded noise uses fresh entropy, and sampler child seeds use a
+    full-width KDF.
+  - NaN RDP no longer clamps to zero.
+- **Evaluation and SWE-bench.**
+  - The local harness applies the official `test_patch` and needs JUnit
+    evidence.
+  - Subprocesses get a minimal environment and are killed as a process group.
+  - Governance and evaluation share one detector entry point. Its
+    normalization covers NFKC, confusables, camelCase and leetspeak, and
+    (C51b) accent folding and blank-filler characters.
+  - (C51b) Instance ids are allowlisted before they reach paths or harness
+    argv.
+  - (C51a) LangGraph streaming appends only the exact patch that the
+    validator checked and the settle node accepted.
+  - A hunk-only diff is not accepted as a patch.
+  - Forensic benchmark packs are committed before collection.
+  - Benchmark CLIs parse JSON strictly, and TLC runners execute a hashed
+    private copy of the jar.
+- **Shared helpers.** New `strict_json`, `framing` (`framed_digest`,
+  `require_plain_id`) and `secure_files` (`private_file`) modules give one
+  policy for parsing, framed digests and private-file reads.
+
+### Changed
+Signatures, defaults and wire formats. Entries marked **Breaking** need caller
+or data changes.
+
+- **Mesh.**
+  - **Breaking:** vote evidence and remote requests are protocol v3 and bind a
+    signed assignment v1 from a trusted assigner. v1, v2, unsigned and
+    aggregate live evidence is rejected.
+  - **Breaking:** `sign_vote_envelope` requires the assigned roster and quorum.
+    Externally supplied registries need `assigner_id` and
+    `assigner_private_key`.
+  - `sign_vote` / `sign_vote_envelope` raise `AssignmentSettledError`,
+    `RecoveredAssignmentError` or `UnauthorizedVoterError`.
+  - **Breaking:** `MeshProof.verify()` returns `False` for v1 proofs unless
+    called with `allow_legacy_v1=True`.
+  - `ConstitutionalMesh(complete_evidence=...)` is deprecated and does nothing.
+  - New `ConstitutionalMesh.assigner_trust_root` (only the pinned assigner
+    grant), `assigner_key_id`, `quarantined_settlements`, and `summary()`
+    quarantine fields. Construction logs and skips bad stored settlements
+    instead of raising.
+  - **Breaking:** mesh key coercion (`register_remote_agent(vote_public_key=...)`,
+    `register_local_signer(vote_private_key=...)` and the constructor key
+    arguments) delegates to `vote_envelope.public_key_from` /
+    `private_key_from`. Hex must be exact lowercase with no whitespace or
+    newline (`ValueError`). `str` subclasses are rejected for private keys,
+    and `bytearray` raises `TypeError`.
+  - `submit_vote_envelope` runs the admission checks (halted, settled,
+    recovered, stale constitution, assigned, registered) before signature
+    verification, so an invalid envelope for a settled or halted assignment
+    raises the admission error instead of `ValueError`. Each submitted
+    envelope is verified once.
+  - `verify_remote_vote_request(nonce_cache=...)` stores expiry times
+    (`max(now, timestamp) + W`) as cache values instead of receipt times.
+  - `PeerAssignment` gains a derived `signed_assignment_digest` field. It is
+    not an `__init__` argument and is excluded from equality and repr.
+  - Performance: the pending-assignment count is an O(1) counter, and the
+    stale-assignment scan runs only after `rotate_constitution` or an observed
+    hash mismatch. Reconcile reads the durable store once per pass, and
+    settlement writes look up one record by id instead of rebuilding the
+    receipt index.
+  - `verify_assignment_vote_envelopes` accepts `assigner_trust_root`,
+    `expected_assigner_id` and `expected_assigner_key_id`.
+  - `vote_envelope` exports `public_key_from`, `private_key_from` and
+    `content_hash`.
+  - **Breaking:** `LocalRemotePeer` rejects non-canonical key hex and request
+    subclasses, and takes `clock=`.
+- **QC votes.**
+  - **Breaking:** QC votes must sign
+    `build_vote_message_v2(assignment_id, artifact_hash, epoch, voter_id)`, and
+    `SignedVote.message()` returns v2. v1 votes are accepted only with
+    `CertificateVerificationPolicy(allow_legacy_v1=True)`.
+  - **Breaking:** partial-committee selections differ from earlier releases;
+    full-set committees are unchanged.
+  - **Breaking:** `ValidatorSet.add(v, *, replace=False, rekey=False)` raises
+    on an existing ID.
+  - `build_vote_message_v2`, `CertificateVerificationPolicy` and
+    `TransitionVerificationPolicy` are now importable from
+    `constitutional_swarm` through the lazy namespace. They are not part of
+    the frozen `__all__` façade.
+- **Transitions and sync.**
+  - **Breaking:** transition certificates use the
+    `constitutional-transition-v3` subject, and existing certificates need
+    re-ratification. `CertificateVerificationPolicy` and
+    `TransitionVerificationPolicy` own the thresholds.
+  - **Breaking:** `ConstitutionDistributor` requires an Ed25519 signing key, and
+    `allow_unsigned` is removed. The sync wire is v2, and v1 needs
+    `allow_legacy_v1=True`.
+  - **Breaking:** `verify_task_hash` takes only the full 64-hex digest.
+- **Governance gates.**
+  - **Breaking:** `govern(fn=None, *, action_type=None, block_on_violation=True,
+    block_on_warnings=False)` raises `ConstitutionalViolationError` on an
+    invalid result or a verified Z3 counterexample. `constitutional_dna` takes
+    the same keywords. WARN matches are logged and counted in
+    `stats["warnings"]`.
+  - **Breaking:** a DNA with a `maci_role` needs `action_type`.
+  - **Breaking:** `FederatedConstitutionBridge(issuer_keys=...)` is needed to
+    register credentials. `AgentCredential.expires_at` is required and
+    `issuer_signature` must verify. `gate()` and `revoke()` require `org_id`,
+    and empty `domains` deny (use `ALL_DOMAINS`).
+  - **Breaking:** `DebateResolver(participants=...)` is required for any
+    challenge to count.
+  - **Breaking:** `MacAcgsConfig.auto_challenge` and `auto_defend` default to
+    `False`.
+  - Debate seals are v2.
+- **Governed handoff.**
+  - **Breaking:** only `true` (no arguments) and `echo` (plain words) can run.
+    `command_allowlist` selects from `SAFE_COMMANDS` and can no longer add
+    commands:
+    - a list, tuple or set narrows the table (unknown names are ignored, and
+      an empty one enables nothing);
+    - a non-sequence value, such as a string, enables nothing;
+    - an absent or null value enables the whole table.
+  - **Breaking:** `tool_call` executables must be bare names.
+  - **Breaking (C51a):** `ExternalAgentAdapter` resolves its command's
+    `argv[0]` on `FIXED_SUBPROCESS_PATH` or requires an absolute path. These
+    raise `RuntimeError` before any child starts:
+    - a relative command (`./agent`);
+    - an empty or whitespace-only command, which used to run the task file
+      itself;
+    - an unparseable command;
+    - a command that does not resolve.
+  - `FIXED_SUBPROCESS_PATH` is now `/usr/bin:/bin:/usr/local/bin`, so
+    `/usr/local/bin` can no longer shadow system tools.
+  - **Breaking:** a repeated task id or `pack` over an existing bundle raises
+    `FileExistsError`.
+  - `ACGS_SIGNING_KEY_FILE` is preferred and `ACGS_SIGNING_KEY` is deprecated.
+  - Removed `DENIED_INTERPRETER_COMMANDS`; added `SAFE_COMMANDS` and
+    `SafeCommandSpec`.
+- **Receipts and settlement.**
+  - **Breaking:** receipt decisions must match their tallies.
+  - **Breaking:** settlement signers cannot also be voters, the assigner or
+    the producer.
+  - New `verify_bundle(..., require_proof_grade=...)` and
+    `acgs-verify-receipts --require-proof-grade`.
+  - `verify_dsse_envelope` returns structured `invalid` instead of raising.
+  - **Breaking (platform):** without `fcntl` or `msvcrt`, settlement stores
+    raise `SettlementLockUnavailableError`.
+  - New `exclusive_file_lock` and `lookup_settlement`.
+- **Bittensor.**
+  - **Breaking:** `MinerAxonServer` needs `response_signing_key=` (or the
+    dev-only `allow_unsigned_responses=True`) and must be attached with
+    `server.attach_to(axon)`.
+  - `constitutional_swarm.bittensor` now exports `authenticate_response`,
+    `verify_axon_response_signature` and `request_binding_digest`.
+  - **Breaking:** the testnet `miner` needs `--trusted-validators`, and the
+    testnet validator needs `--authority-keys` (an owner-only file) and
+    public-only `--authorized-voters`.
+  - **Breaking:** `AnchorRecord.verify_membership(proof, *, expected_root)`
+    requires a caller-pinned root. `AuditBatch.verify_entry()` requires
+    `expected_root` and `expected_batch_id`, and `verify_merkle_path()`
+    requires `leaf_count` and `leaf_index`.
+  - **Breaking:** `AuditLogEntry.from_dict` and `AuditBatch.from_dict` reject
+    unknown and missing keys.
+  - **Breaking:** audit leaves and Merkle roots are v2, and pre-C35 roots do not
+    verify.
+  - **Breaking:** `compute_commitment_hash(..., *, session_id, case_id,
+    miner_uid)`, and NMC sessions need a non-empty `required_miners`.
+  - **Breaking:** `RuleCodifier(governors=..., proposer_id=...)`, and
+    approve/activate/reject/revoke take `governor=`.
+  - **Breaking:** `BayesianThresholdUpdater(precedent_store=...)`.
+  - **Breaking:** `finalize_case` votes must cover the recorded selection
+    exactly, and `register_validator` rejects duplicates.
+  - **Breaking:** `CertificateIssuer` needs a cert-scoped prover;
+    `ZKPStubProver` needs `allow_insecure_stub=True`.
+  - **Breaking:** `EmissionCalculator.compute` needs `registered_miners` or
+    `allow_unregistered=True`.
+  - **Breaking:** `TierManager.register_miner(initial_tier=...)` above
+    APPRENTICE needs `admin_override=True`, and `record_precedent(miner_uid,
+    precedent_id)`.
+  - **Breaking:** removed inert fields; passing any of them raises
+    `TypeError`:
+    - `ValidatorConfig.authenticity_detection`
+    - `ValidatorConfig.reputation_decay_rate`
+    - `SubnetMetrics.avg_judgment_time_seconds`
+    - `SubnetMetrics.active_validators`
+    - `SubnetMetrics.manifold_spectral_bound`
+    - `ValidationSynapse.authenticity_score`
+  - **Breaking:** removed `ConstitutionalMiner.record_acceptance` and
+    `record_rejection`.
+- **Private voting and DP.**
+  - **Breaking:** `tally()` and `PrivateBallotBox` need `eligible_voters` and
+    default to `strict_v2=True`. The hash-scaffold prover needs
+    `allow_insecure_hash_prover=True`.
+  - **Breaking:** `compute_nullifier(*, voter_pub, epoch, subject)`.
+  - **Breaking:** commit, nullifier and signature wire formats are v2.
+  - **Breaking:** `swarm_ode.calibrate_sigma(*, certified_spectral_bound,
+    matrix_dimension, epsilon, delta)`, and returned sigmas change.
+  - **Breaking:** `DiscreteGaussianSampler` streams differ from earlier
+    releases.
+  - **Breaking:** `swarm_ode.integrate(crdt=...)` records
+    `bodes_passed=False`.
+- **Gossip.**
+  - **Breaking:** `GossipServer`, `GossipClient` and `SwarmNode` take
+    `transport_security` (`"auto"` by default). Under `auto` a non-loopback
+    host needs TLS material, and the client must ACK.
+- **APCC.**
+  - **Breaking:** `verify_authority_observation` and
+    `AuthorityObservationVerificationStream.consume` require keyword-only
+    `expected_request`, and `VerifiedAuthorityObservation` gains
+    `request_digest`.
+  - **Breaking:** removed the `apcc.codec` observation delegates; import them
+    from `apcc.observation`.
+  - B5 `ADAPTER_VERSION` is `gcb1-subprocess-v2`, and old B5 state must be
+    recreated.
+  - **Breaking:** the authority child requires distinct role keys and an
+    explicit policy version, and `KeySourceRef(kind=...)` accepts only `"file"`
+    or `"consumed"`.
+  - `TrustedGovernanceBootstrap` raises `authority_anchor_mismatch` for seals
+    that do not match its config, and `governed_commit.sign_control_command`
+    is removed.
+  - See the store note at the top of this section.
+- **Evaluation.**
+  - **Breaking:** monotonic-MAS `EVALUATION_VERSION` is 4; start new run ids.
+  - **Breaking:** `AbliterationAdmissionGate(reference={})` raises.
+  - **Breaking:** `EvolutionLog.admit()` is read-only.
+  - **Breaking:** forensic packs are `acgs-forensic-pack-v5` and must be
+    regenerated. `IncidentSpec` and `generate_incident_specs` are removed; use
+    `generate_artifact_pack()`.
+  - `spectral_sphere_project` and `replace_raw_trust` raise on non-finite or
+    unbounded input.
+  - `LatentDNAWrapper.enable()` checks the declared hidden width.
+  - (C51b) The normalized matching pass decomposes (NFKD), drops combining
+    marks and format characters, then recomposes (NFC), so accented keywords
+    such as `dísáble` are caught. Visibly blank fillers (U+115F, U+1160,
+    U+3164, U+FFA0, U+2800) become spaces, and zero-width characters are
+    still deleted.
+  - (C51b) ROLE-004 matches `rm` recursive and force flags in any order
+    (`-fr`, `-Rf`, `-r -f`, long options) using bounded patterns only.
+    `farm -fr` is a known benign catch.
+  - (C51b) The MCFS rule-set hash changes from `4b9636ce4710779f` to
+    `ebcb7caa26e6abfb`. The project constitutional hash `608508a9bd224290` is
+    unchanged.
+- **SWE-bench.**
+  - **Breaking (C51b):** instance ids must match
+    `[A-Za-z0-9][A-Za-z0-9._-]*`, checked in `run_one_by_one` and in the
+    official runner's `load_instance_ids` before an id reaches a path or the
+    harness argv. Path components reject a leading `-`.
+  - **Breaking:** local evaluation needs the official `test_patch` and JUnit
+    evidence.
+  - Generation summaries report `patch_generated` and `patch_rate`;
+    `resolved` and `resolve_rate` remain as deprecated aliases.
+  - `GovernedAgent(semantic=False)` adds normalized-pass metadata.
+  - CRDT `bodes_passed` is true only for accepted patches.
+  - `run_one`, `run_swarm_batch` and `run_best_of_k_batch` take `run_root=`.
+    Without it, library calls use a private temp root.
+  - `scripts/run_mc_swarm.py` labels results `pass@k`.
+  - (C51b) `scripts/run_mc_swarm.py` changes:
+    - it uses the shared `build_swe_bench_prompt`, so the MC prompt now
+      includes hints and headers;
+    - it reports evaluated and unevaluated candidate counts;
+    - it adds patch and apply `@k` metric labels (existing keys are unchanged);
+    - it requires `--agents >= 1`.
+- **LangGraph.**
+  - **Breaking:** graph builders need a pinned `dna.hash`.
+  - **Breaking:** custom graphs must emit clean validation evidence and
+    `governance_status="accepted"` from the settle node.
+  - Error labels are a closed set (`governance_rejected`, `governance_halted`,
+    `governance_incomplete`, `invalid_patch`).
+  - (C51a) `stream_to_crdt` appends at most once, after the stream ends. It
+    appends only if the final patch equals both the patch the validate node
+    checked and the patch the settle node read when it accepted.
+  - (C51a) Each update is bound to the input state its task read, so a
+    same-step sibling cannot attach evidence or acceptance to another patch.
+  - (C51a) Nothing is appended in these cases:
+    - the caller breaks early, calls `aclose()`, or an exception occurs
+      mid-stream;
+    - a cached or replayed updates chunk arrives;
+    - a task starts without a result event.
+  - (C51a) Non-dict (pydantic or dataclass) state is supported.
+- **Core.**
+  - `CapabilityRegistry` is thread-safe, and `find_best(domain=...)` returns
+    `None` when nothing in the domain matches.
+  - `discover_agents` raises on duplicate names.
+- **Build.**
+  - Make gates fail closed unless the locked venv is exact (run `make setup`).
+  - Ruff is pinned to 0.15.12.
+  - Publishing grants OIDC only to the publish job.
+
+### Fixed
+- The APCC store no longer bricks itself on a fresh-attempt `stage_result`
+  whose expected version differs from the node version. It now raises
+  `STAGED_RESULT_CONFLICT` and writes nothing.
+- Governed commit: a denied control command no longer commits partial writes,
+  and `REVOKE_ROOT` no longer commits outside the transaction.
+- `load_pending` no longer races `clear_pending`. Settlement lookups no longer
+  leak connections or rescan the whole store.
+- `sign_vote_envelope` no longer raises `KeyError` when a cache purge races it.
+- Emission caps conserve mass, NaN and bool inputs are rejected, and tier
+  snapshots are detached.
+- `PrivateBallotBox(provers=None)` no longer fails on `dict(None)`.
+- Duplicate implementations were folded into one shared copy each: diff
+  extraction, Messages-API agents, `workflow_bindings`, Merkle code,
+  admission gates, and strict-JSON hooks.
+- `tests/test_c15_forensic_commitment_hardening.py` no longer pins a foreign
+  worktree path.
+
+### Migration
+- **APCC stores:** see the note at the top of this section.
+- **Regenerate** stored or signed artifacts in any of the formats that changed
+  above:
+  - private-vote commits and reveals;
+  - handoff v1 bundles;
+  - governance-receipt fixtures;
+  - debate seals;
+  - v1/v2 mesh vote evidence and missing-assignment evidence;
+  - transition v2 certificates;
+  - forensic packs (v5);
+  - monotonic-MAS runs (v4);
+  - audit-log batches (leaf and Merkle v2);
+  - B5 state.
+- **Coordinate wire rollouts** for:
+  - mesh protocol v3;
+  - QC vote message v2;
+  - constitution-sync v2;
+  - bittensor response protocol v2;
+  - gossip anti-entropy and TLS.
+- **Provision trust anchors:**
+  - assigner and request-signing keys (`--authority-keys`);
+  - public voter grants;
+  - trusted validator hotkeys;
+  - federated issuer keys;
+  - debate participants;
+  - rule-codifier governors;
+  - an `ACGS_SIGNING_KEY_FILE`.
+- **Explicit opt-ins** keep the old permissive behaviour. Use them only for
+  development:
+  - `allow_legacy_v1`;
+  - `strict_v2=False` and `allow_insecure_hash_prover`;
+  - `allow_unsigned_responses`;
+  - `allow_insecure_stub`;
+  - `allow_unregistered`;
+  - `admin_override`;
+  - `block_on_violation=False`;
+  - `single_operator_dev`.
+
 ## [1.1.0] - 2026-08-16
 
 Import-star and optional-dependency break relative to 1.0.0. See

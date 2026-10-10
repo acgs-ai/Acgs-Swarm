@@ -190,17 +190,22 @@ passed the fail-closed contract. The reviewer's role is approval, not bypass.
 ```python
 from constitutional_swarm.langgraph_runtime import stream_to_crdt
 from constitutional_swarm.merkle_crdt import MerkleCRDT
-from constitutional_swarm.gossip_protocol import GossipNode
+from constitutional_swarm.gossip_protocol import SwarmNode
 
-crdt = MerkleCRDT()
-gossip = GossipNode(...)
+crdt = MerkleCRDT("agent-1")
+gossip = SwarmNode(...)
 
-async for cid in stream_to_crdt(graph, inputs, crdt, gossip_node=gossip):
-    print("appended", cid)
+async for update in stream_to_crdt(graph, inputs, crdt, gossip_node=gossip):
+    print("node update", update)  # {node_name: state_update}
+print("CRDT size", crdt.size)  # grows by 1 if the run settled as accepted, else by 0
 ```
 
-Each yielded CID corresponds to one artifact appended to the CRDT and
-broadcast to peers via the configured gossip node. The function preserves the
+The stream yields LangGraph `{node_name: state_update}` chunks, not CIDs.
+After the graph stream is fully drained, the function appends at most one
+artifact: the final state, and only when the validator's clean evidence and the
+settle node's `accepted` verdict were both bound to the final patch. It then
+runs one gossip round. Breaking out early, closing the generator, or an
+exception mid-stream appends nothing. The function preserves the
 constitutional hash on every artifact and is safe to drive from an `asyncio`
 event loop.
 

@@ -17,6 +17,7 @@ dependencies = [
   "acgs-lite>=2.8.1",
   "cryptography>=44.0.2",
   "pydantic>=2,<3",
+  "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -32,21 +33,18 @@ PyPI = "https://pypi.org/project/constitutional-swarm/"
 # transport.py:133 artifact that vanishes under 2.x) and a langgraph-triggered
 # internal crash; an unbounded upper edge would let a future release flip the
 # gate non-deterministically — counter to this gate's env-consistency contract.
-# ruff bounded below 0.16: 0.16.0 expands the default rule set (BLE001, TRY004,
-# PERF402, RUF100, ...) and flips the lint gate red with 54 findings on a tree
-# that is clean under 0.15.x (uv.lock pins 0.15.12). Same env-consistency
-# rationale as the mypy bound; raise deliberately alongside a lint-clean pass.
+# Ruff is exact-pinned because both the available rules and their behavior are
+# part of the lint gate. Upgrade deliberately alongside a lint-clean pass.
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
-  "ruff>=0.4,<0.16",
+  "ruff==0.15.12",
   "mypy>=2,<3",
   "numpy>=1.24",
   # scripts/agent_check.py (make agent-check / CI agent-operability) imports
   # these directly. They used to arrive transitively via numpy/braintrust and
   # vanished once those left the default extra graph.
   "jsonschema>=4.18",
-  "pyyaml>=6.0",
 ]
 # Observability for testnet/eval scripts only (scripts/testnet_deploy.py).
 # Not imported by the runtime; pytest still disables the plugin via addopts.
@@ -119,6 +117,14 @@ acgs-verify-receipts = "constitutional_swarm.governance_receipts_cli:main"
 where = ["src"]
 include = ["constitutional_swarm*"]
 
+[tool.ruff]
+required-version = "==0.15.12"
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 # Static type-check gate (BLOCKERS.md B3). Runs via `make typecheck` and two CI
 # jobs (no-extras + typecheck-transport). Most unstubbed third-party deps
@@ -163,7 +169,7 @@ follow_imports_for_stubs = true
 checked = ["postgres", "transport"]
 
 [tool.constitutional_swarm.typecheck_coverage.excepted]
-dev = "tooling only (pytest/ruff/mypy/numpy/jsonschema/pyyaml for tests + agent-check); not imported by the default runtime"
+dev = "tooling only (pytest/ruff/mypy/numpy/jsonschema for tests + agent-check); not imported by the default runtime"
 braintrust = "optional testnet/eval telemetry; pytest disables the plugin; not imported by src/"
 bittensor = "bittensor ships no py.typed; installing adds no coverage over ignore_missing_imports"
 research = "torch/transformers are heavy and crash mypy; low value-to-cost — follow_imports=skip if ever gated"

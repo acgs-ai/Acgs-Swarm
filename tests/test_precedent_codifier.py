@@ -20,9 +20,13 @@ from constitutional_swarm.bittensor.map_elites import (
     MinerApproach,
 )
 from constitutional_swarm.bittensor.precedent_backed_codifier import PrecedentBackedCodifier
-from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
+from constitutional_swarm.bittensor.precedent_store import PrecedentRecord, PrecedentStore
 from constitutional_swarm.bittensor.protocol import EscalationType
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
+from tests.test_c14_protocol_hardening import (
+    c14_precedent_signed_record,
+    c14_precedent_test_store,
+)
 
 
 def _precedent(idx: int) -> PrecedentRecord:
@@ -31,7 +35,7 @@ def _precedent(idx: int) -> PrecedentRecord:
     Identical impact vectors so the records agglomerate into a single cluster;
     votes_for=9 / votes_against=1 gives validator_grade == 0.9.
     """
-    return PrecedentRecord.create(
+    return c14_precedent_signed_record(
         case_id=f"case-{idx}",
         task_id=f"task-{idx}",
         miner_uid=f"miner-{idx}",
@@ -39,7 +43,6 @@ def _precedent(idx: int) -> PrecedentRecord:
         reasoning="Access to PII lacked explicit consent verification.",
         votes_for=9,
         votes_against=1,
-        proof_root_hash=f"{idx:064x}",
         escalation_type=EscalationType.CONSTITUTIONAL_CONFLICT,
         impact_vector={
             "safety": 0.1,
@@ -53,6 +56,15 @@ def _precedent(idx: int) -> PrecedentRecord:
         constitutional_hash=CONSTITUTIONAL_HASH,
         ambiguous_dimensions=("privacy", "security"),
     )
+
+
+def _admit(
+    store: PrecedentStore,
+    records: list[PrecedentRecord],
+) -> list[PrecedentRecord]:
+    for record in records:
+        store.add(record)
+    return list(store.active_records_by_id([record.precedent_id for record in records]))
 
 
 def _grid_batch(fitness: float) -> list[MinerApproach]:
@@ -89,8 +101,9 @@ class TestPrecedentBackedCodifier:
 
     def test_ignores_live_approaches_arg(self) -> None:
         """find_clusters discards its argument and clusters the observed stream (PR #118)."""
-        codifier = PrecedentBackedCodifier()
-        codifier.observe_many(_precedent(i) for i in range(6))
+        store = c14_precedent_test_store(CONSTITUTIONAL_HASH)
+        codifier = PrecedentBackedCodifier(precedent_store=store)
+        codifier.observe_many(_admit(store, [_precedent(i) for i in range(6)]))
 
         clusters = codifier.find_clusters(["garbage", "more garbage"])
         assert clusters, "the observed precedents must be clustered regardless of the arg"
@@ -98,15 +111,20 @@ class TestPrecedentBackedCodifier:
 
     def test_observe_and_observe_many_accumulate(self) -> None:
         """observe(), observe_many(), and the seed param all grow the stream."""
-        codifier = PrecedentBackedCodifier()
-        codifier.observe(_precedent(0))
+        store = c14_precedent_test_store(CONSTITUTIONAL_HASH)
+        codifier = PrecedentBackedCodifier(precedent_store=store)
+        codifier.observe(_admit(store, [_precedent(0)])[0])
         assert len(codifier.precedents) == 1
 
-        codifier.observe_many(_precedent(i) for i in range(1, 5))
+        codifier.observe_many(_admit(store, [_precedent(i) for i in range(1, 5)]))
         assert len(codifier.precedents) == 5
         assert sum(len(c.precedent_ids) for c in codifier.find_clusters([])) == 5
 
-        seeded = PrecedentBackedCodifier(precedents=[_precedent(i) for i in range(3)])
+        seed_store = c14_precedent_test_store(CONSTITUTIONAL_HASH)
+        seeded = PrecedentBackedCodifier(
+            precedents=_admit(seed_store, [_precedent(i) for i in range(3)]),
+            precedent_store=seed_store,
+        )
         assert len(seeded.precedents) == 3
 
     def test_empty_stream_proposes_nothing(self) -> None:
@@ -125,8 +143,13 @@ class TestPrecedentBackedCodifier:
         constitutional update is guarded separately in the example test; this is
         the direct CAMECycleResult.rules_proposed companion.)
         """
-        codifier = PrecedentBackedCodifier(min_cluster_size=5, min_validator_agreement=0.70)
-        codifier.observe_many(_precedent(i) for i in range(15))
+        store = c14_precedent_test_store(CONSTITUTIONAL_HASH)
+        codifier = PrecedentBackedCodifier(
+            precedent_store=store,
+            min_cluster_size=5,
+            min_validator_agreement=0.70,
+        )
+        codifier.observe_many(_admit(store, [_precedent(i) for i in range(15)]))
 
         coord = CAMECoordinator(codifier=codifier)
         try:

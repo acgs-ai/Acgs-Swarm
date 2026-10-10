@@ -331,9 +331,12 @@ def detect_from_weights(
     Computes per-matrix refusal energy against ``direction`` (a refusal direction
     re-extracted from a trusted reference model).
 
-    - With a ``reference`` (matched matrix names): flag when the aggregated
-      candidate/reference energy ratio drops below ``ratio_threshold`` (default
-      0.25 -- i.e. >=75% of the refusal energy removed).
+    - With a ``reference``: require coverage of every reference matrix, then flag
+      when the aggregated candidate/reference energy ratio drops below
+      ``ratio_threshold`` (default 0.25 -- i.e. >=75% of the refusal energy
+      removed). Candidate matrix names must equal the reference names exactly:
+      missing or unknown (e.g. renamed) matrices are always flagged,
+      independently of aggregation.
     - Without a reference: flag when the aggregated absolute energy falls below
       ``abs_floor`` (an exact abliteration drives energy to ~0).
 
@@ -352,9 +355,6 @@ def detect_from_weights(
     - ``"mean"``: the average ratio/energy.
     """
 
-    if not write_matrices:
-        msg = "write_matrices is empty; nothing to probe"
-        raise ValueError(msg)
     if not 0.0 < ratio_threshold <= 1.0:
         msg = "ratio_threshold must be in (0, 1]"
         raise ValueError(msg)
@@ -367,25 +367,61 @@ def detect_from_weights(
     if not 0.0 <= quantile <= 1.0:
         msg = "quantile must be in [0, 1]"
         raise ValueError(msg)
+    if not write_matrices:
+        if reference:
+            missing_names = ", ".join(sorted(reference))
+            msg = (
+                "write_matrices is empty; missing reference matrices: "
+                f"{missing_names}"
+            )
+        else:
+            msg = "write_matrices is empty; nothing to probe"
+        raise ValueError(msg)
+    if reference is not None and not reference:
+        msg = "reference is empty; coverage cannot be verified"
+        raise ValueError(msg)
     r = _unit(direction)
     per_layer = {name: weight_refusal_energy(W, r) for name, W in write_matrices.items()}
     energies = np.array(list(per_layer.values()), dtype=np.float64)
     reasons: list[str] = []
 
     if reference is not None:
-        ratios = []
-        for name, energy in per_layer.items():
-            ref_W = reference.get(name)
-            if ref_W is None:
-                continue
+        reference_energy: dict[str, float] = {}
+        for name, ref_W in reference.items():
             ref_energy = weight_refusal_energy(ref_W, r)
             if ref_energy <= 0.0:
                 msg = f"reference refusal energy for {name!r} must be positive"
                 raise ValueError(msg)
-            ratios.append(energy / ref_energy)
-        if not ratios:
-            msg = "reference shares no matrix names with write_matrices"
-            raise ValueError(msg)
+            reference_energy[name] = ref_energy
+            candidate_W = write_matrices.get(name)
+            if candidate_W is not None:
+                candidate_shape = np.asarray(candidate_W).shape
+                reference_shape = np.asarray(ref_W).shape
+                if candidate_shape != reference_shape:
+                    msg = (
+                        f"matrix shape mismatch for {name!r}: candidate "
+                        f"{candidate_shape} != reference {reference_shape}"
+                    )
+                    raise ValueError(msg)
+        # Coverage is exact in both directions: every reference matrix must be
+        # probed, and no candidate matrix may fall outside the reference set
+        # (a renamed matrix would otherwise escape scoring). Either mismatch is
+        # flagged for this candidate rather than scored on a subset.
+        missing = sorted(set(reference) - set(write_matrices))
+        unknown = sorted(set(write_matrices) - set(reference))
+        if missing:
+            reasons.append(f"missing reference matrices: {', '.join(missing)}")
+        if unknown:
+            reasons.append(f"unknown matrices not in reference: {', '.join(unknown)}")
+        if reasons:
+            return AbliterationReport(
+                abliterated=True,
+                mode="weight",
+                score=1.0,
+                per_layer_energy=per_layer,
+                reasons=reasons,
+            )
+        ratios = [energy / reference_energy[name] for name, energy in per_layer.items()]
         agg_ratio = _aggregate(np.array(ratios, dtype=np.float64), aggregate, quantile)
         abliterated = agg_ratio < ratio_threshold
         score = float(np.clip(1.0 - agg_ratio, 0.0, 1.0))

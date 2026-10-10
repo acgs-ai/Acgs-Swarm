@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   test:
@@ -43,21 +42,25 @@ jobs:
         run: twine check dist/*
       - name: Smoke test wheel install
         run: pip install dist/*.whl && python -c "import constitutional_swarm; print('import OK')"
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-python-distributions
+          path: dist/*
+          if-no-files-found: error
 
   publish:
     needs: [test, package]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: pypi
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Download validated distributions
+        uses: actions/download-artifact@v4
         with:
-          python-version: "3.11"
-      - name: Install build tools
-        run: pip install build twine
-      - name: Build
-        run: python -m build --wheel --sdist
-      - name: Check
-        run: twine check dist/*
+          name: validated-python-distributions
+          path: dist/
       - name: Publish
         uses: pypa/gh-action-pypi-publish@v1.14.2

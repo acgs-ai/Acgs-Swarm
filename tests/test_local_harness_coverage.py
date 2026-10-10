@@ -13,6 +13,7 @@ from constitutional_swarm.swe_bench.local_harness import (
     _as_list,
     _parse_django_summary,
     _run,
+    _safe_id,
 )
 
 # ---------------------------------------------------------------------------
@@ -25,6 +26,7 @@ _INSTANCE = {
     "base_commit": "deadbeef",
     "FAIL_TO_PASS": ["tests/test_demo.py::test_thing"],
     "PASS_TO_PASS": ["tests/test_demo.py::test_other"],
+    "test_patch": "1\t1\ttests/test_demo.py\0",
 }
 
 _PATCH = """\
@@ -37,7 +39,7 @@ _PATCH = """\
 
 
 class _FakeRunner:
-    """Scriptable subprocess.run replacement."""
+    """Scriptable shared process-runner replacement."""
 
     def __init__(self, scripts: list[tuple[list[str], int, str]]):
         self.scripts = list(scripts)
@@ -48,19 +50,29 @@ class _FakeRunner:
         cmd: list[str],
         *,
         cwd: Any = None,
-        input: Any = None,
-        capture_output: bool = False,
-        text: bool = False,
-        timeout: Any = None,
-        check: bool = False,
+        input_text: Any = None,
+        timeout_s: Any = None,
+        env: Any = None,
     ) -> subprocess.CompletedProcess:
         self.calls.append(list(cmd))
+        if "--numstat" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "1\t1\ttests/test_demo.py\0", "")
         for i, (prefix, rc, out) in enumerate(self.scripts):
-            joined = " ".join(cmd)
-            if all(tok in joined for tok in prefix):
+            if _matches(cmd, prefix):
                 self.scripts.pop(i)
                 return subprocess.CompletedProcess(cmd, rc, out, "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+def _matches(cmd: list[str], expected: list[str]) -> bool:
+    """Match exact argv elements in order, allowing unrelated arguments between them."""
+    position = 0
+    for token in expected:
+        try:
+            position = cmd.index(token, position) + 1
+        except ValueError:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +83,7 @@ class _FakeRunner:
 def test_run_timeout_returns_124():
     """_run returns (124, ...) when subprocess.TimeoutExpired is raised."""
     with patch(
-        "subprocess.run",
+        "constitutional_swarm.swe_bench.local_harness._run_process",
         side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=5),
     ):
         rc, msg = _run(["git", "status"], timeout=5)
@@ -81,7 +93,10 @@ def test_run_timeout_returns_124():
 
 def test_run_file_not_found_returns_127():
     """_run returns (127, ...) when subprocess.FileNotFoundError is raised."""
-    with patch("subprocess.run", side_effect=FileNotFoundError("no such file")):
+    with patch(
+        "constitutional_swarm.swe_bench.local_harness._run_process",
+        side_effect=FileNotFoundError("no such file"),
+    ):
         rc, msg = _run(["nonexistent-binary"])
     assert rc == 127
     assert "missing binary" in msg
@@ -192,29 +207,12 @@ def test_load_instances_datasets_success():
     fake_ds = [fake_row, fake_row, fake_row]
 
     mock_load = MagicMock(return_value=fake_ds)
-    with patch.dict("sys.modules", {"datasets": MagicMock(load_dataset=mock_load)}):
-        with patch(
-            "constitutional_swarm.swe_bench.local_harness.load_dataset",
-            mock_load,
-            create=True,
-        ):
-            # Directly patch the import inside the function
-            import constitutional_swarm.swe_bench.local_harness as lh
+    mock_datasets = MagicMock(load_dataset=mock_load)
+    with patch.dict("sys.modules", {"datasets": mock_datasets}):
+        result = load_instances(dataset="example/dataset", split="validation", limit=2)
 
-            _ = getattr(lh, "load_dataset", None)
-            try:
-                # Patch the module-level name that gets resolved during import
-                with patch(
-                    "builtins.__import__",
-                    side_effect=lambda name, *args, **kwargs: (
-                        type("M", (), {"load_dataset": mock_load})()
-                        if name == "datasets"
-                        else __import__(name, *args, **kwargs)
-                    ),
-                ):
-                    _ = load_instances(limit=2)
-            except Exception:
-                pass  # ImportError fallback is fine here
+    assert result == [fake_row, fake_row]
+    mock_load.assert_called_once_with("example/dataset", split="validation")
 
 
 def test_load_instances_datasets_with_mock_import(tmp_path):
@@ -247,11 +245,11 @@ def test_harness_worktree_clone_failure(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),  # initial full clone
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),  # initial full clone
             (["clone", "--no-hardlinks"], 1, "clone error output"),  # worktree clone fails
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
     assert "worktree clone failed" in result.error
@@ -267,14 +265,14 @@ def test_harness_checkout_failure(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 1, "checkout error"),  # first checkout fails
             (["fetch", "origin"], 0, ""),  # fetch for retry
             (["checkout", "--detach"], 1, "checkout error 2"),  # retry also fails
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
     assert "checkout failed" in result.error
@@ -289,7 +287,7 @@ def test_harness_existing_cache_triggers_fetch(tmp_path):
     """When repo cache exists, harness runs git fetch before cloning worktree."""
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     # Pre-create the cache dir to simulate an already-cached repo
-    cache = harness.repo_cache_dir / "demo_demo"
+    cache = harness.repo_cache_dir / _safe_id("demo/demo", field_name="repo")
     cache.mkdir(parents=True)
 
     runner = _FakeRunner(
@@ -302,7 +300,7 @@ def test_harness_existing_cache_triggers_fetch(tmp_path):
             (["-m", "pytest"], 0, "====== 1 passed in 0.1s ======"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         _ = harness.evaluate(_INSTANCE, patch=_PATCH)
     # Verify fetch was called
     calls_joined = [" ".join(c) for c in runner.calls]
@@ -319,7 +317,7 @@ def test_harness_pass_to_pass_failure_sets_log_tail(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -329,7 +327,7 @@ def test_harness_pass_to_pass_failure_sets_log_tail(tmp_path):
             (["-m", "pytest"], 0, "====== 1 failed in 0.1s ======"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.pass_to_pass_failed == 1
     # log_tail is set when pass_to_pass fails and fail_to_pass had no log
@@ -355,16 +353,18 @@ def test_harness_django_collection_error_counts_all_as_failed(tmp_path):
 
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
             # runtests.py returns non-zero with no summary = collection error
-            (["runtests.py"], 1, "ImportError: failed to import"),
-            (["runtests.py"], 1, "ImportError: failed to import"),
+            (["tests/runtests.py"], 1, "ImportError: failed to import"),
+            (["tests/runtests.py"], 1, "ImportError: failed to import"),
         ]
     )
-    with patch.object(lh.shutil, "rmtree"), patch("subprocess.run", side_effect=runner):
+    with patch.object(lh.shutil, "rmtree"), patch(
+        "constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner
+    ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.fail_to_pass_failed >= 1
 
@@ -386,7 +386,7 @@ def test_harness_venv_cleanup_in_finally(tmp_path):
 
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -410,7 +410,7 @@ def test_harness_venv_cleanup_in_finally(tmp_path):
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/uv",
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
         patch.object(lh.shutil, "rmtree", side_effect=tracking_rmtree),
     ):
         _ = harness.evaluate(_INSTANCE, patch=_PATCH)
@@ -429,7 +429,7 @@ def test_ensure_env_uv_python_install_fails(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True, python_version="3.10")
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -441,7 +441,7 @@ def test_ensure_env_uv_python_install_fails(tmp_path):
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/uv",
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
@@ -454,12 +454,13 @@ def test_ensure_env_uv_venv_fails(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True, python_version="3.10")
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
-            (["apply", "--index"], 0, ""),
+            (["apply", "--index"], 0, ""),  # candidate patch
+            (["apply", "--index"], 0, ""),  # official test patch
             (["uv", "python", "install"], 0, ""),  # install ok
-            (["uv", "venv"], 1, "venv error"),  # venv fails
+            (["uv", "venv", "--seed", "--python", "3.10"], 1, "venv error"),
         ]
     )
     with (
@@ -467,7 +468,7 @@ def test_ensure_env_uv_venv_fails(tmp_path):
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/uv",
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
@@ -484,14 +485,14 @@ def test_ensure_env_venv_creation_fails(tmp_path):
     )
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
             (["-m", "venv"], 1, "venv creation error"),  # venv fails
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
     assert "venv creation failed" in result.error
@@ -507,7 +508,7 @@ def test_ensure_env_pip_bootstrap_fails(tmp_path):
     )
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -515,7 +516,7 @@ def test_ensure_env_pip_bootstrap_fails(tmp_path):
             (["pip", "install"], 1, "pip error"),  # pip bootstrap fails
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.error is not None
     assert "pip bootstrap failed" in result.error
@@ -532,7 +533,7 @@ def test_harness_env_isolation_test_python_none_returns_early(tmp_path):
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True, python_version="3.10")
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -544,7 +545,7 @@ def test_harness_env_isolation_test_python_none_returns_early(tmp_path):
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/uv",
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     # Should return early without running tests

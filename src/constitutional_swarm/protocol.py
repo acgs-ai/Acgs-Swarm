@@ -1,8 +1,8 @@
 """Canonical protocol encoders for the future Rust core boundary.
 
-The mesh still accepts the historical Python byte formats for compatibility.
-This module makes that explicit by keeping legacy encoders separate from the
-versioned, domain-separated encoders that a Rust implementation must target.
+Live protocol paths accept version 2 only. The explicitly named legacy
+encoders in this module exist solely to reproduce frozen historical fixtures;
+they are not compatibility paths for live builders or verifiers.
 """
 
 from __future__ import annotations

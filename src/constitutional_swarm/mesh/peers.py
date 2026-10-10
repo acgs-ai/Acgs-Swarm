@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
+
+from constitutional_swarm.mesh.vote_envelope import (
+    SignedAssignment,
+    signed_assignment_digest,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class PeerAssignment:
-    """A validation assignment linking a producer's output to peer validators."""
+    """A validation assignment linking a producer's output to peer validators.
+
+    ``signed_assignment_digest`` is derived from ``signed_assignment`` at
+    construction (including every ``dataclasses.replace``), so per-vote checks
+    reuse it instead of re-serializing the assignment.
+    """
 
     assignment_id: str
     producer_id: str
@@ -18,7 +29,24 @@ class PeerAssignment:
     peers: tuple[str, ...]
     constitutional_hash: str
     timestamp: float
+    task_id: str = ""
     is_recovered: bool = False
+    assigned_peers_hash: str = ""
+    assigned_peer_count: int = 0
+    quorum: int = 0
+    evidence_mode: Literal["independent", "single_operator_dev"] | None = None
+    signed_assignment: SignedAssignment | None = None
+    signed_assignment_digest: str = field(
+        init=False, default="", repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.signed_assignment is not None:
+            object.__setattr__(
+                self,
+                "signed_assignment_digest",
+                signed_assignment_digest(self.signed_assignment),
+            )
 
 
 @dataclass

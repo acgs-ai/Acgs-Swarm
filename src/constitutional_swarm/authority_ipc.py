@@ -11,9 +11,17 @@ from collections.abc import Mapping
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
+)
+
+# H1 re-export: every authority JSON decode uses this single strict policy.
+from constitutional_swarm.strict_json import (
+    StrictJSONError,
+    loads as strict_loads,
+    reject_duplicate_keys as reject_duplicate_keys,
 )
 
 PROTOCOL = "apcc-authority-ipc-v1"
@@ -83,43 +91,18 @@ def recv_frame(connection: socket.socket, max_frame_bytes: int) -> Any:
     if size > max_frame_bytes:
         raise FrameProtocolError("frame_too_large")
     try:
-        value = json.loads(
-            recv_exact(connection, size).decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_constant,
+        return strict_loads(
+            recv_exact(connection, size), max_bytes=max_frame_bytes, max_depth=64
         )
-        pending: list[tuple[Any, int]] = [(value, 0)]
-        while pending:
-            item, depth = pending.pop()
-            if depth > 64:
-                raise ValueError("json_nesting_too_deep")
-            if isinstance(item, dict):
-                pending.extend((child, depth + 1) for child in item.values())
-            elif isinstance(item, list):
-                pending.extend((child, depth + 1) for child in item)
-        return value
-    except (
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        RecursionError,
-        ValueError,
-    ) as exc:
-        if isinstance(exc, FrameProtocolError):
-            raise
+    except StrictJSONError as exc:
         raise FrameProtocolError("malformed_json") from exc
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate_json_key")
-        result[key] = value
-    return result
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"nonfinite_json_constant:{value}")
+def raw_public_bytes(key: Ed25519PublicKey) -> bytes:
+    """Return the 32-byte raw encoding of one Ed25519 public key."""
+    if not isinstance(key, Ed25519PublicKey):
+        raise TypeError("raw_public_bytes requires an Ed25519PublicKey")
+    return key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
 def signed_response(

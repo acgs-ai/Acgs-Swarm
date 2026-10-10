@@ -1926,3 +1926,79 @@ class _FailController:
     def hit(self, point: str) -> None:
         if point == self.point:
             raise _InjectedFault(point)
+
+
+def assert_new_candidate_stage_binds_node_version_conforms(
+    harness: AuthorityStoreHarness, tmp_path: Path
+) -> None:
+    """A fresh-attempt stage whose claimed version differs from the node is refused.
+
+    Regression (apcc-stores-1): the authority used to persist the node version
+    but derive the sealed audit identity from the request's claim, so the store
+    sealed a state its own reopen validator rejected and could never reopen.
+    """
+    path = tmp_path / "stage-node-version-binding"
+    store = harness.open_store(path, None)
+    request = harness.make_request(commit_id="stage-node-version-binding", nonce_byte=71)
+    staged = harness.stage_request(request)
+    fresh_subject = replace(request.subject, attempt_id="fresh-version-attempt")
+    before = harness.snapshot(store)
+    with pytest.raises(ValueError, match=FailureCode.STAGED_RESULT_CONFLICT.value):
+        store.stage_result(
+            StageResultRequest(fresh_subject, "7", staged.result_bytes)
+        )
+    assert harness.snapshot(store) == before
+    reopened = harness.reopen_store(path)
+    accepted = reopened.stage_result(
+        StageResultRequest(
+            fresh_subject, staged.expected_node_version, staged.result_bytes
+        )
+    )
+    assert accepted.candidate_state.lifecycle is CandidateLifecycle.RESULT_STAGED
+    context = harness.reopen_store(path).read_commit_context(
+        CommitContextRequest(
+            fresh_subject.workflow_id,
+            fresh_subject.node_id,
+            fresh_subject.attempt_id,
+            fresh_subject.agent_id,
+        )
+    )
+    assert context.candidate_state.lifecycle is CandidateLifecycle.RESULT_STAGED
+    assert context.audit_event_id == accepted.audit_event_id
+
+
+def assert_certificate_revocation_binds_owning_workflow_conforms(
+    harness: AuthorityStoreHarness, tmp_path: Path
+) -> None:
+    """CERTIFICATE revocation naming a foreign workflow is refused (apcc-stores-3)."""
+    path = tmp_path / "certificate-revocation-workflow"
+    store = harness.open_store(path, None)
+    request = harness.make_request(commit_id="revocation-workflow", nonce_byte=72)
+    _stage(store, harness, request)
+    committed = store.atomic_commit(request)
+    assert committed.decision.outcome is RequestOutcome.COMMITTED
+    assert committed.certificate_digest is not None
+    foreign_workflow = request.subject.workflow_id + "-foreign"
+    before = harness.snapshot(store)
+    with pytest.raises(ValueError, match="does not belong to the revocation workflow"):
+        store.revoke(
+            RevocationRequest(
+                RevocationScope.CERTIFICATE,
+                foreign_workflow,
+                committed.certificate_digest,
+                "1",
+                "cross-workflow revocation",
+            )
+        )
+    assert harness.snapshot(store) == before
+    revoked = store.revoke(
+        RevocationRequest(
+            RevocationScope.CERTIFICATE,
+            request.subject.workflow_id,
+            committed.certificate_digest,
+            "1",
+            "owning-workflow revocation",
+        )
+    )
+    assert revoked.target_id == committed.certificate_digest
+    harness.reopen_store(path)

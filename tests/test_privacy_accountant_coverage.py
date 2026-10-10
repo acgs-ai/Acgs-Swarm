@@ -66,12 +66,13 @@ class TestRdpSubsampledGaussianBranches:
 
 
 class TestRdpToEpsilonBalle2020:
-    def test_all_alphas_skipped_returns_inf(self):
-        """Lines 121-126: all alphas <= 1.01 → best_eps stays inf."""
+    def test_order_just_above_one_is_used(self):
+        """Every mathematically valid finite order above one is converted."""
         from constitutional_swarm.privacy_accountant import _rdp_to_epsilon_balle2020
 
-        eps, _ = _rdp_to_epsilon_balle2020([0.1], [1.005], delta=1e-5)
-        assert eps == math.inf
+        eps, alpha = _rdp_to_epsilon_balle2020([0.1], [1.005], delta=1e-5)
+        assert math.isfinite(eps)
+        assert alpha == 1.005
 
     def test_normal_path_returns_finite(self):
         """Sanity: normal alpha > 1.01 path returns finite epsilon."""

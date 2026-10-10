@@ -6,12 +6,21 @@ from dataclasses import replace
 
 import pytest
 from acgs_lite import Constitution
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from constitutional_swarm import (
     ConstitutionalMesh,
     JSONLSettlementStore,
     ReconciliationReport,
+    SettlementPersistenceError,
     SettlementRecord,
 )
+from constitutional_swarm.mesh.vote_envelope import VoteSignerRegistry
+
+_STARTUP_ASSIGNER_ID = "startup-reconcile-assigner"
+
+
+def _startup_assigner_private_key() -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(bytes([250]) * 32)
 
 
 class _SelectiveFailingSettlementStore:
@@ -26,7 +35,10 @@ class _SelectiveFailingSettlementStore:
 
     def append(self, record: SettlementRecord) -> None:
         assignment_id = str(record.assignment["assignment_id"])
-        if assignment_id in self._failing_assignment_ids:
+        if (
+            "*" in self._failing_assignment_ids
+            or assignment_id in self._failing_assignment_ids
+        ):
             raise OSError(f"phase 2 commit failed for {assignment_id}")
         self._settled[assignment_id] = record
 
@@ -54,34 +66,48 @@ def _build_pending_record(
     *,
     seed: int,
     is_recovered: bool = False,
-) -> tuple[Constitution, SettlementRecord]:
+) -> tuple[Constitution, SettlementRecord, VoteSignerRegistry]:
     constitution = Constitution.default()
-    source_mesh = ConstitutionalMesh(constitution, seed=seed)
-    for i in range(5):
-        source_mesh.register_local_signer(f"agent-{i:02d}")
-
-    result = source_mesh.full_validation("agent-00", "safe output", artifact_id)
-    assignment = source_mesh._assignments[result.assignment_id]
-    record = SettlementRecord(
-        assignment=source_mesh._serialize_assignment(assignment),
-        result=source_mesh._serialize_result(result),
-        constitutional_hash=result.constitutional_hash,
-        is_recovered=is_recovered,
-        votes=source_mesh._vote_dicts(
-            source_mesh._votes.get(assignment.assignment_id, [])
-        ),
+    source_store = _SelectiveFailingSettlementStore(failing_assignment_ids={"*"})
+    vote_registry = VoteSignerRegistry()
+    assigner_private_key = _startup_assigner_private_key()
+    vote_registry.register(
+        _STARTUP_ASSIGNER_ID,
+        assigner_private_key.public_key(),
+        roles={"assigner"},
     )
-    if not is_recovered:
-        record = replace(
-            record,
-            assignment={**record.assignment, "is_recovered": False},
+    source_mesh = ConstitutionalMesh(
+        constitution,
+        seed=seed,
+        settlement_store=source_store,
+        quorum=3,
+        vote_registry=vote_registry,
+        assigner_private_key=assigner_private_key,
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
+    )
+    for i in range(5):
+        source_mesh.register_local_signer(
+            f"agent-{i:02d}",
+            vote_private_key=Ed25519PrivateKey.from_private_bytes(bytes([i + 1]) * 32),
         )
-    return constitution, record
+
+    with pytest.raises(SettlementPersistenceError):
+        source_mesh.full_validation("agent-00", "safe output", artifact_id)
+    pending = source_store.load_pending()[0]
+    record = replace(
+        pending,
+        is_recovered=is_recovered,
+        assignment={**pending.assignment, "is_recovered": is_recovered},
+    )
+    return constitution, record, source_mesh.vote_registry
 
 
 def test_reconcile_pending_settlements_reports_empty_store(tmp_path) -> None:
     store = JSONLSettlementStore(tmp_path / "mesh-empty.jsonl")
-    mesh = ConstitutionalMesh(Constitution.default(), seed=201, settlement_store=store)
+    mesh = ConstitutionalMesh(
+        Constitution.default(), seed=201, settlement_store=store, quorum=3
+    )
 
     report = mesh.reconcile_pending_settlements()
 
@@ -89,7 +115,7 @@ def test_reconcile_pending_settlements_reports_empty_store(tmp_path) -> None:
 
 
 def test_reconcile_pending_settlements_skips_recovered_pending_record(tmp_path) -> None:
-    constitution, record = _build_pending_record(
+    constitution, record, vote_registry = _build_pending_record(
         "art-reconcile-recovered",
         seed=202,
         is_recovered=True,
@@ -101,7 +127,12 @@ def test_reconcile_pending_settlements_skips_recovered_pending_record(tmp_path) 
         constitution,
         seed=203,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=vote_registry,
+        assigner_private_key=_startup_assigner_private_key(),
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
 
@@ -115,7 +146,7 @@ def test_reconcile_pending_settlements_skips_recovered_pending_record(tmp_path) 
 
 
 def test_reconcile_pending_settlements_settles_unrecovered_pending_record(tmp_path) -> None:
-    constitution, record = _build_pending_record(
+    constitution, record, vote_registry = _build_pending_record(
         "art-reconcile-unrecovered",
         seed=204,
         is_recovered=False,
@@ -127,7 +158,12 @@ def test_reconcile_pending_settlements_settles_unrecovered_pending_record(tmp_pa
         constitution,
         seed=205,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=vote_registry,
+        assigner_private_key=_startup_assigner_private_key(),
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
     )
     report = mesh.reconcile_pending_settlements()
     restored = mesh.get_result(str(record.assignment["assignment_id"]))
@@ -147,7 +183,7 @@ def test_reconcile_pending_settlements_settles_unrecovered_pending_record(tmp_pa
 
 
 def test_auto_reconcile_false_defers_until_manual_call(tmp_path) -> None:
-    constitution, record = _build_pending_record(
+    constitution, record, vote_registry = _build_pending_record(
         "art-reconcile-manual",
         seed=206,
         is_recovered=False,
@@ -159,7 +195,12 @@ def test_auto_reconcile_false_defers_until_manual_call(tmp_path) -> None:
         constitution,
         seed=207,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=vote_registry,
+        assigner_private_key=_startup_assigner_private_key(),
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
     )
 
     with pytest.raises(KeyError):
@@ -178,12 +219,12 @@ def test_auto_reconcile_false_defers_until_manual_call(tmp_path) -> None:
 
 
 def test_reconcile_pending_settlements_captures_failures_and_continues() -> None:
-    constitution, failing_record = _build_pending_record(
+    constitution, failing_record, vote_registry = _build_pending_record(
         "art-reconcile-fail",
         seed=208,
         is_recovered=False,
     )
-    _, succeeding_record = _build_pending_record(
+    _, succeeding_record, _ = _build_pending_record(
         "art-reconcile-success",
         seed=209,
         is_recovered=False,
@@ -198,7 +239,12 @@ def test_reconcile_pending_settlements_captures_failures_and_continues() -> None
         constitution,
         seed=210,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=vote_registry,
+        assigner_private_key=_startup_assigner_private_key(),
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
     )
 
     report = mesh.reconcile_pending_settlements()
@@ -215,7 +261,7 @@ def test_reconcile_pending_settlements_captures_failures_and_continues() -> None
 
 
 def test_reconcile_pending_settlements_is_idempotent(tmp_path) -> None:
-    constitution, record = _build_pending_record(
+    constitution, record, vote_registry = _build_pending_record(
         "art-reconcile-idempotent",
         seed=211,
         is_recovered=False,
@@ -226,7 +272,12 @@ def test_reconcile_pending_settlements_is_idempotent(tmp_path) -> None:
         constitution,
         seed=212,
         settlement_store=store,
+        quorum=3,
         auto_reconcile=False,
+        vote_registry=vote_registry,
+        assigner_private_key=_startup_assigner_private_key(),
+        assigner_id=_STARTUP_ASSIGNER_ID,
+        evidence_mode="single_operator_dev",
     )
 
     first_report = mesh.reconcile_pending_settlements()

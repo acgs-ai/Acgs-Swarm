@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -55,10 +56,17 @@ if TYPE_CHECKING:
 
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH as _CONSTITUTIONAL_HASH
 from constitutional_swarm.debate_resolver import (
+    AUTO_CHALLENGER_ID,
     DebateResolver,
+    DebateRole,
     FinalVerdict,
+    Proposal,
     VerdictOutcome,
 )
+
+# A challenge provider returns real reviewer challenges for one proposal as
+# ``(challenger_id, objection, severity)``; challenger ids must be registered.
+ChallengeProvider = Callable[[Proposal], Iterable[tuple[str, str, float]]]
 
 # ---------------------------------------------------------------------------
 # Events and audit
@@ -76,6 +84,7 @@ class PipelineEventType(Enum):
     HASH_VERIFIED = "hash_verified"
     HASH_MISMATCH = "hash_mismatch"
     CYCLE_COMPLETE = "cycle_complete"
+    CYCLE_ABORTED = "cycle_aborted"
 
 
 @dataclass
@@ -166,9 +175,12 @@ class MacAcgsConfig:
         constitutional_hash:      Hash enforced at every constitution update.
         debate_approval_threshold: Min approval score for rule acceptance.
         debate_min_challenges:    Challenger quorum for debate resolution.
-        auto_challenge:           If True, pipeline auto-generates a Devil's
-                                  Advocate challenge for every proposal.
-        auto_defend:              If True, pipeline auto-generates a defense.
+        auto_challenge:           If True, pipeline records a synthetic Devil's
+                                  Advocate challenge (``AUTO_CHALLENGER_ID``)
+                                  for every proposal. It never counts toward
+                                  quorum, so it cannot approve anything.
+        auto_defend:              If True, pipeline auto-generates a proposer
+                                  defense.
         max_updates_per_cycle:    Cap on constitutional updates per cycle.
         audit_log_size:           Maximum audit log entries.
         came_config:              Config forwarded to CAMECoordinator.
@@ -177,8 +189,8 @@ class MacAcgsConfig:
     constitutional_hash: str = _CONSTITUTIONAL_HASH
     debate_approval_threshold: float = 0.6
     debate_min_challenges: int = 1
-    auto_challenge: bool = True
-    auto_defend: bool = True
+    auto_challenge: bool = False
+    auto_defend: bool = False
     max_updates_per_cycle: int = 5
     audit_log_size: int = 5000
     came_config: CAMECoordinatorConfig = field(default_factory=_default_came_config)
@@ -239,9 +251,14 @@ class MacAcgsLoop:
     Wires together CAME evolution → adversarial debate → constitutional
     update in a single `run_cycle()` call.
 
+    Rules are approved only through challenges from registered external
+    challengers supplied by ``challenge_provider``; synthetic auto-challenges
+    are never counted, so with no provider every proposal deadlocks.
+
     Usage::
 
-        loop = MacAcgsLoop()
+        loop = MacAcgsLoop(challenge_provider=review_queue.challenges_for)
+        loop.add_external_challenger("human-reviewer-1")
 
         # Each cycle: submit observations, get constitution updates
         from constitutional_swarm.bittensor.map_elites import MinerApproach
@@ -251,9 +268,6 @@ class MacAcgsLoop:
         print(result.proposals_approved)      # rules that passed debate
         print(result.constitution_updates)    # committed rule changes
 
-        # Add human challengers before running cycle
-        loop.add_external_challenger("human-reviewer-1")
-
         # Review audit log
         for event in loop.audit_log():
             print(event["event_type"], event["details"])
@@ -261,7 +275,9 @@ class MacAcgsLoop:
     Args:
         config: MacAcgsConfig (default: sensible defaults).
         came: Optional pre-built CAMECoordinator.
-        debate: Optional pre-built DebateResolver.
+        debate: Optional pre-built DebateResolver; its constitutional hash must
+            equal ``config.constitutional_hash``.
+        challenge_provider: Optional source of real reviewer challenges.
     """
 
     def __init__(
@@ -270,8 +286,20 @@ class MacAcgsLoop:
         *,
         came: CAMECoordinator | None = None,
         debate: DebateResolver | None = None,
+        challenge_provider: ChallengeProvider | None = None,
     ) -> None:
         self._config = config or MacAcgsConfig()
+        if debate is not None and (
+            debate.constitutional_hash != self._config.constitutional_hash
+        ):
+            raise ValueError(
+                "injected DebateResolver constitutional hash "
+                f"{debate.constitutional_hash!r} != config hash "
+                f"{self._config.constitutional_hash!r}"
+            )
+        if challenge_provider is not None and not callable(challenge_provider):
+            raise ValueError("challenge_provider must be callable or None")
+        self._challenge_provider = challenge_provider
         if came is None:
             from constitutional_swarm.bittensor.came_coordinator import CAMECoordinator
 
@@ -293,10 +321,11 @@ class MacAcgsLoop:
     def add_external_challenger(self, agent_id: str) -> None:
         """Register an external challenger (human reviewer or validator).
 
-        External challengers are used in auto-challenge mode: the pipeline
-        attributes auto-generated challenges to the first registered challenger
-        (or 'auto-challenger' if none registered).
+        Grants the CHALLENGER role in the debate registry so challenges this
+        reviewer submits through ``challenge_provider`` count toward quorum.
+        Synthetic auto-challenges are never attributed to registered reviewers.
         """
+        self._debate.register_participant(agent_id, DebateRole.CHALLENGER)
         self._external_challengers.append(agent_id)
 
     # ── Main cycle ───────────────────────────────────────────────────────
@@ -403,7 +432,7 @@ class MacAcgsLoop:
 
                 # Open debate
                 try:
-                    self._debate.propose(
+                    proposal = self._debate.propose(
                         proposal_id=pid,
                         proposer_id=proposer_id,
                         domain="constitutional-evolution",
@@ -423,13 +452,40 @@ class MacAcgsLoop:
                 except ValueError:
                     continue  # duplicate pid (shouldn't happen with uuid)
 
-                # Auto-challenge
+                # Real reviewer challenges (registered identities only). A
+                # provider failure or unregistered identity aborts the cycle
+                # loudly, after the abort is recorded in the audit log.
+                if self._challenge_provider is not None:
+                    try:
+                        for challenger_id, objection, severity in self._challenge_provider(
+                            proposal
+                        ):
+                            self._debate.challenge(
+                                proposal_id=pid,
+                                challenger_id=challenger_id,
+                                objection=objection,
+                                severity=severity,
+                            )
+                    except Exception as exc:
+                        events.append(
+                            self._event(
+                                PipelineEventType.CYCLE_ABORTED,
+                                cycle,
+                                {
+                                    "proposal_id": pid,
+                                    "stage": "challenge_provider",
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc)[:200],
+                                    "proposals_opened": proposals_opened,
+                                    "updates_committed": len(updates),
+                                },
+                            )
+                        )
+                        self._persist_events(events)
+                        raise
+
+                # Synthetic challenge: recorded under a fixed id, never counted.
                 if self._config.auto_challenge:
-                    challenger_id = (
-                        self._external_challengers[i % len(self._external_challengers)]
-                        if self._external_challengers
-                        else "auto-challenger"
-                    )
                     objection = (
                         f"Auto-generated Devil's Advocate challenge for proposal {pid}: "
                         f"Does this rule improve constitutional consistency "
@@ -437,9 +493,9 @@ class MacAcgsLoop:
                     )
                     self._debate.challenge(
                         proposal_id=pid,
-                        challenger_id=challenger_id,
+                        challenger_id=AUTO_CHALLENGER_ID,
                         objection=objection,
-                        severity=0.10,  # low severity; auto-challenge + 1 defense clears threshold
+                        severity=0.10,
                     )
 
                 # Auto-defend
@@ -508,10 +564,7 @@ class MacAcgsLoop:
             )
         )
 
-        # Persist events
-        self._audit_log.extend(events)
-        if len(self._audit_log) > self._config.audit_log_size:
-            self._audit_log = self._audit_log[-self._config.audit_log_size :]
+        self._persist_events(events)
 
         return MacAcgsCycleResult(
             cycle_number=cycle,
@@ -560,8 +613,21 @@ class MacAcgsLoop:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _verify_hash(self) -> bool:
-        """Verify the constitutional hash is intact (fail-closed gate)."""
-        return self._config.constitutional_hash == _CONSTITUTIONAL_HASH
+        """Verify the constitutional hash is intact (fail-closed gate).
+
+        The config must carry the pinned hash and the debate resolver that
+        seals verdicts must enforce that same hash.
+        """
+        return (
+            self._config.constitutional_hash == _CONSTITUTIONAL_HASH
+            and self._debate.constitutional_hash == self._config.constitutional_hash
+        )
+
+    def _persist_events(self, events: list[PipelineEvent]) -> None:
+        """Append cycle events to the bounded audit log."""
+        self._audit_log.extend(events)
+        if len(self._audit_log) > self._config.audit_log_size:
+            self._audit_log = self._audit_log[-self._config.audit_log_size :]
 
     def _event(
         self,

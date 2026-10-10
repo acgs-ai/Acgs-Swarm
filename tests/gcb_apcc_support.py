@@ -34,6 +34,7 @@ from constitutional_swarm.authority_child import (
     KeySourceRef,
     OutboxSinkRef,
 )
+from constitutional_swarm.swarm import workflow_bindings
 
 
 def _seed(label: str) -> bytes:
@@ -249,27 +250,7 @@ def provision_executor_workflow(
     admin: object, dag: object, *, policy_version: str
 ) -> None:
     """Provision exact executor bindings through the trusted test admin."""
-    nodes = dag.nodes  # type: ignore[attr-defined]
-    topology = {node_id: node.depends_on for node_id, node in nodes.items()}
-    capabilities = {
-        node_id: node.required_capabilities for node_id, node in nodes.items()
-    }
-    input_digests = {
-        node_id: hashlib.sha256(
-            json.dumps(
-                {
-                    "title": node.title,
-                    "description": node.description,
-                    "domain": node.domain,
-                    "required_capabilities": node.required_capabilities,
-                    "depends_on": node.depends_on,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        for node_id, node in nodes.items()
-    }
+    topology, capabilities, input_digests = workflow_bindings(dag)  # type: ignore[arg-type]
     admin.create_workflow(  # type: ignore[attr-defined]
         workflow_id=dag.dag_id,  # type: ignore[attr-defined]
         nodes=topology,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -12,6 +14,7 @@ from constitutional_swarm.swe_bench.local_harness import (
     LocalSWEBenchHarness,
     _as_list,
     _parse_pytest_summary,
+    _safe_id,
 )
 
 _INSTANCE = {
@@ -20,6 +23,7 @@ _INSTANCE = {
     "base_commit": "deadbeef",
     "FAIL_TO_PASS": ["tests/test_demo.py::test_thing"],
     "PASS_TO_PASS": ["tests/test_demo.py::test_other"],
+    "test_patch": "1\t1\ttests/test_demo.py\0",
 }
 
 _PATCH = """\
@@ -30,9 +34,18 @@ _PATCH = """\
 +fixed
 """
 
+_PYTEST_THING_PASSED = (
+    "PASSED tests/test_demo.py::test_thing\n"
+    "============================== 1 passed in 0.01s =============================="
+)
+_PYTEST_OTHER_PASSED = (
+    "PASSED tests/test_demo.py::test_other\n"
+    "============================== 1 passed in 0.01s =============================="
+)
+
 
 class _FakeRunner:
-    """Scriptable ``subprocess.run`` replacement keyed by command prefix."""
+    """Scriptable shared process-runner replacement keyed by command prefix."""
 
     def __init__(self, scripts: list[tuple[list[str], int, str]]):
         self.scripts = list(scripts)
@@ -43,24 +56,45 @@ class _FakeRunner:
         cmd: list[str],
         *,
         cwd: Any = None,
-        input: Any = None,
-        capture_output: bool = False,
-        text: bool = False,
-        timeout: Any = None,
-        check: bool = False,
+        input_text: Any = None,
+        timeout_s: Any = None,
+        env: Any = None,
     ) -> subprocess.CompletedProcess:
         self.calls.append(list(cmd))
+        if "--numstat" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "1\t1\ttests/test_demo.py\0", "")
         for i, (prefix, rc, out) in enumerate(self.scripts):
             if _matches(cmd, prefix):
                 self.scripts.pop(i)
+                if "--junitxml" in cmd and rc == 0 and "PASSED" in out:
+                    _write_passing_junit(cmd)
                 return subprocess.CompletedProcess(cmd, rc, out, "")
         # Unmatched → treat as success no-op (keeps tests tolerant to extras).
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
 def _matches(cmd: list[str], prefix: list[str]) -> bool:
-    joined = " ".join(cmd)
-    return all(tok in joined for tok in prefix)
+    """Match exact argv elements in order, allowing unrelated arguments between them."""
+    position = 0
+    for token in prefix:
+        try:
+            position = cmd.index(token, position) + 1
+        except ValueError:
+            return False
+    return True
+
+
+def _write_passing_junit(cmd: list[str]) -> None:
+    """Materialize the authoritative artifact produced by a successful pytest run."""
+    test_id = cmd[-1]
+    parts = test_id.split("::")
+    attributes = {"file": parts[0], "name": parts[-1]}
+    if len(parts) > 2:
+        attributes["classname"] = ".".join(parts[1:-1])
+    suite = ET.Element("testsuite")
+    ET.SubElement(suite, "testcase", attributes)
+    junit_path = Path(cmd[cmd.index("--junitxml") + 1])
+    ET.ElementTree(suite).write(junit_path, encoding="unicode")
 
 
 def test_parse_pytest_summary_mixed_counts() -> None:
@@ -116,15 +150,15 @@ def test_harness_resolves_when_all_tests_pass(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
-            (["pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            (["pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is True
@@ -138,15 +172,15 @@ def test_harness_not_resolved_when_fail_to_pass_still_failing(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
-            (["pytest", "test_thing"], 1, "== 1 failed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_thing"], 1, "== 1 failed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is False
@@ -157,16 +191,16 @@ def test_harness_apply_failure_falls_back_to_3way(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 1, "strict apply rejected"),
             (["apply", "--3way"], 0, ""),
-            (["pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            (["pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is True
@@ -176,64 +210,62 @@ def test_harness_apply_falls_back_to_recount(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 1, "error: corrupt patch at line 11"),
             (["apply", "--index", "--recount"], 0, ""),
-            (["pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            (["pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is True
 
 
-def test_harness_apply_falls_back_to_patch1(tmp_path) -> None:
-    """When all `git apply` variants fail (context drift), patch(1) with fuzz saves us."""
+def test_harness_apply_has_no_patch1_fallback(tmp_path) -> None:
+    """When all `git apply` variants fail, the harness fails closed: there is no
+    patch(1) fuzz fallback (its header parsing can write .git metadata or
+    git-ignored files and hide changes from the pytest-control gate)."""
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 1, "error: patch failed"),
             (["apply", "--index", "--recount"], 1, "error: patch failed"),
             (["apply", "--3way"], 1, "error: patch failed"),
-            (["patch", "-p1", "--forward", "--fuzz=3"], 0, "patching file foo.py\n"),
-            (["git", "add", "-A"], 0, ""),
-            (["pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
         ]
     )
     with (
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
         patch(
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/patch",
         ),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
-    assert result.applied is True
-    assert result.resolved is True
+    assert result.applied is False
+    assert result.resolved is False
+    assert result.error == "patch did not apply"
 
 
 def test_harness_apply_failure_reports_cleanly(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 1, "rej1"),
             (["apply", "--index", "--recount"], 1, "rej_recount"),
             (["apply", "--3way"], 1, "rej2"),
-            (["patch", "-p1"], 1, "patch1 rejected"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is False
     assert result.resolved is False
@@ -245,15 +277,15 @@ def test_harness_env_error_counts_requested_tests_as_failed(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
-            (["pytest", "test_thing"], 2, "ERROR: no module named 'django'"),
-            (["pytest", "test_other"], 2, "ERROR: no module named 'django'"),
+            (["pytest", "tests/test_demo.py::test_thing"], 2, "ERROR: no module named 'django'"),
+            (["pytest", "tests/test_demo.py::test_other"], 2, "ERROR: no module named 'django'"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is False
@@ -265,17 +297,17 @@ def test_harness_checkout_retries_after_fetching_commit(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 1, "unknown revision"),
             (["fetch", "origin", "deadbeef"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
-            (["pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            (["pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            (["pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is True
@@ -285,10 +317,10 @@ def test_harness_clone_failure_stops_pipeline(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 128, "fatal: repository not found"),
+            (["clone", "https://github.com/demo/demo.git"], 128, "fatal: repository not found"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.stage == "clone"
     assert result.applied is False
@@ -298,20 +330,27 @@ def test_harness_clone_failure_stops_pipeline(tmp_path) -> None:
 def test_harness_env_isolation_uses_venv_python(tmp_path) -> None:
     """With env_isolation=True, pytest runs through the venv's python, not the host interpreter."""
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True)
+    venv_python = str(
+        tmp_path
+        / "venvs"
+        / _safe_id(_INSTANCE["instance_id"], field_name="instance_id")
+        / "bin"
+        / "python"
+    )
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
             (["-m", "venv"], 0, ""),
             (["pip", "install", "--quiet", "--upgrade"], 0, ""),
             (["pip", "install", "--quiet"], 0, ""),
-            (["/bin/python", "-m", "pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["/bin/python", "-m", "pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            ([venv_python, "-m", "pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            ([venv_python, "-m", "pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is True
@@ -325,7 +364,7 @@ def test_harness_env_isolation_install_failure_is_reported(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True)
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -334,7 +373,7 @@ def test_harness_env_isolation_install_failure_is_reported(tmp_path) -> None:
             (["pip", "install", "--quiet"], 1, "ERROR: could not build wheel"),
         ]
     )
-    with patch("subprocess.run", side_effect=runner):
+    with patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
     assert result.resolved is False
@@ -346,9 +385,16 @@ def test_harness_env_isolation_install_failure_is_reported(tmp_path) -> None:
 def test_harness_env_isolation_uses_uv_for_python_version(tmp_path) -> None:
     """With python_version set, harness uses `uv python install` + `uv venv --python`."""
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True, python_version="3.10")
+    venv_python = str(
+        tmp_path
+        / "venvs"
+        / _safe_id(_INSTANCE["instance_id"], field_name="instance_id")
+        / "bin"
+        / "python"
+    )
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -356,8 +402,8 @@ def test_harness_env_isolation_uses_uv_for_python_version(tmp_path) -> None:
             (["uv", "venv", "--seed", "--python", "3.10"], 0, ""),
             (["pip", "install", "--quiet", "--upgrade"], 0, ""),
             (["pip", "install", "--quiet"], 0, ""),
-            (["/bin/python", "-m", "pytest", "test_thing"], 0, "== 1 passed in 0.01s =="),
-            (["/bin/python", "-m", "pytest", "test_other"], 0, "== 1 passed in 0.01s =="),
+            ([venv_python, "-m", "pytest", "tests/test_demo.py::test_thing"], 0, _PYTEST_THING_PASSED),
+            ([venv_python, "-m", "pytest", "tests/test_demo.py::test_other"], 0, _PYTEST_OTHER_PASSED),
         ]
     )
     with (
@@ -365,7 +411,7 @@ def test_harness_env_isolation_uses_uv_for_python_version(tmp_path) -> None:
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value="/usr/bin/uv",
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
@@ -382,7 +428,7 @@ def test_harness_env_isolation_uv_missing_is_reported(tmp_path) -> None:
     harness = LocalSWEBenchHarness(work_dir=tmp_path, env_isolation=True, python_version="3.10")
     runner = _FakeRunner(
         [
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
@@ -393,7 +439,7 @@ def test_harness_env_isolation_uv_missing_is_reported(tmp_path) -> None:
             "constitutional_swarm.swe_bench.local_harness.shutil.which",
             return_value=None,
         ),
-        patch("subprocess.run", side_effect=runner),
+        patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner),
     ):
         result = harness.evaluate(_INSTANCE, patch=_PATCH)
     assert result.applied is True
@@ -452,15 +498,15 @@ def test_parse_django_summary_ok_and_failed() -> None:
     assert _parse_django_summary(ok) == (6, 0)
 
     mixed = ".F.E..\n----------\nRan 6 tests in 0.42s\n\nFAILED (failures=1, errors=1, skipped=2)\n"
-    # 6 total - (1 failure + 1 error) = 4 passed
-    assert _parse_django_summary(mixed) == (4, 2)
+    # Required tests only pass with an explicit pass status; skips are failures.
+    assert _parse_django_summary(mixed) == (2, 4)
 
     # No summary block (crash) → (0, 0), caller decides
     assert _parse_django_summary("segfault!\n") == (0, 0)
 
-    # OK with skips — skipped are not failures
+    # OK with skips still means the skipped required tests did not pass.
     ok_skip = "Ran 5 tests in 0.10s\n\nOK (skipped=2)\n"
-    assert _parse_django_summary(ok_skip) == (5, 0)
+    assert _parse_django_summary(ok_skip) == (3, 2)
 
 
 def test_harness_django_instance_uses_runtests_not_pytest(tmp_path) -> None:
@@ -470,7 +516,9 @@ def test_harness_django_instance_uses_runtests_not_pytest(tmp_path) -> None:
     # Make the worktree look like django/django BEFORE clone happens —
     # the FakeRunner doesn't actually execute git, so we pre-create the
     # worktree path the harness will then adopt.
-    worktree = harness.work_dir / "django__django-10914"
+    worktree = harness.work_dir / _safe_id(
+        "django__django-10914", field_name="instance_id"
+    )
     worktree.mkdir(parents=True)
     (worktree / "tests").mkdir()
     (worktree / "tests" / "runtests.py").write_text("# django\n")
@@ -481,9 +529,17 @@ def test_harness_django_instance_uses_runtests_not_pytest(tmp_path) -> None:
         "base_commit": "cafef00d",
         "FAIL_TO_PASS": ["test_utils.tests.OverrideSettingsTests.test_foo"],
         "PASS_TO_PASS": ["test_utils.tests.OverrideSettingsTests.test_bar"],
+        "test_patch": "1\t1\ttests/test_demo.py\0",
     }
 
-    django_ok = "Ran 1 test in 0.10s\n\nOK\n"
+    django_foo_ok = (
+        "test_foo (test_utils.tests.OverrideSettingsTests.test_foo) ... ok\n"
+        "Ran 1 test in 0.10s\n\nOK\n"
+    )
+    django_bar_ok = (
+        "test_bar (test_utils.tests.OverrideSettingsTests.test_bar) ... ok\n"
+        "Ran 1 test in 0.10s\n\nOK\n"
+    )
 
     runner = _FakeRunner(
         [
@@ -493,12 +549,12 @@ def test_harness_django_instance_uses_runtests_not_pytest(tmp_path) -> None:
             # the clone no-op (FakeRunner returns rc=0 with no fs change)
             # and re-seed after. Instead, short-circuit: set keep_worktree
             # and pre-seed, then make the clone & checkout pass by matching.
-            (["clone", "https://github.com"], 0, ""),
+            (["clone", "https://github.com/demo/demo.git"], 0, ""),
             (["clone", "--no-hardlinks"], 0, ""),
             (["checkout", "--detach"], 0, ""),
             (["apply", "--index"], 0, ""),
-            (["tests/runtests.py", "test_foo"], 0, django_ok),
-            (["tests/runtests.py", "test_bar"], 0, django_ok),
+            (["tests/runtests.py", "test_utils.tests.OverrideSettingsTests.test_foo"], 0, django_foo_ok),
+            (["tests/runtests.py", "test_utils.tests.OverrideSettingsTests.test_bar"], 0, django_bar_ok),
         ]
     )
     # Pre-seed will be wiped by evaluate's rmtree; we work around by
@@ -506,7 +562,7 @@ def test_harness_django_instance_uses_runtests_not_pytest(tmp_path) -> None:
     # FakeRunner tolerant so unmatched calls are no-ops.
     import constitutional_swarm.swe_bench.local_harness as lh
 
-    with patch.object(lh.shutil, "rmtree"), patch("subprocess.run", side_effect=runner):
+    with patch.object(lh.shutil, "rmtree"), patch("constitutional_swarm.swe_bench.local_harness._run_process", side_effect=runner):
         result = harness.evaluate(instance, patch=_PATCH)
 
     assert result.applied is True

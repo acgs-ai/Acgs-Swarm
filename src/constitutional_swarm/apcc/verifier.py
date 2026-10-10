@@ -5,13 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .codec import (
     CodecError,
+    DetachedEnvelope,
+    _decode_envelope_certificate,
     canonical_statement,
-    decode_certificate,
-    decode_envelope,
     encode_authority_status_body,
     normalize_authority_status,
 )
@@ -42,6 +42,8 @@ class VerificationResult:
     ok: bool
     code: FailureCode | None = None
     certificate: CommitCertificate | None = None
+    certificate_digest: str | None = None
+    """Verified SHA-256 of the exact canonical certificate payload bytes."""
 
 
 class PredecessorResolver(Protocol):
@@ -57,6 +59,10 @@ class CausalClosureLimits:
     max_depth: int = 64
     max_certificates: int = 4096
     max_total_bytes: int = 64 * 1024 * 1024
+
+
+_MAX_CAUSAL_DEPTH = 512
+"""Upper bound on ``CausalClosureLimits.max_depth``; keeps the DFS recursion-safe."""
 
 
 class TrustRole(StrEnum):
@@ -400,11 +406,24 @@ def _bindings(certificate: CommitCertificate) -> FailureCode | None:
 
 def verify_historical(envelope: bytes, *, trust: ScopedTrust) -> VerificationResult:
     """Verify a canonical certificate as evidence of a historical commit."""
+    return _verify_historical_detached(envelope, trust=trust)[0]
+
+
+def _verify_historical_detached(
+    envelope: bytes, *, trust: ScopedTrust
+) -> tuple[VerificationResult, DetachedEnvelope | None]:
+    """Verify history from one decode; return the envelope only on success."""
     try:
-        detached = decode_envelope(envelope)
-        certificate = decode_certificate(detached.payload)
+        detached, certificate = _decode_envelope_certificate(envelope)
     except CodecError as exc:
-        return _failure(exc.code)
+        return _failure(exc.code), None
+    result = _verify_decoded_historical(detached, certificate, trust)
+    return result, detached if result.ok else None
+
+
+def _verify_decoded_historical(
+    detached: DetachedEnvelope, certificate: CommitCertificate, trust: ScopedTrust
+) -> VerificationResult:
     if sha256_digest(detached.payload) != detached.payload_sha256:
         return _failure(FailureCode.INVALID_COMMIT_SEAL)
     header_error = _header(certificate)
@@ -428,7 +447,9 @@ def verify_historical(envelope: bytes, *, trust: ScopedTrust) -> VerificationRes
     binding_error = _bindings(certificate)
     if binding_error is not None:
         return _failure(binding_error)
-    return VerificationResult(True, certificate=certificate)
+    return VerificationResult(
+        True, certificate=certificate, certificate_digest=detached.payload_sha256
+    )
 
 
 def _predecessor_identity(
@@ -483,6 +504,7 @@ def verify_causal_closure(
             or type(max_certificates) is not int
             or type(max_total_bytes) is not int
             or max_depth < 0
+            or max_depth > _MAX_CAUSAL_DEPTH
             or max_certificates < 1
             or max_total_bytes < 1
         )
@@ -492,11 +514,8 @@ def verify_causal_closure(
         return _failure(FailureCode.SIZE_LIMIT_EXCEEDED)
     if len(envelope) > limits.max_total_bytes:
         return _failure(FailureCode.SIZE_LIMIT_EXCEEDED)
-    assert root.certificate is not None
-    try:
-        root_digest = decode_envelope(envelope).payload_sha256
-    except CodecError as exc:
-        return _failure(exc.code)
+    assert root.certificate is not None and root.certificate_digest is not None
+    root_digest = root.certificate_digest
     cache: dict[str, CommitCertificate] = {root_digest: root.certificate}
     active: set[str] = {root_digest}
     complete: set[str] = set()
@@ -524,13 +543,11 @@ def verify_causal_closure(
                 if total_bytes + len(predecessor_bytes) > limits.max_total_bytes:
                     return FailureCode.SIZE_LIMIT_EXCEEDED
                 historical = verify_historical(predecessor_bytes, trust=trust)
-                if not historical.ok or historical.certificate is None:
-                    return FailureCode.INVALID_PREDECESSOR
-                try:
-                    detached = decode_envelope(predecessor_bytes)
-                except CodecError:
-                    return FailureCode.INVALID_PREDECESSOR
-                if detached.payload_sha256 != digest:
+                if (
+                    not historical.ok
+                    or historical.certificate is None
+                    or historical.certificate_digest != digest
+                ):
                     return FailureCode.INVALID_PREDECESSOR
                 resolved = historical.certificate
                 cache[digest] = resolved
@@ -594,6 +611,35 @@ def verify_current(
     maximum_staleness_ms: str,
 ) -> VerificationResult:
     """Verify history plus the sole APCC v1 current-consumption status."""
+    return _verify_current_status(
+        lambda: verify_historical(envelope, trust=trust),
+        trust=trust,
+        authority_status=authority_status,
+        request_nonce=request_nonce,
+        now_ms=now_ms,
+        highest_trust_log_sequence=highest_trust_log_sequence,
+        highest_trust_log_head=highest_trust_log_head,
+        maximum_staleness_ms=maximum_staleness_ms,
+    )
+
+
+def _verify_current_status(
+    historical_result: Callable[[], VerificationResult],
+    *,
+    trust: ScopedTrust,
+    authority_status: AuthorityStatus | Mapping[str, object] | bytes | None,
+    request_nonce: str,
+    now_ms: str,
+    highest_trust_log_sequence: str,
+    highest_trust_log_head: str,
+    maximum_staleness_ms: str,
+) -> VerificationResult:
+    """Run every ``verify_current`` check in order with an injected history step.
+
+    ``historical_result`` runs exactly where ``verify_current`` verifies history,
+    so a caller holding an already-verified result reuses it without changing
+    failure-code precedence.
+    """
     try:
         b64u_decode(request_nonce, expected_length=16)
         b64u_decode(highest_trust_log_head, expected_length=32)
@@ -604,11 +650,11 @@ def verify_current(
     maximum_staleness = _decimal_argument(maximum_staleness_ms)
     if now is None or highest is None or maximum_staleness is None:
         return _failure(FailureCode.INVALID_DECIMAL_STRING)
-    historical = verify_historical(envelope, trust=trust)
+    historical = historical_result()
     if not historical.ok:
         return historical
     certificate = historical.certificate
-    assert certificate is not None
+    assert certificate is not None and historical.certificate_digest is not None
     if authority_status is None:
         return _failure(FailureCode.AUTHORITY_STATUS_REQUIRED)
     try:
@@ -639,7 +685,7 @@ def verify_current(
         return _failure(FailureCode.AUTHORITY_STATUS_INVALID_SIGNATURE)
     if status.request_nonce != request_nonce:
         return _failure(FailureCode.AUTHORITY_STATUS_NONCE_MISMATCH)
-    if status.certificate_digest != certificate.canonical_digest:
+    if status.certificate_digest != historical.certificate_digest:
         return _failure(FailureCode.AUTHORITY_STATUS_CERTIFICATE_MISMATCH)
     if status.certificate_sequence != certificate.header.certificate_sequence:
         return _failure(FailureCode.AUTHORITY_STATUS_CERTIFICATE_MISMATCH)
@@ -669,7 +715,7 @@ def verify_current(
         return _failure(FailureCode.AUTHORITY_STATUS_REVOKED)
     if status.superseded != "no":
         return _failure(FailureCode.AUTHORITY_STATUS_SUPERSEDED)
-    return VerificationResult(True, certificate=certificate)
+    return historical
 
 
 __all__ = [

@@ -159,38 +159,16 @@ class SWEBenchHarness:
         Keys
         ----
         total:              Number of tasks attempted.
-        resolved:           Tasks where success=True (non-empty patch).
-        resolve_rate:       resolved / total.
+        patch_generated:    Tasks with a non-empty generated patch.
+        patch_rate:         patch_generated / total.
+        resolved:           Deprecated alias of patch_generated.
+        resolve_rate:       Deprecated alias of patch_rate.
+        evaluation_mode:    ``"patch_generation_only"``.
         governed_count:     Tasks where wrapper was active.
         mean_intervention:  Mean intervention_rate across governed tasks.
         mean_duration_s:    Mean wall-clock time per task.
         """
-        if not results:
-            return {
-                "total": 0,
-                "resolved": 0,
-                "resolve_rate": 0.0,
-                "governed_count": 0,
-                "mean_intervention": 0.0,
-                "mean_duration_s": 0.0,
-            }
-
-        total = len(results)
-        resolved = sum(1 for r in results if r.success)
-        governed = [r for r in results if r.governed]
-        mean_intervention = (
-            sum(r.intervention_rate for r in governed) / len(governed) if governed else 0.0
-        )
-        mean_duration = sum(r.duration_s for r in results) / total
-
-        return {
-            "total": total,
-            "resolved": resolved,
-            "resolve_rate": resolved / total,
-            "governed_count": len(governed),
-            "mean_intervention": mean_intervention,
-            "mean_duration_s": mean_duration,
-        }
+        return _patch_generation_metrics(results)
 
     @staticmethod
     def to_jsonl(results: list[SWEPatch], path: Path) -> None:
@@ -222,3 +200,31 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 records.append(json.loads(line))
     return records
+
+
+def _patch_generation_metrics(results: list[SWEPatch]) -> dict[str, Any]:
+    """Describe patch generation without implying official SWE-bench resolution."""
+    total = len(results)
+    patch_generated = sum(1 for result in results if bool(result.patch.strip()))
+    patch_rate = patch_generated / total if total else 0.0
+    governed = [result for result in results if result.governed]
+    mean_intervention = (
+        sum(result.intervention_rate for result in governed) / len(governed)
+        if governed
+        else 0.0
+    )
+    return {
+        "total": total,
+        "patch_generated": patch_generated,
+        "patch_rate": patch_rate,
+        # Deprecated compatibility aliases. These values are patch-generation
+        # metrics and must not be interpreted as official SWE-bench resolution.
+        "resolved": patch_generated,
+        "resolve_rate": patch_rate,
+        "evaluation_mode": "patch_generation_only",
+        "governed_count": len(governed),
+        "mean_intervention": mean_intervention,
+        "mean_duration_s": (
+            sum(result.duration_s for result in results) / total if total else 0.0
+        ),
+    }
