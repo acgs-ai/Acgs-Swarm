@@ -334,6 +334,7 @@ def test_private_vote_rejects_same_voter_key_with_rotated_nullifier() -> None:
         epoch=b"epoch",
         subject=b"subject",
         eligible_voters=frozenset({_pubkey_bytes(sk)}),
+        strict_v2=False,
     )
 
     assert len(result.accepted) == 1

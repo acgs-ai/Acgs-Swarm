@@ -608,7 +608,7 @@ def test_sampler_docs_describe_float64_inverse_cdf_scan() -> None:
     assert "float64" in doc
     assert "inverse" in doc.lower()
     assert "cdf" in doc.lower()
-    assert "linear" in doc.lower()
+    assert "searchsorted" in doc.lower()
     assert "alias method" not in doc.lower()
     assert "no floating-point" not in doc.lower()
     assert "distribution standard deviation" in doc.lower()

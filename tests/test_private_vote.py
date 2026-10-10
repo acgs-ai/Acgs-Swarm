@@ -127,6 +127,7 @@ class TestBallotBox:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset(_pub(key) for key in keys),
+            strict_v2=False,
         )
 
     def _voter(self, box, choice, secret, sk=None):
@@ -283,10 +284,12 @@ class TestTallyFunction:
         reveals2 = list(reversed(reveals1))
         eligible = frozenset(_pub(sk) for sk in (sk1, sk2, sk3))
         t1 = tally(
-            commits1, reveals1, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible
+            commits1, reveals1, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible,
+            strict_v2=False,
         )
         t2 = tally(
-            commits2, reveals2, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible
+            commits2, reveals2, epoch=EPOCH, subject=SUBJECT, eligible_voters=eligible,
+            strict_v2=False,
         )
         assert t1.accepted == t2.accepted
         assert dict(t1.totals) == dict(t2.totals)
@@ -315,6 +318,7 @@ class TestTallyFunction:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({_pub(sk1)}),
+            strict_v2=False,
         )
         assert result.total_valid == 1
         assert any(reason == "duplicate voter" for _, reason in result.rejected)
@@ -341,6 +345,7 @@ class TestTallyFunction:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({_pub(sk)}),
+            strict_v2=False,
         )
         assert result.total_valid == 0
         assert any("does not open" in reason for _, reason in result.rejected)
@@ -375,6 +380,7 @@ class TestTallyFunction:
                 epoch=EPOCH,
                 subject=SUBJECT,
                 eligible_voters=frozenset({_pub(sk)}),
+                strict_v2=False,
                 require_all_revealed=True,
             )
 
@@ -429,6 +435,7 @@ class TestMultipleRevealsProtection:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
         )
         assert result.totals[BallotChoice.YEA] == 1, (
             "valid reveal should be found even when preceded by an invalid reveal"
@@ -458,6 +465,7 @@ class TestMultipleRevealsProtection:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
         )
         assert result.totals[BallotChoice.YEA] == 0
         assert len(result.rejected) == 1
@@ -473,6 +481,7 @@ class TestSubmitCommitV2Validation:
             epoch=EPOCH,
             subject=SUBJECT,
             eligible_voters=frozenset({commit.voter}),
+            strict_v2=False,
         )
 
     def _commit(self, proof_scheme=None, validity_proof=None):
