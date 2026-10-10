@@ -16,6 +16,7 @@ from constitutional_swarm.bittensor.rule_codifier import (
     _cosine,
     _generate_rule_text,
     _infer_severity,
+    constitution_hash,
 )
 from tests.test_c14_protocol_hardening import (
     c14_precedent_signed_record,
@@ -23,11 +24,29 @@ from tests.test_c14_protocol_hardening import (
 )
 
 
+GOVERNOR = "sn-owner-governor"
+
+
 def RuleCodifier(constitutional_hash, *args, **kwargs):  # type: ignore[no-untyped-def]
     kwargs.setdefault("precedent_store", c14_precedent_test_store(constitutional_hash))
+    kwargs.setdefault("governors", {GOVERNOR})
     return _RuleCodifier(constitutional_hash, *args, **kwargs)
 
-CONST_HASH = "608508a9bd224290"
+SIMPLE_CONSTITUTION = """\
+name: test-constitution
+rules:
+  - id: safety-01
+    text: Do not cause harm
+    severity: critical
+    hardcoded: true
+    keywords:
+      - harm
+"""
+
+
+# C38: activation only extends the YAML the codifier is pinned to, so the
+# codifier (and its precedent epoch) is pinned to SIMPLE_CONSTITUTION's hash.
+CONST_HASH = constitution_hash(SIMPLE_CONSTITUTION)
 
 _PRIVACY_VEC = {
     "safety": 0.1,
@@ -113,18 +132,6 @@ def _canonical_cluster(
     return next(cluster for cluster in clusters if source_ids.intersection(cluster.precedent_ids))
 
 
-SIMPLE_CONSTITUTION = """\
-name: test-constitution
-rules:
-  - id: safety-01
-    text: Do not cause harm
-    severity: critical
-    hardcoded: true
-    keywords:
-      - harm
-"""
-
-
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -163,15 +170,15 @@ class TestUtilities:
 
     def test_append_rule_to_yaml_with_rules(self):
         yaml = SIMPLE_CONSTITUTION
-        block = "  - id: new-rule\n    text: new rule\n"
-        result = _append_rule_to_yaml(yaml, block)
+        rule = {"id": "new-rule", "text": "new rule"}
+        result = _append_rule_to_yaml(yaml, rule)
         assert "new-rule" in result
         assert result.index("safety-01") < result.index("new-rule")
 
     def test_append_rule_to_yaml_without_rules(self):
         yaml = "name: minimal"
-        block = "  - id: r1\n    text: rule\n"
-        result = _append_rule_to_yaml(yaml, block)
+        rule = {"id": "r1", "text": "rule"}
+        result = _append_rule_to_yaml(yaml, rule)
         assert "rules:" in result
         assert "r1" in result
 
@@ -290,26 +297,26 @@ class TestApprovalWorkflow:
 
     def test_approve(self):
         codifier, candidate = self._setup()
-        approved = codifier.approve(candidate.candidate_id)
+        approved = codifier.approve(candidate.candidate_id, governor=GOVERNOR)
         assert approved.status == RuleCandidateStatus.APPROVED
         assert approved.approved_at is not None
 
     def test_reject(self):
         codifier, candidate = self._setup()
-        rejected = codifier.reject(candidate.candidate_id, reason="contradicts safety-01")
+        rejected = codifier.reject(candidate.candidate_id, reason="contradicts safety-01", governor=GOVERNOR)
         assert rejected.status == RuleCandidateStatus.REJECTED
         assert "contradicts" in rejected.rejection_reason
 
     def test_approve_wrong_state_raises(self):
         codifier, candidate = self._setup()
-        codifier.reject(candidate.candidate_id)
+        codifier.reject(candidate.candidate_id, governor=GOVERNOR)
         with pytest.raises(ValueError, match="rejected"):
-            codifier.approve(candidate.candidate_id)
+            codifier.approve(candidate.candidate_id, governor=GOVERNOR)
 
     def test_activate(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        activated, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        activated, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
         assert activated.status == RuleCandidateStatus.ACTIVE
         assert activated.constitutional_hash_after != CONST_HASH
@@ -320,21 +327,21 @@ class TestApprovalWorkflow:
     def test_activate_not_approved_raises(self):
         codifier, candidate = self._setup()
         with pytest.raises(ValueError, match="pending"):
-            codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+            codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
     def test_revoke_active_rule(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
-        revoked = codifier.revoke(candidate.candidate_id, reason="bad rule")
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
+        revoked = codifier.revoke(candidate.candidate_id, reason="bad rule", governor=GOVERNOR)
         assert revoked.status == RuleCandidateStatus.REVOKED
         assert "bad rule" in revoked.revocation_reason
         assert codifier.active_rules == []
 
     def test_activate_appends_rule_to_yaml(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        _, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        _, new_yaml = codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         assert "safety-01" in new_yaml  # original rule preserved
         assert candidate.rule_id in new_yaml  # new rule appended
 
@@ -347,12 +354,12 @@ class TestApprovalWorkflow:
         c1 = codifier.propose_rules([privacy])[0]
         c2 = codifier.propose_rules([security])[0]
 
-        codifier.approve(c1.candidate_id)
-        _, yaml1 = codifier.activate(c1.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(c1.candidate_id, governor=GOVERNOR)
+        _, yaml1 = codifier.activate(c1.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         hash_after_1 = codifier.constitutional_hash
 
-        codifier.approve(c2.candidate_id)
-        codifier.activate(c2.candidate_id, yaml1)
+        codifier.approve(c2.candidate_id, governor=GOVERNOR)
+        codifier.activate(c2.candidate_id, yaml1, governor=GOVERNOR)
         hash_after_2 = codifier.constitutional_hash
 
         assert hash_after_1 != hash_after_2
@@ -360,12 +367,12 @@ class TestApprovalWorkflow:
     def test_nonexistent_candidate_raises(self):
         codifier = RuleCodifier(CONST_HASH)
         with pytest.raises(KeyError):
-            codifier.approve("nonexistent")
+            codifier.approve("nonexistent", governor=GOVERNOR)
 
     def test_summary(self):
         codifier, candidate = self._setup()
-        codifier.approve(candidate.candidate_id)
-        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION)
+        codifier.approve(candidate.candidate_id, governor=GOVERNOR)
+        codifier.activate(candidate.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         s = codifier.summary()
         assert s["total_candidates"] == 1
         assert s["active_rules"] == 1
@@ -487,12 +494,12 @@ class TestRuleCodificationE2E:
 
         # Step 3: Governor approves the first candidate
         target = candidates[0]
-        approved = codifier.approve(target.candidate_id)
+        approved = codifier.approve(target.candidate_id, governor=GOVERNOR)
         assert approved.status == RuleCandidateStatus.APPROVED
         assert approved.approved_at is not None
 
         # Step 4: Activate — append to constitution YAML
-        activated, new_yaml = codifier.activate(target.candidate_id, SIMPLE_CONSTITUTION)
+        activated, new_yaml = codifier.activate(target.candidate_id, SIMPLE_CONSTITUTION, governor=GOVERNOR)
 
         # Verify state: ACTIVE
         assert activated.status == RuleCandidateStatus.ACTIVE
@@ -533,12 +540,12 @@ class TestRuleCodificationE2E:
         assert pending[0].status == RuleCandidateStatus.PENDING
 
         # Transition to APPROVED
-        codifier.approve(cid)
+        codifier.approve(cid, governor=GOVERNOR)
         approved = next(c for c in codifier.all_candidates() if c.candidate_id == cid)
         assert approved.status == RuleCandidateStatus.APPROVED
 
         # Transition to ACTIVE
-        codifier.activate(cid, SIMPLE_CONSTITUTION)
+        codifier.activate(cid, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         active = next(c for c in codifier.all_candidates() if c.candidate_id == cid)
         assert active.status == RuleCandidateStatus.ACTIVE
 
@@ -556,7 +563,7 @@ class TestRuleCodificationE2E:
         candidates = codifier.propose_rules(clusters)
         assert len(candidates) >= 1
 
-        rejected = codifier.reject(candidates[0].candidate_id, reason="does not meet standards")
+        rejected = codifier.reject(candidates[0].candidate_id, reason="does not meet standards", governor=GOVERNOR)
         assert rejected.status == RuleCandidateStatus.REJECTED
         assert "does not meet standards" in rejected.rejection_reason
 
@@ -575,10 +582,10 @@ class TestRuleCodificationE2E:
         assert len(candidates) >= 1
 
         cid = candidates[0].candidate_id
-        codifier.approve(cid)
-        codifier.activate(cid, SIMPLE_CONSTITUTION)
+        codifier.approve(cid, governor=GOVERNOR)
+        codifier.activate(cid, SIMPLE_CONSTITUTION, governor=GOVERNOR)
         assert len(codifier.active_rules) == 1
 
-        revoked = codifier.revoke(cid, reason="superseded by newer rule")
+        revoked = codifier.revoke(cid, reason="superseded by newer rule", governor=GOVERNOR)
         assert revoked.status == RuleCandidateStatus.REVOKED
         assert codifier.active_rules == []

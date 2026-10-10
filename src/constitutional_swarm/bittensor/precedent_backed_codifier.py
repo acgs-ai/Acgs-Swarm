@@ -60,11 +60,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from constitutional_swarm.bittensor.precedent_store import PrecedentStore
-from constitutional_swarm.bittensor.rule_codifier import RuleCodifier
+from constitutional_swarm.bittensor.rule_codifier import _DEFAULT_PROPOSER_ID, RuleCodifier
 from constitutional_swarm.constants import CONSTITUTIONAL_HASH
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Collection, Iterable
 
     from constitutional_swarm.bittensor.precedent_store import PrecedentRecord
 
@@ -105,6 +105,12 @@ class PrecedentBackedCodifier:
     similarity_threshold:
         Cosine-similarity threshold for agglomerative precedent clustering.
         Ignored when ``codifier`` is supplied.
+    governors:
+        Governor roster allowed to approve/activate proposed rules (empty means
+        no one can). Ignored when ``codifier`` is supplied.
+    proposer_id:
+        Identity recorded as the proposer; it may never act as a governor.
+        Ignored when ``codifier`` is supplied.
     """
 
     def __init__(
@@ -117,6 +123,8 @@ class PrecedentBackedCodifier:
         min_cluster_size: int = 5,
         min_validator_agreement: float = 0.85,
         similarity_threshold: float = 0.80,
+        governors: Collection[str] = (),
+        proposer_id: str = _DEFAULT_PROPOSER_ID,
     ) -> None:
         if codifier is not None and precedent_store is not None:
             raise ValueError("precedent_store cannot be supplied with a pre-built codifier")
@@ -126,8 +134,11 @@ class PrecedentBackedCodifier:
             min_validator_agreement=min_validator_agreement,
             similarity_threshold=similarity_threshold,
             precedent_store=precedent_store,
+            governors=governors,
+            proposer_id=proposer_id,
         )
-        self._precedent_ids: list[str] = []
+        self._precedent_ids: list[str] = []  # observation order
+        self._seen_precedent_ids: set[str] = set()  # O(1) membership
         if precedents:
             self.observe_many(precedents)
 
@@ -147,7 +158,8 @@ class PrecedentBackedCodifier:
     def observe(self, precedent: PrecedentRecord) -> None:
         """Observe an exact record already admitted to the configured store."""
         [canonical] = self.precedent_store.require_canonical_records([precedent])
-        if canonical.precedent_id not in self._precedent_ids:
+        if canonical.precedent_id not in self._seen_precedent_ids:
+            self._seen_precedent_ids.add(canonical.precedent_id)
             self._precedent_ids.append(canonical.precedent_id)
 
     def observe_many(self, precedents: Iterable[PrecedentRecord]) -> None:

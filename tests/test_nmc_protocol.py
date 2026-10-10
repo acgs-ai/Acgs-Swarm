@@ -19,8 +19,14 @@ from constitutional_swarm.bittensor.nmc_protocol import (
 # ---------------------------------------------------------------------------
 
 
-def _commitment(judgment: str, nonce: str) -> str:
-    return compute_commitment_hash(judgment, nonce)
+def _commitment(session: NMCSession, miner_uid: str, judgment: str, nonce: str) -> str:
+    return compute_commitment_hash(
+        judgment,
+        nonce,
+        session_id=session.session_id,
+        case_id=session.case_id,
+        miner_uid=miner_uid,
+    )
 
 
 def _make_session(
@@ -31,7 +37,7 @@ def _make_session(
 ) -> NMCSession:
     return NMCSession(
         case_id="ESC-001",
-        required_miners=required_miners,
+        required_miners=required_miners if required_miners is not None else {"m1", "m2"},
         min_reveals=min_reveals,
         deadline_seconds=deadline,
         exclude_sybils=exclude_sybils,
@@ -61,7 +67,7 @@ def _three_miner_session(
 
     # Commit phase
     for m in miners:
-        session.accept_commitment(m, _commitment(judgments[m], nonces[m]))
+        session.accept_commitment(m, _commitment(session, m, judgments[m], nonces[m]))
 
     # Reveal phase (auto-transitioned)
     for m in miners:
@@ -80,7 +86,7 @@ class TestCommitReveal:
         session = _make_session()
         nonce = uuid.uuid4().hex
         judgment = "allow_with_conditions"
-        h = _commitment(judgment, nonce)
+        h = _commitment(session, "m1", judgment, nonce)
         session.accept_commitment("m1", h)
         session.close_commits()
         session.accept_reveal("m1", judgment, nonce)  # should not raise
@@ -89,7 +95,7 @@ class TestCommitReveal:
         session = _make_session()
         nonce = uuid.uuid4().hex
         judgment = "allow"
-        h = _commitment(judgment, nonce)
+        h = _commitment(session, "m1", judgment, nonce)
         session.accept_commitment("m1", h)
         session.close_commits()
         with pytest.raises(ValueError, match="does not match commitment"):
@@ -99,7 +105,7 @@ class TestCommitReveal:
         session = _make_session()
         nonce = uuid.uuid4().hex
         judgment = "allow"
-        h = _commitment(judgment, nonce)
+        h = _commitment(session, "m1", judgment, nonce)
         session.accept_commitment("m1", h)
         session.close_commits()
         with pytest.raises(ValueError, match="does not match commitment"):
@@ -118,35 +124,35 @@ class TestSessionState:
 
     def test_auto_transition_to_revealing(self):
         session = _make_session(required_miners={"m1", "m2"})
-        session.accept_commitment("m1", _commitment("allow", "n1"))
+        session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
         assert session.state == NMCSessionState.OPEN
-        session.accept_commitment("m2", _commitment("deny", "n2"))
+        session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
         assert session.state == NMCSessionState.REVEALING
 
     def test_manual_close_commits(self):
         session = _make_session()
-        session.accept_commitment("m1", _commitment("allow", "n1"))
+        session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
         count = session.close_commits()
         assert count == 1
         assert session.state == NMCSessionState.REVEALING
 
     def test_commit_after_reveal_phase_raises(self):
         session = _make_session()
-        session.accept_commitment("m1", _commitment("allow", "n1"))
+        session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
         session.close_commits()
         with pytest.raises(ValueError, match="not OPEN"):
-            session.accept_commitment("m2", _commitment("allow", "n2"))
+            session.accept_commitment("m2", _commitment(session, "m2", "allow", "n2"))
 
     def test_reveal_without_commitment_raises(self):
         session = _make_session()
-        session.accept_commitment("m1", _commitment("allow", "n1"))
+        session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
         session.close_commits()
         with pytest.raises(ValueError, match="never committed"):
             session.accept_reveal("ghost", "allow", "nonce")
 
     def test_double_commit_raises(self):
         session = _make_session()
-        h = _commitment("allow", "n1")
+        h = _commitment(session, "m1", "allow", "n1")
         session.accept_commitment("m1", h)
         with pytest.raises(ValueError, match="already committed"):
             session.accept_commitment("m1", h)
@@ -154,7 +160,7 @@ class TestSessionState:
     def test_double_reveal_raises(self):
         session = _make_session()
         nonce = "n1"
-        h = _commitment("allow", nonce)
+        h = _commitment(session, "m1", "allow", nonce)
         session.accept_commitment("m1", h)
         session.close_commits()
         session.accept_reveal("m1", "allow", nonce)
@@ -173,8 +179,8 @@ class TestSessionState:
 
     def test_pending_reveal_miners(self):
         session = _make_session(required_miners={"m1", "m2"})
-        session.accept_commitment("m1", _commitment("allow", "n1"))
-        session.accept_commitment("m2", _commitment("deny", "n2"))
+        session.accept_commitment("m1", _commitment(session, "m1", "allow", "n1"))
+        session.accept_commitment("m2", _commitment(session, "m2", "deny", "n2"))
         # All committed → REVEALING; no reveals yet
         session.accept_reveal("m1", "allow", "n1")
         assert "m2" in session.pending_reveal_miners
@@ -229,11 +235,11 @@ class TestSynthesis:
         assert consensus.is_high_confidence is True
 
     def test_below_min_reveals_raises(self):
-        session = NMCSession("ESC-x", min_reveals=3)
+        session = NMCSession("ESC-x", required_miners={"m1", "m2", "m3"}, min_reveals=3)
         # Commit 2 miners (need 3 reveals), close, reveal both, try to synthesize
         data = {"m1": ("allow", "n1"), "m2": ("deny", "n2")}
         for m, (j, n) in data.items():
-            session.accept_commitment(m, _commitment(j, n))
+            session.accept_commitment(m, _commitment(session, m, j, n))
         session.close_commits()  # only 2 committed
         for m, (j, n) in data.items():
             session.accept_reveal(m, j, n)
@@ -337,24 +343,24 @@ class TestSybilDetection:
 class TestNMCCoordinator:
     def test_create_session(self):
         coord = NMCCoordinator()
-        session = coord.create_session("ESC-001")
+        session = coord.create_session("ESC-001", required_miners={"m1", "m2"})
         assert session.case_id == "ESC-001"
 
     def test_duplicate_case_raises(self):
         coord = NMCCoordinator()
-        coord.create_session("ESC-001")
+        coord.create_session("ESC-001", required_miners={"m1", "m2"})
         with pytest.raises(ValueError, match="already exists"):
-            coord.create_session("ESC-001")
+            coord.create_session("ESC-001", required_miners={"m1", "m2"})
 
     def test_get_session(self):
         coord = NMCCoordinator()
-        coord.create_session("ESC-002")
+        coord.create_session("ESC-002", required_miners={"m1", "m2"})
         assert coord.get_session("ESC-002") is not None
         assert coord.get_session("ESC-999") is None
 
     def test_outcome_before_synthesis_is_none(self):
         coord = NMCCoordinator()
-        coord.create_session("ESC-003")
+        coord.create_session("ESC-003", required_miners={"m1", "m2"})
         assert coord.get_session_outcome("ESC-003") is None
 
     def test_outcome_after_synthesis(self):
@@ -366,7 +372,7 @@ class TestNMCCoordinator:
         data = {"m1": ("allow", "n1"), "m2": ("deny", "n2")}
         # Phase 1: all commits
         for m, (j, n) in data.items():
-            session.accept_commitment(m, _commitment(j, n))
+            session.accept_commitment(m, _commitment(session, m, j, n))
         # Phase 2: all reveals (auto-transitioned after both committed)
         for m, (j, n) in data.items():
             session.accept_reveal(m, j, n)
@@ -379,11 +385,11 @@ class TestNMCCoordinator:
     def test_active_vs_completed(self):
         coord = NMCCoordinator()
         session = coord.create_session("ESC-A", required_miners={"m1", "m2"})
-        coord.create_session("ESC-B")  # still open
+        coord.create_session("ESC-B", required_miners={"m1", "m2"})  # still open
         # Complete ESC-A: commits first, then reveals
         data = {"m1": ("allow", "na1"), "m2": ("allow", "na2")}
         for m, (j, n) in data.items():
-            session.accept_commitment(m, _commitment(j, n))
+            session.accept_commitment(m, _commitment(session, m, j, n))
         for m, (j, n) in data.items():
             session.accept_reveal(m, j, n)
         session.synthesize()
@@ -395,7 +401,7 @@ class TestNMCCoordinator:
         session = coord.create_session("ESC-S", required_miners={"m1", "m2"})
         # Commits first
         for m in ["m1", "m2"]:
-            session.accept_commitment(m, _commitment("same", "nonce-" + m))
+            session.accept_commitment(m, _commitment(session, m, "same", "nonce-" + m))
         # Then reveals (auto-transitioned after both committed)
         for m in ["m1", "m2"]:
             session.accept_reveal(m, "same", "nonce-" + m)
@@ -406,7 +412,7 @@ class TestNMCCoordinator:
 
     def test_summary(self):
         coord = NMCCoordinator()
-        coord.create_session("ESC-1")
+        coord.create_session("ESC-1", required_miners={"m1", "m2"})
         s = coord.summary()
         assert s["total_sessions"] == 1
         assert s["synthesized"] == 0

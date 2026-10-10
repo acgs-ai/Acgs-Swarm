@@ -976,9 +976,34 @@ def test_c6_threshold_domain_filter_requires_authoritative_metadata() -> None:
 
 
 def test_c6_threshold_domain_filter_uses_case_metadata_only() -> None:
-    updater = BayesianThresholdUpdater()
-    healthcare = _c6_precedent("opaque-a", score=0.9)
-    finance = _c6_precedent("opaque-b", score=0.1)
+    # C38: evidence must come from records admitted to the injected store.
+    from tests.test_c14_protocol_hardening import (
+        c14_precedent_signed_record,
+        c14_precedent_test_store,
+    )
+
+    store = c14_precedent_test_store(_C6_HASH)
+    updater = BayesianThresholdUpdater(precedent_store=store)
+
+    def admitted(case_id: str, score: float) -> PrecedentRecord:
+        impact = {name: 0.1 for name in _C6_DIMS}
+        impact["security"] = score
+        return store.admit(
+            c14_precedent_signed_record(
+                case_id=case_id,
+                task_id=f"task-{case_id}",
+                miner_uid="miner-c6",
+                judgment="Domain-neutral judgment text",
+                votes_for=5,
+                votes_against=0,
+                impact_vector=impact,
+                constitutional_hash=_C6_HASH,
+                ambiguous_dimensions=("security",),
+            )
+        )
+
+    healthcare = admitted("opaque-a", 0.9)
+    finance = admitted("opaque-b", 0.1)
     metadata = {"opaque-a": "healthcare", "opaque-b": "finance"}
 
     hc = updater.collect_evidence(
