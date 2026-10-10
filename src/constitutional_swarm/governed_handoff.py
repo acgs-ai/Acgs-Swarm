@@ -176,8 +176,9 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset(
 def _select_safe_commands(configured: Any) -> set[str]:
     """Return the safe commands an operator selection enables.
 
-    A missing selection enables every safe command; a malformed (non-list)
-    selection enables nothing. A list can only narrow the code-owned set:
+    A missing (None) selection enables every safe command; any other value that
+    is not a list, tuple or set enables nothing. A sequence can only narrow the
+    code-owned set:
     unknown names are ignored, never added, and an empty list enables nothing.
     """
 
@@ -392,7 +393,8 @@ class PolicyEngine:
             re.compile(pattern, re.IGNORECASE) for pattern in secret_patterns
         ]
         # Closed set: a configured list narrows SAFE_COMMANDS (an empty list
-        # enables nothing); a missing or non-list value enables the whole set.
+        # enables nothing); a missing or null value enables the whole set and
+        # any other non-sequence value enables nothing.
         self.command_allowlist = _select_safe_commands(policy.get("command_allowlist"))
 
     def decide(self, gate: str, subject: str, **context: Any) -> PolicyDecision:
