@@ -148,14 +148,14 @@ class TestTierPromotion:
         mgr.register_miner("m1", domains={"finance"})
         for _i in range(200):
             mgr.record_judgment("m1", accepted=True, reputation=1.9)
-        promotion = mgr.record_precedent("m1")
+        promotion = mgr.record_precedent("m1", "prec-1")
         assert promotion is not None
         assert promotion.to_tier == MinerTier.ELDER
 
     def test_record_precedent_contributes(self):
         mgr = TierManager()
         mgr.register_miner("m1")
-        mgr.record_precedent("m1")
+        mgr.record_precedent("m1", "prec-1")
         perf = mgr.get_performance("m1")
         assert perf.precedents_contributed == 1
 

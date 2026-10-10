@@ -1,5 +1,8 @@
 """Island-Based TAO Emission Tuning.
 
+EXPERIMENTAL: research module with no runtime caller. It is not exported from
+``constitutional_swarm.bittensor`` and must not drive live emissions.
+
 Evolves the emission weight formula using island-based evolution.
 Four islands with different parameter families compete. Event-driven
 migration breaks local optima when ceiling is detected.
@@ -13,12 +16,17 @@ selection, Gaussian mutation, single-point crossover.
 
 from __future__ import annotations
 
+import math
 import random
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from constitutional_swarm.bittensor.protocol import TIER_TAO_MULTIPLIER, MinerTier
+
+# With two observations every non-constant predictor scores rho = +/-1, so a
+# fitness signal needs at least three ranked points to carry any information.
+MIN_FITNESS_OBSERVATIONS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,23 +103,47 @@ class MigrationEvent:
     timestamp: float
 
 
+def _average_ranks(values: list[float]) -> list[float]:
+    """Return 1-based ranks with tied values sharing their average rank."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        average = (start + end) / 2.0 + 1.0
+        for k in range(start, end + 1):
+            ranks[order[k]] = average
+        start = end + 1
+    return ranks
+
+
 def _spearman_rho(x: list[float], y: list[float]) -> float:
-    """Compute Spearman rank correlation coefficient."""
+    """Spearman rank correlation with average ranks for ties.
+
+    Computed as the Pearson correlation of the rank vectors, which is exact in
+    the presence of ties (the ``1 - 6*sum(d^2)/(n(n^2-1))`` shortcut is not).
+    Returns 0.0 when either side has no rank variance (e.g. a constant
+    predictor) or there are fewer than two points.
+    """
     n = len(x)
+    if n != len(y):
+        raise ValueError("x and y must have the same length")
     if n < 2:
         return 0.0
-
-    def _rank(values: list[float]) -> list[float]:
-        indexed = sorted(enumerate(values), key=lambda p: p[1])
-        ranks = [0.0] * n
-        for rank, (idx, _) in enumerate(indexed):
-            ranks[idx] = float(rank)
-        return ranks
-
-    rx = _rank(x)
-    ry = _rank(y)
-    d_sq = sum((rx[i] - ry[i]) ** 2 for i in range(n))
-    return 1.0 - (6.0 * d_sq) / (n * (n * n - 1))
+    rx = _average_ranks(x)
+    ry = _average_ranks(y)
+    mean_x = math.fsum(rx) / n
+    mean_y = math.fsum(ry) / n
+    dx = [r - mean_x for r in rx]
+    dy = [r - mean_y for r in ry]
+    var_x = math.fsum(d * d for d in dx)
+    var_y = math.fsum(d * d for d in dy)
+    if var_x == 0.0 or var_y == 0.0:
+        return 0.0
+    cov = math.fsum(a * b for a, b in zip(dx, dy, strict=True))
+    return max(-1.0, min(1.0, cov / math.sqrt(var_x * var_y)))
 
 
 class EmissionEvolver:
@@ -217,8 +249,11 @@ class EmissionEvolver:
         genome: EmissionGenome,
         observations: list[MinerQualityObservation],
     ) -> float:
-        """Spearman rank correlation between genome's weights and ground truth."""
-        if len(observations) < 2:
+        """Spearman rank correlation between genome's weights and ground truth.
+
+        Returns 0.0 (no information) below ``MIN_FITNESS_OBSERVATIONS``.
+        """
+        if len(observations) < MIN_FITNESS_OBSERVATIONS:
             return 0.0
 
         predicted = [
@@ -328,7 +363,16 @@ class EmissionEvolver:
         return from_island, new_to
 
     def evolve_all(self, observations: list[MinerQualityObservation]) -> None:
-        """One generation across all islands with ceiling-triggered migration."""
+        """One generation across all islands with ceiling-triggered migration.
+
+        Raises ValueError below ``MIN_FITNESS_OBSERVATIONS`` observations: there
+        is no fitness signal to select on.
+        """
+        if len(observations) < MIN_FITNESS_OBSERVATIONS:
+            raise ValueError(
+                f"evolve_all needs at least {MIN_FITNESS_OBSERVATIONS} observations, "
+                f"got {len(observations)}"
+            )
         if not self._islands:
             self.initialize_islands()
 
@@ -353,7 +397,10 @@ class EmissionEvolver:
                     _, new_target = self.migrate(source, target)
                     self._islands[stag_id] = new_target
 
-        # Update global best
+        # Update global best. Re-score the incumbent on the current observation
+        # set first so a fitness earned on stale or degenerate data cannot lock in.
+        if self._global_best is not None:
+            self._global_best_fitness = self.evaluate_genome(self._global_best, observations)
         for island in self._islands.values():
             if island.best_genome and island.best_fitness > self._global_best_fitness:
                 self._global_best = island.best_genome
@@ -376,7 +423,7 @@ class EmissionEvolver:
             )
             for o in observations
         }
-        total = sum(raw.values())
+        total = math.fsum(raw.values())
         if total <= 0:
             return {uid: 1.0 / len(raw) for uid in raw}
         return {uid: w / total for uid, w in raw.items()}

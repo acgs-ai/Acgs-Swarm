@@ -248,6 +248,8 @@ class TierManager:
                     self._promotion_min_acceptance_rate[tier] = validated_rate
         self._miners: dict[str, MinerPerformance] = {}
         self._promotion_log: list[TierPromotion] = []
+        # precedent_id -> crediting miner; one precedent credits one miner once
+        self._precedent_credits: dict[str, str] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -259,17 +261,42 @@ class TierManager:
         miner_uid: str,
         domains: set[str] | None = None,
         initial_tier: MinerTier = MinerTier.APPRENTICE,
+        *,
+        admin_override: bool = False,
     ) -> MinerPerformance:
-        """Register a new miner. Idempotent — re-registration is a no-op."""
+        """Register a new miner. Idempotent — re-registration is a no-op.
+
+        A fresh miner has no history, so it only qualifies for APPRENTICE.
+        Any higher ``initial_tier`` is a privileged grant and requires
+        ``admin_override=True``; the grant is recorded in ``promotion_log``.
+        The next tier evaluation still applies the structural rules.
+        """
+        if not isinstance(initial_tier, MinerTier):
+            raise TypeError("initial_tier must be a MinerTier")
+        if type(admin_override) is not bool:
+            raise TypeError("admin_override must be a bool")
         with self._lock:
             if miner_uid in self._miners:
                 return self._snapshot(self._miners[miner_uid])
 
-            perf = MinerPerformance(
-                miner_uid=miner_uid,
-                current_tier=initial_tier,
-                domains=set(domains or []),
-            )
+            perf = MinerPerformance(miner_uid=miner_uid, domains=set(domains or []))
+            if initial_tier is not MinerTier.APPRENTICE:
+                if not admin_override:
+                    raise ValueError(
+                        f"initial_tier {initial_tier.value!r} is not earned by a new "
+                        "miner; pass admin_override=True for a privileged grant"
+                    )
+                perf.current_tier = initial_tier
+                self._promotion_log.append(
+                    TierPromotion(
+                        event_id=uuid.uuid4().hex[:8],
+                        miner_uid=miner_uid,
+                        from_tier=MinerTier.APPRENTICE,
+                        to_tier=initial_tier,
+                        reason="admin_override at registration",
+                        occurred_at=time.time(),
+                    )
+                )
             self._miners[miner_uid] = perf
             self._sync_registry(perf)
             return self._snapshot(perf)
@@ -278,6 +305,9 @@ class TierManager:
         """Remove a miner from tracking and the CapabilityRegistry."""
         with self._lock:
             self._miners.pop(miner_uid, None)
+            self._precedent_credits = {
+                pid: uid for pid, uid in self._precedent_credits.items() if uid != miner_uid
+            }
             self._registry.unregister(miner_uid)
 
     # ------------------------------------------------------------------
@@ -354,15 +384,31 @@ class TierManager:
             # Re-evaluate tier
             return self._evaluate_tier(perf)
 
-    def record_precedent(self, miner_uid: str) -> TierPromotion | None:
-        """Record that a miner's judgment was stored as precedent.
+    def record_precedent(self, miner_uid: str, precedent_id: str) -> TierPromotion | None:
+        """Record that a miner's judgment was stored as precedent ``precedent_id``.
 
-        Precedent contributions feed the Elder promotion criteria.
+        Precedent contributions feed the Elder promotion criteria, so each
+        admitted precedent is credited at most once: a repeat for the same
+        miner is a no-op, and crediting it to a different miner raises.
+        The miner must already be registered.
         """
+        if not isinstance(precedent_id, str):
+            raise TypeError("precedent_id must be a string")
+        canonical_id = precedent_id.strip()
+        if not canonical_id:
+            raise ValueError("precedent_id must be non-empty")
         with self._lock:
-            if miner_uid not in self._miners:
-                self._register_miner_unlocked(miner_uid)
-            perf = self._miners[miner_uid]
+            perf = self._miners.get(miner_uid)
+            if perf is None:
+                raise ValueError(f"miner {miner_uid!r} is not registered")
+            credited_to = self._precedent_credits.get(canonical_id)
+            if credited_to == miner_uid:
+                return None
+            if credited_to is not None:
+                raise ValueError(
+                    f"precedent {canonical_id!r} is already credited to another miner"
+                )
+            self._precedent_credits[canonical_id] = miner_uid
             perf.precedents_contributed += 1
             return self._evaluate_tier(perf)
 
@@ -475,10 +521,7 @@ class TierManager:
 
     def tier_distribution(self) -> dict[str, int]:
         with self._lock:
-            counts: dict[str, int] = {t.value: 0 for t in MinerTier}
-            for p in self._miners.values():
-                counts[p.current_tier.value] += 1
-            return counts
+            return self._tier_distribution_unlocked()
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
@@ -504,16 +547,11 @@ class TierManager:
         self,
         miner_uid: str,
         domains: set[str] | None = None,
-        initial_tier: MinerTier = MinerTier.APPRENTICE,
     ) -> MinerPerformance:
-        """Internal registration without acquiring the lock (caller holds it)."""
+        """Internal APPRENTICE registration without acquiring the lock (caller holds it)."""
         if miner_uid in self._miners:
             return self._miners[miner_uid]
-        perf = MinerPerformance(
-            miner_uid=miner_uid,
-            current_tier=initial_tier,
-            domains=set(domains or []),
-        )
+        perf = MinerPerformance(miner_uid=miner_uid, domains=set(domains or []))
         self._miners[miner_uid] = perf
         self._sync_registry(perf)
         return perf
