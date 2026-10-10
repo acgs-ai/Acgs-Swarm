@@ -59,12 +59,24 @@ def main(argv: list[str] | None = None) -> int:
             "verification; output is labelled evidence_policy=development."
         ),
     )
+    parser.add_argument(
+        "--require-proof-grade",
+        action="store_true",
+        help=(
+            "Fail closed unless the verdict is evidence_policy=proof_grade (rejects dev "
+            "vote evidence and deterministic fixture trust roots)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
         trusted_signers = None
         if args.trusted_signers is not None:
             trusted_signers = json.loads(args.trusted_signers.read_text())
+        if args.require_proof_grade and args.allow_dev_evidence:
+            raise ValueError(
+                "--require-proof-grade cannot be combined with --allow-dev-evidence"
+            )
         if args.settlement_store is not None:
             if args.allow_dev_evidence:
                 raise ValueError(
@@ -107,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 trusted_signers=trusted_signers,
                 expected_signer_role=args.expected_signer_role,
                 require_independent_votes=not args.allow_dev_evidence,
+                require_proof_grade=args.require_proof_grade,
             )
     except Exception as exc:
         print(
@@ -132,5 +145,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"receipt verification failed before verdict construction: {exc}", file=sys.stderr)
         return 2
 
+    if args.require_proof_grade and verdict.valid and verdict.evidence_policy != "proof_grade":
+        # Defence in depth for verifiers that do not take require_proof_grade.
+        verdict = verdict.model_copy(
+            update={
+                "valid": False,
+                "issues": [
+                    *verdict.issues,
+                    ReceiptIssue(
+                        code="evidence_policy_not_proof_grade",
+                        message="proof-grade evidence was required, but the policy is development",
+                    ),
+                ],
+            }
+        )
     print(verdict_to_json(verdict))
     return 0 if verdict.valid else 1
