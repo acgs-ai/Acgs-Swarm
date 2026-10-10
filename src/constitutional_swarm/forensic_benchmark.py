@@ -174,31 +174,6 @@ class BenchmarkScorecard(BaseModel):
     acgs_wins: bool
 
 
-class IncidentSpec(BaseModel):
-    """Synthetic adversarial incident specification with hidden ground truth."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    incident_id: str = Field(min_length=1)
-    adversarial_technique: Literal[
-        "collusion",
-        "memory_poisoning",
-        "rule_gaming",
-        "fragmented_actions",
-        "misleading_traces",
-    ]
-    who_acted: str
-    authority_existed: str
-    rule_applied: str
-    evidence_used: str
-    who_approved_or_denied: str
-    what_failed: str
-    outcome_defensible: str
-
-    def answer_key(self) -> dict[str, str]:
-        return {question: str(getattr(self, question)) for question in FORENSIC_QUESTIONNAIRE}
-
-
 class _IncidentEvidenceSource(BaseModel):
     """Condition-neutral source facts used to derive answers and evidence separately."""
 
@@ -789,65 +764,6 @@ def _validate_between_reviewer_question_coverage(
             elif observed != expected_questions:
                 msg = "question cells must be identical across incidents and conditions"
                 raise ValueError(msg)
-
-
-def _paired_incident_correctness_contrasts(
-    answers: Sequence[ReviewerAnswer],
-    baseline: str,
-) -> dict[str, int]:
-    if baseline not in BASELINES[:2]:
-        msg = "strongest baseline must be a non-ACGS benchmark condition"
-        raise ValueError(msg)
-
-    all_cells: set[tuple[str, str, str, str]] = set()
-    matched: dict[tuple[str, str, str], dict[str, ReviewerAnswer]] = defaultdict(dict)
-    relevant_conditions = {baseline, "acgs_receipts_and_audit_artifacts"}
-    for answer in answers:
-        cell = (
-            answer.incident_id,
-            answer.artifact_condition,
-            answer.reviewer_id,
-            answer.question_id,
-        )
-        if cell in all_cells:
-            msg = "duplicate incident/condition/reviewer/question answer cell"
-            raise ValueError(msg)
-        all_cells.add(cell)
-        if answer.artifact_condition in relevant_conditions:
-            key = (answer.incident_id, answer.reviewer_id, answer.question_id)
-            matched[key][answer.artifact_condition] = answer
-
-    incident_contrasts: dict[str, int] = defaultdict(int)
-    incident_cells: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    for key, condition_answers in matched.items():
-        missing = relevant_conditions.difference(condition_answers)
-        if missing:
-            msg = (
-                "missing matched ACGS/baseline answer for "
-                f"incident={key[0]}, reviewer={key[1]}, question={key[2]}"
-            )
-            raise ValueError(msg)
-        acgs_answer = condition_answers["acgs_receipts_and_audit_artifacts"]
-        baseline_answer = condition_answers[baseline]
-        if acgs_answer.ground_truth != baseline_answer.ground_truth:
-            msg = (
-                "ground truth differs across matched conditions for "
-                f"incident={key[0]}, reviewer={key[1]}, question={key[2]}"
-            )
-            raise ValueError(msg)
-        incident_cells[key[0]].add((key[1], key[2]))
-        incident_contrasts[key[0]] += int(
-            _is_correct(acgs_answer.answer, acgs_answer.ground_truth)
-        ) - int(_is_correct(baseline_answer.answer, baseline_answer.ground_truth))
-
-    if not incident_contrasts:
-        msg = "missing matched ACGS/baseline answer pairs"
-        raise ValueError(msg)
-    expected_cells = next(iter(incident_cells.values()))
-    if any(cells != expected_cells for cells in incident_cells.values()):
-        msg = "matched reviewer/question cells must be identical for every incident"
-        raise ValueError(msg)
-    return dict(incident_contrasts)
 
 
 def build_result_bundle(
@@ -2417,15 +2333,6 @@ def default_protocol_manifest() -> dict[str, Any]:
     }
 
 
-def generate_incident_specs(incident_count: int = 50) -> list[IncidentSpec]:
-    """Generate nonce-randomized adversarial incidents for external review pilots."""
-
-    return [
-        _incident_spec_from_source(source)
-        for source in _generate_incident_sources(incident_count, secrets.token_hex(32))
-    ]
-
-
 def _generate_incident_sources(
     incident_count: int,
     pack_nonce: str,
@@ -2455,37 +2362,6 @@ def _generate_incident_sources(
             )
         )
     return sources
-
-
-def _incident_spec_from_source(source: _IncidentEvidenceSource) -> IncidentSpec:
-    ordinal = source.ordinal
-    actor = f"agent-{ordinal:03d}-executor"
-    validator = f"agent-{ordinal:03d}-validator"
-    auditor = f"agent-{ordinal:03d}-auditor"
-    return IncidentSpec(
-        incident_id=source.incident_id,
-        adversarial_technique=source.adversarial_technique,
-        who_acted=actor,
-        authority_existed=(
-            f"{actor} had deploy role, but high-risk action required {validator} "
-            f"approval and {auditor} audit receipt."
-        ),
-        rule_applied=f"devops-high-risk-policy-v0.1::{source.adversarial_technique}",
-        evidence_used=(
-            f"diff-{ordinal:03d},policy-eval-{ordinal:03d},runtime-trace-{ordinal:03d}"
-        ),
-        who_approved_or_denied=(
-            f"{validator} denied after {auditor} flagged {source.adversarial_technique}"
-        ),
-        what_failed=(
-            f"{_failure_description(source.adversarial_technique)} in step {ordinal:03d}"
-        ),
-        outcome_defensible=(
-            "yes: denial/escalation preserved evidence and blocked execution"
-            if ordinal % 4
-            else "partially: execution was contained after delayed detection"
-        ),
-    )
 
 
 def _canonical_answer_key(source: _IncidentEvidenceSource) -> dict[str, str]:
@@ -3297,16 +3173,6 @@ def _mean_pairwise_agreement(answers: Iterable[ReviewerAnswer]) -> float:
         agreements.append(matching_pairs / total_pairs)
 
     return sum(agreements) / len(agreements) if agreements else 1.0
-
-
-def _failure_description(technique: str) -> str:
-    return {
-        "collusion": "executor and validator attempted coordinated approval",
-        "memory_poisoning": "agent memory included poisoned prior authorization",
-        "rule_gaming": "action was split to evade a high-risk threshold",
-        "fragmented_actions": "harm emerged only after stitching fragmented tool calls",
-        "misleading_traces": "trace labels understated the protected resource touched",
-    }[technique]
 
 
 def _reviewer_evidence_artifact(

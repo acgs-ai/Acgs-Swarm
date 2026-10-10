@@ -54,6 +54,12 @@ from constitutional_swarm.governance_fixtures import (
     valid_provenance_bundle,
 )
 from constitutional_swarm.governance_receipts import benchmark_summary, verify_bundle
+from constitutional_swarm.strict_json import StrictJSONError
+from constitutional_swarm.strict_json import loads as strict_json_loads
+
+# Upper bound for every security-relevant JSON document this CLI parses (seals,
+# kit and reviewer manifests). Generous for 200-incident coordinator packs.
+_MAX_SECURITY_JSON_BYTES = 64 * 1024 * 1024
 
 FORBIDDEN_REVIEWER_FILENAMES = {
     "answer_key.json",
@@ -642,8 +648,24 @@ def _write_replication_kit(
 
 def _verify_replication_kit(kit_dir: Path) -> dict[str, object]:
     manifest_path = kit_dir / "kit_manifest.json"
-    kit_manifest = json.loads(manifest_path.read_text())
-    expected_files = kit_manifest.get("files", {})
+    try:
+        kit_manifest = strict_json_loads(
+            manifest_path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES
+        )
+    except (OSError, StrictJSONError) as exc:
+        return {
+            "valid": False,
+            "checked_files": 0,
+            "issues": [
+                {
+                    "code": "invalid_kit_manifest",
+                    "message": f"kit_manifest.json could not be loaded: {exc}",
+                }
+            ],
+        }
+    expected_files = (
+        kit_manifest.get("files", {}) if isinstance(kit_manifest, dict) else None
+    )
     if not isinstance(expected_files, dict):
         return {
             "valid": False,
@@ -764,10 +786,12 @@ def _render_external_replication_submission_markdown(
     result_bundle_url: str,
     replication_metadata_url: str,
     commands_transcript_url: str,
-    trusted_attestors: Iterable[str],
 ) -> str:
-    del trusted_attestors
-    reviewer_blind = bool(bundle_summary.get("reviewer_count", 0)) >= 2
+    raw_reviewer_count = bundle_summary.get("reviewer_count")
+    # Display only: exact int (bool/str/float are shown as unknown).
+    reviewer_count = (
+        str(raw_reviewer_count) if type(raw_reviewer_count) is int else "unknown"
+    )
     result_bundle_check = (
         "x" if result_bundle_url and not result_bundle_url.startswith("TODO") else " "
     )
@@ -782,7 +806,8 @@ def _render_external_replication_submission_markdown(
         else " "
     )
     independent_check = " "
-    reviewer_check = "x" if reviewer_blind else " "
+    # Local evidence cannot prove human blinding, so this is never pre-ticked.
+    reviewer_check = " "
     lines = [
         "# External replication submission",
         "",
@@ -805,6 +830,11 @@ def _render_external_replication_submission_markdown(
         (
             f"- [{reviewer_check}] The reviewers only saw blinded artifacts, not "
             "the hidden answer key or condition labels."
+        ),
+        (
+            "- Note: reviewer blinding is not authenticated by the current "
+            f"evidence format (reviewer_count={reviewer_count}); this box is "
+            "never pre-ticked and must be attested by the replicating group."
         ),
         "",
         "## Rerun summary",
@@ -846,7 +876,7 @@ def _render_external_replication_submission_markdown(
             "inter_reviewer_agreement={agreement}; acgs_wins={wins}"
         ).format(
             incident_count=bundle_summary.get("incident_count"),
-            reviewer_count=bundle_summary.get("reviewer_count"),
+            reviewer_count=reviewer_count,
             p_value=bundle_summary.get("p_value_vs_strongest_baseline"),
             performance_delta=bundle_summary.get(
                 "performance_delta_vs_strongest_baseline"
@@ -923,7 +953,6 @@ def _write_external_replication_submission_package(
         result_bundle_url=result_bundle_url,
         replication_metadata_url=replication_metadata_url,
         commands_transcript_url=commands_transcript_url,
-        trusted_attestors=trusted_attestors,
     )
     submission_fields = {
         "replicating_group_name": bundle.external_replication.replicating_group,
@@ -1019,7 +1048,9 @@ def _validate_external_replication_submission_package(
     if not verdict.valid:
         issues.extend(issue.model_dump(mode="json") for issue in verdict.issues)
 
-    package = json.loads(submission_json_path.read_text())
+    package = strict_json_loads(
+        submission_json_path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES
+    )
     if package.get("schema") != "acgs-v0.1-external-replication-submission":
         issues.append(
             {
@@ -1264,8 +1295,8 @@ def _validate_required_public_artifacts_inventory(path: Path) -> dict[str, objec
     }
     issues: list[dict[str, str]] = []
     try:
-        inventory = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        inventory = strict_json_loads(path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES)
+    except (OSError, StrictJSONError) as exc:
         return {
             "valid": False,
             "issues": [
@@ -1715,8 +1746,10 @@ def _verify_collected_blind_answers_seal(
     condition_key_path: Path,
 ) -> dict[str, object]:
     try:
-        seal = json.loads(seal_path.read_text())
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        seal = strict_json_loads(
+            seal_path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES
+        )
+    except (OSError, StrictJSONError) as exc:
         return {
             "valid": False,
             "success_evidence": False,
@@ -1997,8 +2030,10 @@ def _verify_reviewer_manifest(pack_dir: Path) -> dict[str, object]:
             ],
         }
     try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = strict_json_loads(
+            manifest_path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES
+        )
+    except (OSError, StrictJSONError) as exc:
         return {
             "valid": False,
             "checked_files": 0,
@@ -2133,8 +2168,10 @@ def _reviewer_packet_inventory_issues(pack_dir: Path) -> list[dict[str, str]]:
         manifest_mode = None
     if manifest_mode is not None and stat.S_ISREG(manifest_mode):
         try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError):
+            manifest = strict_json_loads(
+                manifest_path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES
+            )
+        except (OSError, StrictJSONError):
             manifest = None
         if isinstance(manifest, dict) and isinstance(manifest.get("files"), dict):
             for raw_relative_path in manifest["files"]:
@@ -2262,9 +2299,18 @@ def _audit_reviewer_packet(packet_dir: Path) -> dict[str, object]:
             )
             continue
         try:
-            document = json.loads(text)
-        except json.JSONDecodeError:
+            document = strict_json_loads(text, max_bytes=_MAX_SECURITY_JSON_BYTES)
+        except StrictJSONError as exc:
             document = None
+            if _is_lenient_json(text):
+                # Valid to a lenient parser but rejected strictly (duplicate keys,
+                # NaN, depth, size): ambiguous, so fail closed.
+                issues.append(
+                    {
+                        "code": "ambiguous_packet_json",
+                        "message": f"{relative_path} is ambiguous JSON: {exc}",
+                    }
+                )
         if isinstance(document, dict) and _is_coordinator_manifest(document):
             issues.append(
                 {
@@ -2318,6 +2364,16 @@ def _deduplicate_issues(issues: list[dict[str, str]]) -> list[dict[str, str]]:
             seen.add(identity)
             unique.append(issue)
     return unique
+
+
+def _is_lenient_json(text: str) -> bool:
+    try:
+        json.loads(text)
+    except RecursionError:
+        return True
+    except ValueError:
+        return False
+    return True
 
 
 def _is_coordinator_manifest(document: dict[str, object]) -> bool:
@@ -3179,7 +3235,7 @@ def _v0_1_completion_audit(
             ),
             "artifacts": [
                 "src/constitutional_swarm/forensic_benchmark.py:ADVERSARIAL_TECHNIQUES",
-                "src/constitutional_swarm/forensic_benchmark.py:generate_incident_specs",
+                "src/constitutional_swarm/forensic_benchmark.py:generate_artifact_pack",
                 "tests/test_governance_receipts.py::test_generated_artifact_pack_has_50_incidents_and_hidden_answer_key",
             ],
             "verification_commands": [
@@ -3494,7 +3550,7 @@ def _v0_1_completion_audit(
 def _load_answer_key(path: Path | None) -> dict[str, dict[str, str]] | None:
     if path is None:
         return None
-    data = json.loads(path.read_text())
+    data = strict_json_loads(path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES)
     return {
         str(incident_id): {str(question_id): str(answer) for question_id, answer in answers.items()}
         for incident_id, answers in data.items()
@@ -3509,7 +3565,7 @@ def _load_condition_key(path: Path | None) -> dict[str, str] | None:
 
 
 def _load_condition_key_envelope(path: Path) -> tuple[dict[str, str], str]:
-    data = json.loads(path.read_text())
+    data = strict_json_loads(path.read_bytes(), max_bytes=_MAX_SECURITY_JSON_BYTES)
     if not isinstance(data, dict) or set(data) != {"conditions", "pack_nonce"}:
         msg = "condition key must contain only conditions and pack_nonce"
         raise ValueError(msg)
@@ -3738,7 +3794,10 @@ def _canonical_reviewer_packet_issues(
         if observed_paths & coordinator_only_paths:
             expected_files = canonical_files
         else:
-            manifest = json.loads(canonical_files["reviewer_manifest.json"])
+            manifest = strict_json_loads(
+                canonical_files["reviewer_manifest.json"],
+                max_bytes=_MAX_SECURITY_JSON_BYTES,
+            )
             expected_files = {
                 relative_path: canonical_files[relative_path]
                 for relative_path in manifest["files"]
