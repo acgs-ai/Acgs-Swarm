@@ -383,7 +383,7 @@ or data changes.
   - `discover_agents` raises on duplicate names.
 - **Build.**
   - Make gates fail closed unless the locked venv is exact (run `make setup`).
-  - Ruff is pinned to 0.15.12.
+  - Ruff is pinned to 0.16.10.
   - Publishing grants OIDC only to the publish job.
 
 ### Fixed

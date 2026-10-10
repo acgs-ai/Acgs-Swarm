@@ -38,7 +38,7 @@ PyPI = "https://pypi.org/project/constitutional-swarm/"
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
-  "ruff==0.15.12",
+  "ruff==0.16.10",
   "mypy>=2,<3",
   "numpy>=1.24",
   # scripts/agent_check.py (make agent-check / CI agent-operability) imports
@@ -118,7 +118,7 @@ where = ["src"]
 include = ["constitutional_swarm*"]
 
 [tool.ruff]
-required-version = "==0.15.12"
+required-version = "==0.16.10"
 target-version = "py311"
 line-length = 100
 
