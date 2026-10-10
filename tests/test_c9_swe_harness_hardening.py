@@ -250,9 +250,75 @@ def _c9_backend_write_oauth_credentials(tmp_path: Path) -> Path:
     return credential_path
 
 
-def _c9_backend_anthropic_timeout() -> Exception:
-    anthropic = pytest.importorskip("anthropic")
-    httpx = pytest.importorskip("httpx")
+def _c9_fake_anthropic_module() -> types.ModuleType:
+    """Stand-in SDK so CI exercises the agents without the optional extra.
+
+    The exception hierarchy mirrors anthropic's (APITimeoutError subclasses
+    APIConnectionError), which is what the misclassification tests rely on.
+    """
+    module = types.ModuleType("anthropic")
+
+    class APIError(Exception):
+        pass
+
+    class APIStatusError(APIError):
+        pass
+
+    class APIConnectionError(APIError):
+        pass
+
+    class APITimeoutError(APIConnectionError):
+        pass
+
+    module.APIError = APIError
+    module.APIStatusError = APIStatusError
+    module.APIConnectionError = APIConnectionError
+    module.APITimeoutError = APITimeoutError
+    module.Anthropic = MagicMock(name="Anthropic")
+    module.AnthropicVertex = MagicMock(name="AnthropicVertex")
+    module._c9_fake = True
+    return module
+
+
+@pytest.fixture
+def c9_anthropic(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """Real anthropic SDK when installed, otherwise the stand-in module."""
+    try:
+        import anthropic
+    except ImportError:
+        anthropic = _c9_fake_anthropic_module()
+        monkeypatch.setitem(sys.modules, "anthropic", anthropic)
+    return anthropic
+
+
+@pytest.fixture
+def c9_genai(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """Real google-genai SDK when installed, otherwise a stand-in module."""
+    try:
+        from google import genai
+    except ImportError:
+        genai_types = types.ModuleType("google.genai.types")
+        genai_types.HttpOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        genai_types.HttpRetryOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        genai = types.ModuleType("google.genai")
+        genai.Client = MagicMock(name="Client")
+        genai.types = genai_types
+        try:
+            import google
+        except ImportError:
+            google = types.ModuleType("google")
+            google.__path__ = []
+            monkeypatch.setitem(sys.modules, "google", google)
+        monkeypatch.setattr(google, "genai", genai, raising=False)
+        monkeypatch.setitem(sys.modules, "google.genai", genai)
+        monkeypatch.setitem(sys.modules, "google.genai.types", genai_types)
+    return genai
+
+
+def _c9_backend_anthropic_timeout(anthropic: types.ModuleType) -> Exception:
+    if getattr(anthropic, "_c9_fake", False):
+        return anthropic.APITimeoutError("timed out")
+    import httpx
 
     return anthropic.APITimeoutError(httpx.Request("POST", "https://example.invalid"))
 
@@ -285,8 +351,7 @@ def test_c9_backend_base_agent_enforces_timeout_invariant() -> None:
         SWEBenchAgent(timeout_s=0)
 
 
-def test_c9_backend_claude_client_has_hard_timeout_and_no_implicit_retries() -> None:
-    pytest.importorskip("anthropic")
+def test_c9_backend_claude_client_has_hard_timeout_and_no_implicit_retries(c9_anthropic: types.ModuleType) -> None:
     from constitutional_swarm.swe_bench.claude_agent import ClaudeSWEBenchAgent
 
     with patch("anthropic.Anthropic") as client_constructor:
@@ -300,8 +365,7 @@ def test_c9_backend_claude_client_has_hard_timeout_and_no_implicit_retries() -> 
     )
 
 
-def test_c9_backend_claude_rejects_per_call_timeout_override() -> None:
-    pytest.importorskip("anthropic")
+def test_c9_backend_claude_rejects_per_call_timeout_override(c9_anthropic: types.ModuleType) -> None:
     from constitutional_swarm.swe_bench.claude_agent import ClaudeSWEBenchAgent
 
     with patch("anthropic.Anthropic"):
@@ -311,8 +375,8 @@ def test_c9_backend_claude_rejects_per_call_timeout_override() -> None:
 
 def test_c9_backend_oauth_client_has_hard_timeout_and_no_implicit_retries(
     tmp_path: Path,
+    c9_anthropic: types.ModuleType,
 ) -> None:
-    pytest.importorskip("anthropic")
     from constitutional_swarm.swe_bench.claude_oauth_agent import (
         ClaudeOAuthSWEBenchAgent,
     )
@@ -332,8 +396,7 @@ def test_c9_backend_oauth_client_has_hard_timeout_and_no_implicit_retries(
     )
 
 
-def test_c9_backend_vertex_client_has_hard_timeout_and_no_implicit_retries() -> None:
-    pytest.importorskip("anthropic")
+def test_c9_backend_vertex_client_has_hard_timeout_and_no_implicit_retries(c9_anthropic: types.ModuleType) -> None:
     from constitutional_swarm.swe_bench.vertex_agent import VertexClaudeSWEBenchAgent
 
     with patch("anthropic.AnthropicVertex") as client_constructor:
@@ -348,8 +411,7 @@ def test_c9_backend_vertex_client_has_hard_timeout_and_no_implicit_retries() -> 
     )
 
 
-def test_c9_backend_gemini_client_has_hard_timeout_and_one_attempt() -> None:
-    pytest.importorskip("google.genai")
+def test_c9_backend_gemini_client_has_hard_timeout_and_one_attempt(c9_genai: types.ModuleType) -> None:
     from constitutional_swarm.swe_bench.gemini_agent import GeminiSWEBenchAgent
 
     with patch("google.genai.Client") as client_constructor:
@@ -361,8 +423,7 @@ def test_c9_backend_gemini_client_has_hard_timeout_and_one_attempt() -> None:
     assert http_options.retry_options.attempts == 1
 
 
-def test_c9_backend_gemini_rejects_transport_override() -> None:
-    pytest.importorskip("google.genai")
+def test_c9_backend_gemini_rejects_transport_override(c9_genai: types.ModuleType) -> None:
     from constitutional_swarm.swe_bench.gemini_agent import GeminiSWEBenchAgent
 
     with patch("google.genai.Client"):
@@ -395,11 +456,12 @@ def test_c9_backend_anthropic_timeout_is_not_misclassified_as_connection_error(
     class_name: str,
     constructor_target: str,
     constructor_kwargs: dict[str, str],
+    c9_anthropic: types.ModuleType,
 ) -> None:
     module = __import__(module_name, fromlist=[class_name])
     agent_class = getattr(module, class_name)
     client = MagicMock()
-    client.messages.create.side_effect = _c9_backend_anthropic_timeout()
+    client.messages.create.side_effect = _c9_backend_anthropic_timeout(c9_anthropic)
 
     with patch(constructor_target, return_value=client):
         agent = agent_class(**constructor_kwargs)
@@ -411,8 +473,9 @@ def test_c9_backend_anthropic_timeout_is_not_misclassified_as_connection_error(
 
 def test_c9_backend_oauth_timeout_is_not_misclassified_as_connection_error(
     tmp_path: Path,
+    c9_anthropic: types.ModuleType,
 ) -> None:
-    anthropic = pytest.importorskip("anthropic")
+    anthropic = c9_anthropic
 
     from constitutional_swarm.swe_bench.claude_oauth_agent import (
         ClaudeOAuthSWEBenchAgent,
@@ -420,7 +483,7 @@ def test_c9_backend_oauth_timeout_is_not_misclassified_as_connection_error(
 
     credential_path = _c9_backend_write_oauth_credentials(tmp_path)
     client = MagicMock()
-    client.messages.create.side_effect = _c9_backend_anthropic_timeout()
+    client.messages.create.side_effect = _c9_backend_anthropic_timeout(anthropic)
     fake_anthropic = SimpleNamespace(
         Anthropic=MagicMock(return_value=client),
         APIStatusError=anthropic.APIStatusError,
