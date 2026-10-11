@@ -654,7 +654,10 @@ above.
   `expected_node_version="1"` when it stages after a commit, as its neighbours
   already do. That file's SHA-256 moves from `dff15b7f…` to `177d3137…`;
   `postgres_store.py` keeps `576c0449…`. The dated `docs/internal/APCC-1-*`
-  records still describe the pair as it was when they were written.
+  records still describe the pair as it was when they were written. An
+  independent re-review of the current pair and the inherited C32 core changes
+  (`docs/internal/APCC-1-B2-Rereview-2026-10-10.md`) returned APPROVE-WITH-P2,
+  P0=0, P1=0, with two new fail-closed P2s.
 - **APCC observation and empirical (C33, C34).** The request an observation
   answers comes from the caller (`expected_request`) and is compared before any
   cryptographic work; the verified result records `request_digest`. B4 pins its
