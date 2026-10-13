@@ -1,0 +1,14 @@
+{
+  "name": "acgs-document-fixture-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "biome lint src",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "test": "tsc -p tsconfig.test.json && node --test .test-build/replay.test.js"
+  },
+  "dependencies": {"react": "19.2.5", "react-dom": "19.2.5"},
+  "devDependencies": {"typescript": "6.0.2", "vite": "8.0.10", "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3", "@types/node": "24.12.2", "@playwright/test": "1.60.0", "@biomejs/biome": "2.4.14"}
+}

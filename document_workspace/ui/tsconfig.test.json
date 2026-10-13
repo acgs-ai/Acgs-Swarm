@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {"noEmit": false, "outDir": ".test-build", "rootDir": "src"},
+  "include": ["src/replay.ts", "src/replay.test.ts"]
+}

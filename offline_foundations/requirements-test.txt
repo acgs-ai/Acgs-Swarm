@@ -1,0 +1,4 @@
+# Directly tested bounded verification dependencies; no model extras.
+pytest==9.0.3
+ruff==0.15.7
+httpx==0.28.1
