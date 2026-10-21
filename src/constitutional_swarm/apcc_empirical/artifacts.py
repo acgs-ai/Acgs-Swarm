@@ -42,14 +42,47 @@ REVIEWED_MATRIX_SHA256 = (
 REVIEWED_SCHEMA_SHA256 = (
     "7d869fd99381cd0ec65a1e9780ddf82b9a0700f11319c371f7b909a60a44fbae"
 )
+REVIEWED_MATRIX_V2_SHA256 = (
+    "7bdd13fc902e654b344d2e63f79c2a0362964589f76e648fa72666c940eabda1"
+)
+REVIEWED_SCHEMA_V2_SHA256 = (
+    "36bd5035d31085462aa54921c71a231135017438b00bb7fd635f7b02e9989989"
+)
+
+
+@dataclass(frozen=True)
+class _ArtifactProfile:
+    matrix_sha256: str
+    schema_sha256: str
+    schema_version: str
+    matrix_filename: str
+
+    @property
+    def files(self) -> tuple[str, ...]:
+        return (
+            "manifest.json",
+            self.matrix_filename,
+            "raw-result.schema.json",
+            "raw.jsonl",
+        )
+
+
+_PROFILES = {
+    "apcc-1.matrix.v1": _ArtifactProfile(
+        REVIEWED_MATRIX_SHA256,
+        REVIEWED_SCHEMA_SHA256,
+        "apcc-1.raw-result.v1",
+        "matrix.v1.json",
+    ),
+    "apcc-1.matrix.v2": _ArtifactProfile(
+        REVIEWED_MATRIX_V2_SHA256,
+        REVIEWED_SCHEMA_V2_SHA256,
+        "apcc-1.raw-result.v2",
+        "matrix.v2.json",
+    ),
+}
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_ARTIFACT_FILES = (
-    "manifest.json",
-    "matrix.v1.json",
-    "raw-result.schema.json",
-    "raw.jsonl",
-)
 _MAX_RAW_BYTES = 1 << 30
 _MAX_METADATA_BYTES = 1 << 20
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -216,8 +249,10 @@ def _rename_noreplace(source_fd: int, source: str, target_fd: int, target: str) 
     )
 
 
-def _load_schema(raw: bytes) -> tuple[dict[str, object], Draft202012Validator]:
-    if _sha256(raw) != REVIEWED_SCHEMA_SHA256:
+def _load_schema(
+    raw: bytes, *, expected_sha256: str = REVIEWED_SCHEMA_SHA256
+) -> tuple[dict[str, object], Draft202012Validator]:
+    if _sha256(raw) != expected_sha256:
         raise ArtifactViolation("artifact does not contain the exact reviewed schema")
     try:
         value = json.loads(raw)
@@ -231,7 +266,7 @@ def _load_schema(raw: bytes) -> tuple[dict[str, object], Draft202012Validator]:
 
 
 def _load_matrix_payload(raw: bytes) -> ExperimentMatrix:
-    if _sha256(raw) != REVIEWED_MATRIX_SHA256:
+    if _sha256(raw) not in {profile.matrix_sha256 for profile in _PROFILES.values()}:
         raise ArtifactViolation("artifact does not contain the exact reviewed matrix")
     with tempfile.TemporaryDirectory(prefix="apcc-matrix-") as temporary:
         path = Path(temporary) / "matrix.json"
@@ -292,9 +327,11 @@ def _validate_manifest(manifest: dict[str, object]) -> None:
     git_sha = manifest["git_sha"]
     if not isinstance(git_sha, str) or re.fullmatch(r"[0-9a-f]{40}", git_sha) is None:
         raise ArtifactViolation("artifact manifest git_sha is invalid")
-    if manifest["matrix_revision"] != "apcc-1.matrix.v1":
+    revision = manifest["matrix_revision"]
+    if not isinstance(revision, str) or revision not in _PROFILES:
         raise ArtifactViolation("artifact manifest matrix revision is invalid")
-    if manifest["schema_version"] != "apcc-1.raw-result.v1":
+    profile = _PROFILES[revision]
+    if manifest["schema_version"] != profile.schema_version:
         raise ArtifactViolation("artifact manifest schema version is invalid")
     tool_versions = manifest["tool_versions"]
     if (
@@ -357,10 +394,13 @@ class RawArtifactWriter:
             raise ArtifactViolation(
                 "matrix object does not match reviewed matrix source"
             )
+        self._profile = _PROFILES[matrix.revision]
         self._schema_raw = _read_path(
             Path(schema_path), name="schema source", limit=_MAX_METADATA_BYTES
         )
-        _, self._schema_validator = _load_schema(self._schema_raw)
+        _, self._schema_validator = _load_schema(
+            self._schema_raw, expected_sha256=self._profile.schema_sha256
+        )
         self._planned = tuple(planned_trial_ids)
         _validate_planner_subsequence(matrix, self._planned)
         self._environment = dict(environment)
@@ -445,7 +485,17 @@ class RawArtifactWriter:
                 pass
         if self._staging_fd >= 0:
             try:
-                for name in os.listdir(self._staging_fd):
+                # Refresh enumeration without resolving the staging path again:
+                # an fd opened before file creation can retain stale directory
+                # state on disk-backed filesystems, even with a zero offset.
+                enumeration_fd = os.open(
+                    ".", os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=self._staging_fd
+                )
+                try:
+                    names = os.listdir(enumeration_fd)
+                finally:
+                    os.close(enumeration_fd)
+                for name in names:
                     info = os.stat(name, dir_fd=self._staging_fd, follow_symlinks=False)
                     if not stat.S_ISREG(info.st_mode):
                         raise ArtifactViolation(
@@ -489,8 +539,8 @@ class RawArtifactWriter:
             "environment_id": self._environment_id,
             "git_sha": self._git_sha,
             "matrix_revision": self._matrix.revision,
-            "matrix_sha256": REVIEWED_MATRIX_SHA256,
-            "schema_version": "apcc-1.raw-result.v1",
+            "matrix_sha256": self._profile.matrix_sha256,
+            "schema_version": self._profile.schema_version,
             "tool_versions": self._tool_versions,
         }
         if any(record.get(key) != value for key, value in expected_provenance.items()):
@@ -545,7 +595,7 @@ class RawArtifactWriter:
                 src_dir_fd=self._staging_fd,
                 dst_dir_fd=self._staging_fd,
             )
-            _write_at(self._staging_fd, "matrix.v1.json", self._matrix_raw)
+            _write_at(self._staging_fd, self._profile.matrix_filename, self._matrix_raw)
             _write_at(self._staging_fd, "raw-result.schema.json", self._schema_raw)
             raw = _read_at(self._staging_fd, "raw.jsonl", limit=_MAX_RAW_BYTES)
             manifest = {
@@ -553,19 +603,19 @@ class RawArtifactWriter:
                 "environment_id": self._environment_id,
                 "git_sha": self._git_sha,
                 "matrix_revision": self._matrix.revision,
-                "matrix_sha256": REVIEWED_MATRIX_SHA256,
+                "matrix_sha256": self._profile.matrix_sha256,
                 "raw_record_count": self._count,
                 "raw_sha256": _sha256(raw),
                 "raw_size_bytes": len(raw),
-                "schema_sha256": REVIEWED_SCHEMA_SHA256,
-                "schema_version": "apcc-1.raw-result.v1",
+                "schema_sha256": self._profile.schema_sha256,
+                "schema_version": self._profile.schema_version,
                 "tool_versions": self._tool_versions,
                 "trial_ids": list(self._planned),
             }
             _write_at(self._staging_fd, "manifest.json", canonical_json_bytes(manifest))
             sums = b"".join(
                 f"{_sha256(_read_at(self._staging_fd, name, limit=_MAX_RAW_BYTES if name == 'raw.jsonl' else _MAX_METADATA_BYTES))}  {name}\n".encode()
-                for name in sorted(_ARTIFACT_FILES)
+                for name in sorted(self._profile.files)
             )
             _write_at(self._staging_fd, "SHA256SUMS", sums)
             os.fsync(self._staging_fd)
@@ -612,13 +662,19 @@ def read_artifact_run(path: Path) -> ArtifactRun:
     finally:
         os.close(parent_fd)
     try:
-        expected = {*_ARTIFACT_FILES, "SHA256SUMS"}
         try:
             actual = set(os.listdir(run_fd))
         except OSError as error:
             raise ArtifactViolation("cannot list artifact run") from error
-        if actual != expected:
+        profiles = [
+            profile
+            for profile in _PROFILES.values()
+            if actual == {*profile.files, "SHA256SUMS"}
+        ]
+        if len(profiles) != 1:
             raise ArtifactViolation("artifact run has missing or extra files")
+        profile = profiles[0]
+        expected = {*profile.files, "SHA256SUMS"}
         payloads = {
             name: _read_at(
                 run_fd,
@@ -632,7 +688,7 @@ def read_artifact_run(path: Path) -> ArtifactRun:
             os.close(run_fd)
     expected_sums = b"".join(
         f"{_sha256(payloads[name])}  {name}\n".encode()
-        for name in sorted(_ARTIFACT_FILES)
+        for name in sorted(profile.files)
     )
     if payloads["SHA256SUMS"] != expected_sums:
         raise ArtifactViolation("artifact hash manifest is reordered or invalid")
@@ -644,12 +700,18 @@ def read_artifact_run(path: Path) -> ArtifactRun:
     if not isinstance(manifest, dict) or not canonical:
         raise ArtifactViolation("artifact manifest is not canonical")
     _validate_manifest(manifest)
-    if manifest.get("matrix_sha256") != REVIEWED_MATRIX_SHA256:
+    if _PROFILES[str(manifest["matrix_revision"])] != profile:
+        raise ArtifactViolation("artifact file layout does not match matrix revision")
+    if manifest.get("matrix_sha256") != profile.matrix_sha256:
         raise ArtifactViolation("artifact manifest does not pin the reviewed matrix")
-    if manifest.get("schema_sha256") != REVIEWED_SCHEMA_SHA256:
+    if manifest.get("schema_sha256") != profile.schema_sha256:
         raise ArtifactViolation("artifact manifest does not pin the reviewed schema")
-    matrix = _load_matrix_payload(payloads["matrix.v1.json"])
-    _, schema_validator = _load_schema(payloads["raw-result.schema.json"])
+    matrix = _load_matrix_payload(payloads[profile.matrix_filename])
+    if matrix.revision != manifest["matrix_revision"]:
+        raise ArtifactViolation("artifact matrix does not match manifest revision")
+    _, schema_validator = _load_schema(
+        payloads["raw-result.schema.json"], expected_sha256=profile.schema_sha256
+    )
     checks = {
         "raw_sha256": _sha256(payloads["raw.jsonl"]),
         "raw_size_bytes": len(payloads["raw.jsonl"]),
