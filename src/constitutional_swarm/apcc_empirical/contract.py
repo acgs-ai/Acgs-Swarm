@@ -15,6 +15,11 @@ from typing import Any, NoReturn
 
 MATRIX_REVISION = "apcc-1.matrix.v1"
 RAW_RESULT_SCHEMA_VERSION = "apcc-1.raw-result.v1"
+MATRIX_REVISION_V2 = "apcc-1.matrix.v2"
+RAW_RESULT_SCHEMA_VERSION_V2 = "apcc-1.raw-result.v2"
+PERFORMANCE_DURATION_POLICY_V2 = (
+    "max-base-duration-ceil-minimum-operations-over-target-rate"
+)
 _PRNG_PREFIX = b"APCC-1 empirical hash-counter PRNG v1\0"
 _B64U_256 = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -302,6 +307,31 @@ class ExperimentMatrix:
     formal_configs: tuple[FormalConfig, ...]
     seeds: tuple[int, ...]
     repetitions: Repetitions
+
+    @property
+    def raw_result_schema_version(self) -> str:
+        if self.revision == MATRIX_REVISION:
+            return RAW_RESULT_SCHEMA_VERSION
+        if self.revision == MATRIX_REVISION_V2:
+            return RAW_RESULT_SCHEMA_VERSION_V2
+        raise ContractViolation("unknown matrix revision")
+
+    def performance_duration_seconds(self, target_rate: int) -> int:
+        """Return the scheduled duration; completed-count evidence stays mandatory."""
+        if (
+            type(target_rate) is not int
+            or target_rate not in self.target_rates_per_second
+        ):
+            raise ContractViolation("unknown performance target rate")
+        if self.revision == MATRIX_REVISION:
+            return self.repetitions.run_duration_seconds
+        if self.revision != MATRIX_REVISION_V2:
+            raise ContractViolation("unknown matrix revision")
+        minimum = self.repetitions.minimum_completed_operations
+        return max(
+            self.repetitions.run_duration_seconds,
+            (minimum + target_rate - 1) // target_rate,
+        )
 
 
 @dataclass(frozen=True)
@@ -715,9 +745,15 @@ def _validate_matrix(value: object) -> ExperimentMatrix:
         "target_rates_per_second",
         "workloads",
     }
+    if isinstance(value, dict) and value.get("revision") == MATRIX_REVISION_V2:
+        root_keys.add("performance_duration_policy")
     root = _mapping(value, where="matrix", keys=root_keys)
-    if root["revision"] != MATRIX_REVISION:
-        _fail(f"revision must be {MATRIX_REVISION}")
+    if root["revision"] not in (MATRIX_REVISION, MATRIX_REVISION_V2):
+        _fail(f"revision must be {MATRIX_REVISION} or {MATRIX_REVISION_V2}")
+    if root["revision"] == MATRIX_REVISION_V2 and (
+        root["performance_duration_policy"] != PERFORMANCE_DURATION_POLICY_V2
+    ):
+        _fail("performance_duration_policy must use the reviewed v2 rule")
 
     attacks = _id_sequence(root["attacks"], where="attacks", expected=ATTACK_IDS)
     ablations = _id_sequence(
@@ -916,7 +952,7 @@ def _validate_matrix(value: object) -> ExperimentMatrix:
     _validate_workloads(workloads)
 
     return ExperimentMatrix(
-        revision=MATRIX_REVISION,
+        revision=root["revision"],
         matrix_sha256=hashlib.sha256(canonical_json_bytes(value)).hexdigest(),
         baselines=tuple(
             Baseline(str(item["id"]), str(item["name"]), tuple(item["stores"]))
@@ -1379,7 +1415,9 @@ def planned_performance_runs(matrix: ExperimentMatrix) -> Iterator[PerformanceRu
                                 duration_seconds = (
                                     None
                                     if lifecycle_mode == "fixed-operations"
-                                    else matrix.repetitions.run_duration_seconds
+                                    else matrix.performance_duration_seconds(
+                                        target_rate
+                                    )
                                 )
                                 operation_limit = (
                                     matrix.repetitions.minimum_completed_operations
@@ -1459,7 +1497,9 @@ def planned_ablation_performance_runs(
                         sub_seed=sub_seed,
                         payload_pair=cell.payload_pair,
                         lifecycle_mode=cell.lifecycle_mode,
-                        duration_seconds=matrix.repetitions.run_duration_seconds,
+                        duration_seconds=matrix.performance_duration_seconds(
+                            cell.target_rate_per_second
+                        ),
                         operation_limit=None,
                         ablation_id=cell.ablation_id,
                     )
@@ -1682,7 +1722,7 @@ def load_raw_result(path: str | Path, *, matrix: ExperimentMatrix) -> dict[str, 
 
 
 def _validate_raw_result(record: Mapping[str, Any], matrix: ExperimentMatrix) -> None:
-    if record["schema_version"] != RAW_RESULT_SCHEMA_VERSION:
+    if record["schema_version"] != matrix.raw_result_schema_version:
         _fail("raw result has unknown schema version")
     if record["matrix_revision"] != matrix.revision:
         _fail("raw result has unknown matrix revision")
@@ -1951,7 +1991,11 @@ def _validate_workload_evidence(
     if (
         evidence["lifecycle_mode"] != expected_mode
         or evidence["duration_seconds"]
-        != (None if fixed else matrix.repetitions.run_duration_seconds)
+        != (
+            None
+            if fixed
+            else matrix.performance_duration_seconds(record["target_rate_per_second"])
+        )
         or evidence["operation_limit"]
         != (matrix.repetitions.minimum_completed_operations if fixed else None)
     ):
