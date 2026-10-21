@@ -8,6 +8,12 @@ guarded transaction so replay and equivocation precedence cannot be bypassed.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .gcb_projection import _GCBAtomicCommitRequest
+    from .sqlite_store import _IssuedOutboxClaim
+
 from .ports import (
     APCCAuthorityConfig,
     AssembleEvidenceRequest,
@@ -67,3 +73,12 @@ class APCCCommitService:
 
     def commit(self, request: AtomicCommitRequest) -> CommitResult:
         return self._store.atomic_commit(request)
+
+    def _commit_and_claim_for_authority(
+        self, request: _GCBAtomicCommitRequest
+    ) -> tuple[CommitResult, _IssuedOutboxClaim | None]:
+        from .sqlite_store import SQLiteAuthorityStore
+
+        if type(self._store) is not SQLiteAuthorityStore:
+            raise TypeError("authority preclaim requires the SQLite authority store")
+        return self._store._atomic_commit_and_claim_head(request)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import constitutional_swarm
 
 STABLE_FACADE = (
+    "WorkflowProfile",
     "AgentDNA",
     "Artifact",
     "ArtifactStore",

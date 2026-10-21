@@ -16,6 +16,7 @@ from psycopg import sql
 from .model import AuthorityStatus, CommitDecision, FailureCode, RequestOutcome
 from .ports import (
     APCCAuthorityConfig,
+    AuthorityCausalProfile,
     AssembleEvidenceRequest,
     AssembleEvidenceResult,
     AtomicCommitRequest,
@@ -3219,6 +3220,7 @@ def _semantic_config(
         if _json(config_object) != values["config"]:
             raise invalid
         config = _config_from_object(config_object)
+        _require_default_causal_profile(config)
         if catalog_profile == _GCB_CATALOG_PROFILE:
             store_meta = connection.execute(
                 "SELECT singleton,profile,schema_version,authority_store_id,sealed "
@@ -3342,6 +3344,13 @@ def _attest_and_seal_fresh_bootstrap(
         raise ValueError("APCC authority store configuration mismatch")
 
 
+def _require_default_causal_profile(config: APCCAuthorityConfig) -> None:
+    if config.causal_profile is not AuthorityCausalProfile.DEFAULT:
+        raise ValueError(
+            "PostgreSQL authority supports only the default causal profile"
+        )
+
+
 class PostgresAuthorityReader(_AuthorityReaderCore):
     def __init__(
         self,
@@ -3350,6 +3359,7 @@ class PostgresAuthorityReader(_AuthorityReaderCore):
         config: APCCAuthorityConfig,
         status_signer: AuthorityObservationStatusSigner | None = None,
     ) -> None:
+        _require_default_causal_profile(config)
         super().__init__(config.authority_store_id, status_signer)
         self._dsn = dsn
         self.schema_name = schema
@@ -3429,6 +3439,7 @@ class PostgresAuthorityStore(_AuthorityStoreCore):
         probe: _Probe | None,
         catalog_profile: str = _BASE_CATALOG_PROFILE,
     ) -> None:
+        _require_default_causal_profile(config)
         super().__init__(config, runtime)
         self._dsn = dsn
         self.schema_name = schema
@@ -3625,6 +3636,7 @@ class PostgresAuthorityStore(_AuthorityStoreCore):
         runtime: AuthorityRuntime,
         catalog_profile: str,
     ) -> None:
+        _require_default_causal_profile(config)
         _validate_schema_name(schema)
         _validate_role_name(runtime_role)
         _validate_role_name(observer_role)
@@ -3826,6 +3838,7 @@ class PostgresAuthorityStore(_AuthorityStoreCore):
         probe: _Probe | None,
         catalog_profile: str,
     ) -> PostgresAuthorityStore:
+        _require_default_causal_profile(config)
         _validate_schema_name(schema)
         _validate_runtime_signers(config, runtime)
         store = cls(

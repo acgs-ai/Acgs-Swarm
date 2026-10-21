@@ -13,7 +13,7 @@ import json
 import secrets
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
@@ -27,11 +27,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from constitutional_swarm._sqlite_connections import (
+    SQLiteConnection,
+    _ConnectionLease,
+    _configured_connection,
+    _connect_scoped,
+)
 from constitutional_swarm.apcc.codec import canonical_statement
 from constitutional_swarm.apcc.crypto import (
     AUTHORITY_DOMAIN,
     POLICY_DOMAIN,
     PROPOSAL_DOMAIN,
+    b64u_decode,
     b64u_encode,
     domain_preimage,
     predecessor_root as apcc_predecessor_root,
@@ -39,7 +46,6 @@ from constitutional_swarm.apcc.crypto import (
 )
 from constitutional_swarm.apcc.model import (
     AuthorityStatusValue,
-    CandidateLifecycle,
     CertificateBindings,
     CertificateContext,
     CertificateEvidence,
@@ -50,16 +56,15 @@ from constitutional_swarm.apcc.model import (
     RequestOutcome,
     Signature,
 )
+from constitutional_swarm.apcc.observation import AuthorityObservationRequest
 from constitutional_swarm.apcc.ports import (
     APCCAuthorityConfig,
-    AssembleEvidenceRequest,
     AtomicCommitRequest,
     AuthorityRuntime,
+    CommitResult as APCCCommitResult,
     LogicalNodeStatusRequest,
-    ProposeCommitRequest,
     RevocationRequest,
     RevocationScope,
-    StageResultRequest,
 )
 from constitutional_swarm.apcc.service import APCCCommitService
 from constitutional_swarm.apcc.gcb_projection import (
@@ -69,9 +74,19 @@ from constitutional_swarm.apcc.gcb_projection import (
     _GCBProjectionFault,
     _GCBProjectionPlan,
 )
-from constitutional_swarm.apcc.sqlite_store import SQLiteAuthorityStore
+from constitutional_swarm.apcc.sqlite_store import (
+    SQLiteAuthorityStore,
+    _IssuedOutboxClaim,
+    _operation_from_json,
+    _operation_identity,
+)
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
+from constitutional_swarm.workflow_profile import (
+    WorkflowProfile,
+    require_workflow_profile,
+    validate_workflow_nodes,
+)
 
 GCB_RECEIPT_PROFILE = "acgs-swarm/gcb-receipt/v1"
 GCB_SIGNATURE_ALGORITHM = "Ed25519"
@@ -80,9 +95,13 @@ _DOMAIN = b"ACGS-SWARM\x00GCB\x00V1\x00"
 _VERDICT_DOMAIN = b"ACGS-SWARM\x00GCB\x00VERDICT\x00V1\x00"
 _CONTROL_DOMAIN = b"ACGS-SWARM\x00GCB\x00CONTROL\x00V1\x00"
 _CONTROL_SIGNER_DOMAIN = b"ACGS-SWARM-GCB-CONTROL-V1"
-_MAX_WORKFLOW_NODES = 1000
 _ATTEMPT_DOMAIN = b"ACGS-SWARM\x00GCB\x00ATTEMPT\x00V1\x00"
-_LegacyTransaction = sqlite3.Connection
+_LegacyTransaction = SQLiteConnection
+_GCB_ADMISSION_INDEX = "idx_gcb_admission_lookup"
+_GCB_ADMISSION_INDEX_SQL = (
+    "CREATE INDEX idx_gcb_admission_lookup "
+    "ON gcb_control_events(workflow_id,action,outcome)"
+)
 
 
 class _GCBFaultCheckpoint(Enum):
@@ -542,6 +561,7 @@ class GovernedCommitBoundary:
         self._apcc_service: APCCCommitService
         self._policy_signer: Any
         self._registry_signer: Any
+        self.workflow_profile: WorkflowProfile
         del args, kwargs
         raise GovernanceBypassDenied(
             "use GovernedCommitBoundary.open on a sealed store"
@@ -557,15 +577,30 @@ class GovernedCommitBoundary:
             "APCC authority requires typed trusted bootstrap recovery"
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self.path, timeout=self._busy_timeout_ms / 1000, isolation_level=None
+    def _connect(self) -> SQLiteConnection:
+        conn = _connect_scoped(
+            Path(self.path),
+            kind="gcb",
+            database=self.path,
+            timeout=self._busy_timeout_ms / 1000,
+            isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-        return conn
+        return _configured_connection(conn)
+
+    @contextmanager
+    def _connection_context(self) -> Iterator[SQLiteConnection]:
+        """Finish the native context and return only scoped connection leases."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            if type(connection) is _ConnectionLease:
+                connection.close()
 
     @contextmanager
     def _transaction(self):
@@ -601,7 +636,7 @@ class GovernedCommitBoundary:
             raise GovernanceBypassDenied("authority_store_already_exists")
         if not provision and not existed:
             raise GovernanceBypassDenied("sealed_authority_store_required")
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             if provision:
                 if (
                     not store_id
@@ -717,7 +752,7 @@ class GovernedCommitBoundary:
                   ON revocation_outbox(processed,generation);
                 """
             if provision:
-                conn.executescript(schema_sql)
+                conn.executescript(schema_sql + _GCB_ADMISSION_INDEX_SQL + ";")
             self._validate_schema_shape(conn)
             if provision:
                 assert verifier_public_key is not None
@@ -762,7 +797,7 @@ class GovernedCommitBoundary:
                     self._verify_committed_evidence(conn, workflow["workflow_id"])
 
     @staticmethod
-    def _validate_schema_shape(conn: sqlite3.Connection) -> None:
+    def _validate_schema_shape(conn: SQLiteConnection) -> None:
         expected_columns = {
             "schema_meta": ("singleton", "version"),
             "store_seal": (
@@ -908,7 +943,48 @@ class GovernedCommitBoundary:
             )
             if row[1] in expected_columns
         }
-        if named_indexes != {"idx_outbox_pending", "idx_revocation_pending"}:
+        # Absence is the legacy performance profile, including index deletion.
+        # Opening never migrates or repairs it; new stores provision the index.
+        legacy_indexes = {"idx_outbox_pending", "idx_revocation_pending"}
+        reserved_objects = conn.execute(
+            "SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?",
+            (_GCB_ADMISSION_INDEX,),
+        ).fetchall()
+        if not reserved_objects:
+            valid_indexes = named_indexes == legacy_indexes
+        else:
+            reserved = reserved_objects[0]
+            valid_indexes = len(
+                reserved_objects
+            ) == 1 and named_indexes == legacy_indexes | {_GCB_ADMISSION_INDEX}
+            valid_indexes = valid_indexes and (
+                reserved[0] == "index"
+                and reserved[1] == "gcb_control_events"
+                and isinstance(reserved[2], str)
+                and "".join(reserved[2].split()).lower()
+                == "".join(_GCB_ADMISSION_INDEX_SQL.split()).lower()
+            )
+            metadata = [
+                tuple(row)[1:]
+                for row in conn.execute("PRAGMA index_list(gcb_control_events)")
+                if row[1] == _GCB_ADMISSION_INDEX
+            ]
+            keys = [
+                tuple(row)
+                for row in conn.execute("PRAGMA index_xinfo(idx_gcb_admission_lookup)")
+            ]
+            valid_indexes = (
+                valid_indexes
+                and metadata == [(_GCB_ADMISSION_INDEX, 0, "c", 0)]
+                and keys
+                == [
+                    (0, 2, "workflow_id", 0, "BINARY", 1),
+                    (1, 1, "action", 0, "BINARY", 1),
+                    (2, 5, "outcome", 0, "BINARY", 1),
+                    (3, -1, None, 0, "BINARY", 0),
+                ]
+            )
+        if not valid_indexes:
             raise GovernanceBypassDenied("authority_schema_shape_mismatch")
         if conn.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='trigger' "
@@ -935,7 +1011,7 @@ class GovernedCommitBoundary:
         return Artifact(**body)
 
     def control_version(self) -> int:
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             return int(
                 conn.execute(
                     "SELECT control_version FROM store_seal WHERE singleton=1"
@@ -1091,17 +1167,21 @@ class GovernedCommitBoundary:
         return None
 
     def _apply_control_action(
-        self, conn: sqlite3.Connection, command: ControlCommand
+        self, conn: SQLiteConnection, command: ControlCommand
     ) -> int | None:
         parameters = dict(command.parameters)
         workflow_id = command.workflow_id
         if command.action is ControlAction.CREATE_WORKFLOW:
-            nodes = {
-                str(node_id): tuple(str(dep) for dep in dependencies)
-                for node_id, dependencies in dict(parameters["nodes"]).items()
-            }
-            if len(nodes) > _MAX_WORKFLOW_NODES:
-                raise GovernanceBypassDenied("node_status_batch_too_large")
+            if "workflow_profile" in parameters:
+                raise GovernanceBypassDenied("caller_workflow_profile_forbidden")
+            if (
+                parameters.get("admission_profile", WorkflowProfile.DEFAULT.value)
+                != self.workflow_profile.value
+            ):
+                raise GovernanceBypassDenied("workflow_profile_mismatch")
+            nodes = parameters["nodes"]
+            required_capabilities = parameters.get("required_capabilities", {})
+            validate_workflow_nodes(self.workflow_profile, nodes, required_capabilities)
             if not workflow_id or not nodes or not parameters.get("policy_version"):
                 raise GovernanceBypassDenied("invalid_workflow_definition")
             if conn.execute(
@@ -1124,6 +1204,30 @@ class GovernedCommitBoundary:
             if verifier_policy_id != self.verifier_policy_id:
                 raise GovernanceBypassDenied("unsealed_verifier_policy")
             generation = int(parameters.get("generation", 1))
+            input_digests = dict(parameters.get("input_digests", {}))
+            if set(input_digests) - set(nodes):
+                raise GovernanceBypassDenied("invalid_workflow_input_digest")
+            # Finish all per-node conversion and validation before INSERT. A denied
+            # control action is audited in the surrounding committed transaction.
+            prepared_nodes = []
+            for node_id, deps in nodes.items():
+                default_digest = sha256_digest(f"{workflow_id}\x00{node_id}".encode())
+                digest = input_digests.get(node_id) or default_digest
+                if type(digest) is not str:
+                    raise GovernanceBypassDenied("invalid_workflow_input_digest")
+                if len(digest) == 64:
+                    digest = b64u_encode(bytes.fromhex(digest))
+                b64u_decode(digest, expected_length=32)
+                prepared_nodes.append(
+                    (
+                        workflow_id,
+                        node_id,
+                        "ready" if not deps else "blocked",
+                        digest,
+                        json.dumps(sorted(required_capabilities.get(node_id, ()))),
+                        json.dumps(sorted(deps)),
+                    )
+                )
             authority_root = _canonical_digest([])
             authority_epoch = 1
             if hasattr(self, "_apcc_config"):
@@ -1147,33 +1251,11 @@ class GovernedCommitBoundary:
                     1,
                 ),
             )
-            required_capabilities = dict(parameters.get("required_capabilities", {}))
-            input_digests = dict(parameters.get("input_digests", {}))
-            for node_id, deps in nodes.items():
-                default_input_digest = hashlib.sha256(
-                    f"{workflow_id}\x00{node_id}".encode()
-                ).hexdigest()
-                if hasattr(self, "_apcc_config"):
-                    default_input_digest = sha256_digest(
-                        f"{workflow_id}\x00{node_id}".encode()
-                    )
-                digest = str(input_digests.get(node_id) or default_input_digest)
-                if hasattr(self, "_apcc_config") and len(digest) == 64:
-                    try:
-                        digest = b64u_encode(bytes.fromhex(digest))
-                    except ValueError:
-                        pass
+            for prepared in prepared_nodes:
                 conn.execute(
                     """INSERT INTO nodes(workflow_id,node_id,status,version,input_digest,
                        required_capabilities,predecessors,tainted) VALUES(?,?,?,0,?,?,?,0)""",
-                    (
-                        workflow_id,
-                        node_id,
-                        "ready" if not deps else "blocked",
-                        digest,
-                        json.dumps(sorted(required_capabilities.get(node_id, ()))),
-                        json.dumps(sorted(deps)),
-                    ),
+                    prepared,
                 )
             return generation
         if command.action is ControlAction.REGISTER_AGENT:
@@ -1347,7 +1429,7 @@ class GovernedCommitBoundary:
 
     def _record_control(
         self,
-        conn: sqlite3.Connection,
+        conn: SQLiteConnection,
         command: ControlCommand,
         material: str,
         outcome: CommitOutcome,
@@ -1373,7 +1455,7 @@ class GovernedCommitBoundary:
 
     @staticmethod
     def _security_event(
-        conn: sqlite3.Connection,
+        conn: SQLiteConnection,
         event_type: str,
         event_key: str,
         workflow_id: str,
@@ -1401,12 +1483,14 @@ class GovernedCommitBoundary:
         This is a read-only projection attach.  It never creates nodes, changes
         status, promotes staged artifacts, or rewrites policy state.
         """
-        if len(nodes) > _MAX_WORKFLOW_NODES:
-            raise GovernanceBypassDenied("node_status_batch_too_large")
+        validate_workflow_nodes(
+            self.workflow_profile, nodes, required_capabilities or {}
+        )
         required_capabilities = required_capabilities or {}
         input_digests = input_digests or {}
         with self._transaction() as conn:
             workflow = self._workflow(conn, workflow_id)
+            self._verify_workflow_profile(conn, workflow_id)
             if workflow["policy_version"] != policy_version:
                 raise GovernanceBypassDenied("recovery_policy_mismatch")
             stored = {
@@ -1441,8 +1525,58 @@ class GovernedCommitBoundary:
                 for node_id, row in stored.items()
             }
 
+    def _verify_workflow_profile(
+        self, conn: SQLiteConnection, workflow_id: str
+    ) -> None:
+        """Authenticate historical admission without reapplying its expiry."""
+        events = conn.execute(
+            "SELECT command_id,action,workflow_id,expected_control_version,"
+            "resulting_control_version,command_material FROM gcb_control_events "
+            "WHERE workflow_id=? AND action=? AND outcome=?",
+            (
+                workflow_id,
+                ControlAction.CREATE_WORKFLOW.value,
+                CommitOutcome.COMMITTED.value,
+            ),
+        ).fetchall()
+        if len(events) != 1:
+            raise GovernanceBypassDenied("workflow_profile_admission_missing")
+        seal = conn.execute(
+            "SELECT store_id,admin_key_id,admin_public_key FROM store_seal WHERE singleton=1 AND sealed=1"
+        ).fetchone()
+        try:
+            row = events[0]
+            material = json.loads(row[5])
+            material["action"] = ControlAction(material["action"])
+            command = ControlCommand(**material)
+            if (
+                command.store_id != self.store_id
+                or command.store_id != seal[0]
+                or command.admin_key_id != seal[1]
+                or command.command_id != row[0]
+                or command.action.value != row[1]
+                or command.workflow_id != workflow_id
+                or command.workflow_id != row[2]
+                or command.expected_control_version != row[3]
+                or row[4] != row[3] + 1
+            ):
+                raise ValueError("admission identity mismatch")
+            Ed25519PublicKey.from_public_bytes(seal[2]).verify(
+                base64.b64decode(command.signature, validate=True),
+                command.canonical_bytes(),
+            )
+            profile = command.parameters.get(
+                "admission_profile", WorkflowProfile.DEFAULT.value
+            )
+            if profile != self.workflow_profile.value:
+                raise GovernanceBypassDenied("workflow_profile_mismatch")
+        except (InvalidSignature, KeyError, TypeError, ValueError) as error:
+            raise GovernanceBypassDenied(
+                "workflow_profile_admission_invalid"
+            ) from error
+
     def _verify_committed_evidence(
-        self, conn: sqlite3.Connection, workflow_id: str
+        self, conn: SQLiteConnection, workflow_id: str
     ) -> None:
         """Fail closed if any authoritative node lacks intact signed evidence."""
         seal = conn.execute(
@@ -1665,7 +1799,7 @@ class GovernedCommitBoundary:
         return dispatched
 
     def pending_revocations(self) -> int:
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             return conn.execute(
                 "SELECT count(*) FROM revocation_outbox WHERE processed=0 OR dispatched=0"
             ).fetchone()[0]
@@ -1682,7 +1816,7 @@ class GovernedCommitBoundary:
         expires_at: int | None = None,
     ) -> AttemptAuthorizationPayload:
         """Build the exact claim context an agent must sign."""
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             workflow = self._workflow(conn, workflow_id)
             node = self._node(conn, workflow_id, node_id)
             agent = self._agent(conn, workflow_id, agent_id)
@@ -1711,7 +1845,7 @@ class GovernedCommitBoundary:
 
     def _validate_attempt_authorization(
         self,
-        conn: sqlite3.Connection,
+        conn: SQLiteConnection,
         authorization: SignedAttemptAuthorization | None = None,
         *,
         workflow_id: str,
@@ -1865,7 +1999,7 @@ class GovernedCommitBoundary:
         issued_at: int | None = None,
         expires_at: int | None = None,
     ) -> GovernedReceiptPayload:
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             workflow = self._workflow(conn, workflow_id)
             node = self._node(conn, workflow_id, node_id)
             if node["status"] != "result_produced":
@@ -1951,7 +2085,7 @@ class GovernedCommitBoundary:
 
     def _apcc_validation_reason(self, request: CommitRequest) -> str | None:
         request_hash = request.canonical_hash()
-        with self._connect() as connection:
+        with self._connection_context() as connection:
             prior = connection.execute(
                 "SELECT * FROM decisions WHERE commit_id=?", (request.commit_id,)
             ).fetchone()
@@ -2214,148 +2348,116 @@ class GovernedCommitBoundary:
         return binding
 
     def _prepare_apcc_candidate(self, request: AtomicCommitRequest) -> None:
-        with self._apcc_store._transaction() as connection:
-            node = connection.execute(
-                "SELECT version FROM logical_nodes WHERE workflow_id=? AND node_id=?",
-                (request.subject.workflow_id, request.subject.node_id),
-            ).fetchone()
-            if node is None:
-                connection.execute(
-                    "INSERT INTO logical_nodes VALUES (?, ?, ?, NULL)",
-                    (
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                        request.bindings.expected_node_version,
-                    ),
-                )
-            candidate = connection.execute(
-                "SELECT lifecycle FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                (
-                    request.subject.workflow_id,
-                    request.subject.node_id,
-                    request.subject.attempt_id,
-                ),
-            ).fetchone()
-            if candidate is None:
-                connection.execute(
-                    "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, NULL)",
-                    (
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                        request.subject.attempt_id,
-                        request.subject.agent_id,
-                        CandidateLifecycle.EXECUTING.value,
-                        request.bindings.expected_node_version,
-                        json.dumps(
-                            request.subject.to_object(),
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            request.context.to_object(),
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            [
-                                item.to_object()
-                                for item in request.bindings.predecessors
-                            ],
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        sha256_digest(f"candidate:{request.commit_id}".encode("utf-8")),
-                    ),
-                )
-                lifecycle = CandidateLifecycle.EXECUTING
-            else:
-                lifecycle = CandidateLifecycle(candidate[0])
-        if lifecycle is CandidateLifecycle.COMMIT_PENDING:
-            return
-        with self._connect() as connection:
-            staged = connection.execute(
-                "SELECT artifact_json FROM staged_artifacts WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                (
-                    request.subject.workflow_id,
-                    request.subject.node_id,
-                    request.subject.attempt_id,
-                ),
-            ).fetchone()
-        if staged is None:
+        if type(request) is not _GCBAtomicCommitRequest:
+            raise TypeError("GCB preparation requires a typed request")
+        if not self._apcc_store._prepare_gcb_candidate(request):
             raise GovernanceBypassDenied("missing_staged_result")
-        self._apcc_service.stage_result(
-            StageResultRequest(
-                request.subject,
-                request.bindings.expected_node_version,
-                staged[0].encode("utf-8"),
-            )
-        )
-        self._apcc_service.assemble_evidence(AssembleEvidenceRequest(request))
-        self._apcc_service.propose_commit(ProposeCommitRequest(request))
 
-    def commit(self, request: CommitRequest) -> CommitDecision:
-        if hasattr(self, "_apcc_service"):
-            denial = self._deny_invalid_apcc_request(request)
-            if denial is not None:
-                return denial
-            atomic = self._to_apcc_request(request)
-            with self._connect() as connection:
-                already_recorded = connection.execute(
-                    "SELECT 1 FROM commit_index WHERE commit_id=?",
+    def _prepare_commit_request(
+        self, request: CommitRequest
+    ) -> tuple[AtomicCommitRequest | None, CommitDecision | None]:
+        if not hasattr(self, "_apcc_service"):
+            raise GovernanceBypassDenied("APCC authority service is not attached")
+        denial = self._deny_invalid_apcc_request(request)
+        if denial is not None:
+            return None, denial
+        atomic = self._to_apcc_request(request)
+        with self._connection_context() as connection:
+            already_recorded = connection.execute(
+                "SELECT 1 FROM commit_index WHERE commit_id=?",
+                (request.commit_id,),
+            ).fetchone()
+        if already_recorded is None:
+            try:
+                self._prepare_apcc_candidate(atomic)
+            except ValueError:
+                # Another connection may have advanced this shared
+                # candidate between any two lifecycle operations.  The
+                # atomic commit transaction is the authority that decides
+                # whether this exact request won or must be denied.
+                pass
+        return atomic, None
+
+    def _projection_race_denial(
+        self, request: CommitRequest, error: _GCBProjectionDenied
+    ) -> CommitDecision:
+        denial = self._deny_invalid_apcc_request(request)
+        if denial is None:
+            raise GovernanceBypassDenied(
+                f"APCC legacy validation race: {error.reason}"
+            ) from None
+        return denial
+
+    def _projection_fault_denial(self, request: CommitRequest) -> CommitDecision:
+        return CommitDecision(
+            request.commit_id,
+            CommitOutcome.DENIED,
+            "persistence_error",
+            request.receipt.payload.workflow_id,
+            request.receipt.payload.node_id,
+            -1,
+        )
+
+    def _map_apcc_commit_result(
+        self, request: CommitRequest, result: APCCCommitResult
+    ) -> CommitDecision:
+        if result.decision.outcome is RequestOutcome.COMMITTED:
+            with self._connection_context() as connection:
+                row = connection.execute(
+                    "SELECT * FROM decisions WHERE commit_id=?",
                     (request.commit_id,),
                 ).fetchone()
-            if already_recorded is None:
-                try:
-                    self._prepare_apcc_candidate(atomic)
-                except ValueError:
-                    # Another connection may have advanced this shared
-                    # candidate between any two lifecycle operations.  The
-                    # atomic commit transaction is the authority that decides
-                    # whether this exact request won or must be denied.
-                    pass
-            try:
-                result = self._apcc_service.commit(atomic)
-            except _GCBProjectionDenied as error:
-                denial = self._deny_invalid_apcc_request(request)
-                if denial is None:
-                    raise GovernanceBypassDenied(
-                        f"APCC legacy validation race: {error.reason}"
-                    ) from None
-                return denial
-            except _GCBProjectionFault:
-                return CommitDecision(
-                    request.commit_id,
-                    CommitOutcome.DENIED,
-                    "persistence_error",
-                    request.receipt.payload.workflow_id,
-                    request.receipt.payload.node_id,
-                    -1,
-                )
-            else:
-                if result.decision.outcome is RequestOutcome.COMMITTED:
-                    with self._connect() as connection:
-                        row = connection.execute(
-                            "SELECT * FROM decisions WHERE commit_id=?",
-                            (request.commit_id,),
-                        ).fetchone()
-                    if row is None:
-                        raise GovernanceBypassDenied("legacy_projection_missing")
-                    decision = self._decision(row)
-                    self._inject_fault(_GCBFaultCheckpoint.AFTER_DURABLE_COMMIT)
-                    return decision
-                return CommitDecision(
-                    request.commit_id,
-                    CommitOutcome.DENIED,
-                    (
-                        "agent_revoked"
-                        if result.decision.reason is FailureCode.ACTOR_REVOKED
-                        else result.decision.reason
-                    ),
-                    request.receipt.payload.workflow_id,
-                    request.receipt.payload.node_id,
-                    -1,
-                )
-        raise GovernanceBypassDenied("APCC authority service is not attached")
+            if row is None:
+                raise GovernanceBypassDenied("legacy_projection_missing")
+            decision = self._decision(row)
+            self._inject_fault(_GCBFaultCheckpoint.AFTER_DURABLE_COMMIT)
+            return decision
+        return CommitDecision(
+            request.commit_id,
+            CommitOutcome.DENIED,
+            (
+                "agent_revoked"
+                if result.decision.reason is FailureCode.ACTOR_REVOKED
+                else result.decision.reason
+            ),
+            request.receipt.payload.workflow_id,
+            request.receipt.payload.node_id,
+            -1,
+        )
+
+    def commit(self, request: CommitRequest) -> CommitDecision:
+        atomic, denial = self._prepare_commit_request(request)
+        if denial is not None:
+            return denial
+        assert atomic is not None
+        try:
+            result = self._apcc_service.commit(atomic)
+        except _GCBProjectionDenied as error:
+            return self._projection_race_denial(request, error)
+        except _GCBProjectionFault:
+            return self._projection_fault_denial(request)
+        return self._map_apcc_commit_result(request, result)
+
+    def _commit_for_authority(
+        self, request: CommitRequest
+    ) -> tuple[CommitDecision, _IssuedOutboxClaim | None]:
+        atomic, denial = self._prepare_commit_request(request)
+        if denial is not None:
+            return denial, None
+        if type(atomic) is not _GCBAtomicCommitRequest:
+            raise TypeError("authority preclaim requires a typed request")
+        try:
+            result, handle = self._apcc_service._commit_and_claim_for_authority(atomic)
+        except _GCBProjectionDenied as error:
+            return self._projection_race_denial(request, error), None
+        except _GCBProjectionFault:
+            return self._projection_fault_denial(request), None
+        try:
+            return self._map_apcc_commit_result(request, result), handle
+        except BaseException:
+            if handle is not None:
+                self._apcc_store._discard_outbox_claim(handle)
+            raise
 
     def _inject_fault(self, checkpoint: _GCBFaultCheckpoint) -> None:
         if self._fault_checkpoint is checkpoint and not self._fault_checkpoint_fired:
@@ -2589,7 +2691,7 @@ class GovernedCommitBoundary:
 
     def _bind_projection(self, workflow_id: str, store: ArtifactStore) -> Any:
         """Create the sole capability-bearing projector for one workflow."""
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             self._workflow(conn, workflow_id)
         seal_id = _canonical_digest(
             {"store_id": self.store_id, "workflow_id": workflow_id, "path": self.path}
@@ -2642,12 +2744,123 @@ class GovernedCommitBoundary:
                 dispatched += 1
         return dispatched
 
+    def observation_target(
+        self, request: CommitRequest, *, request_nonce: str
+    ) -> AuthorityObservationRequest:
+        """Resolve an exact successful governed request without preparing evidence."""
+        if (
+            type(request) is not CommitRequest
+            or type(request.receipt) is not SignedGovernedReceipt
+            or type(request.receipt.payload) is not GovernedReceiptPayload
+            or type(request.verdict) is not AuthoritativeVerdict
+        ):
+            raise TypeError("observation target requires an exact CommitRequest")
+        if type(request_nonce) is not str:
+            raise TypeError("request_nonce must be a string")
+        b64u_decode(request_nonce, expected_length=16)
+        if not hasattr(self, "_apcc_store"):
+            raise GovernanceBypassDenied("observation_target_unavailable")
+
+        payload = request.receipt.payload
+        request_hash = request.canonical_hash()
+        with self._apcc_store._read_transaction() as connection:
+            connection.row_factory = sqlite3.Row
+            decision = connection.execute(
+                "SELECT request_hash,outcome,workflow_id,node_id,nonce "
+                "FROM decisions WHERE commit_id=?",
+                (request.commit_id,),
+            ).fetchone()
+            if decision is None or decision["outcome"] != CommitOutcome.COMMITTED.value:
+                raise GovernanceBypassDenied("observation_target_unavailable")
+            if (
+                decision["request_hash"] != request_hash
+                or decision["workflow_id"] != payload.workflow_id
+                or decision["node_id"] != payload.node_id
+                or decision["nonce"] != payload.nonce
+                or request.verdict.store_id != self._apcc_config.authority_store_id
+            ):
+                raise GovernanceBypassDenied("observation_target_binding_mismatch")
+
+            indexed = connection.execute(
+                "SELECT c.request_digest AS operation_digest,c.workflow_id,"
+                "c.request_json,r.request_digest AS public_digest,"
+                "d.outcome,d.certificate_digest,d.nonce,d.nonce_owner_commit_id "
+                "FROM commit_index AS c "
+                "JOIN request_index AS r ON r.commit_id=c.commit_id "
+                "JOIN apcc_decisions AS d ON d.commit_id=c.commit_id "
+                "WHERE c.commit_id=?",
+                (request.commit_id,),
+            ).fetchone()
+            if (
+                indexed is None
+                or indexed["outcome"] != RequestOutcome.COMMITTED.value
+                or indexed["certificate_digest"] is None
+                or indexed["workflow_id"] != payload.workflow_id
+                or indexed["nonce"] != payload.nonce
+                or indexed["nonce_owner_commit_id"] != request.commit_id
+            ):
+                raise GovernanceBypassDenied("observation_target_binding_mismatch")
+            try:
+                persisted = indexed["request_json"]
+                if type(persisted) is not str:
+                    raise ValueError("persisted operation is not text")
+                atomic, superseded = _operation_from_json(persisted)
+                operation_digest = _operation_identity(atomic, superseded)
+                producer_bytes = canonical_statement(atomic.evidence.producer_statement)
+                public_digest = sha256_digest(producer_bytes)
+                expected_subject = CertificateSubject(
+                    payload.workflow_id,
+                    payload.node_id,
+                    payload.attempt_id,
+                    payload.agent_id,
+                    payload.authority_snapshot_digest,
+                    payload.input_digest,
+                    payload.output_digest,
+                )
+                expected_signature = Signature(
+                    "Ed25519",
+                    payload.key_id,
+                    b64u_encode(
+                        base64.b64decode(request.receipt.signature, validate=True)
+                    ),
+                )
+                if (
+                    superseded is not None
+                    or atomic.commit_id != request.commit_id
+                    or atomic.nonce != payload.nonce
+                    or atomic.subject != expected_subject
+                    or atomic.signatures.producer != expected_signature
+                    or domain_preimage(PROPOSAL_DOMAIN, producer_bytes)
+                    != payload.canonical_bytes()
+                    or operation_digest != sha256_digest(persisted.encode("utf-8"))
+                    or operation_digest != indexed["operation_digest"]
+                    or public_digest != indexed["public_digest"]
+                    or public_digest != atomic.evidence.producer_statement_digest
+                ):
+                    raise ValueError("persisted operation binding mismatch")
+                return AuthorityObservationRequest(
+                    protocol_version="APCC-1.0-draft",
+                    statement_type="apcc.authority-observation-request",
+                    authority_store_id=self._apcc_config.authority_store_id,
+                    workflow_id=payload.workflow_id,
+                    node_id=payload.node_id,
+                    attempt_id=payload.attempt_id,
+                    expected_commit_id=request.commit_id,
+                    expected_operation_digest=operation_digest,
+                    public_request_digest=public_digest,
+                    request_nonce=request_nonce,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise GovernanceBypassDenied(
+                    "observation_target_binding_mismatch"
+                ) from error
+
     def workflow_node_states(
         self, workflow_id: str, node_ids: Sequence[str]
     ) -> tuple[GovernedNodeState, ...]:
         """Read ordered legacy/APCC node state from one attested snapshot."""
         resolved_ids = tuple(node_ids)
-        if len(resolved_ids) > _MAX_WORKFLOW_NODES:
+        if len(resolved_ids) > self.workflow_profile.max_nodes:
             raise GovernanceBypassDenied("node_status_batch_too_large")
         if not workflow_id or any(not node_id for node_id in resolved_ids):
             raise ValueError("workflow and node identities cannot be empty")
@@ -2663,8 +2876,30 @@ class GovernedCommitBoundary:
         if not requests:
             return ()
         with self._apcc_store._read_transaction() as connection:
-            results = self._apcc_store._logical_node_status_batch_at(
-                connection, requests
+            chunks = tuple(
+                requests[start : start + 1000]
+                for start in range(0, len(requests), 1000)
+            )
+            digests: list[str] = []
+            for chunk in chunks:
+                placeholders = ",".join("?" for _ in chunk)
+                digests.extend(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT certificate_digest FROM logical_nodes WHERE workflow_id=? "
+                        f"AND node_id IN ({placeholders}) AND certificate_digest IS NOT NULL",
+                        (workflow_id, *(request.node_id for request in chunk)),
+                    ).fetchall()
+                )
+            semantic_snapshot = self._apcc_store._attest_batch_snapshot(
+                connection, tuple(digests)
+            )
+            results = tuple(
+                result
+                for chunk in chunks
+                for result in self._apcc_store._logical_node_status_batch_at(
+                    connection, chunk, semantic_snapshot
+                )
             )
             connection.row_factory = sqlite3.Row
             if len(results) != len(requests):
@@ -2672,7 +2907,7 @@ class GovernedCommitBoundary:
             legacy_rows = connection.execute(
                 "SELECT * FROM nodes WHERE workflow_id=?", (workflow_id,)
             ).fetchall()
-            if len(legacy_rows) > _MAX_WORKFLOW_NODES:
+            if len(legacy_rows) > self.workflow_profile.max_nodes:
                 raise GovernanceBypassDenied("node_status_batch_too_large")
             revoked_roots = {
                 row["root_node_id"]
@@ -2736,7 +2971,7 @@ class GovernedCommitBoundary:
         self, workflow_id: str, artifact_id: str
     ) -> Artifact | None:
         """Read an artifact only while its governed commit remains consumable."""
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             row = conn.execute(
                 """SELECT * FROM nodes WHERE workflow_id=? AND artifact_id=?""",
                 (workflow_id, artifact_id),
@@ -2758,7 +2993,7 @@ class GovernedCommitBoundary:
 
     def _apcc_node_is_consumable(
         self,
-        conn: sqlite3.Connection,
+        conn: SQLiteConnection,
         workflow_id: str,
         node_id: str,
     ) -> bool:
@@ -2781,7 +3016,7 @@ class GovernedCommitBoundary:
         return status.status is AuthorityStatusValue.CURRENT
 
     def pending_outbox(self) -> int:
-        with self._connect() as conn:
+        with self._connection_context() as conn:
             return conn.execute(
                 "SELECT count(*) FROM outbox WHERE dispatched=0"
             ).fetchone()[0]
@@ -2831,7 +3066,7 @@ class GovernedCommitBoundary:
         )
 
     def _effective_node_state(
-        self, conn: sqlite3.Connection, row: sqlite3.Row
+        self, conn: SQLiteConnection, row: sqlite3.Row
     ) -> GovernedNodeState:
         state = self._node_state(row)
         workflow_id = row["workflow_id"]
@@ -2905,7 +3140,7 @@ class GovernedCommitBoundary:
 
     def _record(
         self,
-        conn: sqlite3.Connection,
+        conn: SQLiteConnection,
         request: CommitRequest,
         request_hash: str,
         outcome: CommitOutcome,
@@ -3021,7 +3256,7 @@ class GovernedCommitBoundary:
         )
 
     @staticmethod
-    def _authority_root(conn: sqlite3.Connection, workflow_id: str) -> str:
+    def _authority_root(conn: SQLiteConnection, workflow_id: str) -> str:
         entries = []
         for agent in conn.execute(
             """SELECT agent_id,key_id,capabilities,authority_epoch,revocation_epoch,revoked
@@ -3068,7 +3303,7 @@ class GovernedCommitBoundary:
                 )
 
     def _taint_descendants(
-        self, conn: sqlite3.Connection, workflow_id: str, agent_id: str
+        self, conn: SQLiteConnection, workflow_id: str, agent_id: str
     ) -> None:
         tainted = {
             row["node_id"]
@@ -3100,7 +3335,7 @@ class GovernedCommitBoundary:
             )
 
     def _descendant_closure(
-        self, conn: sqlite3.Connection, workflow_id: str, root_node_id: str
+        self, conn: SQLiteConnection, workflow_id: str, root_node_id: str
     ) -> set[str]:
         closure = {root_node_id}
         rows = conn.execute(
@@ -3159,7 +3394,9 @@ class TrustedGovernanceBootstrap:
         policy_signer: Any,
         registry_signer: Any,
         control_signer: Any,
+        workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
     ) -> None:
+        self.workflow_profile = require_workflow_profile(workflow_profile)
         self.config = config
         self.runtime = runtime
         self._policy_signer = policy_signer
@@ -3246,6 +3483,7 @@ class TrustedGovernanceBootstrap:
         port._apcc_config = self.config
         port._policy_signer = self._policy_signer
         port._registry_signer = self._registry_signer
+        port.workflow_profile = self.workflow_profile
         Path(port.path).parent.mkdir(parents=True, exist_ok=True)
         port._initialize(
             provision=provision,
@@ -3264,6 +3502,21 @@ class TrustedGovernanceBootstrap:
             projection_fault=projection_fault,
         )
         port._apcc_store = store
+        with store._read_transaction() as connection:
+            workflows = connection.execute(
+                "SELECT workflow_id FROM workflows"
+            ).fetchall()
+            for (workflow_id,) in workflows:
+                port._verify_workflow_profile(connection, workflow_id)
+                rows = connection.execute(
+                    "SELECT node_id,predecessors,required_capabilities FROM nodes WHERE workflow_id=?",
+                    (workflow_id,),
+                ).fetchall()
+                validate_workflow_nodes(
+                    self.workflow_profile,
+                    {row[0]: tuple(json.loads(row[1])) for row in rows},
+                    {row[0]: tuple(json.loads(row[2])) for row in rows},
+                )
         port._apcc_service = APCCCommitService(
             store=store, config=self.config, runtime=self.runtime
         )
@@ -3424,6 +3677,7 @@ class TrustedGovernanceAdmin:
             workflow_id,
             {
                 "nodes": {key: list(value) for key, value in nodes.items()},
+                "admission_profile": self._bootstrap.workflow_profile.value,
                 "policy_version": policy_version,
                 "required_capabilities": {
                     key: list(value)

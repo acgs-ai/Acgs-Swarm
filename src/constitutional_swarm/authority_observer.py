@@ -39,10 +39,18 @@ class AuthorityObserverLaunchConfig:
     backend_schema: str | None
     controller_key_id: str
     controller_key_source: ControllerKeySourceRef
+    launch_lifetime_ms: int = 300_000
 
     def __post_init__(self) -> None:
         from constitutional_swarm.apcc.codec import _IDENTIFIER
 
+        if (
+            type(self.launch_lifetime_ms) is not int
+            or not 1 <= self.launch_lifetime_ms <= 1_200_000
+        ):
+            raise ValueError(
+                "observer launch lifetime must be between 1 and 1200000 milliseconds"
+            )
         for field_name in ("experiment_id", "run_id", "authority_store_id"):
             value = getattr(self, field_name)
             if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:

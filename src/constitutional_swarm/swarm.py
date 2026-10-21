@@ -30,12 +30,18 @@ from constitutional_swarm.governed_commit import (
     GovernanceBypassDenied,
     GovernedReceiptPayload,
     SignedAttemptAuthorization,
+    SignedGovernedReceipt,
+)
+
+from constitutional_swarm.workflow_profile import (
+    WorkflowProfile,
+    require_workflow_profile,
+    validate_workflow_nodes,
 )
 
 NodeStatus = ExecutionStatus
 _UNSET = object()
 _AUTHORITY_TRANSPORT_ERRORS = (ConnectionError, EOFError, OSError, TimeoutError)
-_MAX_WORKFLOW_NODES = 1000
 
 
 def _neg_priority(node: TaskNode) -> int:
@@ -222,6 +228,7 @@ class SwarmExecutor:
         *,
         policy_version: str = "",
         trusted_admin: object = _UNSET,
+        workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
     ) -> None:
         if boundary is not _UNSET or trusted_admin is not _UNSET:
             raise TypeError(
@@ -232,6 +239,7 @@ class SwarmExecutor:
         self._store = store
         self._execution_client: object | None = None
         self._policy_version = policy_version
+        self._workflow_profile = require_workflow_profile(workflow_profile)
         self._dag: TaskDAG | None = None
         self._lock = threading.Lock()
         self._ready_ids: set[str] = set()
@@ -297,14 +305,38 @@ class SwarmExecutor:
                 self._completed_count += 1
 
     def load_dag(self, dag: TaskDAG) -> None:
-        """Load a task DAG for execution."""
+        """Attach a DAG, rotating only after current authoritative completion.
+
+        Candidate validation and projection construction are staged locally so
+        any failure preserves the previous workflow and all its indexes.
+        """
         with self._lock:
-            if len(dag.nodes) > _MAX_WORKFLOW_NODES:
-                raise GovernanceBypassDenied("node_status_batch_too_large")
-            if self._dag is not None and self._dag.dag_id != dag.dag_id:
+            if type(dag.dag_id) is not str or not dag.dag_id:
+                raise GovernanceBypassDenied("invalid_workflow_identity")
+            dag.dag_id.encode("utf-8")
+            validate_workflow_nodes(
+                self._workflow_profile,
+                {key: node.depends_on for key, node in dag.nodes.items()},
+                {key: node.required_capabilities for key, node in dag.nodes.items()},
+            )
+            for key, node in dag.nodes.items():
+                if key != node.node_id or type(node.description) is not str:
+                    raise GovernanceBypassDenied("invalid_workflow_node_description")
+                node.description.encode("utf-8")
+            rotating = self._dag is not None and self._dag.dag_id != dag.dag_id
+            if rotating and self._execution_client is None:
                 raise GovernanceBypassDenied("executor_workflow_identity_mismatch")
             authoritative_states = None
             if self._execution_client is not None:
+                if (
+                    getattr(
+                        self._execution_client,
+                        "_workflow_profile",
+                        WorkflowProfile.DEFAULT,
+                    )
+                    is not self._workflow_profile
+                ):
+                    raise GovernanceBypassDenied("workflow_profile_mismatch")
                 if not self._policy_version:
                     raise GovernanceBypassDenied(
                         "policy_version is required for governed execution"
@@ -332,6 +364,8 @@ class SwarmExecutor:
                     ).hexdigest()
                     for node in dag.nodes.values()
                 }
+                if rotating:
+                    self._require_authoritative_completion()
                 try:
                     authoritative_states = self._authority_call(
                         "attach_workflow",
@@ -354,30 +388,84 @@ class SwarmExecutor:
                     artifact_id=None,
                 )
                 normalized.metadata.pop("attempt_id", None)
+                normalized.metadata.pop("attempt_authorization", None)
                 normalized_nodes[node_id] = normalized
-            self._dag = TaskDAG(
+            candidate = TaskDAG(
                 dag_id=dag.dag_id, goal=dag.goal, nodes=normalized_nodes
             ).mark_ready()
             if authoritative_states is not None:
+                if set(authoritative_states) != set(candidate.nodes) or any(
+                    state.workflow_id != dag.dag_id or state.node_id != node_id
+                    for node_id, state in authoritative_states.items()
+                ):
+                    raise GovernanceBypassDenied(
+                        "authority_status_batch_order_mismatch"
+                    )
                 for node_id, state in authoritative_states.items():
-                    node = self._dag.nodes[node_id]
+                    node = candidate.nodes[node_id]
                     node.status = ExecutionStatus(state.status)
                     node.claimed_by = state.claimed_by
                     node.artifact_id = state.artifact_id
                     if state.attempt_id is not None:
                         node.metadata["attempt_id"] = state.attempt_id
-            self._rebuild_ready_index()
-            self._build_dep_index()
-            self._dag_has_constrained = any(
-                node.required_capabilities for node in self._dag.nodes.values()
+            ready_list = [
+                node
+                for node in candidate.nodes.values()
+                if node.status is ExecutionStatus.READY
+            ]
+            ready_index = {node.node_id: index for index, node in enumerate(ready_list)}
+            ready_ids = set(ready_index)
+            pending_deps: dict[str, int] = {}
+            children: dict[str, list[str]] = {}
+            completed_count = 0
+            for node_id, node in candidate.nodes.items():
+                pending = 0
+                for dependency in node.depends_on:
+                    children.setdefault(dependency, []).append(node_id)
+                    if (
+                        candidate.nodes[dependency].status
+                        is not ExecutionStatus.GOVERNED_COMMITTED
+                    ):
+                        pending += 1
+                pending_deps[node_id] = pending
+                if node.status is ExecutionStatus.GOVERNED_COMMITTED:
+                    completed_count += 1
+            dag_has_constrained = any(
+                node.required_capabilities for node in candidate.nodes.values()
             )
-            if self._dag_has_constrained:
-                self._all_ready_unconstrained = not any(
-                    self._dag.nodes[nid].required_capabilities
-                    for nid in self._ready_ids
-                )
-            else:
-                self._all_ready_unconstrained = True
+            all_ready_unconstrained = not any(
+                node.required_capabilities for node in ready_list
+            )
+            self._dag = candidate
+            self._ready_list = ready_list
+            self._ready_index = ready_index
+            self._ready_ids = ready_ids
+            self._pending_deps = pending_deps
+            self._children = children
+            self._completed_count = completed_count
+            self._total_count = len(candidate.nodes)
+            self._dag_has_constrained = dag_has_constrained
+            self._all_ready_unconstrained = all_ready_unconstrained
+            self._caps_cache = {}
+
+    def _require_authoritative_completion(self) -> None:
+        """Check one current authority snapshot without mutating the projection."""
+        assert self._dag is not None
+        node_ids = tuple(self._dag.nodes)
+        states = self._authority_call(
+            "workflow_node_states", self._dag.dag_id, node_ids
+        )
+        if len(states) != len(node_ids):
+            raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
+        for node_id, state in zip(node_ids, states, strict=True):
+            if state.workflow_id != self._dag.dag_id or state.node_id != node_id:
+                raise GovernanceBypassDenied("authority_status_batch_order_mismatch")
+            if (
+                ExecutionStatus(state.status) is not ExecutionStatus.GOVERNED_COMMITTED
+                or type(state.commit_id) is not str
+                or not state.commit_id
+            ):
+                raise GovernanceBypassDenied("executor_workflow_not_complete")
 
     def _synchronize_authoritative_states(self) -> None:
         """Refresh the in-memory projection from the SQLite authority."""
@@ -390,6 +478,8 @@ class SwarmExecutor:
         if len(states) != len(node_ids):
             raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
         for node_id, state in zip(node_ids, states, strict=True):
+            if state.workflow_id != self._dag.dag_id or state.node_id != node_id:
+                raise GovernanceBypassDenied("authority_status_batch_order_mismatch")
             node = self._dag.nodes[node_id]
             node.status = ExecutionStatus(state.status)
             node.claimed_by = state.claimed_by
@@ -503,6 +593,8 @@ class SwarmExecutor:
                 raise ValueError(f"Node {node_id} is {node.status.value}, not ready")
             if not isinstance(authorization, SignedAttemptAuthorization):
                 raise GovernanceBypassDenied("signed_attempt_authorization_required")
+            if authorization.payload.workflow_id != self._dag.dag_id:
+                raise GovernanceBypassDenied("executor_workflow_identity_mismatch")
             attempt_id = authorization.payload.attempt_id
             if self._execution_client is None:
                 raise GovernanceBypassDenied("claim requires a governed boundary")
@@ -567,6 +659,8 @@ class SwarmExecutor:
                 authorization = node.metadata.get("attempt_authorization")
             if not isinstance(authorization, SignedAttemptAuthorization):
                 raise GovernanceBypassDenied("signed_attempt_authorization_required")
+            if authorization.payload.workflow_id != self._dag.dag_id:
+                raise GovernanceBypassDenied("executor_workflow_identity_mismatch")
             self._authority_call(
                 "stage_result",
                 workflow_id=self._dag.dag_id,
@@ -586,6 +680,15 @@ class SwarmExecutor:
                 commit_id=uuid.uuid4().hex,
                 nonce=uuid.uuid4().hex,
             )
+
+    def build_request(self, receipt: SignedGovernedReceipt) -> CommitRequest:
+        """Build only requests bound to the currently attached workflow."""
+        with self._lock:
+            if self._dag is None:
+                raise RuntimeError("No DAG loaded")
+            if receipt.payload.workflow_id != self._dag.dag_id:
+                raise GovernanceBypassDenied("executor_workflow_identity_mismatch")
+            return self._authority_call("build_request", receipt)
 
     def commit(self, request: CommitRequest) -> CommitDecision:
         """Commit through GCB and then refresh non-authoritative projections."""

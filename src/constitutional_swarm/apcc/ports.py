@@ -27,7 +27,7 @@ from .observation import (
     AuthorityObservationSnapshot,
     AuthorityObservationState as AuthorityObservationState,
 )
-from .verifier import TrustBinding, TrustRole
+from .verifier import CausalClosureLimits, TrustBinding, TrustRole
 
 
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -110,6 +110,13 @@ class StatusFreshnessPolicy:
             )
 
 
+class AuthorityCausalProfile(StrEnum):
+    """Explicit authority admission bounds; default wire representation is legacy."""
+
+    DEFAULT = "default"
+    W2_LINEAR_100 = "w2-linear-100"
+
+
 @dataclass(frozen=True, slots=True)
 class APCCAuthorityConfig:
     """One-time, public-only identity and five-role trust configuration."""
@@ -121,8 +128,19 @@ class APCCAuthorityConfig:
     commit_trust: TrustBinding
     status_trust: TrustBinding
     freshness: StatusFreshnessPolicy
+    causal_profile: AuthorityCausalProfile = AuthorityCausalProfile.DEFAULT
+
+    @property
+    def causal_limits(self) -> CausalClosureLimits:
+        return CausalClosureLimits(
+            max_depth=99
+            if self.causal_profile is AuthorityCausalProfile.W2_LINEAR_100
+            else 64
+        )
 
     def __post_init__(self) -> None:
+        if type(self.causal_profile) is not AuthorityCausalProfile:
+            raise ValueError("causal_profile must be an AuthorityCausalProfile")
         if not self.authority_store_id:
             raise ValueError("authority_store_id cannot be empty")
         role_groups = (

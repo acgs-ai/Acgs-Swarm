@@ -8,6 +8,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -2113,6 +2114,124 @@ def test_sqlite_open_validates_v3_schema_without_mutating_failed_store(
     ):
         with pytest.raises(ValueError):
             opener()
+        assert _database_file_state(path) == before
+
+
+def test_sqlite_schema_normalization_preserves_manifests() -> None:
+    from constitutional_swarm.apcc import postgres_store
+
+    expected = {}
+    for statement in sqlite_store_module._SCHEMA_STATEMENTS:
+        match = re.match(r"^CREATE (TABLE|TRIGGER|INDEX) ([a-z0-9_]+)", statement, re.I)
+        assert match is not None
+        expected[(match[1].lower(), match[2])] = re.sub(
+            r"\s+", " ", statement.strip()
+        ).lower()
+        for value in (
+            statement,
+            statement.upper(),
+            " \n\t" + statement.replace(" ", "\t\n") + " ",
+        ):
+            assert (
+                sqlite_store_module._normalize_schema_sql(value)
+                == re.sub(r"\s+", " ", value.strip()).lower()
+            )
+    assert sqlite_store_module._REQUIRED_SCHEMA_OBJECTS == expected
+    assert (
+        sqlite_store_module._SCHEMA_FINGERPRINT
+        == "1qM32kCg6RpbrXemVDsaSsUCbgR9glpRKfDQJMym02Y"
+    )
+    assert (
+        postgres_store._POSTGRES_SCHEMA_FINGERPRINT
+        == "gzL5YPoIr7T1VCPHywvCwdn-eL2FjCZHE5LKxd_qjyg"
+    )
+    assert (
+        postgres_store._POSTGRES_GCB_SCHEMA_FINGERPRINT
+        == "9fBv49XHCeUIepey-yokBuh1XJ3Qd7Kl-SYAydLMxe0"
+    )
+
+
+def test_sqlite_schema_normalization_cache_is_bounded() -> None:
+    cached = sqlite_store_module._normalize_schema_sql_cached
+    normalize = sqlite_store_module._normalize_schema_sql
+    cached.cache_clear()
+    try:
+        boundary = "A" * 4096
+        assert normalize(boundary) == "a" * 4096
+        normalize(boundary)
+        assert cached.cache_info().hits == 1
+        for value in ("A" * 4097, "\u0130\u2003SELECT\u00a0X", "", " \r\n\t"):
+            before = cached.cache_info()
+            assert normalize(value) == re.sub(r"\s+", " ", value.strip()).lower()
+            if len(value) > 4096 or not value.isascii():
+                assert cached.cache_info() == before
+        for index in range(300):
+            normalize(f"SELECT {index}")
+        assert cached.cache_info().maxsize == 256
+        assert cached.cache_info().currsize == 256
+        before = cached.cache_info().misses
+        normalize(boundary)
+        assert cached.cache_info().misses == before + 1
+    finally:
+        cached.cache_clear()
+
+
+def test_sqlite_schema_normalization_bypasses_str_subclasses() -> None:
+    class UnhashableString(str):
+        __hash__ = None  # type: ignore[assignment]
+
+    class CustomStrip(str):
+        def strip(self, chars: str | None = None) -> str:
+            return "CUSTOM\t SQL"
+
+    cached = sqlite_store_module._normalize_schema_sql_cached
+    before = cached.cache_info()
+    for value in (UnhashableString(" SELECT X "), CustomStrip("SELECT X")):
+        assert (
+            sqlite_store_module._normalize_schema_sql(value)
+            == re.sub(r"\s+", " ", value.strip()).lower()
+        )
+    assert cached.cache_info() == before
+
+
+@pytest.mark.parametrize(
+    "tamper", ("replacement-trigger", "missing-trigger", "extra-index", "altered-table")
+)
+def test_sqlite_warmed_normalization_cache_rejects_live_schema_tampering(
+    tmp_path: Path, tamper: str
+) -> None:
+    path = tmp_path / f"warm-schema-{tamper}.db"
+    store = _open_store(path, None)
+    reader = SQLiteAuthorityReader.open(path)
+    request = CommitContextRequest("workflow-1", "node-1", "attempt-1", "agent-1")
+    store.read_commit_context(request)
+    reader.read_commit_context(request)
+    assert sqlite_store_module._normalize_schema_sql_cached.cache_info().hits > 0
+    with sqlite3.connect(path) as connection:
+        if tamper in ("replacement-trigger", "missing-trigger"):
+            connection.execute("DROP TRIGGER certificate_dispositions_no_delete")
+            if tamper == "replacement-trigger":
+                connection.execute(
+                    "CREATE TRIGGER certificate_dispositions_no_delete BEFORE DELETE ON certificate_dispositions BEGIN SELECT 1; END"
+                )
+        elif tamper == "extra-index":
+            connection.execute(
+                "CREATE INDEX injected_apcc_index ON certificates(workflow_id)"
+            )
+        else:
+            connection.execute("ALTER TABLE candidates ADD COLUMN injected TEXT")
+    before = _database_file_state(path)
+    for operation in (
+        lambda: store.revoke(
+            RevocationRequest(
+                RevocationScope.ACTOR, "workflow-1", "agent-1", "1", "must deny"
+            )
+        ),
+        lambda: store.read_commit_context(request),
+        lambda: reader.read_commit_context(request),
+    ):
+        with pytest.raises(ValueError, match="schema validation failed"):
+            operation()
         assert _database_file_state(path) == before
 
 
@@ -5105,16 +5224,28 @@ def test_executor_and_gcb_route_only_once_through_apcc_and_block_legacy_paths(
 ) -> None:
     """Dispatcher-level RED: ordinary execution has one APCC authority path."""
     calls: list[AtomicCommitRequest] = []
+    routes: list[str] = []
     original_commit = APCCCommitService.commit
+    original_private_commit = APCCCommitService._commit_and_claim_for_authority
 
     def observed_commit(
         self: APCCCommitService, request: AtomicCommitRequest
     ) -> CommitResult:
         assert isinstance(request, AtomicCommitRequest)
         calls.append(request)
+        routes.append("public")
         return original_commit(self, request)
 
+    def observed_private_commit(self, request):
+        assert isinstance(request, AtomicCommitRequest)
+        calls.append(request)
+        routes.append("private_authority")
+        return original_private_commit(self, request)
+
     monkeypatch.setattr(APCCCommitService, "commit", observed_commit)
+    monkeypatch.setattr(
+        APCCCommitService, "_commit_and_claim_for_authority", observed_private_commit
+    )
     registry = CapabilityRegistry()
     registry.register("agent", [Capability(name="work", domain="d")])
     authority_path = tmp_path / "dispatcher.sqlite3"
@@ -5218,6 +5349,7 @@ def test_executor_and_gcb_route_only_once_through_apcc_and_block_legacy_paths(
     assert isinstance(committed, GovernedCommitDecision)
     assert committed.commit_id == request.commit_id
     assert len(calls) == 2
+    assert routes == ["private_authority", "private_authority"]
     assert calls[0] == calls[1]
     apcc_request = calls[-1]
     assert apcc_request.commit_id == request.commit_id
@@ -5293,6 +5425,7 @@ def test_executor_and_gcb_route_only_once_through_apcc_and_block_legacy_paths(
         replay = legacy_commit(request)
         assert replay == committed
         assert len(calls) == calls_before + 1
+        assert routes[-1] == "public"
         assert isinstance(calls[-1], AtomicCommitRequest)
         assert calls[-1] == apcc_request
         assert _gcb_authority_snapshot(admin) == before_legacy

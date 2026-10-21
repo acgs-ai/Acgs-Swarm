@@ -17,12 +17,20 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from typing import Iterator, Protocol, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from constitutional_swarm._sqlite_connections import (
+    SQLiteConnection,
+    _connect_scoped,
+    _configured_connection,
+    _is_sqlite_connection,
+)
 
 from .codec import (
     canonical_statement,
@@ -91,6 +99,7 @@ from .observation import (
 )
 from .ports import (
     APCCAuthorityConfig,
+    AuthorityCausalProfile,
     AssembleEvidenceRequest,
     AssembleEvidenceResult,
     AtomicCommitRequest,
@@ -195,16 +204,19 @@ def _semantic_checkpoint_body(
     change_sequence: int,
     prior_digest: str,
 ) -> bytes:
-    return _json(
-        {
-            "profile": "APCC-1.0-draft",
-            "kind": "apcc.semantic-checkpoint",
-            "authority_store_id": config.authority_store_id,
-            "schema_fingerprint": schema_fingerprint,
-            "change_sequence": str(change_sequence),
-            "prior_digest": prior_digest,
-        }
-    ).encode("utf-8")
+    body = {
+        "profile": "APCC-1.0-draft",
+        "kind": "apcc.semantic-checkpoint",
+        "authority_store_id": config.authority_store_id,
+        "schema_fingerprint": schema_fingerprint,
+        "change_sequence": str(change_sequence),
+        "prior_digest": prior_digest,
+    }
+    if config.causal_profile is not AuthorityCausalProfile.DEFAULT:
+        body["authority_config_digest"] = sha256_digest(
+            _json(_config_object(config)).encode("utf-8")
+        )
+    return _json(body).encode("utf-8")
 
 
 def _semantic_checkpoint_row(
@@ -560,7 +572,7 @@ def _loads(value: str) -> object:
 
 
 def _gcb_revoked_closure(
-    connection: sqlite3.Connection, workflow_id: str, node_id: str
+    connection: SQLiteConnection, workflow_id: str, node_id: str
 ) -> bool:
     roots = {
         str(row[0])
@@ -589,7 +601,7 @@ def _gcb_revoked_closure(
 
 
 def _load_gcb_projection_facts(
-    connection: sqlite3.Connection,
+    connection: SQLiteConnection,
     clock: AuthorityClock,
     plan: _GCBProjectionPlan,
 ) -> _GCBProjectionFacts:
@@ -694,7 +706,7 @@ def _load_gcb_projection_facts(
 
 
 def _attest_gcb_projection(
-    connection: sqlite3.Connection,
+    connection: SQLiteConnection,
     request: AtomicCommitRequest,
     result: CommitResult,
     plan: _GCBProjectionPlan,
@@ -872,7 +884,7 @@ def _config_object(config: APCCAuthorityConfig) -> dict[str, object]:
             "public_key": b64u_encode(item.public_key),
         }
 
-    return {
+    result: dict[str, object] = {
         "authority_store_id": config.authority_store_id,
         "bindings": [binding(item) for item in config.trust_bindings],
         "freshness": {
@@ -881,14 +893,25 @@ def _config_object(config: APCCAuthorityConfig) -> dict[str, object]:
         },
     }
 
+    if config.causal_profile is not AuthorityCausalProfile.DEFAULT:
+        result["causal_profile"] = config.causal_profile.value
+    return result
+
 
 def _config_from_object(value: object) -> APCCAuthorityConfig:
-    if not isinstance(value, dict) or set(value) != {
-        "authority_store_id",
-        "bindings",
-        "freshness",
-    }:
+    if not isinstance(value, dict) or set(value) not in (
+        {"authority_store_id", "bindings", "freshness"},
+        {"authority_store_id", "bindings", "freshness", "causal_profile"},
+    ):
         raise ValueError("APCC SQLite store schema validation failed")
+    profile = AuthorityCausalProfile.DEFAULT
+    if "causal_profile" in value:
+        if (
+            type(value["causal_profile"]) is not str
+            or value["causal_profile"] != AuthorityCausalProfile.W2_LINEAR_100.value
+        ):
+            raise ValueError("APCC SQLite store causal profile validation failed")
+        profile = AuthorityCausalProfile.W2_LINEAR_100
     store_id = value["authority_store_id"]
     bindings_value = value["bindings"]
     freshness_value = value["freshness"]
@@ -965,6 +988,7 @@ def _config_from_object(value: object) -> APCCAuthorityConfig:
                 freshness_value["maximum_staleness_ms"],
                 freshness_value["issued_status_lifetime_ms"],
             ),
+            profile,
         )
         if _config_object(parsed) != value:
             raise ValueError("APCC SQLite store schema validation failed")
@@ -1213,6 +1237,7 @@ def _observation_effective_revoked(
     connection: _AuthorityConnection,
     certificate_digest: str,
     *,
+    limits: CausalClosureLimits,
     active: set[str] | None = None,
     cache: dict[str, bool] | None = None,
 ) -> bool:
@@ -1224,7 +1249,7 @@ def _observation_effective_revoked(
         return cached
     if (
         certificate_digest in active_digests
-        or len(active_digests) + len(resolved) >= CausalClosureLimits().max_certificates
+        or len(active_digests) + len(resolved) >= limits.max_certificates
     ):
         return True
     active_digests.add(certificate_digest)
@@ -1249,6 +1274,7 @@ def _observation_effective_revoked(
         _observation_effective_revoked(
             connection,
             predecessor.certificate_digest,
+            limits=limits,
             active=active_digests,
             cache=resolved,
         )
@@ -1585,7 +1611,7 @@ class _AuthorityReaderCore:
             if disposition_row is None:
                 raise ValueError("committed observation lacks disposition")
             effectively_revoked = _observation_effective_revoked(
-                connection, certificate_digest
+                connection, certificate_digest, limits=self._config.causal_limits
             )
             supersession = connection.execute(
                 "SELECT new_digest FROM supersession_edges WHERE old_digest=?",
@@ -1735,7 +1761,7 @@ class SQLiteAuthorityReader(_AuthorityReaderCore):
         super().__init__(config.authority_store_id, status_signer)
         self.database_path = Path(path)
         self._config = config
-        self._attested_read_connections: set[sqlite3.Connection] = set()
+        self._attested_read_connections: set[SQLiteConnection] = set()
 
     @classmethod
     def open(
@@ -1758,11 +1784,11 @@ class SQLiteAuthorityReader(_AuthorityReaderCore):
         finally:
             connection.close()
 
-    def _connection(self) -> sqlite3.Connection:
+    def _connection(self) -> SQLiteConnection:
         return _connect_reader(self.database_path)
 
     @contextmanager
-    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+    def _read_transaction(self) -> Iterator[SQLiteConnection]:
         connection = self._connection()
         try:
             connection.execute("BEGIN")
@@ -1776,6 +1802,36 @@ class SQLiteAuthorityReader(_AuthorityReaderCore):
         finally:
             self._attested_read_connections.discard(connection)
             connection.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshCommitEvent:
+    sequence: int
+    event_id: str
+    operation_id: str
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitOutcome:
+    result: CommitResult
+    fresh_event: _FreshCommitEvent | None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _IssuedOutboxClaim:
+    """Opaque identity only; authority facts remain in the issuing store registry."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboxClaimRecord:
+    event: _FreshCommitEvent
+    token: str
+    request_digest: str
+    pid: int
+    thread: int
+    device: int
+    inode: int
 
 
 class _AuthorityStoreCore(_AuthorityReaderCore):
@@ -1807,6 +1863,15 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             raise TypeError("GCB projection requires the SQLite authority store")
 
     def stage_result(self, request: StageResultRequest) -> StageResultResult:
+        with self._transaction() as connection:
+            result, quarantined = self._stage_result_at(connection, request)
+        if quarantined:
+            raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
+        return result
+
+    def _stage_result_at(
+        self, connection: _AuthorityConnection, request: StageResultRequest
+    ) -> tuple[StageResultResult, bool]:
         audit = _audit_id(
             "stage",
             request.subject.workflow_id,
@@ -1816,80 +1881,52 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             request.expected_node_version,
         )
         quarantined = False
-        with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT lifecycle, result, expected_version, subject_json "
-                "FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+        row = connection.execute(
+            "SELECT lifecycle, result, expected_version, subject_json "
+            "FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+            (
+                request.subject.workflow_id,
+                request.subject.node_id,
+                request.subject.attempt_id,
+            ),
+        ).fetchone()
+        if row is None:
+            template = connection.execute(
+                "SELECT context_json FROM candidates WHERE workflow_id=? AND node_id=? LIMIT 1",
+                (request.subject.workflow_id, request.subject.node_id),
+            ).fetchone()
+            node = connection.execute(
+                "SELECT version FROM logical_nodes WHERE workflow_id=? AND node_id=?",
+                (request.subject.workflow_id, request.subject.node_id),
+            ).fetchone()
+            if template is None or node is None:
+                raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
+            connection.execute(
+                "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     request.subject.workflow_id,
                     request.subject.node_id,
                     request.subject.attempt_id,
-                ),
-            ).fetchone()
-            if row is None:
-                template = connection.execute(
-                    "SELECT context_json FROM candidates WHERE workflow_id=? AND node_id=? LIMIT 1",
-                    (request.subject.workflow_id, request.subject.node_id),
-                ).fetchone()
-                node = connection.execute(
-                    "SELECT version FROM logical_nodes WHERE workflow_id=? AND node_id=?",
-                    (request.subject.workflow_id, request.subject.node_id),
-                ).fetchone()
-                if template is None or node is None:
-                    raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
-                connection.execute(
-                    "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                        request.subject.attempt_id,
-                        request.subject.agent_id,
-                        CandidateLifecycle.EXECUTING.value,
-                        str(node[0]),
-                        None,
-                        _json(request.subject.to_object()),
-                        template[0],
-                        "[]",
-                        None,
-                        _audit_id("candidate", request.subject.attempt_id),
-                        None,
-                    ),
-                )
-                row = (
+                    request.subject.agent_id,
                     CandidateLifecycle.EXECUTING.value,
+                    str(node[0]),
                     None,
-                    request.expected_node_version,
                     _json(request.subject.to_object()),
-                )
-            if sha256_digest(request.result_bytes) != request.subject.output_digest:
-                if row[0] == CandidateLifecycle.RESULT_STAGED.value:
-                    connection.execute(
-                        "UPDATE candidates SET lifecycle=? WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                        (
-                            CandidateLifecycle.QUARANTINED.value,
-                            request.subject.workflow_id,
-                            request.subject.node_id,
-                            request.subject.attempt_id,
-                        ),
-                    )
-                    quarantined = True
-                else:
-                    raise ValueError(FailureCode.OUTPUT_DIGEST_MISMATCH.value)
-            if row[0] == CandidateLifecycle.QUARANTINED.value:
-                raise ValueError(FailureCode.QUARANTINED.value)
-            if row[0] not in (
+                    template[0],
+                    "[]",
+                    None,
+                    _audit_id("candidate", request.subject.attempt_id),
+                    None,
+                ),
+            )
+            row = (
                 CandidateLifecycle.EXECUTING.value,
-                CandidateLifecycle.RESULT_STAGED.value,
-            ):
-                raise ValueError(FailureCode.ILLEGAL_NODE_STATE.value)
-            if row[2] != request.expected_node_version or row[3] != _json(
-                request.subject.to_object()
-            ):
-                raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
-            if (
-                row[0] == CandidateLifecycle.RESULT_STAGED.value
-                and _row_bytes(row[1]) != request.result_bytes
-            ):
+                None,
+                request.expected_node_version,
+                _json(request.subject.to_object()),
+            )
+        if sha256_digest(request.result_bytes) != request.subject.output_digest:
+            if row[0] == CandidateLifecycle.RESULT_STAGED.value:
                 connection.execute(
                     "UPDATE candidates SET lifecycle=? WHERE workflow_id=? AND node_id=? AND attempt_id=?",
                     (
@@ -1901,21 +1938,46 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 )
                 quarantined = True
             else:
-                connection.execute(
-                    "UPDATE candidates SET lifecycle=?, result=?, audit_event_id=? "
-                    "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                    (
-                        CandidateLifecycle.RESULT_STAGED.value,
-                        request.result_bytes,
-                        audit,
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                        request.subject.attempt_id,
-                    ),
-                )
-        if quarantined:
+                raise ValueError(FailureCode.OUTPUT_DIGEST_MISMATCH.value)
+        if row[0] == CandidateLifecycle.QUARANTINED.value:
+            raise ValueError(FailureCode.QUARANTINED.value)
+        if row[0] not in (
+            CandidateLifecycle.EXECUTING.value,
+            CandidateLifecycle.RESULT_STAGED.value,
+        ):
+            raise ValueError(FailureCode.ILLEGAL_NODE_STATE.value)
+        if row[2] != request.expected_node_version or row[3] != _json(
+            request.subject.to_object()
+        ):
             raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
-        return StageResultResult(
+        if (
+            row[0] == CandidateLifecycle.RESULT_STAGED.value
+            and _row_bytes(row[1]) != request.result_bytes
+        ):
+            connection.execute(
+                "UPDATE candidates SET lifecycle=? WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+                (
+                    CandidateLifecycle.QUARANTINED.value,
+                    request.subject.workflow_id,
+                    request.subject.node_id,
+                    request.subject.attempt_id,
+                ),
+            )
+            quarantined = True
+        else:
+            connection.execute(
+                "UPDATE candidates SET lifecycle=?, result=?, audit_event_id=? "
+                "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+                (
+                    CandidateLifecycle.RESULT_STAGED.value,
+                    request.result_bytes,
+                    audit,
+                    request.subject.workflow_id,
+                    request.subject.node_id,
+                    request.subject.attempt_id,
+                ),
+            )
+        result = StageResultResult(
             CandidateState(
                 request.subject.workflow_id,
                 request.subject.node_id,
@@ -1924,6 +1986,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             ),
             audit,
         )
+        return result, quarantined
 
     def assemble_evidence(
         self, request: AssembleEvidenceRequest
@@ -1957,87 +2020,94 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         result_type: type[AssembleEvidenceResult] | type[ProposeCommitResult],
     ) -> AssembleEvidenceResult | ProposeCommitResult:
         with self._transaction() as connection:
-            static_error = self._static_error(proposal)
-            if static_error is not None:
-                raise ValueError(static_error.value)
-            row = connection.execute(
-                "SELECT lifecycle, expected_version, result, subject_json, context_json, predecessors_json, proposal_digest "
-                "FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+            return self._advance_at(connection, proposal, expected, target, result_type)
+
+    def _advance_at(
+        self,
+        connection: _AuthorityConnection,
+        proposal: AtomicCommitRequest,
+        expected: CandidateLifecycle,
+        target: CandidateLifecycle,
+        result_type: type[AssembleEvidenceResult] | type[ProposeCommitResult],
+    ) -> AssembleEvidenceResult | ProposeCommitResult:
+        static_error = self._static_error(proposal)
+        if static_error is not None:
+            raise ValueError(static_error.value)
+        row = connection.execute(
+            "SELECT lifecycle, expected_version, result, subject_json, context_json, predecessors_json, proposal_digest "
+            "FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+            (
+                proposal.subject.workflow_id,
+                proposal.subject.node_id,
+                proposal.subject.attempt_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
+        if row[0] == CandidateLifecycle.EXECUTING.value and row[2] is None:
+            code = (
+                FailureCode.RESULT_NOT_STAGED
+                if expected is CandidateLifecycle.RESULT_STAGED
+                else FailureCode.ILLEGAL_NODE_STATE
+            )
+            raise ValueError(code.value)
+        if not _candidate_matches(
+            row,
+            proposal,
+            evidence_bound=expected is not CandidateLifecycle.RESULT_STAGED,
+        ):
+            raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
+        if row[0] == CandidateLifecycle.QUARANTINED.value:
+            raise ValueError(FailureCode.QUARANTINED.value)
+        if row[0] != expected.value:
+            code = (
+                FailureCode.RESULT_NOT_STAGED
+                if expected is CandidateLifecycle.RESULT_STAGED
+                else FailureCode.ILLEGAL_NODE_STATE
+            )
+            raise ValueError(code.value)
+        audit = _audit_id(
+            target.value, proposal.commit_id, _proposal_identity(proposal)
+        )
+        if target is CandidateLifecycle.EVIDENCE_ASSEMBLED:
+            connection.execute(
+                "UPDATE candidates SET lifecycle=?, context_json=?, predecessors_json=?, audit_event_id=?, proposal_digest=?, proposal_json=? "
+                "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
                 (
+                    target.value,
+                    _json(proposal.context.to_object()),
+                    _json(
+                        [item.to_object() for item in proposal.bindings.predecessors]
+                    ),
+                    audit,
+                    _proposal_identity(proposal),
+                    _authority_request_json(proposal),
                     proposal.subject.workflow_id,
                     proposal.subject.node_id,
                     proposal.subject.attempt_id,
                 ),
-            ).fetchone()
-            if row is None:
-                raise ValueError(FailureCode.CROSS_ATTEMPT_REPLAY.value)
-            if row[0] == CandidateLifecycle.EXECUTING.value and row[2] is None:
-                code = (
-                    FailureCode.RESULT_NOT_STAGED
-                    if expected is CandidateLifecycle.RESULT_STAGED
-                    else FailureCode.ILLEGAL_NODE_STATE
-                )
-                raise ValueError(code.value)
-            if not _candidate_matches(
-                row,
-                proposal,
-                evidence_bound=expected is not CandidateLifecycle.RESULT_STAGED,
-            ):
-                raise ValueError(FailureCode.STAGED_RESULT_CONFLICT.value)
-            if row[0] == CandidateLifecycle.QUARANTINED.value:
-                raise ValueError(FailureCode.QUARANTINED.value)
-            if row[0] != expected.value:
-                code = (
-                    FailureCode.RESULT_NOT_STAGED
-                    if expected is CandidateLifecycle.RESULT_STAGED
-                    else FailureCode.ILLEGAL_NODE_STATE
-                )
-                raise ValueError(code.value)
-            audit = _audit_id(
-                target.value, proposal.commit_id, _proposal_identity(proposal)
             )
-            if target is CandidateLifecycle.EVIDENCE_ASSEMBLED:
-                connection.execute(
-                    "UPDATE candidates SET lifecycle=?, context_json=?, predecessors_json=?, audit_event_id=?, proposal_digest=?, proposal_json=? "
-                    "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                    (
-                        target.value,
-                        _json(proposal.context.to_object()),
-                        _json(
-                            [
-                                item.to_object()
-                                for item in proposal.bindings.predecessors
-                            ]
-                        ),
-                        audit,
-                        _proposal_identity(proposal),
-                        _authority_request_json(proposal),
-                        proposal.subject.workflow_id,
-                        proposal.subject.node_id,
-                        proposal.subject.attempt_id,
-                    ),
-                )
-            else:
-                connection.execute(
-                    "UPDATE candidates SET lifecycle=?, proposal_digest=?, audit_event_id=?, proposal_json=? "
-                    "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
-                    (
-                        target.value,
-                        _proposal_identity(proposal),
-                        audit,
-                        _authority_request_json(proposal),
-                        proposal.subject.workflow_id,
-                        proposal.subject.node_id,
-                        proposal.subject.attempt_id,
-                    ),
-                )
-            value = CandidateState(
-                proposal.subject.workflow_id,
-                proposal.subject.node_id,
-                proposal.subject.attempt_id,
-                target,
+        else:
+            connection.execute(
+                "UPDATE candidates SET lifecycle=?, proposal_digest=?, audit_event_id=?, proposal_json=? "
+                "WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+                (
+                    target.value,
+                    _proposal_identity(proposal),
+                    audit,
+                    _authority_request_json(proposal),
+                    proposal.subject.workflow_id,
+                    proposal.subject.node_id,
+                    proposal.subject.attempt_id,
+                ),
             )
-            return result_type(value, audit)
+        value = CandidateState(
+            proposal.subject.workflow_id,
+            proposal.subject.node_id,
+            proposal.subject.attempt_id,
+            target,
+        )
+        return result_type(value, audit)
 
     def atomic_commit(self, request: AtomicCommitRequest) -> CommitResult:
         return self._commit(request, supersede_old=None, projection_plan=None)
@@ -2048,21 +2118,37 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         supersede_old: str | None,
         projection_plan: _GCBProjectionPlan | None = None,
     ) -> CommitResult:
-        prefix = "supersession_" if supersede_old is not None else ""
         request_digest = _operation_identity(request, supersede_old)
         with self._transaction() as connection:
-            existing = connection.execute(
-                "SELECT request_digest FROM commit_index WHERE commit_id=?",
-                (request.commit_id,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] == request_digest:
-                    if projection_plan is not None:
-                        _attest_gcb_projection_replay(
-                            connection, request, projection_plan
-                        )
-                    return _replay(connection, request.commit_id, request_digest)
-                return self._conflict(
+            outcome = self._commit_at(
+                connection, request, supersede_old, projection_plan, request_digest
+            )
+        if outcome.fresh_event is not None and supersede_old is None:
+            self._hit("after_commit_before_response")
+        return outcome.result
+
+    def _commit_at(
+        self,
+        connection: _AuthorityConnection,
+        request: AtomicCommitRequest,
+        supersede_old: str | None,
+        projection_plan: _GCBProjectionPlan | None,
+        request_digest: str,
+    ) -> _CommitOutcome:
+        prefix = "supersession_" if supersede_old is not None else ""
+        existing = connection.execute(
+            "SELECT request_digest FROM commit_index WHERE commit_id=?",
+            (request.commit_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] == request_digest:
+                if projection_plan is not None:
+                    _attest_gcb_projection_replay(connection, request, projection_plan)
+                return _CommitOutcome(
+                    _replay(connection, request.commit_id, request_digest), None
+                )
+            return _CommitOutcome(
+                self._conflict(
                     connection,
                     request.commit_id,
                     request_digest,
@@ -2078,225 +2164,228 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                         }
                     ),
                     supersede_old,
-                )
-            self._hit(f"before_{prefix}verification")
-            certificate: CommitCertificate | None = None
-            sequence: str | None = None
-            error: FailureCode | None
-            if connection.execute(
-                "SELECT 1 FROM nonce_ledger WHERE nonce=?", (request.nonce,)
-            ).fetchone():
-                error = FailureCode.NONCE_REPLAY
-            else:
-                sequence = self._next_sequence(connection)
-                certificate = self._certificate(request, sequence)
-                error = self._certificate_error(certificate)
-                if error is None:
-                    error = self._preflight(
-                        connection, request, supersede_old, certificate
-                    )
-            self._hit(f"after_{prefix}verification")
-            if error is not None:
-                return self._negative(connection, request, error, supersede_old)
-            assert certificate is not None
-            assert sequence is not None
-            self._hit(f"before_{prefix}seal")
-            payload, envelope, digest = self._seal(certificate)
-            self._hit(f"after_{prefix}seal")
-            self._hit(f"before_{prefix}commit_index_reservation")
-            connection.execute(
-                "INSERT INTO commit_index VALUES (?, ?, ?, ?)",
-                (
-                    request.commit_id,
-                    request_digest,
-                    request.subject.workflow_id,
-                    _operation_request_json(request, supersede_old),
                 ),
+                None,
             )
-            self._hit(f"after_{prefix}commit_index_reservation")
-            self._hit(f"before_{prefix}request_index_write")
-            connection.execute(
-                "INSERT INTO request_index VALUES (?, ?)",
-                (_public_request_digest(request), request.commit_id),
+        self._hit(f"before_{prefix}verification")
+        certificate: CommitCertificate | None = None
+        sequence: str | None = None
+        error: FailureCode | None
+        if connection.execute(
+            "SELECT 1 FROM nonce_ledger WHERE nonce=?", (request.nonce,)
+        ).fetchone():
+            error = FailureCode.NONCE_REPLAY
+        else:
+            sequence = self._next_sequence(connection)
+            certificate = self._certificate(request, sequence)
+            error = self._certificate_error(certificate)
+            if error is None:
+                error = self._preflight(connection, request, supersede_old, certificate)
+        self._hit(f"after_{prefix}verification")
+        if error is not None:
+            return _CommitOutcome(
+                self._negative(connection, request, error, supersede_old), None
             )
-            self._hit(f"after_{prefix}request_index_write")
-            self._hit(f"before_{prefix}nonce_ledger")
-            connection.execute(
-                "INSERT INTO nonce_ledger VALUES (?, ?)",
-                (request.nonce, request.commit_id),
-            )
-            self._hit(f"after_{prefix}nonce_ledger")
-            self._hit(f"before_{prefix}candidate_update")
-            # Candidate lifecycle is independent from a request outcome: a
-            # successful commit leaves the durable staged state COMMIT_PENDING.
-            self._hit(f"after_{prefix}candidate_update")
-            self._hit(f"before_{prefix}audit_write")
-            audit = _audit_id("commit", request.commit_id, request_digest)
-            _write_audit(
-                connection,
-                audit,
-                "committed",
+        assert certificate is not None
+        assert sequence is not None
+        self._hit(f"before_{prefix}seal")
+        payload, envelope, digest = self._seal(certificate)
+        self._hit(f"after_{prefix}seal")
+        self._hit(f"before_{prefix}commit_index_reservation")
+        connection.execute(
+            "INSERT INTO commit_index VALUES (?, ?, ?, ?)",
+            (
                 request.commit_id,
-                **({"old_certificate_digest": supersede_old} if supersede_old else {}),
-            )
-            self._hit(f"after_{prefix}audit_write")
-            self._hit(f"before_{prefix}evidence_refs")
+                request_digest,
+                request.subject.workflow_id,
+                _operation_request_json(request, supersede_old),
+            ),
+        )
+        self._hit(f"after_{prefix}commit_index_reservation")
+        self._hit(f"before_{prefix}request_index_write")
+        connection.execute(
+            "INSERT INTO request_index VALUES (?, ?)",
+            (_public_request_digest(request), request.commit_id),
+        )
+        self._hit(f"after_{prefix}request_index_write")
+        self._hit(f"before_{prefix}nonce_ledger")
+        connection.execute(
+            "INSERT INTO nonce_ledger VALUES (?, ?)",
+            (request.nonce, request.commit_id),
+        )
+        self._hit(f"after_{prefix}nonce_ledger")
+        self._hit(f"before_{prefix}candidate_update")
+        # Candidate lifecycle is independent from a request outcome: a
+        # successful commit leaves the durable staged state COMMIT_PENDING.
+        self._hit(f"after_{prefix}candidate_update")
+        self._hit(f"before_{prefix}audit_write")
+        audit = _audit_id("commit", request.commit_id, request_digest)
+        _write_audit(
+            connection,
+            audit,
+            "committed",
+            request.commit_id,
+            **({"old_certificate_digest": supersede_old} if supersede_old else {}),
+        )
+        self._hit(f"after_{prefix}audit_write")
+        self._hit(f"before_{prefix}evidence_refs")
+        connection.execute(
+            "INSERT INTO evidence_refs VALUES (?, ?, ?, ?)",
+            (
+                request.commit_id,
+                request.evidence.producer_statement_digest,
+                request.evidence.policy_statement_digest,
+                request.evidence.authority_statement_digest,
+            ),
+        )
+        self._hit(f"after_{prefix}evidence_refs")
+        if supersede_old is None:
+            self._hit("before_node_write")
             connection.execute(
-                "INSERT INTO evidence_refs VALUES (?, ?, ?, ?)",
+                "UPDATE logical_nodes SET version=?, certificate_digest=? WHERE workflow_id=? AND node_id=?",
                 (
-                    request.commit_id,
-                    request.evidence.producer_statement_digest,
-                    request.evidence.policy_statement_digest,
-                    request.evidence.authority_statement_digest,
-                ),
-            )
-            self._hit(f"after_{prefix}evidence_refs")
-            if supersede_old is None:
-                self._hit("before_node_write")
-                connection.execute(
-                    "UPDATE logical_nodes SET version=?, certificate_digest=? WHERE workflow_id=? AND node_id=?",
-                    (
-                        request.bindings.committed_node_version,
-                        digest,
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                    ),
-                )
-                self._hit("after_node_write")
-                self._hit("before_node_pointer_write")
-                self._hit("after_node_pointer_write")
-            self._hit(f"before_{prefix}certificate_write")
-            connection.execute(
-                "INSERT INTO certificates(certificate_digest, commit_id, certificate_json, envelope, workflow_id, node_id, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
+                    request.bindings.committed_node_version,
                     digest,
-                    request.commit_id,
-                    payload,
-                    envelope,
                     request.subject.workflow_id,
                     request.subject.node_id,
-                    sequence,
                 ),
             )
-            self._hit(f"after_{prefix}certificate_write")
-            output_row = connection.execute(
-                "SELECT result FROM candidates WHERE workflow_id=? AND node_id=? "
-                "AND attempt_id=?",
-                (
-                    request.subject.workflow_id,
-                    request.subject.node_id,
-                    request.subject.attempt_id,
-                ),
-            ).fetchone()
-            if output_row is None or output_row[0] is None:
-                raise ValueError("committed APCC operation lacks staged output")
-            output_bytes = _row_bytes(output_row[0])
-            if sha256_digest(output_bytes) != request.subject.output_digest:
-                raise ValueError("committed APCC output digest mismatch")
-            connection.execute(
-                "INSERT INTO commit_output_refs VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    request.commit_id,
-                    request.subject.workflow_id,
-                    request.subject.node_id,
-                    request.subject.attempt_id,
-                    request.subject.output_digest,
-                    len(output_bytes),
-                ),
-            )
-            if request.bindings.predecessors:
-                self._hit(f"before_{prefix}predecessor_edges")
-                for predecessor in request.bindings.predecessors:
-                    connection.execute(
-                        "INSERT INTO predecessor_edges(child_commit_id, predecessor_digest) VALUES (?, ?)",
-                        (request.commit_id, predecessor.certificate_digest),
-                    )
-                self._hit(f"after_{prefix}predecessor_edges")
-            self._hit(f"before_{prefix}decision_write")
-            connection.execute(
-                "INSERT INTO apcc_decisions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    request.commit_id,
-                    RequestOutcome.COMMITTED.value,
-                    "OK",
-                    audit,
-                    digest,
-                    request.nonce,
-                    request.commit_id,
-                ),
-            )
-            self._hit(f"after_{prefix}decision_write")
-            if supersede_old is None:
-                self._hit("before_disposition_write")
-                connection.execute(
-                    "INSERT INTO certificate_dispositions VALUES (?, 1, ?)",
-                    (digest, CertificateDisposition.CURRENT.value),
-                )
-                self._hit("after_disposition_write")
-            else:
-                self._hit("before_supersession_old_disposition_write")
-                connection.execute(
-                    "INSERT INTO certificate_dispositions VALUES (?, 2, ?)",
-                    (supersede_old, CertificateDisposition.SUPERSEDED.value),
-                )
-                self._hit("after_supersession_old_disposition_write")
-                self._hit("before_supersession_new_disposition_write")
-                connection.execute(
-                    "INSERT INTO certificate_dispositions VALUES (?, 1, ?)",
-                    (digest, CertificateDisposition.CURRENT.value),
-                )
-                self._hit("after_supersession_new_disposition_write")
-                edge = _audit_id("replace", supersede_old, digest)
-                self._hit("before_supersession_replacement_edge_write")
-                connection.execute(
-                    "INSERT INTO supersession_edges(edge_id, old_digest, new_digest, nonce) VALUES (?, ?, ?, ?)",
-                    (edge, supersede_old, digest, request.nonce),
-                )
-                self._hit("after_supersession_replacement_edge_write")
-                self._hit("before_supersession_node_pointer_write")
-                connection.execute(
-                    "UPDATE logical_nodes SET version=?, certificate_digest=? WHERE workflow_id=? AND node_id=?",
-                    (
-                        request.bindings.committed_node_version,
-                        digest,
-                        request.subject.workflow_id,
-                        request.subject.node_id,
-                    ),
-                )
-                self._hit("after_supersession_node_pointer_write")
-            self._hit(f"before_{prefix}trust_log_write")
-            trust_sequence, _trust_head = self._append_trust(
-                connection, "commit", digest, audit
-            )
-            self._hit(f"after_{prefix}trust_log_write")
-            event = _audit_id("outbox", "COMMIT", request.commit_id, digest)
-            self._hit(f"before_{prefix}outbox_write")
-            connection.execute(
-                "INSERT INTO apcc_outbox(event_sequence,event_id,event_kind,operation_id,event_json,audit_event_id,trust_sequence,state,lease_token,lease_until_ms,delivered) "
-                "VALUES (?, ?, 'COMMIT', ?, ?, ?, ?, 'PENDING', NULL, NULL, 0)",
-                (
-                    trust_sequence,
-                    event,
-                    request.commit_id,
-                    payload,
-                    audit,
-                    trust_sequence,
-                ),
-            )
-            self._hit(f"after_{prefix}outbox_write")
-            self._hit(f"before_{prefix}commit")
-            result = CommitResult(
-                CommitDecision(request.commit_id, RequestOutcome.COMMITTED, "OK"),
+            self._hit("after_node_write")
+            self._hit("before_node_pointer_write")
+            self._hit("after_node_pointer_write")
+        self._hit(f"before_{prefix}certificate_write")
+        connection.execute(
+            "INSERT INTO certificates(certificate_digest, commit_id, certificate_json, envelope, workflow_id, node_id, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                digest,
+                request.commit_id,
                 payload,
                 envelope,
-                digest,
+                request.subject.workflow_id,
+                request.subject.node_id,
+                sequence,
+            ),
+        )
+        self._hit(f"after_{prefix}certificate_write")
+        output_row = connection.execute(
+            "SELECT result FROM candidates WHERE workflow_id=? AND node_id=? "
+            "AND attempt_id=?",
+            (
+                request.subject.workflow_id,
+                request.subject.node_id,
+                request.subject.attempt_id,
+            ),
+        ).fetchone()
+        if output_row is None or output_row[0] is None:
+            raise ValueError("committed APCC operation lacks staged output")
+        output_bytes = _row_bytes(output_row[0])
+        if sha256_digest(output_bytes) != request.subject.output_digest:
+            raise ValueError("committed APCC output digest mismatch")
+        connection.execute(
+            "INSERT INTO commit_output_refs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                request.commit_id,
+                request.subject.workflow_id,
+                request.subject.node_id,
+                request.subject.attempt_id,
+                request.subject.output_digest,
+                len(output_bytes),
+            ),
+        )
+        if request.bindings.predecessors:
+            self._hit(f"before_{prefix}predecessor_edges")
+            for predecessor in request.bindings.predecessors:
+                connection.execute(
+                    "INSERT INTO predecessor_edges(child_commit_id, predecessor_digest) VALUES (?, ?)",
+                    (request.commit_id, predecessor.certificate_digest),
+                )
+            self._hit(f"after_{prefix}predecessor_edges")
+        self._hit(f"before_{prefix}decision_write")
+        connection.execute(
+            "INSERT INTO apcc_decisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                request.commit_id,
+                RequestOutcome.COMMITTED.value,
+                "OK",
                 audit,
-            )
-            if supersede_old is None:
-                self._run_projection(connection, request, result, projection_plan)
+                digest,
+                request.nonce,
+                request.commit_id,
+            ),
+        )
+        self._hit(f"after_{prefix}decision_write")
         if supersede_old is None:
-            self._hit("after_commit_before_response")
-        return result
+            self._hit("before_disposition_write")
+            connection.execute(
+                "INSERT INTO certificate_dispositions VALUES (?, 1, ?)",
+                (digest, CertificateDisposition.CURRENT.value),
+            )
+            self._hit("after_disposition_write")
+        else:
+            self._hit("before_supersession_old_disposition_write")
+            connection.execute(
+                "INSERT INTO certificate_dispositions VALUES (?, 2, ?)",
+                (supersede_old, CertificateDisposition.SUPERSEDED.value),
+            )
+            self._hit("after_supersession_old_disposition_write")
+            self._hit("before_supersession_new_disposition_write")
+            connection.execute(
+                "INSERT INTO certificate_dispositions VALUES (?, 1, ?)",
+                (digest, CertificateDisposition.CURRENT.value),
+            )
+            self._hit("after_supersession_new_disposition_write")
+            edge = _audit_id("replace", supersede_old, digest)
+            self._hit("before_supersession_replacement_edge_write")
+            connection.execute(
+                "INSERT INTO supersession_edges(edge_id, old_digest, new_digest, nonce) VALUES (?, ?, ?, ?)",
+                (edge, supersede_old, digest, request.nonce),
+            )
+            self._hit("after_supersession_replacement_edge_write")
+            self._hit("before_supersession_node_pointer_write")
+            connection.execute(
+                "UPDATE logical_nodes SET version=?, certificate_digest=? WHERE workflow_id=? AND node_id=?",
+                (
+                    request.bindings.committed_node_version,
+                    digest,
+                    request.subject.workflow_id,
+                    request.subject.node_id,
+                ),
+            )
+            self._hit("after_supersession_node_pointer_write")
+        self._hit(f"before_{prefix}trust_log_write")
+        trust_sequence, _trust_head = self._append_trust(
+            connection, "commit", digest, audit
+        )
+        self._hit(f"after_{prefix}trust_log_write")
+        event = _audit_id("outbox", "COMMIT", request.commit_id, digest)
+        self._hit(f"before_{prefix}outbox_write")
+        connection.execute(
+            "INSERT INTO apcc_outbox(event_sequence,event_id,event_kind,operation_id,event_json,audit_event_id,trust_sequence,state,lease_token,lease_until_ms,delivered) "
+            "VALUES (?, ?, 'COMMIT', ?, ?, ?, ?, 'PENDING', NULL, NULL, 0)",
+            (
+                trust_sequence,
+                event,
+                request.commit_id,
+                payload,
+                audit,
+                trust_sequence,
+            ),
+        )
+        self._hit(f"after_{prefix}outbox_write")
+        self._hit(f"before_{prefix}commit")
+        result = CommitResult(
+            CommitDecision(request.commit_id, RequestOutcome.COMMITTED, "OK"),
+            payload,
+            envelope,
+            digest,
+            audit,
+        )
+        if supersede_old is None:
+            self._run_projection(connection, request, result, projection_plan)
+        return _CommitOutcome(
+            result,
+            _FreshCommitEvent(int(trust_sequence), event, request.commit_id, payload),
+        )
 
     def _preflight(
         self,
@@ -2982,7 +3071,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             closure.update(child.closure)
             depth = max(depth, child.depth + 1)
         active.remove(digest)
-        limits = CausalClosureLimits()
+        limits = self._config.causal_limits
         if error is None and depth > limits.max_depth:
             error = FailureCode.DEPTH_LIMIT_EXCEEDED
         if error is None and (
@@ -3109,7 +3198,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
     def _request_causal_error(
         self, connection: _AuthorityConnection, root: CommitCertificate
     ) -> FailureCode | None:
-        limits = CausalClosureLimits()
+        limits = self._config.causal_limits
         root_payload = encode_certificate(root)
         root_envelope = encode_envelope(
             root_payload,
@@ -3198,6 +3287,7 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             root_envelope,
             trust=_trust(self._config),
             resolver=resolver,
+            limits=self._config.causal_limits,
         )
         if not closure.ok:
             if closure.code in {
@@ -3339,9 +3429,13 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         self.authority_store_id = config.authority_store_id
         self._probe: _FaultProbe | None = None
         self._gcb_attached = False
+        self._issued_outbox_claims: dict[
+            int, tuple[_IssuedOutboxClaim, _OutboxClaimRecord]
+        ] = {}
+        self._outbox_claim_lock = Lock()
         self._gcb_projection_fault: _GCBProjectionCheckpoint | None = None
         self._gcb_projection_fault_fired = False
-        self._attested_read_connections: set[sqlite3.Connection] = set()
+        self._attested_read_connections: set[SQLiteConnection] = set()
         raise ValueError("use SQLiteAuthorityStore.open on a provisioned store")
 
     @classmethod
@@ -3575,11 +3669,158 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         store.authority_store_id = config.authority_store_id
         store._probe = probe
         store._gcb_attached = gcb_attached
+        store._issued_outbox_claims = {}
+        store._outbox_claim_lock = Lock()
         store._gcb_projection_fault = projection_fault
         store._gcb_projection_fault_fired = False
         store._attested_read_connections = set()
         store._ensure_semantic_checkpoint()
         return store
+
+    def _initialize_gcb_candidate_at(
+        self, connection: SQLiteConnection, request: _GCBAtomicCommitRequest
+    ) -> CandidateLifecycle:
+        node = connection.execute(
+            "SELECT version FROM logical_nodes WHERE workflow_id=? AND node_id=?",
+            (request.subject.workflow_id, request.subject.node_id),
+        ).fetchone()
+        if node is None:
+            connection.execute(
+                "INSERT INTO logical_nodes VALUES (?, ?, ?, NULL)",
+                (
+                    request.subject.workflow_id,
+                    request.subject.node_id,
+                    request.bindings.expected_node_version,
+                ),
+            )
+        candidate = connection.execute(
+            "SELECT lifecycle FROM candidates WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+            (
+                request.subject.workflow_id,
+                request.subject.node_id,
+                request.subject.attempt_id,
+            ),
+        ).fetchone()
+        if candidate is None:
+            connection.execute(
+                "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, NULL)",
+                (
+                    request.subject.workflow_id,
+                    request.subject.node_id,
+                    request.subject.attempt_id,
+                    request.subject.agent_id,
+                    CandidateLifecycle.EXECUTING.value,
+                    request.bindings.expected_node_version,
+                    json.dumps(
+                        request.subject.to_object(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        request.context.to_object(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        [item.to_object() for item in request.bindings.predecessors],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    sha256_digest(f"candidate:{request.commit_id}".encode("utf-8")),
+                ),
+            )
+            lifecycle = CandidateLifecycle.EXECUTING
+        else:
+            lifecycle = CandidateLifecycle(candidate[0])
+        return lifecycle
+
+    def _prepare_gcb_candidate(self, request: _GCBAtomicCommitRequest) -> bool:
+        """Prepare an unacknowledged GCB request in one durable transaction.
+
+        Every logical phase validates and seals its checkpoint. Expected state
+        errors commit only successful phases; infrastructure failures roll back
+        the whole unacknowledged batch. Atomic commit remains a separate call.
+        False preserves the caller's missing-staged-result exception boundary.
+        """
+        if not self._gcb_attached or type(request) is not _GCBAtomicCommitRequest:
+            raise TypeError(
+                "GCB preparation requires an attached store and typed request"
+            )
+        connection = _connect(self.database_path)
+        deferred: ValueError | None = None
+        missing = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for phase in ("initialize", "stage", "assemble", "propose"):
+                self._validate_mutation_checkpoint(connection)
+                connection.execute("SAVEPOINT gcb_preparation_phase")
+                stop = False
+                try:
+                    if phase == "initialize":
+                        lifecycle = self._initialize_gcb_candidate_at(
+                            connection, request
+                        )
+                        stop = lifecycle is CandidateLifecycle.COMMIT_PENDING
+                    elif phase == "stage":
+                        staged = connection.execute(
+                            "SELECT artifact_json FROM staged_artifacts WHERE workflow_id=? AND node_id=? AND attempt_id=?",
+                            (
+                                request.subject.workflow_id,
+                                request.subject.node_id,
+                                request.subject.attempt_id,
+                            ),
+                        ).fetchone()
+                        if staged is None:
+                            missing = stop = True
+                        else:
+                            _, quarantined = self._stage_result_at(
+                                connection,
+                                StageResultRequest(
+                                    request.subject,
+                                    request.bindings.expected_node_version,
+                                    staged[0].encode("utf-8"),
+                                ),
+                            )
+                            if quarantined:
+                                deferred = ValueError(
+                                    FailureCode.STAGED_RESULT_CONFLICT.value
+                                )
+                                stop = True
+                    elif phase == "assemble":
+                        self._advance_at(
+                            connection,
+                            request,
+                            CandidateLifecycle.RESULT_STAGED,
+                            CandidateLifecycle.EVIDENCE_ASSEMBLED,
+                            AssembleEvidenceResult,
+                        )
+                    else:
+                        self._advance_at(
+                            connection,
+                            request,
+                            CandidateLifecycle.EVIDENCE_ASSEMBLED,
+                            CandidateLifecycle.COMMIT_PENDING,
+                            ProposeCommitResult,
+                        )
+                except ValueError as error:
+                    if str(error) not in {code.value for code in FailureCode}:
+                        raise
+                    connection.execute("ROLLBACK TO gcb_preparation_phase")
+                    deferred = error
+                    stop = True
+                self._seal_mutation_checkpoint(connection)
+                connection.execute("RELEASE gcb_preparation_phase")
+                if stop:
+                    break
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        if deferred is not None:
+            raise deferred
+        return not missing
 
     def atomic_commit(self, request: AtomicCommitRequest) -> CommitResult:
         if self._gcb_attached:
@@ -3594,7 +3835,154 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             raise _GCBProjectionDenied("gcb_projection_requires_attached_store")
         return self._commit(request, supersede_old=None, projection_plan=None)
 
-    def _connection(self) -> sqlite3.Connection:
+    def _atomic_commit_and_claim_head(
+        self, request: _GCBAtomicCommitRequest
+    ) -> tuple[CommitResult, _IssuedOutboxClaim | None]:
+        """Compose fresh commit and its head claim for one authority dispatch.
+
+        Both logical checkpoints remain sealed. No handle exists until commit
+        returns successfully; ambiguous commit or response loss leaves a durable
+        lease recoverable by ordinary expiry. Public atomic commit stays separate.
+        """
+        if not self._gcb_attached or type(request) is not _GCBAtomicCommitRequest:
+            raise TypeError(
+                "authority preclaim requires attached SQLite and typed GCB request"
+            )
+        request_digest = _operation_identity(request, None)
+        record: _OutboxClaimRecord | None = None
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_mutation_checkpoint(connection)
+            outcome = self._commit_at(
+                connection, request, None, request._gcb_projection_plan, request_digest
+            )
+            self._seal_mutation_checkpoint(connection)
+            fresh = outcome.fresh_event
+            with self._outbox_claim_lock:
+                capacity = len(self._issued_outbox_claims) < 128
+            if fresh is not None and capacity:
+                self._validate_mutation_checkpoint(connection)
+                head = connection.execute(
+                    "SELECT event_sequence,event_id,event_kind,operation_id,event_json,state FROM apcc_outbox "
+                    "WHERE state<>'DELIVERED' ORDER BY event_sequence LIMIT 1"
+                ).fetchone()
+                if head is not None and tuple(head) == (
+                    fresh.sequence,
+                    fresh.event_id,
+                    "COMMIT",
+                    fresh.operation_id,
+                    fresh.payload,
+                    "PENDING",
+                ):
+                    now = _trusted_now(self._runtime.clock)
+                    if now > _MAX_SAFE_INTEGER - 30_000:
+                        raise ValueError(FailureCode.INVALID_DECIMAL_STRING.value)
+                    token = secrets.token_hex(32)
+                    changed = connection.execute(
+                        "UPDATE apcc_outbox SET state='CLAIMED',lease_token=?,lease_claimed_ms=?,lease_until_ms=?,delivered=0 "
+                        "WHERE event_sequence=? AND event_id=? AND state='PENDING'",
+                        (token, now, now + 30_000, fresh.sequence, fresh.event_id),
+                    ).rowcount
+                    if changed != 1:
+                        raise ValueError(
+                            "fresh authority outbox claim changed unexpectedly"
+                        )
+                    stat = self.database_path.stat()
+                    record = _OutboxClaimRecord(
+                        fresh,
+                        token,
+                        request_digest,
+                        os.getpid(),
+                        get_ident(),
+                        stat.st_dev,
+                        stat.st_ino,
+                    )
+                self._seal_mutation_checkpoint(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        if outcome.fresh_event is not None:
+            self._hit("after_commit_before_response")
+        if record is None:
+            return outcome.result, None
+        handle = _IssuedOutboxClaim()
+        with self._outbox_claim_lock:
+            if len(self._issued_outbox_claims) >= 128:
+                return outcome.result, None
+            self._issued_outbox_claims[id(handle)] = (handle, record)
+        return outcome.result, handle
+
+    def _discard_outbox_claim(self, handle: _IssuedOutboxClaim) -> None:
+        with self._outbox_claim_lock:
+            entry = self._issued_outbox_claims.get(id(handle))
+            if entry is not None and entry[0] is handle:
+                del self._issued_outbox_claims[id(handle)]
+
+    def _consume_outbox_claim(
+        self, handle: _IssuedOutboxClaim
+    ) -> _OutboxClaimRecord | None:
+        with self._outbox_claim_lock:
+            entry = self._issued_outbox_claims.get(id(handle))
+            if (
+                type(handle) is not _IssuedOutboxClaim
+                or entry is None
+                or entry[0] is not handle
+            ):
+                raise ValueError("unissued authority outbox claim")
+            record = entry[1]
+            stat = self.database_path.stat()
+            if (record.pid, record.thread, record.device, record.inode) != (
+                os.getpid(),
+                get_ident(),
+                stat.st_dev,
+                stat.st_ino,
+            ):
+                raise ValueError("authority outbox claim owner changed")
+            del self._issued_outbox_claims[id(handle)]
+        # Revalidate a fresh read snapshot; never deliver under a writer lock.
+        with self._read_transaction() as connection:
+            head = connection.execute(
+                "SELECT event_sequence,event_id,event_kind,operation_id,event_json,state,lease_token,lease_until_ms "
+                "FROM apcc_outbox WHERE state<>'DELIVERED' ORDER BY event_sequence LIMIT 1"
+            ).fetchone()
+            owner = connection.execute(
+                "SELECT request_digest FROM commit_index WHERE commit_id=?",
+                (record.event.operation_id,),
+            ).fetchone()
+            now = _trusted_now(self._runtime.clock)
+            if owner is None or owner[0] != record.request_digest:
+                raise ValueError("authority outbox claim request mismatch")
+            if (
+                head is None
+                or tuple(head[:7])
+                != (
+                    record.event.sequence,
+                    record.event.event_id,
+                    "COMMIT",
+                    record.event.operation_id,
+                    record.event.payload,
+                    "CLAIMED",
+                    record.token,
+                )
+                or head[7] is None
+                or int(head[7]) <= now
+            ):
+                return None
+        return record
+
+    def _recover_claimed_outbox(
+        self, request: OutboxRecoveryRequest, handle: _IssuedOutboxClaim
+    ) -> OutboxRecoveryResult:
+        try:
+            return self._recover_outbox(request, handle)
+        finally:
+            self._discard_outbox_claim(handle)
+
+    def _connection(self) -> SQLiteConnection:
         return _connect_reader(self.database_path)
 
     def _observation_current_status(
@@ -3628,7 +4016,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             connection.close()
 
     @contextmanager
-    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+    def _read_transaction(self) -> Iterator[SQLiteConnection]:
         connection = self._connection()
         try:
             connection.execute("BEGIN")
@@ -3649,7 +4037,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         certificate_digests: Sequence[str] = (),
     ) -> _SemanticSnapshot:
         if (
-            not isinstance(connection, sqlite3.Connection)
+            not _is_sqlite_connection(connection)
             or connection not in self._attested_read_connections
         ):
             raise ValueError("APCC SQLite batch snapshot was not attested")
@@ -3659,7 +4047,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         if self._probe is not None:
             self._probe.hit(point)
 
-    def _validate_mutation_checkpoint(self, connection: sqlite3.Connection) -> None:
+    def _validate_mutation_checkpoint(self, connection: SQLiteConnection) -> None:
         config_text = _validate_schema_manifest(connection, storage_checks=False)
         if config_text != _json(_config_object(self._config)):
             raise ValueError(
@@ -3667,14 +4055,12 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             )
         _verify_semantic_checkpoint(connection, self._config, _SCHEMA_FINGERPRINT)
 
-    def _seal_mutation_checkpoint(self, connection: sqlite3.Connection) -> None:
+    def _seal_mutation_checkpoint(self, connection: SQLiteConnection) -> None:
         _seal_semantic_checkpoint(
             connection, self._config, self._runtime, _SCHEMA_FINGERPRINT
         )
 
-    def _finalize_attached_gcb_transaction(
-        self, connection: sqlite3.Connection
-    ) -> None:
+    def _finalize_attached_gcb_transaction(self, connection: SQLiteConnection) -> None:
         """Validate and seal APCC changes made by the trusted GCB control path."""
         _, _, checkpoint_digest, _, signature = _semantic_checkpoint_row(connection)
         if not checkpoint_digest and not signature:
@@ -3703,7 +4089,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             connection.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self) -> Iterator[SQLiteConnection]:
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -3730,7 +4116,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             return
         if not self._gcb_attached:
             raise _GCBProjectionDenied("gcb_projection_requires_attached_store")
-        if not isinstance(connection, sqlite3.Connection):
+        if not _is_sqlite_connection(connection):
             raise TypeError("SQLite APCC projection requires a SQLite transaction")
         _validate_gcb_projection_identity(request, plan)
         facts = _load_gcb_projection_facts(connection, self._runtime.clock, plan)
@@ -3859,44 +4245,56 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             raise _GCBProjectionFault(checkpoint.value)
 
     def recover_outbox(self, request: OutboxRecoveryRequest) -> OutboxRecoveryResult:
+        return self._recover_outbox(request, None)
+
+    def _recover_outbox(
+        self, request: OutboxRecoveryRequest, handle: _IssuedOutboxClaim | None
+    ) -> OutboxRecoveryResult:
         maximum = _canonical_positive_decimal(request.max_items, maximum=1000)
+        preclaimed = self._consume_outbox_claim(handle) if handle is not None else None
         delivered_ids: list[str] = []
         lease_ms = 30_000
-        for _ in range(maximum):
-            token = secrets.token_hex(32)
-            now = _trusted_now(self._runtime.clock)
-            if now > _MAX_SAFE_INTEGER - lease_ms:
-                raise ValueError(FailureCode.INVALID_DECIMAL_STRING.value)
-            connection = _connect(self.database_path)
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                self._validate_mutation_checkpoint(connection)
-                head = connection.execute(
-                    "SELECT event_sequence,event_id,event_json,state,lease_until_ms "
-                    "FROM apcc_outbox WHERE state<>'DELIVERED' "
-                    "ORDER BY event_sequence LIMIT 1"
-                ).fetchone()
-                if head is None or (
-                    head[3] == "CLAIMED" and head[4] is not None and int(head[4]) > now
-                ):
+        for item_index in range(maximum):
+            if item_index == 0 and preclaimed is not None:
+                token = preclaimed.token
+                event_id, payload = preclaimed.event.event_id, preclaimed.event.payload
+            else:
+                token = secrets.token_hex(32)
+                now = _trusted_now(self._runtime.clock)
+                if now > _MAX_SAFE_INTEGER - lease_ms:
+                    raise ValueError(FailureCode.INVALID_DECIMAL_STRING.value)
+                connection = _connect(self.database_path)
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._validate_mutation_checkpoint(connection)
+                    head = connection.execute(
+                        "SELECT event_sequence,event_id,event_json,state,lease_until_ms "
+                        "FROM apcc_outbox WHERE state<>'DELIVERED' "
+                        "ORDER BY event_sequence LIMIT 1"
+                    ).fetchone()
+                    if head is None or (
+                        head[3] == "CLAIMED"
+                        and head[4] is not None
+                        and int(head[4]) > now
+                    ):
+                        self._seal_mutation_checkpoint(connection)
+                        connection.commit()
+                        break
+                    claimed = connection.execute(
+                        "UPDATE apcc_outbox SET state='CLAIMED',lease_token=?,lease_claimed_ms=?,lease_until_ms=?,delivered=0 "
+                        "WHERE event_sequence=? AND (state='PENDING' OR (state='CLAIMED' AND lease_until_ms<=?))",
+                        (token, now, now + lease_ms, head[0], now),
+                    ).rowcount
                     self._seal_mutation_checkpoint(connection)
                     connection.commit()
-                    break
-                claimed = connection.execute(
-                    "UPDATE apcc_outbox SET state='CLAIMED',lease_token=?,lease_claimed_ms=?,lease_until_ms=?,delivered=0 "
-                    "WHERE event_sequence=? AND (state='PENDING' OR (state='CLAIMED' AND lease_until_ms<=?))",
-                    (token, now, now + lease_ms, head[0], now),
-                ).rowcount
-                self._seal_mutation_checkpoint(connection)
-                connection.commit()
-                if claimed != 1:
-                    continue
-                event_id, payload = str(head[1]), bytes(head[2])
-            except Exception:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
+                    if claimed != 1:
+                        continue
+                    event_id, payload = str(head[1]), bytes(head[2])
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
             try:
                 self._runtime.outbox_sink.deliver(event_id, payload)
             except Exception:
@@ -3929,32 +4327,33 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
                 if changed == 1:
                     delivered_ids.append(event_id)
                 self._seal_mutation_checkpoint(finalize)
+                terminal = changed == 1 and (
+                    item_index == maximum - 1
+                    or finalize.execute(
+                        "SELECT 1 FROM apcc_outbox WHERE state<>'DELIVERED' LIMIT 1"
+                    ).fetchone()
+                    is None
+                )
+                if terminal:
+                    # Seal delivery before validating the original audit phase.
+                    # Failure rolls back to the durable claim; earlier delivered
+                    # events survive and this event can retry after lease expiry.
+                    self._validate_mutation_checkpoint(finalize)
+                    result = self._audit_outbox_recovery_at(finalize, delivered_ids)
+                    self._seal_mutation_checkpoint(finalize)
+                    finalize.commit()
+                    return result
                 finalize.commit()
             except Exception:
                 finalize.rollback()
                 raise
             finally:
                 finalize.close()
-        audit = _audit_id(
-            "outbox-delivered", *(delivered_ids if delivered_ids else ["none"])
-        )
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_mutation_checkpoint(connection)
-            if (
-                delivered_ids
-                and connection.execute(
-                    "SELECT 1 FROM audit_events WHERE audit_event_id=?", (audit,)
-                ).fetchone()
-                is None
-            ):
-                _write_audit(connection, audit, "outbox_delivered", "outbox")
-            pending = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM apcc_outbox WHERE state<>'DELIVERED'"
-                ).fetchone()[0]
-            )
+            result = self._audit_outbox_recovery_at(connection, delivered_ids)
             self._seal_mutation_checkpoint(connection)
             connection.commit()
         except Exception:
@@ -3962,6 +4361,27 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             raise
         finally:
             connection.close()
+        return result
+
+    def _audit_outbox_recovery_at(
+        self, connection: SQLiteConnection, delivered_ids: Sequence[str]
+    ) -> OutboxRecoveryResult:
+        audit = _audit_id(
+            "outbox-delivered", *(delivered_ids if delivered_ids else ["none"])
+        )
+        if (
+            delivered_ids
+            and connection.execute(
+                "SELECT 1 FROM audit_events WHERE audit_event_id=?", (audit,)
+            ).fetchone()
+            is None
+        ):
+            _write_audit(connection, audit, "outbox_delivered", "outbox")
+        pending = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM apcc_outbox WHERE state<>'DELIVERED'"
+            ).fetchone()[0]
+        )
         return OutboxRecoveryResult(str(len(delivered_ids)), str(pending), audit)
 
 
@@ -4056,6 +4476,14 @@ _SCHEMA_STATEMENTS = (
 
 
 def _normalize_schema_sql(value: str) -> str:
+    # Cache only bounded, plain ASCII text, never live schema validity.
+    if type(value) is not str or len(value) > 4096 or not value.isascii():
+        return re.sub(r"\s+", " ", value.strip()).lower()
+    return _normalize_schema_sql_cached(value)
+
+
+@lru_cache(maxsize=256)
+def _normalize_schema_sql_cached(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip()).lower()
 
 
@@ -4071,22 +4499,24 @@ def _sqlite_uri(path: Path, mode: str) -> str:
     return f"{Path(path).resolve().as_uri()}?mode={mode}"
 
 
-def _configure_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
+def _configure_connection(connection: SQLiteConnection) -> SQLiteConnection:
     try:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
-        return connection
+        return _configured_connection(connection)
     except Exception:
         connection.close()
         raise
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def _connect(path: Path) -> SQLiteConnection:
     if not Path(path).is_file():
         raise ValueError("APCC SQLite store is not provisioned")
     try:
-        connection = sqlite3.connect(
-            _sqlite_uri(path, "rw"),
+        connection = _connect_scoped(
+            path,
+            kind="apcc-write",
+            database=_sqlite_uri(path, "rw"),
             uri=True,
             isolation_level=None,
             check_same_thread=False,
@@ -4097,12 +4527,14 @@ def _connect(path: Path) -> sqlite3.Connection:
     return _configure_connection(connection)
 
 
-def _connect_reader(path: Path) -> sqlite3.Connection:
+def _connect_reader(path: Path) -> SQLiteConnection:
     if not Path(path).is_file():
         raise ValueError("APCC SQLite store is not provisioned")
     try:
-        connection = sqlite3.connect(
-            _sqlite_uri(path, "ro"),
+        connection = _connect_scoped(
+            path,
+            kind="apcc-read",
+            database=_sqlite_uri(path, "ro"),
             uri=True,
             isolation_level=None,
             check_same_thread=False,
@@ -4113,14 +4545,14 @@ def _connect_reader(path: Path) -> sqlite3.Connection:
     try:
         _configure_connection(connection)
         connection.execute("PRAGMA query_only=ON")
-        return connection
+        return _configured_connection(connection)
     except Exception:
         connection.close()
         raise
 
 
-def _connect_create(path: Path) -> sqlite3.Connection:
-    connection: sqlite3.Connection | None = None
+def _connect_create(path: Path) -> SQLiteConnection:
+    connection: SQLiteConnection | None = None
     try:
         connection = sqlite3.connect(
             _sqlite_uri(path, "rwc"),
@@ -4224,7 +4656,7 @@ def _validate_schema_manifest(
     return config
 
 
-def _validate_schema(connection: sqlite3.Connection) -> str:
+def _validate_schema(connection: SQLiteConnection) -> str:
     config = _validate_schema_manifest(connection, storage_checks=True)
     parsed_config = _config_from_object(_loads(config))
     _validate_semantic_integrity(connection, parsed_config)
@@ -5135,7 +5567,7 @@ def _validate_semantic_integrity(
     return _SemanticSnapshot(dict(certificates), dict(latest), dict(envelope_sizes))
 
 
-def _schema(connection: sqlite3.Connection) -> None:
+def _schema(connection: SQLiteConnection) -> None:
     for statement in _SCHEMA_STATEMENTS:
         if statement in _SEMANTIC_CHECKPOINT_TRIGGERS:
             continue

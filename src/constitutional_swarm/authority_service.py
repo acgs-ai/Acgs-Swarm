@@ -11,11 +11,12 @@ import os
 import secrets
 import select
 import socket
+import sys
 import struct
 import threading
 import time
-from collections.abc import Collection, Mapping, Sequence
-from contextlib import ExitStack
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from enum import Enum
 from typing import Any, TypeVar
@@ -44,10 +45,15 @@ from constitutional_swarm.apcc.observation import (
     verify_signed_authority_observation,
 )
 from constitutional_swarm.apcc.ports import (
+    APCCAuthorityConfig,
     AuthorityObservationStore,
     OutboxRecoveryRequest,
 )
 from constitutional_swarm.artifact import Artifact, ArtifactStore
+from constitutional_swarm.workflow_profile import (
+    WorkflowProfile,
+    require_workflow_profile,
+)
 from constitutional_swarm.authority_isolation import (
     CONTROLLED_BOOT_POSITIVE_ASSUMPTIONS,
     CONTROLLED_BOOT_RESIDUAL_EXCLUSIONS,
@@ -610,13 +616,34 @@ def _trusted_decode(codec: Any, value: Any) -> Any:
         raise GovernanceBypassDenied("authority_unavailable") from exc
 
 
+def _decode_bound_observation_target(
+    value: Any, request: CommitRequest, request_nonce: str
+) -> AuthorityObservationRequest:
+    target = decode_authority_observation_request(canonical_json(value))
+    payload = request.receipt.payload
+    if (
+        target.authority_store_id != request.verdict.store_id
+        or target.workflow_id != payload.workflow_id
+        or target.node_id != payload.node_id
+        or target.attempt_id != payload.attempt_id
+        or target.expected_commit_id != request.commit_id
+        or target.request_nonce != request_nonce
+    ):
+        raise ValueError("observation target response binding mismatch")
+    return target
+
+
 class AuthorityOutboxRecoveryError(RuntimeError):
     """Bounded authority-side outbox recovery failure."""
 
 
-def _recover_outbox(admin: Any) -> None:
+def _recover_outbox(admin: Any, claim: Any = None) -> None:
     try:
-        admin.commit_port._apcc_store.recover_outbox(OutboxRecoveryRequest("100"))
+        store = admin.commit_port._apcc_store
+        if claim is None:
+            store.recover_outbox(OutboxRecoveryRequest("100"))
+        else:
+            store._recover_claimed_outbox(OutboxRecoveryRequest("100"), claim)
     except Exception as exc:
         raise AuthorityOutboxRecoveryError("outbox_recovery_failed") from exc
 
@@ -632,9 +659,26 @@ def _handle_execution_request(admin: Any, request: Any) -> Any:
         return {"authority_pid": os.getpid()}
     if operation == "commit":
         body = _exact_object(parameters, {"commit_request"}, "commit_operation")
-        decision = admin.commit(_decode_commit_request(body["commit_request"]))
-        _recover_outbox(admin)
-        return _encode_commit_decision(decision)
+        decision, claim = admin.commit_port._commit_for_authority(
+            _decode_commit_request(body["commit_request"])
+        )
+        try:
+            _recover_outbox(admin, claim)
+            return _encode_commit_decision(decision)
+        finally:
+            if claim is not None:
+                admin.commit_port._apcc_store._discard_outbox_claim(claim)
+    if operation == "observation_target":
+        body = _exact_object(
+            parameters,
+            {"commit_request", "request_nonce"},
+            "observation_target_operation",
+        )
+        _require_types(body, strings={"request_nonce"})
+        return admin.observation_target(
+            _decode_commit_request(body["commit_request"]),
+            request_nonce=body["request_nonce"],
+        ).to_object()
     if operation == "build_request":
         body = _exact_object(parameters, {"receipt"}, "build_request_operation")
         receipt = _exact_object(body["receipt"], {"payload", "signature"}, "receipt")
@@ -696,7 +740,10 @@ def _handle_execution_request(admin: Any, request: Any) -> Any:
             raise ValueError("invalid_node_ids")
         if not node_ids:
             raise ValueError("empty_node_status_batch")
-        if len(node_ids) > 1000:
+        profile = require_workflow_profile(
+            getattr(admin, "workflow_profile", WorkflowProfile.DEFAULT)
+        )
+        if len(node_ids) > profile.max_nodes:
             raise ValueError("node_status_batch_too_large")
         states = admin.workflow_node_states(body["workflow_id"], tuple(node_ids))
         if len(states) != len(node_ids):
@@ -884,6 +931,7 @@ class _JSONClient:
         "_sequence",
         "_poisoned",
         "_rpc_lock",
+        "_workflow_profile",
     )
 
     def __init__(self, max_frame_bytes: int) -> None:
@@ -898,6 +946,7 @@ class _JSONClient:
         self._sequence = 0
         self._poisoned = False
         self._rpc_lock = threading.RLock()
+        self._workflow_profile = WorkflowProfile.DEFAULT
 
     def _poison(self) -> None:
         self._poisoned = True
@@ -906,6 +955,9 @@ class _JSONClient:
 
     def _authenticated_rpc(self, operation: str, request: Mapping[str, Any]) -> Any:
         envelope = {"operation": operation, "request": dict(request)}
+        frame_budget = self._workflow_profile.frame_budget(
+            operation, self._max_frame_bytes
+        )
         try:
             request_digest = ipc_digest(envelope)
         except (TypeError, ValueError, UnicodeError) as exc:
@@ -918,9 +970,9 @@ class _JSONClient:
             self._sequence += 1
             try:
                 # Spawn reduction preserves O_NONBLOCK but not the timeout.
-                connection.settimeout(2.0)
-                send_authenticated_frame(connection, envelope, self._max_frame_bytes)
-                response = recv_authenticated_frame(connection, self._max_frame_bytes)
+                connection.settimeout(self._workflow_profile.control_timeout_seconds)
+                send_authenticated_frame(connection, envelope, frame_budget)
+                response = recv_authenticated_frame(connection, frame_budget)
                 result, error = verify_response(
                     response,
                     public_key=Ed25519PublicKey.from_public_bytes(public_key_bytes),
@@ -986,10 +1038,12 @@ def _bind_verified_child_channel(
     authority_pid: int,
     ipc_public_key: Ed25519PublicKey,
     max_frame_bytes: int,
+    workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
 ) -> _ClientT:
     """Bind a channel only after ``start_authority`` verifies readiness."""
     instance = client_type(max_frame_bytes)
-    connection.settimeout(2.0)
+    instance._workflow_profile = require_workflow_profile(workflow_profile)
+    connection.settimeout(workflow_profile.control_timeout_seconds)
     instance._channel_socket = connection
     instance._channel_role = channel_role
     instance._session = session
@@ -1003,6 +1057,22 @@ def _bind_verified_child_channel(
 class _AuthorityExecutionChannel(_JSONClient):
     """Child-only authenticated authority channel; never a scheduler API."""
 
+    _w2_epoch_binding: tuple[int, str] | None = None
+
+    def _rpc(self, operation: str, request: Mapping[str, Any]) -> Any:
+        if self._w2_epoch_binding is not None:
+            epoch, plan_digest = self._w2_epoch_binding
+            return super()._rpc(
+                "w2_epoch_v1",
+                {
+                    "epoch": epoch,
+                    "plan_digest": plan_digest,
+                    "operation": operation,
+                    "request": dict(request),
+                },
+            )
+        return super()._rpc(operation, request)
+
     def health(self) -> dict[str, int]:
         result = self._rpc("health", {})
         body = _exact_object(result, {"authority_pid"}, "health_response")
@@ -1014,6 +1084,22 @@ class _AuthorityExecutionChannel(_JSONClient):
         return _trusted_decode(
             _decode_commit_decision,
             self._rpc("commit", {"commit_request": _encode_commit_request(request)}),
+        )
+
+    def observation_target(
+        self, request: CommitRequest, *, request_nonce: str
+    ) -> AuthorityObservationRequest:
+        return _trusted_decode(
+            lambda value: _decode_bound_observation_target(
+                value, request, request_nonce
+            ),
+            self._rpc(
+                "observation_target",
+                {
+                    "commit_request": _encode_commit_request(request),
+                    "request_nonce": request_nonce,
+                },
+            ),
         )
 
     def build_request(self, receipt: SignedGovernedReceipt) -> CommitRequest:
@@ -1065,10 +1151,17 @@ class _AuthorityExecutionChannel(_JSONClient):
         )
         if not isinstance(result, dict) or any(type(key) is not str for key in result):
             raise GovernanceBypassDenied("authority_unavailable")
-        return {
+        states = {
             node_id: _trusted_decode(_decode_node_state, state)
             for node_id, state in result.items()
         }
+        if set(states) != set(nodes) or any(
+            state.workflow_id != workflow_id or state.node_id != node_id
+            for node_id, state in states.items()
+        ):
+            self._poison()
+            raise GovernanceBypassDenied("authority_status_batch_order_mismatch")
+        return states
 
     def node_state(self, workflow_id: str, node_id: str) -> GovernedNodeState:
         return self.workflow_node_states(workflow_id, (node_id,))[0]
@@ -1079,7 +1172,7 @@ class _AuthorityExecutionChannel(_JSONClient):
         resolved_ids = tuple(node_ids)
         if not resolved_ids:
             raise GovernanceBypassDenied("empty_node_status_batch")
-        if len(resolved_ids) > 1000:
+        if len(resolved_ids) > self._workflow_profile.max_nodes:
             raise GovernanceBypassDenied("node_status_batch_too_large")
         with self._rpc_lock:
             result = self._rpc(
@@ -1323,10 +1416,13 @@ def _observer_child_main(
     launch_public: dict[str, str],
     controller_public_key: bytes,
     max_frame_bytes: int,
+    expected_authority_config_digest: str,
     credential_connection: Any | None,
+    _w2_binding: tuple[int, str] | None = None,
 ) -> None:
     """Serve one isolated read-only observer channel from a spawned child."""
     status_signer: _StatusSigningClient | None = None
+    connections = ExitStack()
     try:
         harden_current_process()
         os.chdir("/")
@@ -1350,10 +1446,14 @@ def _observer_child_main(
         if backend.kind == "sqlite":
             from pathlib import Path
 
+            from constitutional_swarm._sqlite_connections import _reuse_connections
             from constitutional_swarm.apcc.sqlite_store import SQLiteAuthorityReader
 
             observer: AuthorityObservationStore = SQLiteAuthorityReader.open(
                 Path(backend.sqlite_path or ""), status_signer=status_signer
+            )
+            connections.enter_context(
+                _reuse_connections(Path(backend.sqlite_path or ""), maximum_idle=1)
             )
         else:
             from constitutional_swarm.apcc.postgres_store import PostgresAuthorityReader
@@ -1372,6 +1472,15 @@ def _observer_child_main(
         if read_transaction is None:
             raise TypeError("observer store does not expose attested launch facts")
         with read_transaction() as launch_connection:
+            from constitutional_swarm.apcc.sqlite_store import _config_object
+
+            observer_config = getattr(observer, "_config", None)
+            if (
+                not isinstance(observer_config, APCCAuthorityConfig)
+                or sha256_digest(canonical_json(_config_object(observer_config)))
+                != expected_authority_config_digest
+            ):
+                raise ValueError("observer authority configuration mismatch")
             trust_row = launch_connection.execute(
                 "SELECT sequence,entry_digest FROM trust_log "
                 "ORDER BY sequence DESC LIMIT 1"
@@ -1441,8 +1550,13 @@ def _observer_child_main(
         readiness.send(tcb_ready)
         readiness.close()
         sequence = 0
+        w2_last_observation: tuple[bytes, str] | None = None
+        w2_sealed_tail: dict[str, Any] | None = None
         while True:
             try:
+                # An idle owner is not a partial frame. Keep the existing
+                # per-recv timeout once bytes arrive; EOF also wakes select.
+                select.select([connection], [], [])
                 request_envelope = recv_authenticated_frame(connection, max_frame_bytes)
             except (ConnectionError, OSError, TimeoutError, ValueError):
                 return
@@ -1452,6 +1566,54 @@ def _observer_child_main(
                 envelope = _exact_object(
                     request_envelope, {"operation", "request"}, "observer_request"
                 )
+                if (
+                    _w2_binding is not None
+                    and envelope["operation"] == "w2_seal_tail_v1"
+                ):
+                    from constitutional_swarm.apcc_empirical.w2_renewal_runtime import (
+                        sign_observer_tail,
+                    )
+
+                    parameters = _exact_object(
+                        envelope["request"], {"nonce"}, "w2_tail_request"
+                    )
+                    from constitutional_swarm.apcc.crypto import (
+                        b64u_decode as decode_tail_nonce,
+                    )
+
+                    decode_tail_nonce(parameters["nonce"], expected_length=16)
+                    if w2_last_observation is None:
+                        raise ValueError("cannot seal empty observer tail")
+                    if w2_sealed_tail is None:
+                        w2_sealed_tail = sign_observer_tail(
+                            key,
+                            {
+                                "launch_digest": launch_attestation_digest,
+                                "session_id": session,
+                                "observation_sequence": w2_last_observation[1],
+                                "observation_digest": sha256_digest(
+                                    w2_last_observation[0]
+                                ),
+                                "epoch": str(_w2_binding[0]),
+                                "plan_digest": _w2_binding[1],
+                                "nonce": parameters["nonce"],
+                            },
+                        )
+                    elif w2_sealed_tail["body"]["nonce"] != parameters["nonce"]:
+                        raise ValueError("observer tail already sealed")
+                    response = signed_response(
+                        key=key,
+                        session=session,
+                        channel="observer",
+                        sequence=sequence,
+                        authority_pid=os.getpid(),
+                        request_digest=request_digest,
+                        result=w2_sealed_tail,
+                    )
+                    send_authenticated_frame(connection, response, max_frame_bytes)
+                    continue
+                if w2_sealed_tail is not None:
+                    raise ValueError("observer tail already sealed")
                 if envelope["operation"] != "observe":
                     raise LookupError("unknown_observer_operation")
                 parameters = _exact_object(
@@ -1492,6 +1654,8 @@ def _observer_child_main(
                     signature,
                 )
                 encoded = encode_signed_authority_observation(signed)
+                if _w2_binding is not None:
+                    w2_last_observation = (encoded, str(sequence))
                 result = {
                     "observation_b64u": base64.urlsafe_b64encode(encoded)
                     .rstrip(b"=")
@@ -1527,14 +1691,17 @@ def _observer_child_main(
             pass
         raise
     finally:
-        readiness.close()
-        connection.close()
-        if status_signer is not None:
-            status_signer.close()
-        else:
-            status_connection.close()
-        if credential_connection is not None:
-            credential_connection.close()
+        try:
+            connections.__exit__(*sys.exc_info())
+        finally:
+            readiness.close()
+            connection.close()
+            if status_signer is not None:
+                status_signer.close()
+            else:
+                status_connection.close()
+            if credential_connection is not None:
+                credential_connection.close()
 
 
 def _safe_close(resource: Any) -> None:
@@ -1782,7 +1949,10 @@ def _start_observer(
     controller_signer: _ControllerSigner,
     controller_key_id: str,
     controller_public_key: bytes,
+    expected_authority_config_digest: str,
     postgres_observer_dsn: str | None = None,
+    _w2_binding: tuple[int, str] | None = None,
+    _w2_on_spawn: Any = None,
 ) -> tuple[Any, AuthorityObserverClient, dict[str, object]]:
     if backend.kind == "postgresql":
         if type(postgres_observer_dsn) is not str:
@@ -1825,7 +1995,9 @@ def _start_observer(
                 launch_public,
                 controller_public_key,
                 max_frame_bytes,
+                expected_authority_config_digest,
                 credential_recv,
+                *(() if _w2_binding is None else (_w2_binding,)),
             ),
             name="apcc-authority-observer-child",
         )
@@ -1836,6 +2008,8 @@ def _start_observer(
             raise IsolationUnavailable(
                 "ISOLATION_UNAVAILABLE: observer child has no process identity"
             )
+        if _w2_on_spawn is not None:
+            _w2_on_spawn("observer", observer_pid)
         child.close()
         status_connection.close()
         ready_child.close()
@@ -2262,12 +2436,22 @@ def _scheduler_dispatch(executor: Any, operation: str, request: Any) -> Any:
         signed = SignedGovernedReceipt(
             _decode_receipt_payload(receipt["payload"]), receipt["signature"]
         )
-        return _encode_commit_request(executor._authority_call("build_request", signed))
+        return _encode_commit_request(executor.build_request(signed))
     if operation == "commit":
         payload = _exact_object(body, {"request"}, "commit")
         return _encode_commit_decision(
             executor.commit(_decode_commit_request(payload["request"]))
         )
+    if operation == "observation_target":
+        payload = _exact_object(
+            body, {"commit_request", "request_nonce"}, "observation_target"
+        )
+        _require_types(payload, strings={"request_nonce"})
+        return executor._authority_call(
+            "observation_target",
+            _decode_commit_request(payload["commit_request"]),
+            request_nonce=payload["request_nonce"],
+        ).to_object()
     if operation == "authoritative_artifact":
         payload = _exact_object(body, {"artifact_id"}, "authoritative_artifact")
         _require_types(payload, strings={"artifact_id"})
@@ -2279,6 +2463,42 @@ def _scheduler_dispatch(executor: Any, operation: str, request: Any) -> Any:
         _exact_object(body, set(), "progress")
         return executor.progress
     raise LookupError("unknown_scheduler_operation")
+
+
+def _scheduler_lane_dispatch(
+    lanes: dict[int, Any], factory: Callable[[], Any], request: Any
+) -> Any:
+    """Route controller projections without widening the authority channel."""
+    body = _exact_object(request, {"lane", "operation", "request"}, "w2_lane_v1")
+    lane = body["lane"]
+    operation = body["operation"]
+    if type(lane) is not int or not 0 <= lane < 16:
+        raise ValueError("invalid_w2_lane")
+    if type(operation) is not str or operation not in {
+        "health",
+        "load_dag",
+        "available_tasks",
+        "prepare_claim",
+        "claim",
+        "produce_result",
+        "build_request",
+        "commit",
+        "observation_target",
+        "authoritative_artifact",
+        "is_complete",
+        "progress",
+    }:
+        raise ValueError("invalid_w2_lane_operation")
+    if type(body["request"]) is not dict:
+        raise ValueError("invalid_scheduler_request")
+    if lane not in lanes:
+        if operation != "load_dag":
+            raise ValueError("w2_lane_not_loaded")
+        projection = factory()
+        result = _scheduler_dispatch(projection, operation, body["request"])
+        lanes[lane] = projection
+        return result
+    return _scheduler_dispatch(lanes[lane], operation, body["request"])
 
 
 _SCHEDULER_READY_DOMAIN = b"APCC-B6-DORMANT-SCHEDULER-READY-V1"
@@ -2356,19 +2576,23 @@ def _receive_scheduler_activation(
             message = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid scheduler activation frame") from error
+        activation_fields = {
+            "stage",
+            "launch_nonce",
+            "scheduler_session",
+            "authority_session",
+            "authority_pid",
+            "ipc_public_key",
+            "max_frame_bytes",
+            "policy_version",
+            "registry_snapshot",
+        }
+        if type(message) is dict and "workflow_profile" in message:
+            activation_fields.add("workflow_profile")
+            WorkflowProfile(message["workflow_profile"])
         body = _exact_object(
             message,
-            {
-                "stage",
-                "launch_nonce",
-                "scheduler_session",
-                "authority_session",
-                "authority_pid",
-                "ipc_public_key",
-                "max_frame_bytes",
-                "policy_version",
-                "registry_snapshot",
-            },
+            activation_fields,
             "scheduler_activation",
         )
         if (
@@ -2413,6 +2637,7 @@ def _dormant_scheduler_child(
     launch_nonce: str,
     scheduler_session: str,
     max_frame_bytes: int,
+    workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
 ) -> None:
     """Harden before secrets exist, then remain inert until descriptor admission."""
     harden_current_process()
@@ -2444,6 +2669,8 @@ def _dormant_scheduler_child(
             body["launch_nonce"] != launch_nonce
             or body["scheduler_session"] != scheduler_session
             or body["max_frame_bytes"] != max_frame_bytes
+            or WorkflowProfile(body.get("workflow_profile", "default"))
+            is not workflow_profile
         ):
             raise ValueError("scheduler activation cross-binding")
         active_body = {
@@ -2465,7 +2692,7 @@ def _dormant_scheduler_child(
     control.close()
     from constitutional_swarm.swarm import SwarmExecutor
 
-    scheduler_socket.settimeout(2.0)
+    scheduler_socket.settimeout(workflow_profile.control_timeout_seconds)
     authority_channel = _bind_verified_child_channel(
         _AuthorityExecutionChannel,
         authority_socket,
@@ -2476,16 +2703,33 @@ def _dormant_scheduler_child(
             b64u_decode(body["ipc_public_key"])
         ),
         max_frame_bytes=body["max_frame_bytes"],
+        workflow_profile=workflow_profile,
     )
     executor = SwarmExecutor(
         _decode_registry_snapshot(body["registry_snapshot"]),
         ArtifactStore(),
         policy_version=body["policy_version"],
+        workflow_profile=workflow_profile,
     )
     executor._execution_client = authority_channel
+    lanes: dict[int, Any] = {}
+
+    def new_projection() -> Any:
+        projection = SwarmExecutor(
+            _decode_registry_snapshot(body["registry_snapshot"]),
+            ArtifactStore(),
+            policy_version=body["policy_version"],
+            workflow_profile=workflow_profile,
+        )
+        projection._execution_client = authority_channel
+        return projection
+
     sequence = 0
     try:
         while True:
+            # Waiting between requests must not consume the frame-read timeout.
+            # Owner close/EOF wakes readiness and follows the existing teardown.
+            select.select([scheduler_socket], [], [])
             envelope = recv_authenticated_frame(scheduler_socket, max_frame_bytes)
             request = _exact_object(
                 envelope, {"sequence", "operation", "request"}, "scheduler_envelope"
@@ -2497,10 +2741,46 @@ def _dormant_scheduler_child(
             ):
                 raise ValueError("invalid_scheduler_sequence")
             sequence = request["sequence"]
+            frame_budget = workflow_profile.frame_budget(
+                request["operation"], max_frame_bytes
+            )
             try:
-                result = _scheduler_dispatch(
-                    executor, request["operation"], request["request"]
-                )
+                if len(canonical_json(envelope)) > frame_budget:
+                    raise GovernanceBypassDenied("request_frame_too_large")
+                epoch_binding = None
+                if request["operation"] == "w2_epoch_v1":
+                    wrapped = _exact_object(
+                        request["request"],
+                        {"epoch", "plan_digest", "operation", "request"},
+                        "w2_epoch_v1",
+                    )
+                    if (
+                        type(wrapped["epoch"]) is not int
+                        or wrapped["epoch"] < 0
+                        or type(wrapped["plan_digest"]) is not str
+                    ):
+                        raise ValueError("invalid_w2_epoch")
+                    epoch_binding = (wrapped["epoch"], wrapped["plan_digest"])
+                    authority_channel._w2_epoch_binding = epoch_binding
+                    request = {
+                        **request,
+                        "operation": wrapped["operation"],
+                        "request": wrapped["request"],
+                    }
+                if request["operation"] == "check_w2_admission_epoch":
+                    if epoch_binding is None:
+                        raise ValueError("missing_w2_epoch")
+                    result = authority_channel._rpc(
+                        "check_w2_admission_epoch", request["request"]
+                    )
+                elif request["operation"] == "w2_lane_v1":
+                    result = _scheduler_lane_dispatch(
+                        lanes, new_projection, request["request"]
+                    )
+                else:
+                    result = _scheduler_dispatch(
+                        executor, request["operation"], request["request"]
+                    )
                 response = {"sequence": sequence, "result": result, "error": None}
             except GovernanceBypassDenied as exc:
                 response = {
@@ -2514,7 +2794,9 @@ def _dormant_scheduler_child(
                     "result": None,
                     "error": {"kind": type(exc).__name__, "message": str(exc)},
                 }
-            send_authenticated_frame(scheduler_socket, response, max_frame_bytes)
+            finally:
+                authority_channel._w2_epoch_binding = None
+            send_authenticated_frame(scheduler_socket, response, frame_budget)
     except (ConnectionError, OSError, TimeoutError, ValueError):
         pass
     finally:
@@ -2579,6 +2861,7 @@ class _DormantScheduler:
         "_max_frame_bytes",
         "_used",
         "_transferred",
+        "_workflow_profile",
     )
 
     def __init__(
@@ -2591,6 +2874,7 @@ class _DormantScheduler:
         key_id: str,
         public_key: Ed25519PublicKey,
         max_frame_bytes: int,
+        workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
     ) -> None:
         self._process = process
         self._control = control
@@ -2601,6 +2885,7 @@ class _DormantScheduler:
         self._max_frame_bytes = max_frame_bytes
         self._used = False
         self._transferred = False
+        self._workflow_profile = require_workflow_profile(workflow_profile)
 
     @property
     def pid(self) -> int | None:
@@ -2645,6 +2930,8 @@ class _DormantScheduler:
             "policy_version": policy_version,
             "registry_snapshot": registry_snapshot,
         }
+        if self._workflow_profile is not WorkflowProfile.DEFAULT:
+            body["workflow_profile"] = self._workflow_profile.value
         encoded = canonical_json(body)
         if len(encoded) > self._max_frame_bytes:
             raise ValueError("scheduler activation metadata is too large")
@@ -2685,7 +2972,12 @@ class _DormantScheduler:
         _abort_process(self._process)
 
 
-def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
+def _start_dormant_scheduler(
+    max_frame_bytes: int,
+    workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
+    *,
+    _w2_on_spawn: Any = None,
+) -> _DormantScheduler:
     """Spawn and attest the inert scheduler before any bootstrap source is read."""
     if not hasattr(socket, "MSG_CMSG_CLOEXEC"):
         raise IsolationUnavailable(
@@ -2700,7 +2992,7 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
         session = f"scheduler-{secrets.token_urlsafe(24)}"
         process = context.Process(
             target=_dormant_scheduler_child,
-            args=(child, launch_nonce, session, max_frame_bytes),
+            args=(child, launch_nonce, session, max_frame_bytes, workflow_profile),
             name="apcc-dormant-scheduler-child",
         )
         cleanup.callback(_abort_process, process)
@@ -2710,6 +3002,8 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
             raise IsolationUnavailable(
                 "ISOLATION_UNAVAILABLE: dormant scheduler has no process identity"
             )
+        if _w2_on_spawn is not None:
+            _w2_on_spawn("scheduler", pid)
         child.close()
         parent.settimeout(5)
         raw = parent.recv(16_385)
@@ -2761,6 +3055,7 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
             key_id=key_id,
             public_key=public_key,
             max_frame_bytes=max_frame_bytes,
+            workflow_profile=workflow_profile,
         )
         cleanup.pop_all()
         return dormant
@@ -2777,6 +3072,9 @@ class _SwarmExecutionHandle:
         "_lock",
         "_closed",
         "_on_close",
+        "_workflow_profile",
+        "_lane_context",
+        "_epoch_context",
     )
 
     def __init__(
@@ -2785,15 +3083,56 @@ class _SwarmExecutionHandle:
         process: Any,
         max_frame_bytes: int,
         on_close: Any | None = None,
+        workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT,
     ) -> None:
         self._socket = connection
-        self._socket.settimeout(2.0)
+        self._workflow_profile = require_workflow_profile(workflow_profile)
+        self._socket.settimeout(workflow_profile.control_timeout_seconds)
         self._process = process
         self._max_frame_bytes = max_frame_bytes
         self._sequence = 0
         self._lock = threading.RLock()
         self._closed = False
         self._on_close = on_close
+        self._lane_context = threading.local()
+        self._epoch_context = threading.local()
+
+    @contextmanager
+    def w2_epoch(self, epoch: int, plan_digest: str) -> Iterator[_SwarmExecutionHandle]:
+        if (
+            type(epoch) is not int
+            or epoch < 0
+            or type(plan_digest) is not str
+            or not plan_digest
+        ):
+            raise ValueError("invalid_w2_epoch")
+        if getattr(self._epoch_context, "binding", None) is not None:
+            raise ValueError("nested_w2_epoch")
+        self._epoch_context.binding = (epoch, plan_digest)
+        try:
+            yield self
+        finally:
+            del self._epoch_context.binding
+
+    def check_w2_admission_epoch(self) -> Any:
+        return self._rpc("check_w2_admission_epoch", {})
+
+    @contextmanager
+    def w2_lane(self, lane: int) -> Iterator[_SwarmExecutionHandle]:
+        """Select one bounded projection on this thread and the existing channel.
+
+        The controller must drain complete proof verification before reloading a
+        lane. The scheduler independently retains complete-only DAG rotation.
+        """
+        if type(lane) is not int or not 0 <= lane < 16:
+            raise ValueError("invalid_w2_lane")
+        if getattr(self._lane_context, "lane", None) is not None:
+            raise ValueError("nested_w2_lane")
+        self._lane_context.lane = lane
+        try:
+            yield self
+        finally:
+            del self._lane_context.lane
 
     @property
     def pid(self) -> int | None:
@@ -2803,7 +3142,24 @@ class _SwarmExecutionHandle:
             return None
 
     def _rpc(self, operation: str, request: Mapping[str, Any]) -> Any:
+        lane = getattr(self._lane_context, "lane", None)
+        if lane is not None and operation != "check_w2_admission_epoch":
+            request = {"lane": lane, "operation": operation, "request": dict(request)}
+            operation = "w2_lane_v1"
+        epoch_binding = getattr(self._epoch_context, "binding", None)
+        if epoch_binding is not None:
+            epoch, plan_digest = epoch_binding
+            request = {
+                "epoch": epoch,
+                "plan_digest": plan_digest,
+                "operation": operation,
+                "request": dict(request),
+            }
+            operation = "w2_epoch_v1"
         failure: BaseException | None = None
+        frame_budget = self._workflow_profile.frame_budget(
+            operation, self._max_frame_bytes
+        )
         callback: Any | None = None
         body: dict[str, Any] | None = None
         with self._lock:
@@ -2818,9 +3174,9 @@ class _SwarmExecutionHandle:
                         "operation": operation,
                         "request": dict(request),
                     },
-                    self._max_frame_bytes,
+                    frame_budget,
                 )
-                response = recv_authenticated_frame(self._socket, self._max_frame_bytes)
+                response = recv_authenticated_frame(self._socket, frame_budget)
                 body = _exact_object(
                     response, {"sequence", "result", "error"}, "scheduler_response"
                 )
@@ -2941,6 +3297,22 @@ class _SwarmExecutionHandle:
             self._rpc("commit", {"request": _encode_commit_request(request)}),
         )
 
+    def observation_target(
+        self, request: CommitRequest, *, request_nonce: str
+    ) -> AuthorityObservationRequest:
+        return _trusted_decode(
+            lambda value: _decode_bound_observation_target(
+                value, request, request_nonce
+            ),
+            self._rpc(
+                "observation_target",
+                {
+                    "commit_request": _encode_commit_request(request),
+                    "request_nonce": request_nonce,
+                },
+            ),
+        )
+
     def authoritative_artifact(self, artifact_id: str) -> Artifact | None:
         return _trusted_decode(
             _decode_artifact,
@@ -2999,6 +3371,8 @@ class AuthorityServiceHandle:
         "_watchers",
         "_watcher_fds",
         "_closed",
+        "_w2_renewal",
+        "_w2_retired_observers",
     )
 
     def __init__(
@@ -3034,6 +3408,8 @@ class AuthorityServiceHandle:
         self._watchers: list[threading.Thread] = []
         self._watcher_fds: set[int] = set()
         self._closed = False
+        self._w2_renewal: Any = None
+        self._w2_retired_observers: set[str] = set()
         self._watch_process_locked("authority", self._process)
         self._watch_process_locked("scheduler", self._scheduler_worker.process)
 
@@ -3142,6 +3518,8 @@ class AuthorityServiceHandle:
 
     def _component_failed(self, role: str) -> None:
         with self._lifecycle_lock:
+            if role in self._w2_retired_observers:
+                return
             if self._controlled_boot.phase in {
                 ControlledBootPhase.CLOSING,
                 ControlledBootPhase.CLOSED,
@@ -3181,6 +3559,12 @@ class AuthorityServiceHandle:
             attempt(executor.close)
         for observer in self._observers:
             attempt(observer.close)
+        if self._w2_renewal is not None:
+            attempt(self._w2_renewal["control"].close)
+            for status in self._w2_renewal["status"]:
+                attempt(status.close)
+            if "signer" in self._w2_renewal:
+                attempt(self._w2_renewal["signer"].shutdown)
         attempt(self._scheduler_worker.close)
         if self._execution_channel is not None:
             attempt(self._execution_channel.close)
@@ -3267,6 +3651,7 @@ class AuthorityServiceHandle:
                         self._scheduler_worker.process,
                         self._max_frame_bytes,
                         self._executor_closed,
+                        workflow_profile=self._authority_config.workflow_profile,
                     )
                     executor.health()
                     self._executors.append(executor)
@@ -3422,7 +3807,11 @@ def _verify_readiness(
 
 
 def start_authority(
-    config: Any, *, readiness_timeout: float = 5.0
+    config: Any,
+    *,
+    readiness_timeout: float = 5.0,
+    _w2_renewal: Any = None,
+    _w2_on_spawn: Any = None,
 ) -> AuthorityServiceHandle:
     """Pre-harden the scheduler, then irreversibly bootstrap the authority."""
     from constitutional_swarm.authority_child import (
@@ -3441,7 +3830,18 @@ def start_authority(
     authority_source_path = config.key_source.location
     context = multiprocessing.get_context("spawn")
     with ExitStack() as cleanup:
-        dormant_scheduler = _start_dormant_scheduler(config.max_frame_bytes)
+        dormant_scheduler = (
+            _start_dormant_scheduler(
+                config.frame_limit,
+                **({} if _w2_on_spawn is None else {"_w2_on_spawn": _w2_on_spawn}),
+            )
+            if config.workflow_profile is WorkflowProfile.DEFAULT
+            else _start_dormant_scheduler(
+                config.frame_limit,
+                config.workflow_profile,
+                **({} if _w2_on_spawn is None else {"_w2_on_spawn": _w2_on_spawn}),
+            )
+        )
         cleanup.callback(dormant_scheduler.close)
         secret = consume_secret_file(
             authority_source_path,
@@ -3466,6 +3866,16 @@ def start_authority(
         status_parent, status_child = socket.socketpair(socket.AF_UNIX)
         cleanup.callback(_safe_close, status_parent)
         cleanup.callback(_safe_close, status_child)
+        renewal_parents: list[socket.socket] = []
+        renewal_children: list[socket.socket] = []
+        if _w2_renewal is not None:
+            _w2_renewal.validate(config)
+            for _ in range(_w2_renewal.maximum_renewals + 1):
+                parent, child = socket.socketpair(socket.AF_UNIX)
+                renewal_parents.append(parent)
+                renewal_children.append(child)
+                cleanup.callback(_safe_close, parent)
+                cleanup.callback(_safe_close, child)
         ready_parent, ready_child = context.Pipe(duplex=True)
         cleanup.callback(_safe_close, ready_parent)
         cleanup.callback(_safe_close, ready_child)
@@ -3484,6 +3894,7 @@ def start_authority(
                 admin_child,
                 status_child,
                 ready_child,
+                *(() if _w2_renewal is None else (_w2_renewal, renewal_children)),
             ),
             name="apcc-authority-child",
         )
@@ -3494,9 +3905,13 @@ def start_authority(
             raise IsolationUnavailable(
                 "ISOLATION_UNAVAILABLE: authority child has no process identity"
             )
+        if _w2_on_spawn is not None:
+            _w2_on_spawn("authority", authority_pid)
         execution_child.close()
         admin_child.close()
         status_child.close()
+        for endpoint in renewal_children:
+            endpoint.close()
         ready_child.close()
         if not ready_parent.poll(readiness_timeout):
             raise TimeoutError("authority hardening readiness timed out")
@@ -3524,7 +3939,8 @@ def start_authority(
             session=body["session"],
             authority_pid=authority_pid,
             ipc_public_key=ipc_public_key,
-            max_frame_bytes=config.max_frame_bytes,
+            max_frame_bytes=config.frame_limit,
+            workflow_profile=config.workflow_profile,
         )
         admin_transport = _bind_verified_child_channel(
             _JSONClient,
@@ -3533,7 +3949,8 @@ def start_authority(
             session=body["session"],
             authority_pid=authority_pid,
             ipc_public_key=ipc_public_key,
-            max_frame_bytes=config.max_frame_bytes,
+            max_frame_bytes=config.frame_limit,
+            workflow_profile=config.workflow_profile,
         )
         status_transport = _bind_verified_child_channel(
             _StatusSigningClient,
@@ -3542,7 +3959,9 @@ def start_authority(
             session=body["session"],
             authority_pid=authority_pid,
             ipc_public_key=ipc_public_key,
-            max_frame_bytes=config.max_frame_bytes,
+            max_frame_bytes=config.workflow_profile.frame_budget(
+                "status_signing", config.frame_limit
+            ),
         )
         handle = AuthorityServiceHandle(
             process,
@@ -3550,13 +3969,19 @@ def start_authority(
             AuthorityAdminClient(admin_transport),
             body["session"],
             b64u_decode(body["ipc_public_key"]),
-            child_config.max_frame_bytes,
+            child_config.frame_limit,
             status_transport,
             child_config,
             authority_source_path,
             dormant_scheduler,
             _controlled_boot_result(ControlledBootPhase.AUTHORITY_READY),
         )
+        if _w2_renewal is not None:
+            from constitutional_swarm.apcc_empirical.w2_renewal_runtime import (
+                _bind_renewal,
+            )
+
+            handle._w2_renewal = _bind_renewal(handle, _w2_renewal, renewal_parents)
         cleanup.pop_all()
         ready_parent.close()
         return handle
@@ -3657,6 +4082,10 @@ def _start_authority_observer_locked(
     launch: Any,
     *,
     postgres_observer_dsn: str | None,
+    _controller_signer_override: Any = None,
+    _observer_role: str = "observer",
+    _w2_binding: tuple[int, str] | None = None,
+    _w2_on_spawn: Any = None,
 ) -> AuthorityObserverHandle:
     """Start the observer while the authority lifecycle lock is held."""
     from constitutional_swarm.authority_child import AuthorityChildConfig
@@ -3707,14 +4136,17 @@ def _start_authority_observer_locked(
         schema_version = _AUTHORITY_SCHEMA_VERSION
         schema_fingerprint = _POSTGRES_CATALOG_FINGERPRINT
     controller_source_path = launch.controller_key_source.location
-    controller_secret = consume_secret_file(
-        controller_source_path,
-        maximum_bytes=256,
-        label="observer controller key",
-    )
-    controller_signer = _start_controller_signer(
-        launch.controller_key_source, controller_secret
-    )
+    if _controller_signer_override is None:
+        controller_secret = consume_secret_file(
+            controller_source_path,
+            maximum_bytes=256,
+            label="observer controller key",
+        )
+        controller_signer = _start_controller_signer(
+            launch.controller_key_source, controller_secret
+        )
+    else:
+        controller_signer = _controller_signer_override
     with ExitStack() as signer_cleanup:
         signer_cleanup.callback(controller_signer.close)
         issued = int(time.time() * 1000)
@@ -3736,7 +4168,7 @@ def _start_authority_observer_locked(
             "schema_fingerprint": schema_fingerprint,
             "status_key_id": authority.status_trust.key_id,
             "not_before_ms": str(issued),
-            "not_after_ms": str(issued + 300_000),
+            "not_after_ms": str(issued + launch.launch_lifetime_ms),
         }
         status_channel = authority_handle._status_signing_channel
         if status_channel is None:
@@ -3747,18 +4179,25 @@ def _start_authority_observer_locked(
         if authority_pid is None:
             status_socket.close()
             raise RuntimeError("authority child has no process identity")
+        from constitutional_swarm.apcc.sqlite_store import _config_object
+
         process, client, attestation_object = _start_observer(
             backend,
             status_connection=status_socket,
             status_session=authority_handle._session_id,
             authority_pid=authority_pid,
             authority_ipc_public_key=authority_handle._ipc_public_key,
-            max_frame_bytes=authority_config.max_frame_bytes,
+            max_frame_bytes=authority_config.frame_limit,
             launch_public=launch_public,
             controller_signer=controller_signer,
             controller_key_id=launch.controller_key_id,
             controller_public_key=controller_public,
+            expected_authority_config_digest=sha256_digest(
+                canonical_json(_config_object(authority))
+            ),
             postgres_observer_dsn=postgres_observer_dsn,
+            **({} if _w2_binding is None else {"_w2_binding": _w2_binding}),
+            **({} if _w2_on_spawn is None else {"_w2_on_spawn": _w2_on_spawn}),
         )
         signer_cleanup.pop_all()
     try:
@@ -3783,5 +4222,5 @@ def _start_authority_observer_locked(
         process,
         client,
         attestation,
-        lambda: authority_handle._component_failed("observer"),
+        lambda: authority_handle._component_failed(_observer_role),
     )
