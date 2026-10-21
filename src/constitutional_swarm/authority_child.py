@@ -9,7 +9,9 @@ import os
 import secrets
 import select
 import socket
+import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +19,7 @@ from typing import Any, Literal
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from constitutional_swarm._sqlite_connections import _reuse_connections
 from constitutional_swarm.apcc.model import FailureCode, Signature
 from constitutional_swarm.apcc.ports import (
     APCCAuthorityConfig,
@@ -37,6 +40,10 @@ from constitutional_swarm.authority_ipc import (
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
 from constitutional_swarm.governed_commit import TrustedGovernanceBootstrap
 from constitutional_swarm.strict_json import loads as strict_loads
+from constitutional_swarm.workflow_profile import (
+    WorkflowProfile,
+    require_workflow_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +201,30 @@ class AuthorityChildConfig:
     key_source: KeySourceRef
     outbox_sink: OutboxSinkRef = OutboxSinkRef()
     provision: bool = False
-    max_frame_bytes: int = 1_048_576
+    max_frame_bytes: int | None = None
+    workflow_profile: WorkflowProfile = WorkflowProfile.DEFAULT
 
     def __post_init__(self) -> None:
-        if not self.database_path or self.max_frame_bytes <= 0:
+        require_workflow_profile(self.workflow_profile)
+        if self.max_frame_bytes is None:
+            object.__setattr__(
+                self, "max_frame_bytes", self.workflow_profile.max_frame_bytes
+            )
+        if (
+            not self.database_path
+            or type(self.max_frame_bytes) is not int
+            or self.max_frame_bytes <= 0
+        ):
             raise ValueError("invalid authority child configuration")
+        if self.workflow_profile is WorkflowProfile.W6_INDEPENDENT_10000:
+            if self.max_frame_bytes > self.workflow_profile.max_frame_bytes:
+                raise ValueError("workflow profile frame budget exceeded")
+
+    @property
+    def frame_limit(self) -> int:
+        """Resolved finite frame ceiling after profile default selection."""
+        assert self.max_frame_bytes is not None
+        return self.max_frame_bytes
 
 
 def _public_bytes(key: Ed25519PrivateKey) -> bytes:
@@ -394,6 +420,7 @@ def _bootstrap(
         policy_signer=_PolicySigner(keys.policy),
         registry_signer=_DetachedSigner(keys.registry),
         control_signer=_DetachedSigner(keys.control),
+        workflow_profile=config.workflow_profile,
     )
 
 
@@ -403,6 +430,8 @@ def authority_child_main(
     admin_channel: socket.socket,
     status_channel: socket.socket,
     readiness: Any,
+    w2_renewal: Any = None,
+    renewal_channels: list[socket.socket] | None = None,
 ) -> None:
     """Load authority secrets after spawn and serve two exclusive channels."""
     from constitutional_swarm.authority_isolation import (
@@ -410,6 +439,7 @@ def authority_child_main(
         harden_current_process,
     )
 
+    connections = ExitStack()
     try:
         harden_current_process()
         from constitutional_swarm.authority_service import (
@@ -435,12 +465,24 @@ def authority_child_main(
             if config.provision
             else bootstrap.open_admin(path)
         )
+        connections.enter_context(_reuse_connections(path, maximum_idle=3))
         # A lock wait at boot is recorded and retried by the loop; any other
         # recovery failure still aborts startup before readiness.
         recovery = _OutboxRecoveryMonitor()
-        recovery.run(admin)
+        if w2_renewal is None:
+            recovery.run(admin)
         ephemeral = Ed25519PrivateKey.generate()
         session = secrets.token_urlsafe(24)
+        if w2_renewal is not None:
+            session = "w2-" + session
+        renewal = None
+        if w2_renewal is not None:
+            from constitutional_swarm.apcc_empirical.w2_renewal_runtime import (
+                _RenewalOwner,
+            )
+
+            renewal = _RenewalOwner(w2_renewal, config, keys, admin, session)
+            connections.callback(renewal.close)
         ready_body = {
             "protocol": PROTOCOL,
             "authority_pid": os.getpid(),
@@ -455,23 +497,32 @@ def authority_child_main(
             }
         )
         readiness.close()
-        execution.settimeout(2.0)
-        admin_channel.settimeout(2.0)
+        execution.settimeout(config.workflow_profile.control_timeout_seconds)
+        admin_channel.settimeout(config.workflow_profile.control_timeout_seconds)
         status_channel.settimeout(2.0)
         channels = {
             execution: "execution",
             admin_channel: "admin",
             status_channel: "status-signing",
         }
-        sequences = {"execution": 0, "admin": 0, "status-signing": 0}
+        status_epochs = {status_channel: 0}
+        if renewal is not None:
+            assert renewal_channels is not None
+            control, *successor_status = renewal_channels
+            channels[control] = "w2-renewal-control"
+            for epoch, endpoint in enumerate(successor_status, start=1):
+                endpoint.settimeout(2.0)
+                channels[endpoint] = "status-signing"
+                status_epochs[endpoint] = epoch
+        sequences = {endpoint: 0 for endpoint in channels}
         while channels:
             readable, _, _ = select.select(list(channels), [], [], 0.25)
             for connection in readable:
                 channel = channels[connection]
                 try:
-                    request = recv_frame(connection, config.max_frame_bytes)
+                    request = recv_frame(connection, config.frame_limit)
                 except FrameProtocolError as exc:
-                    sequences[channel] += 1
+                    sequences[connection] += 1
                     try:
                         send_frame(
                             connection,
@@ -479,17 +530,17 @@ def authority_child_main(
                                 key=ephemeral,
                                 session=session,
                                 channel=channel,
-                                sequence=sequences[channel],
+                                sequence=sequences[connection],
                                 authority_pid=os.getpid(),
                                 request_digest=digest(
                                     {
                                         "invalid_frame": exc.code,
-                                        "sequence": sequences[channel],
+                                        "sequence": sequences[connection],
                                     }
                                 ),
                                 error={"code": exc.code, "message": ""},
                             ),
-                            config.max_frame_bytes,
+                            config.frame_limit,
                         )
                     except (ConnectionError, OSError, ValueError):
                         channels.pop(connection, None)
@@ -502,15 +553,43 @@ def authority_child_main(
                     channels.pop(connection, None)
                     connection.close()
                     continue
-                sequences[channel] += 1
+                sequences[connection] += 1
                 request_digest = digest(request)
+                frame_budget = config.workflow_profile.frame_budget(
+                    request.get("operation", "") if isinstance(request, dict) else "",
+                    config.frame_limit,
+                )
                 try:
-                    if channel == "execution":
+                    if len(canonical_json(request)) > frame_budget:
+                        raise ValueError("request_frame_too_large")
+                    if renewal is not None:
+                        request = renewal.route(
+                            channel, request, status_epochs.get(connection)
+                        )
+                    if channel == "w2-renewal-control":
+                        assert renewal is not None
+                        result = renewal.control(request)
+                    elif (
+                        channel == "execution"
+                        and request["operation"] == "check_w2_admission_epoch"
+                        and renewal is not None
+                    ):
+                        if request["request"] != {}:
+                            raise ValueError("invalid W2 admission check fields")
+                        result = {
+                            "epoch": renewal.epoch,
+                            "plan_digest": renewal.config.plan_digest,
+                        }
+                    elif channel == "execution":
                         result = _handle_execution_request(admin, request, recovery)
                     elif channel == "admin":
                         result = _handle_admin_request(admin, request, recovery)
                     else:
-                        result = _handle_status_sign_request(request, admin)
+                        result = _handle_status_sign_request(
+                            request, admin.commit_port._apcc_store
+                        )
+                    if renewal is not None:
+                        renewal.after_request(channel, request, result)
                 except Exception as exc:
                     code = _request_error_code(exc, channel)
                     logger.warning(
@@ -524,7 +603,7 @@ def authority_child_main(
                         key=ephemeral,
                         session=session,
                         channel=channel,
-                        sequence=sequences[channel],
+                        sequence=sequences[connection],
                         authority_pid=os.getpid(),
                         request_digest=request_digest,
                         error={"code": code, "message": code},
@@ -534,13 +613,13 @@ def authority_child_main(
                         key=ephemeral,
                         session=session,
                         channel=channel,
-                        sequence=sequences[channel],
+                        sequence=sequences[connection],
                         authority_pid=os.getpid(),
                         request_digest=request_digest,
                         result=result,
                     )
                 try:
-                    send_frame(connection, response, config.max_frame_bytes)
+                    send_frame(connection, response, frame_budget)
                 except FrameSizeError:
                     try:
                         send_frame(
@@ -549,7 +628,7 @@ def authority_child_main(
                                 key=ephemeral,
                                 session=session,
                                 channel=channel,
-                                sequence=sequences[channel],
+                                sequence=sequences[connection],
                                 authority_pid=os.getpid(),
                                 request_digest=request_digest,
                                 error={
@@ -557,7 +636,7 @@ def authority_child_main(
                                     "message": "response_too_large",
                                 },
                             ),
-                            config.max_frame_bytes,
+                            config.frame_limit,
                         )
                     except (ConnectionError, OSError, FrameSizeError, ValueError):
                         channels.pop(connection, None)
@@ -568,9 +647,9 @@ def authority_child_main(
                 # A commit asks for publication only now that its reply is sent,
                 # so a fatal publication failure stops the authority before it
                 # serves another request without turning the reply into an error.
-                if recovery.due():
+                if (renewal is None or renewal.mutations_enabled) and recovery.due():
                     recovery.run(admin)
-            if recovery.due():
+            if (renewal is None or renewal.mutations_enabled) and recovery.due():
                 recovery.run(admin)
     except BaseException as exc:
         logger.error(
@@ -584,3 +663,5 @@ def authority_child_main(
         finally:
             readiness.close()
         raise
+    finally:
+        connections.__exit__(*sys.exc_info())

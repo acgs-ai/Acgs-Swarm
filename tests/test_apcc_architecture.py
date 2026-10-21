@@ -253,6 +253,15 @@ def test_runtime_and_public_bootstrap_configuration_are_portable_and_separate() 
         "commit_trust",
         "status_trust",
         "freshness",
+        "causal_profile",
+    }
+    assert (
+        get_type_hints(ports.APCCAuthorityConfig)["causal_profile"]
+        is ports.AuthorityCausalProfile
+    )
+    assert set(ports.AuthorityCausalProfile) == {
+        ports.AuthorityCausalProfile.DEFAULT,
+        ports.AuthorityCausalProfile.W2_LINEAR_100,
     }
     assert not any(
         forbidden in name.lower()

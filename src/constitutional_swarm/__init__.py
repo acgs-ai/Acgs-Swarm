@@ -93,6 +93,7 @@ from constitutional_swarm.settlement_store import (
     SQLiteSettlementStore,
 )
 from constitutional_swarm.swarm import SwarmExecutor, TaskDAG, TaskNode
+from constitutional_swarm.workflow_profile import WorkflowProfile
 
 # Legacy names stay importable via ``__getattr__`` so existing callers and
 # tests keep working. They are not loaded until first attribute access.
@@ -403,6 +404,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "WorkflowProfile",
     "AgentDNA",
     "Artifact",
     "ArtifactStore",

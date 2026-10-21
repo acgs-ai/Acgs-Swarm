@@ -19,6 +19,7 @@ from constitutional_swarm.governed_commit import (
     CommitOutcome,
     CommitRequest,
     GovernanceBypassDenied,
+    GovernedNodeState,
     TrustedGovernanceBootstrap,
     VerdictDecision,
     _GCBFaultCheckpoint,
@@ -892,10 +893,22 @@ def test_executor_admission_accepts_1000_and_rejects_1001_before_authority_call(
             policy_version: str,
             required_capabilities: Mapping[str, Sequence[str]] | None = None,
             input_digests: Mapping[str, str] | None = None,
-        ) -> dict[str, object]:
-            del workflow_id, policy_version, required_capabilities, input_digests
+        ) -> dict[str, GovernedNodeState]:
+            del policy_version, required_capabilities, input_digests
             self.calls.append(len(nodes))
-            return {}
+            return {
+                node_id: GovernedNodeState(
+                    workflow_id=workflow_id,
+                    node_id=node_id,
+                    status="ready",
+                    version=0,
+                    attempt_id=None,
+                    claimed_by=None,
+                    artifact_id=None,
+                    commit_id=None,
+                )
+                for node_id in nodes
+            }
 
     accepted_client = AdmissionClient()
     accepted = compose_test_executor(
