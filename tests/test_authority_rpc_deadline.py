@@ -2,16 +2,23 @@
 
 The authority store waits up to its busy_timeout (5 s) for a write lock. The
 IPC response deadlines must outlast that wait, or a transient outside writer
-fails the controlled boot and tears down every authority child.
+fails the controlled boot and tears down every authority child. Longer
+deadlines must not slow teardown: close() interrupts an RPC stuck on a hung peer.
 """
 
 from __future__ import annotations
 
+import socket
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from constitutional_swarm import authority_service
+from constitutional_swarm.governance_errors import GovernanceBypassDenied
 from constitutional_swarm.artifact import Artifact
 from constitutional_swarm.authority_service import start_authority
 from constitutional_swarm.capability import CapabilityRegistry
@@ -98,3 +105,65 @@ def test_commit_survives_outside_writer_lock_within_busy_timeout(tmp_path) -> No
         if holder is not None:
             holder.join(timeout=_LOCK_HOLD_S + 5.0)
         authority.close()
+
+
+def _assert_close_interrupts_hung_rpc(client, rpc, peer: socket.socket) -> None:
+    outcome: list[BaseException | None] = []
+
+    def call() -> None:
+        try:
+            rpc()
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    caller = threading.Thread(target=call)
+    caller.start()
+    peer.settimeout(5.0)
+    assert peer.recv(1)  # the request is on the wire; the caller blocks for a reply
+    started = time.monotonic()
+    client.close()
+    elapsed = time.monotonic() - started
+    caller.join(timeout=5.0)
+    assert not caller.is_alive()
+    assert elapsed < 1.0
+    assert len(outcome) == 1 and isinstance(outcome[0], GovernanceBypassDenied)
+    with pytest.raises(GovernanceBypassDenied):
+        rpc()
+
+
+def test_authority_client_close_interrupts_rpc_to_hung_peer() -> None:
+    left, peer = socket.socketpair()
+    try:
+        client = authority_service._bind_verified_child_channel(
+            authority_service._AuthorityExecutionChannel,
+            left,
+            channel_role="execution",
+            session="session",
+            authority_pid=1,
+            ipc_public_key=Ed25519PrivateKey.generate().public_key(),
+            max_frame_bytes=1 << 16,
+        )
+        _assert_close_interrupts_hung_rpc(client, client.health, peer)
+    finally:
+        left.close()
+        peer.close()
+
+
+def test_scheduler_handle_close_interrupts_rpc_to_hung_scheduler() -> None:
+    left, peer = socket.socketpair()
+    try:
+        closed: list[None] = []
+        handle = authority_service._SwarmExecutionHandle(
+            left,
+            SimpleNamespace(pid=None),
+            max_frame_bytes=1 << 16,
+            on_close=lambda: closed.append(None),
+        )
+        _assert_close_interrupts_hung_rpc(handle, handle.health, peer)
+        handle.close()
+        assert len(closed) == 1
+    finally:
+        left.close()
+        peer.close()

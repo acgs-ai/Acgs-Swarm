@@ -13,7 +13,7 @@ import socket
 import struct
 import threading
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from enum import Enum
@@ -960,8 +960,11 @@ class _JSONClient:
         return result
 
     def close(self) -> None:
-        with self._rpc_lock:
+        _acquire_interrupting(self._rpc_lock, lambda: self._channel_socket)
+        try:
             self._poison()
+        finally:
+            self._rpc_lock.release()
 
     def _detach_socket(self) -> socket.socket:
         """Transfer the authenticated endpoint exactly once to a spawn child."""
@@ -1540,6 +1543,26 @@ def _safe_close(resource: Any) -> None:
         resource.close()
     except (AttributeError, OSError):
         pass
+
+
+def _acquire_interrupting(
+    lock: Any, connection: Callable[[], socket.socket | None]
+) -> None:
+    """Take an RPC lock, first waking any in-flight RPC blocked on the connection.
+
+    The RPC holds the lock across its whole send and receive, so close() would
+    otherwise wait out the full response deadline against a hung peer. Shutdown
+    makes that receive fail at once and the RPC fails closed on its own path.
+    The connection is read only once the lock is known to be held by an RPC.
+    """
+    if lock.acquire(blocking=False):
+        return
+    if (endpoint := connection()) is not None:
+        try:
+            endpoint.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    lock.acquire()
 
 
 def _controlled_boot_result(
@@ -2969,8 +2992,11 @@ class _SwarmExecutionHandle:
 
     def close(self) -> None:
         callback: Any | None
-        with self._lock:
+        _acquire_interrupting(self._lock, lambda: self._socket)
+        try:
             callback = self._close_locked()
+        finally:
+            self._lock.release()
         if callback is not None:
             callback()
 
