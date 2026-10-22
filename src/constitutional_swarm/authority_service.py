@@ -87,6 +87,14 @@ from constitutional_swarm.governed_commit import (
     VerdictDecision,
 )
 
+# Client response deadlines. An authority call must outlast one continuous
+# SQLite lock wait up to the store's busy_timeout (5 s), so a stall the store
+# survives does not poison the channel; repeated intermittent contention within
+# one request can still exceed it. A scheduler call chains up to two authority
+# calls and must outlast both, so an inner failure returns as a governance error.
+_AUTHORITY_RPC_TIMEOUT_S = 10.0
+_SCHEDULER_RPC_TIMEOUT_S = 30.0
+
 _PREDECESSOR_FIELDS = {
     "node_id",
     "node_version",
@@ -921,7 +929,7 @@ class _JSONClient:
             self._sequence += 1
             try:
                 # Spawn reduction preserves O_NONBLOCK but not the timeout.
-                connection.settimeout(2.0)
+                connection.settimeout(_AUTHORITY_RPC_TIMEOUT_S)
                 send_authenticated_frame(connection, envelope, self._max_frame_bytes)
                 response = recv_authenticated_frame(connection, self._max_frame_bytes)
                 result, error = verify_response(
@@ -992,7 +1000,7 @@ def _bind_verified_child_channel(
 ) -> _ClientT:
     """Bind a channel only after ``start_authority`` verifies readiness."""
     instance = client_type(max_frame_bytes)
-    connection.settimeout(2.0)
+    connection.settimeout(_AUTHORITY_RPC_TIMEOUT_S)
     instance._channel_socket = connection
     instance._channel_role = channel_role
     instance._session = session
@@ -2782,7 +2790,7 @@ class _SwarmExecutionHandle:
         on_close: Any | None = None,
     ) -> None:
         self._socket = connection
-        self._socket.settimeout(2.0)
+        self._socket.settimeout(_SCHEDULER_RPC_TIMEOUT_S)
         self._process = process
         self._max_frame_bytes = max_frame_bytes
         self._sequence = 0

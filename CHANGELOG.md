@@ -387,6 +387,11 @@ or data changes.
   - Publishing grants OIDC only to the publish job.
 
 ### Fixed
+- A database lock held for 2–5 s by another process no longer kills the
+  authority. Authority calls now wait 10 s for a reply (above the store's 5 s
+  SQLite `busy_timeout`) and scheduler calls 30 s (above two chained authority
+  calls), instead of 2 s each. Before, a commit stalled on the lock failed with
+  `authority_unavailable` and the controlled boot moved to `failed`.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.
