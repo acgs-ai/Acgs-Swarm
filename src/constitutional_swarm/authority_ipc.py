@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import selectors
 import socket
 import struct
 from collections.abc import Mapping
@@ -77,6 +78,17 @@ def recv_exact(connection: socket.socket, size: int) -> bytes:
         chunks.append(chunk)
         size -= len(chunk)
     return b"".join(chunks)
+
+
+def wait_for_frame(connection: socket.socket) -> None:
+    """Block without a deadline until the peer sends bytes or closes.
+
+    Idle time between requests is unbounded; the socket timeout still bounds
+    each read once ``recv_frame`` starts reading a frame.
+    """
+    with selectors.DefaultSelector() as selector:
+        selector.register(connection, selectors.EVENT_READ)
+        selector.select()
 
 
 def send_frame(connection: socket.socket, value: Any, max_frame_bytes: int) -> None:

@@ -71,6 +71,7 @@ from constitutional_swarm.authority_ipc import (
     signed_response,
     strict_loads,
     verify_response,
+    wait_for_frame,
 )
 from constitutional_swarm.governed_commit import (
     AttemptAuthorizationPayload,
@@ -1450,6 +1451,7 @@ def _observer_child_main(
         sequence = 0
         while True:
             try:
+                wait_for_frame(connection)
                 request_envelope = recv_authenticated_frame(connection, max_frame_bytes)
             except (ConnectionError, OSError, TimeoutError, ValueError):
                 return
@@ -2516,6 +2518,7 @@ def _dormant_scheduler_child(
     sequence = 0
     try:
         while True:
+            wait_for_frame(scheduler_socket)
             envelope = recv_authenticated_frame(scheduler_socket, max_frame_bytes)
             request = _exact_object(
                 envelope, {"sequence", "operation", "request"}, "scheduler_envelope"
