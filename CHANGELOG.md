@@ -387,6 +387,11 @@ or data changes.
   - Publishing grants OIDC only to the publish job.
 
 ### Fixed
+- The APCC observer and dormant-scheduler children no longer exit after 2 s
+  without a request, which failed the controlled boot. They now wait for the
+  next request without a deadline (`authority_ipc.wait_for_frame`); the 2 s
+  socket timeout still bounds each read once a frame has started. Request
+  freshness comes from signed nonces and sequence numbers, not connection age.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.
