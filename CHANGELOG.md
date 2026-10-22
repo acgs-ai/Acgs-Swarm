@@ -9,10 +9,11 @@ The format is based on Keep a Changelog.
 ## [2.0.0rc1] - 2026-10-22
 
 Pre-release. Major bump: the changes below break signed-artifact formats and
-verifier trust configuration (see **Migration**). `pip` installs it only when
-pinned exactly (`constitutional-swarm==2.0.0rc1`); final 2.0.0 follows after
-downstream validation. First PyPI publication since 0.1.1 — 1.0.0 and 1.1.0
-were tagged in this changelog but never published.
+verifier trust configuration (see **Migration**). `pip` skips it unless the
+specifier names a pre-release (e.g. `constitutional-swarm==2.0.0rc1`) or `--pre`
+is passed; final 2.0.0 follows after downstream validation. First PyPI
+publication since 0.1.1 — 1.0.0 and 1.1.0 were recorded in this changelog but
+never published.
 
 Security-fix campaign (batches C1–C48, C25b, C35b, C42b, C51a, C51b). Verifiers now take
 their trust anchors (keys, roots, rosters, thresholds) from their own
