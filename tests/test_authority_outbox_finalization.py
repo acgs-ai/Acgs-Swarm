@@ -1,10 +1,12 @@
 """Regression tests: outbox writes after a sink delivery must not give up early.
 
 Background recovery scopes a 250 ms lock wait so contention cannot stall the
-serving loop. Once an event is with the sink, though, the finalize and the
-delivery audit must wait the full store default: giving up strands a live
-lease (head-of-line stall, then redelivery) or drops the audit for good.
-Health must also show a head stuck behind a live lease instead of "ok".
+serving loop. Once an event is with the sink, the finalize must wait the full
+store default: giving up strands a live lease (head-of-line stall, then
+redelivery). Each delivery is audited in the transaction that records it, so
+no later failure can leave it unaudited. Health shows a head stuck behind a
+live lease as "stalled" instead of "ok". A commit reply never waits for
+publication.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from tests.authority_harness import (
     recording_sink_class,
     start_in_thread_authority,
     store_counts,
+    wait_until,
 )
 from tests.gcb_apcc_support import authority_child_config, producer_key
 
@@ -64,6 +67,29 @@ def _hold_lock_once(writer: OutsideWriter, seconds: float) -> threading.Timer:
     return timer
 
 
+def test_commit_reply_does_not_wait_for_publication(tmp_path, monkeypatch) -> None:
+    sink = recording_sink_class()
+    authority, config = _start(tmp_path, monkeypatch, sink)
+    released = threading.Event()
+    sink.after_deliver = staticmethod(lambda _event_id: released.wait(5.0))
+    try:
+        _executor, request = prepare_commit(authority, producer_key("agent"))
+        started = time.monotonic()
+        decision = authority.execution.commit(request)
+        elapsed = time.monotonic() - started
+        assert decision.outcome is CommitOutcome.COMMITTED
+        # Publication runs after the reply, so a slow sink cannot delay it.
+        assert elapsed < 2.0
+        released.set()
+        assert wait_until(
+            lambda: store_counts(config.database_path)["outbox"] == {"DELIVERED": 1}, 5.0
+        )
+        assert authority.is_alive(), authority.failures
+    finally:
+        released.set()
+        authority.close()
+
+
 def test_finalize_after_delivery_waits_out_short_outside_write(tmp_path, monkeypatch) -> None:
     sink = recording_sink_class()
     authority, config = _start(tmp_path, monkeypatch, sink)
@@ -78,14 +104,17 @@ def test_finalize_after_delivery_waits_out_short_outside_write(tmp_path, monkeyp
     sink.after_deliver = staticmethod(after_deliver)
     try:
         executor, request = prepare_commit(authority, producer_key("agent"))
+        before = len(_delivered_audits(config.database_path))
         armed["on"] = True
         executor.commit(request)
         event = store_counts(config.database_path)["commit_events"][0]
-        outbox = store_counts(config.database_path)["outbox"]
-        assert outbox.get("CLAIMED", 0) == 0, outbox
-        assert sink.events.count(event) == 1
+        assert wait_until(lambda: event in sink.events, 5.0)
+        assert wait_until(
+            lambda: store_counts(config.database_path)["outbox"] == {"DELIVERED": 1}, 5.0
+        )
         time.sleep(1.5)
         assert sink.events.count(event) == 1
+        assert len(_delivered_audits(config.database_path)) == before + 1
         assert authority.admin.health()["outbox_recovery"] == "ok"
         assert authority.is_alive(), authority.failures
     finally:
@@ -93,34 +122,39 @@ def test_finalize_after_delivery_waits_out_short_outside_write(tmp_path, monkeyp
         authority.close()
 
 
-def test_delivery_audit_waits_out_short_outside_write(tmp_path, monkeypatch) -> None:
+def test_lock_wait_after_delivery_keeps_its_audit(tmp_path, monkeypatch) -> None:
     sink = recording_sink_class()
     authority, config = _start(tmp_path, monkeypatch, sink)
     writer = OutsideWriter(config.database_path)
-    armed = {"on": False}
-    original = sqlite_store._audit_id
+    state = {"armed": False, "delivered": False}
+    original_connect = sqlite_store._connect
+    sink.after_deliver = staticmethod(lambda _event_id: state.update(delivered=True))
 
-    def audit_id(*parts):
-        if armed["on"] and parts[:1] == ("outbox-delivered",) and parts[1:] != ("none",):
-            armed["on"] = False
+    def connect(path):
+        connection = original_connect(path)
+        # The first short-wait connection after a delivery is the next claim.
+        if state["armed"] and state["delivered"] and sqlite_store._BUSY_TIMEOUT_MS.get() == 250:
+            state["armed"] = False
             _hold_lock_once(writer, _OUTSIDE_HOLD_S)
-        return original(*parts)
+        return connection
 
-    monkeypatch.setattr(sqlite_store, "_audit_id", audit_id)
+    monkeypatch.setattr(sqlite_store, "_connect", connect)
     try:
         executor, request = prepare_commit(authority, producer_key("agent"))
-        before = _delivered_audits(config.database_path)
-        armed["on"] = True
+        before = len(_delivered_audits(config.database_path))
+        state["armed"] = True
         executor.commit(request)
+        assert wait_until(lambda: not state["armed"], 5.0)
         assert store_counts(config.database_path)["outbox"] == {"DELIVERED": 1}
-        assert len(_delivered_audits(config.database_path)) == len(before) + 1
+        assert len(_delivered_audits(config.database_path)) == before + 1
+        assert wait_until(lambda: authority.admin.health()["outbox_recovery"] == "ok", 5.0)
         assert authority.is_alive(), authority.failures
     finally:
         writer.release()
         authority.close()
 
 
-def test_delivery_audit_lock_timeout_replies_committed_then_fails_closed(
+def test_finalize_lock_timeout_leaves_event_claimed_and_unaudited(
     tmp_path, monkeypatch
 ) -> None:
     sink = recording_sink_class()
@@ -128,29 +162,28 @@ def test_delivery_audit_lock_timeout_replies_committed_then_fails_closed(
     writer = OutsideWriter(config.database_path)
     monkeypatch.setattr(sqlite_store, "_DEFAULT_BUSY_TIMEOUT_MS", 200)
     armed = {"on": False}
-    original = sqlite_store._audit_id
 
-    def audit_id(*parts):
-        if armed["on"] and parts[:1] == ("outbox-delivered",) and parts[1:] != ("none",):
+    def after_deliver(_event_id) -> None:
+        if armed["on"]:
             armed["on"] = False
             writer.acquire()
-        return original(*parts)
 
-    monkeypatch.setattr(sqlite_store, "_audit_id", audit_id)
+    sink.after_deliver = staticmethod(after_deliver)
     try:
         executor, request = prepare_commit(authority, producer_key("agent"))
+        before = len(_delivered_audits(config.database_path))
         armed["on"] = True
-        decision = executor.commit(request)
-        assert decision.outcome is CommitOutcome.COMMITTED
-        # A delivery whose audit cannot be written is not a lock wait to ride
-        # out: no later run could write it, so the authority stops.
-        authority.thread.join(5.0)
-        assert not authority.is_alive()
-        assert len(authority.failures) == 1
-        failure = authority.failures[0]
-        assert isinstance(failure, authority_service.AuthorityOutboxRecoveryError)
-        assert str(failure.__cause__) == "outbox_delivered_audit_not_recorded"
-        assert not authority_service._is_transient_contention(failure)
+        executor.commit(request)
+        assert wait_until(
+            lambda: authority.admin.health()["outbox_recovery"] == "backing_off", 5.0
+        )
+        writer.release()
+        # Delivered but not finalized: the lease holds it for redelivery, and
+        # no audit claims a delivery the store has not recorded.
+        assert store_counts(config.database_path)["outbox"] == {"CLAIMED": 1}
+        assert len(_delivered_audits(config.database_path)) == before
+        assert wait_until(lambda: authority.admin.health()["outbox_recovery"] == "stalled", 5.0)
+        assert authority.is_alive(), authority.failures
     finally:
         writer.release()
         authority.close()

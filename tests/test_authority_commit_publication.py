@@ -298,6 +298,7 @@ def _in_process_commit(tmp_path):
         authorization=authorization,
     )
     request = admin.build_request(sign_governed_receipt(payload, key))
+    client.key = key
     return executor, client, request
 
 
@@ -340,3 +341,41 @@ def test_executor_commit_returns_committed_when_revoked_before_refresh(tmp_path)
     replay = client._inner.commit(request)
     assert replay.outcome is CommitOutcome.COMMITTED
     assert executor.available_tasks("agent") == []
+
+
+def test_executor_commit_returns_committed_when_superseded_before_refresh(tmp_path) -> None:
+    executor, client, request = _in_process_commit(tmp_path)
+    assert executor.commit(request).outcome is CommitOutcome.COMMITTED
+    key = client.key
+    authorization = sign_attempt_authorization(executor.prepare_claim("child", "agent"), key)
+    executor.claim("child", "agent", authorization)
+    payload = executor.produce_result(
+        "child",
+        Artifact("child-artifact", "child", "agent", "text", "result"),
+        authorization=authorization,
+    )
+    child_request = client.admin.build_request(sign_governed_receipt(payload, key))
+    # Revoking the committed parent supersedes the child just committed.
+    client.before_refresh = lambda: client.admin.revoke_root(
+        workflow_id="wf", node_id="root", event_id="revoke", reason="operator"
+    )
+    decision = executor.commit(child_request)
+    assert decision.outcome is CommitOutcome.COMMITTED
+    assert client.before_refresh is None
+    states = client._inner.workflow_node_states("wf", ("child",))
+    assert states[0].status == "superseded"
+
+
+def test_executor_commit_still_raises_when_revoked_node_carries_another_commit(
+    tmp_path,
+) -> None:
+    executor, client, request = _in_process_commit(tmp_path)
+    real = client._inner.workflow_node_states
+
+    def foreign_commit(workflow_id, node_ids):
+        states = real(workflow_id, node_ids)
+        return (replace(states[0], status="revoked", commit_id="other"), *states[1:])
+
+    client.workflow_node_states = foreign_commit
+    with pytest.raises(GovernanceBypassDenied, match="commit_projection_authority_mismatch"):
+        executor.commit(request)

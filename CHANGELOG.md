@@ -419,21 +419,27 @@ or data changes.
   oldest pending event is held by an unexpired delivery lease, so nothing can
   be delivered until it expires. Both clients parse the new fields strictly
   and fail closed on a malformed reply. Once an event has reached the sink,
-  the writes that mark it delivered and audit the delivery wait the full 5 s
-  default rather than 250 ms, so a short outside write no longer strands the
-  lease (a 30 s stall, then redelivery) or drops the delivery audit. If the
-  delivery audit still cannot be written, the authority stops: no later run
-  could write it.
+  the write that marks it delivered waits the full 5 s default rather than
+  250 ms, so a short outside write no longer strands the lease (a 30 s stall,
+  then redelivery). The SQLite store now writes one `outbox_delivered` audit
+  per event, in the same transaction that marks it delivered, instead of one
+  per batch after the batch; a failure later in the run can no longer leave a
+  delivery unaudited. The audit id format is unchanged (a one-event batch
+  already produced the same id), and existing batch audits remain valid. The
+  PostgreSQL store, which the authority child does not open, still writes the
+  per-batch audit.
 - A commit that is already durable is no longer reported as failed when
   publishing its outbox event fails. The decision and its pending outbox row
   are written in one transaction, so the caller now always receives the true
   decision; before, it received `internal_error` and a retry returned
-  `COMMITTED` for a commit that had already happened. A lock wait during
-  publication is left to background recovery (also capped at 250 ms). Any
-  other publication failure still stops the authority, immediately after the
-  reply is sent and before it serves another request. `SwarmExecutor.commit`
+  `COMMITTED` for a commit that had already happened. Publication now runs
+  right after the reply is sent, so it can no longer delay the reply past the
+  client deadline. A lock wait during publication backs off like any other
+  recovery run. Any other publication failure still stops the authority
+  before it serves another request. `SwarmExecutor.commit`
   likewise returns a `COMMITTED` decision when the follow-up node-state
-  refresh fails or shows the node revoked or superseded in the meantime, and
+  refresh fails or shows the node revoked or superseded (with the same commit
+  id) in the meantime, and
   resynchronizes its projection on the next read; it still raises when a
   successful refresh reply is otherwise inconsistent with the commit.
 - Closing a scheduler executor handle now returns only after its close

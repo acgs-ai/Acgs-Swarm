@@ -565,11 +565,11 @@ def authority_child_main(
                 except (ConnectionError, OSError):
                     channels.pop(connection, None)
                     connection.close()
-                # A durable commit whose publication failed fatally has had its
-                # true reply sent; fail closed now, before serving anything else.
-                fatal = recovery.take_deferred_fatal()
-                if fatal is not None:
-                    raise fatal
+                # A commit asks for publication only now that its reply is sent,
+                # so a fatal publication failure stops the authority before it
+                # serves another request without turning the reply into an error.
+                if recovery.due():
+                    recovery.run(admin)
             if recovery.due():
                 recovery.run(admin)
     except BaseException as exc:

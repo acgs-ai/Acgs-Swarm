@@ -696,23 +696,17 @@ class _OutboxRecoveryMonitor:
     failure is re-raised so the caller fails closed exactly as before.
     """
 
-    __slots__ = ("_clock", "_state", "_failures", "_deferred_fatal", "next_due")
+    __slots__ = ("_clock", "_state", "_failures", "next_due")
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._state = "ok"
         self._failures = 0
-        self._deferred_fatal: BaseException | None = None
         self.next_due = clock() + _OUTBOX_RECOVERY_INTERVAL_S
 
-    def defer_fatal(self, exc: BaseException) -> None:
-        """Hold a fatal failure until the current reply has been sent."""
-        if self._deferred_fatal is None:
-            self._deferred_fatal = exc
-
-    def take_deferred_fatal(self) -> BaseException | None:
-        fatal, self._deferred_fatal = self._deferred_fatal, None
-        return fatal
+    def request_run(self) -> None:
+        """Make the next run due now, ahead of any backoff."""
+        self.next_due = min(self.next_due, self._clock())
 
     def due(self) -> bool:
         return self._clock() >= self.next_due
@@ -754,8 +748,8 @@ class _OutboxRecoveryMonitor:
                     "outbox_recovery_pending": result.pending_count,
                 },
             )
+        # Lock-wait failures still count toward escalation across a stall.
         self._state = "stalled"
-        self._failures = 0
         self.next_due = self._clock() + _OUTBOX_RECOVERY_INTERVAL_S
 
     def record_success(self) -> None:
@@ -810,34 +804,16 @@ def _publish_after_commit(admin: Any, recovery: _OutboxRecoveryMonitor | None) -
     """Publish outbox events once the commit transaction is durable.
 
     The decision and its PENDING outbox row are already committed together,
-    so a publication failure must not turn the reply into an error: the caller
-    would retry a commit that already happened. A lock wait is left to the
-    background recovery. Any other failure is deferred to the serving loop,
-    which stops the authority right after this reply is sent.
+    so publication must not delay or replace the reply: the caller would
+    retry a commit that already happened. The serving loop runs recovery
+    right after the reply is sent, where a lock wait backs off and any other
+    failure stops the authority before it serves another request.
     """
     if recovery is None:
-        # No serving loop to fail closed after the reply: keep the old contract.
+        # No serving loop to run it after the reply: keep the old contract.
         _recover_outbox(admin)
         return
-    try:
-        result = _background_recover_outbox(admin)
-    except AuthorityOutboxRecoveryError as exc:
-        if _is_transient_contention(exc):
-            logger.warning(
-                "authority post-commit outbox publication deferred to background "
-                "recovery: cause=%s",
-                type(exc.__cause__).__name__,
-            )
-            recovery.record_transient(exc)
-            return
-        logger.error(
-            "authority post-commit outbox publication failed; stopping after reply: "
-            "cause=%s",
-            type(exc.__cause__).__name__,
-        )
-        recovery.defer_fatal(exc)
-    else:
-        recovery.record_result(result)
+    recovery.request_run()
 
 
 def _authority_health(recovery: _OutboxRecoveryMonitor | None) -> dict[str, Any]:

@@ -3944,6 +3944,16 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
                     (event_id, token),
                 ).rowcount
                 if changed == 1:
+                    # Audit each delivery with the row that records it, so no
+                    # failure later in the run can leave a delivery unaudited.
+                    audit = _audit_id("outbox-delivered", event_id)
+                    if (
+                        finalize.execute(
+                            "SELECT 1 FROM audit_events WHERE audit_event_id=?", (audit,)
+                        ).fetchone()
+                        is None
+                    ):
+                        _write_audit(finalize, audit, "outbox_delivered", "outbox")
                     delivered_ids.append(event_id)
                 self._seal_mutation_checkpoint(finalize)
                 finalize.commit()
@@ -3952,25 +3962,11 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
                 raise
             finally:
                 finalize.close()
-        audit = _audit_id(
-            "outbox-delivered", *(delivered_ids if delivered_ids else ["none"])
-        )
-        connection = (
-            _connect_full_wait(self.database_path)
-            if delivered_ids
-            else _connect(self.database_path)
-        )
+        audit = _audit_id("outbox-delivered", delivered_ids[-1] if delivered_ids else "none")
+        connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_mutation_checkpoint(connection)
-            if (
-                delivered_ids
-                and connection.execute(
-                    "SELECT 1 FROM audit_events WHERE audit_event_id=?", (audit,)
-                ).fetchone()
-                is None
-            ):
-                _write_audit(connection, audit, "outbox_delivered", "outbox")
             pending = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM apcc_outbox WHERE state<>'DELIVERED'"
@@ -3978,12 +3974,8 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             )
             self._seal_mutation_checkpoint(connection)
             connection.commit()
-        except Exception as error:
+        except Exception:
             connection.rollback()
-            if delivered_ids:
-                # Delivered rows are final, so no later run can write this
-                # audit. Never let a lock wait pass this off as transient.
-                raise RuntimeError("outbox_delivered_audit_not_recorded") from error
             raise
         finally:
             connection.close()
@@ -4146,7 +4138,7 @@ def _connect_full_wait(path: Path) -> sqlite3.Connection:
     """Connect with the default lock wait, ignoring any shorter scoped value.
 
     Outbox writes after a sink delivery use this: giving up early there would
-    strand the lease (forcing redelivery) or drop the delivery audit.
+    strand the lease, stalling the outbox and forcing a redelivery.
     """
     with _scoped_busy_timeout(_DEFAULT_BUSY_TIMEOUT_MS):
         return _connect(path)

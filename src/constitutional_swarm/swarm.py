@@ -721,8 +721,11 @@ class SwarmExecutor:
             if len(refreshed_states) != len(refreshed_ids):
                 raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
             authority_state = refreshed_states[0]
-            if authority_state.status in {"revoked", "superseded"}:
-                # Revoked after the commit landed: the decision still stands.
+            if (
+                authority_state.status in {"revoked", "superseded"}
+                and authority_state.commit_id == decision.commit_id
+            ):
+                # Revoked after this commit landed: the decision still stands.
                 # Indexes stay dirty, so the next read picks up the revocation.
                 return decision
             if authority_state.status != "governed_committed":
