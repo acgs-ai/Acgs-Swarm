@@ -16,6 +16,7 @@ import sqlite3
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence, Set
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
@@ -4087,10 +4088,27 @@ def _sqlite_uri(path: Path, mode: str) -> str:
     return f"{Path(path).resolve().as_uri()}?mode={mode}"
 
 
+# Lock wait for every store connection. Background maintenance scopes a lower
+# value so a contended tick cannot stall its caller; requests keep the default.
+_BUSY_TIMEOUT_MS: ContextVar[int] = ContextVar("apcc_sqlite_busy_timeout_ms", default=5000)
+
+
+@contextmanager
+def _scoped_busy_timeout(milliseconds: int) -> Iterator[None]:
+    """Apply ``milliseconds`` to connections opened in this context only."""
+    if type(milliseconds) is not int or milliseconds < 0:
+        raise ValueError("busy timeout must be a non-negative integer")
+    token = _BUSY_TIMEOUT_MS.set(milliseconds)
+    try:
+        yield
+    finally:
+        _BUSY_TIMEOUT_MS.reset(token)
+
+
 def _configure_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
     try:
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_MS.get())}")
         return connection
     except Exception:
         connection.close()

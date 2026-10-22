@@ -400,6 +400,23 @@ or data changes.
   next request without a deadline (`authority_ipc.wait_for_frame`); the 2 s
   socket timeout still bounds each read once a frame has started. Request
   freshness comes from signed nonces and sequence numbers, not connection age.
+- An outside SQLite writer that holds the lock past the store's `busy_timeout`
+  no longer kills an idle authority. Before, the once-a-second outbox
+  recovery waited out the lock, raised, and the authority process exited.
+  A recovery failure that is only `SQLITE_BUSY` now backs off (1 s doubling
+  to 30 s, back to 1 s on success) and is reported as `escalated` after 10
+  failures in a row. Any other failure, including a sink error later masked
+  by `SQLITE_BUSY`, still stops the authority as before. Only SQLite errors
+  are classified, because the authority child opens only the SQLite store.
+  Startup recovery and the background ticks wait at most 250 ms for the
+  lock, so a contended tick holds the single serving loop for a fraction of
+  a second rather than up to 5 s against the 10 s client deadline. Requests
+  keep the 5 s default `busy_timeout`, because a request that can wait out a
+  short outside lock should still succeed. Authority health replies (execution
+  and admin channels) gain `outbox_recovery` (`ok`, `backing_off` or
+  `escalated`) and `outbox_recovery_failures`, so a stuck outbox is visible
+  to the supervisor instead of only in the child's log. Both clients parse
+  the new fields strictly and fail closed on a malformed reply.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.
