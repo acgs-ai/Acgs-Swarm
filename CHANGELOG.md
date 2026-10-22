@@ -417,6 +417,17 @@ or data changes.
   `escalated`) and `outbox_recovery_failures`, so a stuck outbox is visible
   to the supervisor instead of only in the child's log. Both clients parse
   the new fields strictly and fail closed on a malformed reply.
+- A commit that is already durable is no longer reported as failed when
+  publishing its outbox event fails. The decision and its pending outbox row
+  are written in one transaction, so the caller now always receives the true
+  decision; before, it received `internal_error` and a retry returned
+  `COMMITTED` for a commit that had already happened. A lock wait during
+  publication is left to background recovery (also capped at 250 ms). Any
+  other publication failure still stops the authority, immediately after the
+  reply is sent and before it serves another request. `SwarmExecutor.commit`
+  likewise returns a `COMMITTED` decision when the follow-up node-state
+  refresh fails, and resynchronizes its projection on the next read; it still
+  raises when a successful refresh reply is inconsistent with the commit.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.

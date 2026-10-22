@@ -695,13 +695,23 @@ class _OutboxRecoveryMonitor:
     failure is re-raised so the caller fails closed exactly as before.
     """
 
-    __slots__ = ("_clock", "_state", "_failures", "next_due")
+    __slots__ = ("_clock", "_state", "_failures", "_deferred_fatal", "next_due")
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._state = "ok"
         self._failures = 0
+        self._deferred_fatal: BaseException | None = None
         self.next_due = clock() + _OUTBOX_RECOVERY_INTERVAL_S
+
+    def defer_fatal(self, exc: BaseException) -> None:
+        """Hold a fatal failure until the current reply has been sent."""
+        if self._deferred_fatal is None:
+            self._deferred_fatal = exc
+
+    def take_deferred_fatal(self) -> BaseException | None:
+        fatal, self._deferred_fatal = self._deferred_fatal, None
+        return fatal
 
     def due(self) -> bool:
         return self._clock() >= self.next_due
@@ -771,6 +781,40 @@ class _OutboxRecoveryMonitor:
         )
 
 
+def _publish_after_commit(admin: Any, recovery: _OutboxRecoveryMonitor | None) -> None:
+    """Publish outbox events once the commit transaction is durable.
+
+    The decision and its PENDING outbox row are already committed together,
+    so a publication failure must not turn the reply into an error: the caller
+    would retry a commit that already happened. A lock wait is left to the
+    background recovery. Any other failure is deferred to the serving loop,
+    which stops the authority right after this reply is sent.
+    """
+    if recovery is None:
+        # No serving loop to fail closed after the reply: keep the old contract.
+        _recover_outbox(admin)
+        return
+    try:
+        _background_recover_outbox(admin)
+    except AuthorityOutboxRecoveryError as exc:
+        if _is_transient_contention(exc):
+            logger.warning(
+                "authority post-commit outbox publication deferred to background "
+                "recovery: cause=%s",
+                type(exc.__cause__).__name__,
+            )
+            recovery.record_transient(exc)
+            return
+        logger.error(
+            "authority post-commit outbox publication failed; stopping after reply: "
+            "cause=%s",
+            type(exc.__cause__).__name__,
+        )
+        recovery.defer_fatal(exc)
+    else:
+        recovery.record_success()
+
+
 def _authority_health(recovery: _OutboxRecoveryMonitor | None) -> dict[str, Any]:
     fields = (recovery or _OutboxRecoveryMonitor()).health_fields()
     return {"authority_pid": os.getpid(), **fields}
@@ -813,7 +857,7 @@ def _handle_execution_request(
     if operation == "commit":
         body = _exact_object(parameters, {"commit_request"}, "commit_operation")
         decision = admin.commit(_decode_commit_request(body["commit_request"]))
-        _recover_outbox(admin)
+        _publish_after_commit(admin, recovery)
         return _encode_commit_decision(decision)
     if operation == "build_request":
         body = _exact_object(parameters, {"receipt"}, "build_request_operation")

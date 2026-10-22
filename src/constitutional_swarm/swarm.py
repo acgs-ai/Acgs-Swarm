@@ -710,9 +710,14 @@ class SwarmExecutor:
                 decision.node_id,
                 *self._children.get(decision.node_id, ()),
             )
-            refreshed_states = self._authority_call(
-                "workflow_node_states", self._dag.dag_id, refreshed_ids
-            )
+            try:
+                refreshed_states = self._authority_call(
+                    "workflow_node_states", self._dag.dag_id, refreshed_ids
+                )
+            except GovernanceBypassDenied:
+                # The decision is durable; only the projection refresh failed.
+                # Indexes stay dirty, so the next read resynchronizes them.
+                return decision
             if len(refreshed_states) != len(refreshed_ids):
                 raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
             authority_state = refreshed_states[0]
