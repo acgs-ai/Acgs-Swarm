@@ -578,8 +578,21 @@ def _harness(environment: _PostgresEnvironment) -> AuthorityStoreHarness:
             support, "_only_denied_decision_and_audit"
         ),
         assert_missing_recovery_delta=getattr(support, "_missing_recovery_delta"),
-        assert_outbox_delivery_delta=getattr(support, "_only_outbox_delivery"),
+        assert_outbox_delivery_delta=_only_outbox_batch_delivery,
     )
+
+
+def _only_outbox_batch_delivery(before: AuthoritySnapshot, after: AuthoritySnapshot) -> None:
+    """PostgreSQL still writes one outbox_delivered audit per recovery batch."""
+    changed = {
+        name
+        for name in set(before.tables) | set(after.tables)
+        if before.tables.get(name) != after.tables.get(name)
+    }
+    assert changed == {"outbox", "audit_events"}
+    assert len(after.tables["outbox"]) == len(before.tables["outbox"])
+    assert len(after.tables["audit_events"]) == len(before.tables["audit_events"]) + 1
+    assert before.current_pointers == after.current_pointers
 
 
 def _advance(
