@@ -253,11 +253,15 @@ class _FlakyRefreshClient:
         self._inner = inner
         self.refresh_failure: BaseException | None = None
         self.refresh_result = None
+        self.before_refresh = None
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
     def workflow_node_states(self, workflow_id, node_ids):
+        if self.before_refresh is not None:
+            hook, self.before_refresh = self.before_refresh, None
+            hook()
         if self.refresh_failure is not None:
             failure, self.refresh_failure = self.refresh_failure, None
             raise failure
@@ -281,6 +285,7 @@ def _in_process_commit(tmp_path):
         workflow_id="wf", agent_id="agent", public_key=key.public_key(), capabilities=()
     )
     client = _FlakyRefreshClient(InProcessExecutionClientHarness(admin))
+    client.admin = admin
     executor = compose_test_executor(
         CapabilityRegistry(), ArtifactStore(), client, policy_version="1"
     )
@@ -321,3 +326,17 @@ def test_executor_commit_still_raises_on_refresh_integrity_mismatch(tmp_path) ->
     client.refresh_result = ()
     with pytest.raises(GovernanceBypassDenied, match="authority_status_batch_length_mismatch"):
         executor.commit(request)
+
+
+def test_executor_commit_returns_committed_when_revoked_before_refresh(tmp_path) -> None:
+    executor, client, request = _in_process_commit(tmp_path)
+    # Another request revokes the node between the commit and the refresh.
+    client.before_refresh = lambda: client.admin.revoke_root(
+        workflow_id="wf", node_id="root", event_id="revoke", reason="operator"
+    )
+    decision = executor.commit(request)
+    assert decision.outcome is CommitOutcome.COMMITTED
+    assert client.before_refresh is None  # the revocation really landed first
+    replay = client._inner.commit(request)
+    assert replay.outcome is CommitOutcome.COMMITTED
+    assert executor.available_tasks("agent") == []

@@ -3917,7 +3917,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             try:
                 self._runtime.outbox_sink.deliver(event_id, payload)
             except Exception:
-                release = _connect(self.database_path)
+                release = _connect_full_wait(self.database_path)
                 try:
                     release.execute("BEGIN IMMEDIATE")
                     self._validate_mutation_checkpoint(release)
@@ -3934,7 +3934,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
                 finally:
                     release.close()
                 raise
-            finalize = _connect(self.database_path)
+            finalize = _connect_full_wait(self.database_path)
             try:
                 finalize.execute("BEGIN IMMEDIATE")
                 self._validate_mutation_checkpoint(finalize)
@@ -3955,7 +3955,11 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         audit = _audit_id(
             "outbox-delivered", *(delivered_ids if delivered_ids else ["none"])
         )
-        connection = _connect(self.database_path)
+        connection = (
+            _connect_full_wait(self.database_path)
+            if delivered_ids
+            else _connect(self.database_path)
+        )
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_mutation_checkpoint(connection)
@@ -3974,8 +3978,12 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
             )
             self._seal_mutation_checkpoint(connection)
             connection.commit()
-        except Exception:
+        except Exception as error:
             connection.rollback()
+            if delivered_ids:
+                # Delivered rows are final, so no later run can write this
+                # audit. Never let a lock wait pass this off as transient.
+                raise RuntimeError("outbox_delivered_audit_not_recorded") from error
             raise
         finally:
             connection.close()
@@ -4090,7 +4098,10 @@ def _sqlite_uri(path: Path, mode: str) -> str:
 
 # Lock wait for every store connection. Background maintenance scopes a lower
 # value so a contended tick cannot stall its caller; requests keep the default.
-_BUSY_TIMEOUT_MS: ContextVar[int] = ContextVar("apcc_sqlite_busy_timeout_ms", default=5000)
+_DEFAULT_BUSY_TIMEOUT_MS = 5000
+_BUSY_TIMEOUT_MS: ContextVar[int] = ContextVar(
+    "apcc_sqlite_busy_timeout_ms", default=_DEFAULT_BUSY_TIMEOUT_MS
+)
 
 
 @contextmanager
@@ -4129,6 +4140,16 @@ def _connect(path: Path) -> sqlite3.Connection:
     except sqlite3.OperationalError as error:
         raise ValueError("APCC SQLite store is not provisioned") from error
     return _configure_connection(connection)
+
+
+def _connect_full_wait(path: Path) -> sqlite3.Connection:
+    """Connect with the default lock wait, ignoring any shorter scoped value.
+
+    Outbox writes after a sink delivery use this: giving up early there would
+    strand the lease (forcing redelivery) or drop the delivery audit.
+    """
+    with _scoped_busy_timeout(_DEFAULT_BUSY_TIMEOUT_MS):
+        return _connect(path)
 
 
 def _connect_reader(path: Path) -> sqlite3.Connection:

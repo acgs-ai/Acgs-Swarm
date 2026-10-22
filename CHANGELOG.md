@@ -413,10 +413,17 @@ or data changes.
   a second rather than up to 5 s against the 10 s client deadline. Requests
   keep the 5 s default `busy_timeout`, because a request that can wait out a
   short outside lock should still succeed. Authority health replies (execution
-  and admin channels) gain `outbox_recovery` (`ok`, `backing_off` or
-  `escalated`) and `outbox_recovery_failures`, so a stuck outbox is visible
-  to the supervisor instead of only in the child's log. Both clients parse
-  the new fields strictly and fail closed on a malformed reply.
+  and admin channels) gain `outbox_recovery` (`ok`, `stalled`, `backing_off`
+  or `escalated`) and `outbox_recovery_failures`, so a stuck outbox is visible
+  to the supervisor instead of only in the child's log. `stalled` means the
+  oldest pending event is held by an unexpired delivery lease, so nothing can
+  be delivered until it expires. Both clients parse the new fields strictly
+  and fail closed on a malformed reply. Once an event has reached the sink,
+  the writes that mark it delivered and audit the delivery wait the full 5 s
+  default rather than 250 ms, so a short outside write no longer strands the
+  lease (a 30 s stall, then redelivery) or drops the delivery audit. If the
+  delivery audit still cannot be written, the authority stops: no later run
+  could write it.
 - A commit that is already durable is no longer reported as failed when
   publishing its outbox event fails. The decision and its pending outbox row
   are written in one transaction, so the caller now always receives the true
@@ -426,8 +433,9 @@ or data changes.
   other publication failure still stops the authority, immediately after the
   reply is sent and before it serves another request. `SwarmExecutor.commit`
   likewise returns a `COMMITTED` decision when the follow-up node-state
-  refresh fails, and resynchronizes its projection on the next read; it still
-  raises when a successful refresh reply is inconsistent with the commit.
+  refresh fails or shows the node revoked or superseded in the meantime, and
+  resynchronizes its projection on the next read; it still raises when a
+  successful refresh reply is otherwise inconsistent with the commit.
 - Closing a scheduler executor handle now returns only after its close
   callback has finished. Before, when `close()` interrupted an in-flight
   call, the interrupted call's thread ran the callback and `close()` could

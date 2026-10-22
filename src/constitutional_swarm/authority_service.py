@@ -46,6 +46,7 @@ from constitutional_swarm.apcc.observation import (
 from constitutional_swarm.apcc.ports import (
     AuthorityObservationStore,
     OutboxRecoveryRequest,
+    OutboxRecoveryResult,
 )
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.authority_isolation import (
@@ -104,7 +105,7 @@ _BACKGROUND_BUSY_TIMEOUT_MS = 250
 _OUTBOX_RECOVERY_INTERVAL_S = 1.0
 _OUTBOX_RECOVERY_MAX_BACKOFF_S = 30.0
 _OUTBOX_RECOVERY_ESCALATE_AFTER = 10
-_OUTBOX_RECOVERY_STATES = frozenset({"ok", "backing_off", "escalated"})
+_OUTBOX_RECOVERY_STATES = frozenset({"ok", "stalled", "backing_off", "escalated"})
 
 logger = logging.getLogger(__name__)
 
@@ -636,9 +637,9 @@ class AuthorityOutboxRecoveryError(RuntimeError):
     """Bounded authority-side outbox recovery failure."""
 
 
-def _recover_outbox(admin: Any) -> None:
+def _recover_outbox(admin: Any) -> OutboxRecoveryResult:
     try:
-        admin.commit_port._apcc_store.recover_outbox(OutboxRecoveryRequest("100"))
+        return admin.commit_port._apcc_store.recover_outbox(OutboxRecoveryRequest("100"))
     except Exception as exc:
         raise AuthorityOutboxRecoveryError("outbox_recovery_failed") from exc
 
@@ -680,11 +681,11 @@ def _is_transient_contention(exc: BaseException) -> bool:
     return True
 
 
-def _background_recover_outbox(admin: Any) -> None:
+def _background_recover_outbox(admin: Any) -> OutboxRecoveryResult:
     from constitutional_swarm.apcc.sqlite_store import _scoped_busy_timeout
 
     with _scoped_busy_timeout(_BACKGROUND_BUSY_TIMEOUT_MS):
-        _recover_outbox(admin)
+        return _recover_outbox(admin)
 
 
 class _OutboxRecoveryMonitor:
@@ -725,13 +726,37 @@ class _OutboxRecoveryMonitor:
     def run(self, admin: Any) -> None:
         """Recover once under the background lock wait; re-raise if fatal."""
         try:
-            _background_recover_outbox(admin)
+            result = _background_recover_outbox(admin)
         except AuthorityOutboxRecoveryError as exc:
             if not _is_transient_contention(exc):
                 raise
             self.record_transient(exc)
         else:
+            self.record_result(result)
+
+    def record_result(self, result: OutboxRecoveryResult) -> None:
+        """Record a run that raised nothing: ok, or stalled behind a live lease.
+
+        A run only stops with events pending and none delivered when the head
+        event is held by an unexpired lease, so nothing can move until it ends.
+        """
+        if result.delivered_count != "0" or result.pending_count == "0":
             self.record_success()
+            return
+        if self._state != "stalled":
+            logger.warning(
+                "authority outbox recovery state=stalled previous=%s pending=%s",
+                self._state,
+                result.pending_count,
+                extra={
+                    "outbox_recovery": "stalled",
+                    "outbox_recovery_previous": self._state,
+                    "outbox_recovery_pending": result.pending_count,
+                },
+            )
+        self._state = "stalled"
+        self._failures = 0
+        self.next_due = self._clock() + _OUTBOX_RECOVERY_INTERVAL_S
 
     def record_success(self) -> None:
         if self._state != "ok":
@@ -795,7 +820,7 @@ def _publish_after_commit(admin: Any, recovery: _OutboxRecoveryMonitor | None) -
         _recover_outbox(admin)
         return
     try:
-        _background_recover_outbox(admin)
+        result = _background_recover_outbox(admin)
     except AuthorityOutboxRecoveryError as exc:
         if _is_transient_contention(exc):
             logger.warning(
@@ -812,7 +837,7 @@ def _publish_after_commit(admin: Any, recovery: _OutboxRecoveryMonitor | None) -
         )
         recovery.defer_fatal(exc)
     else:
-        recovery.record_success()
+        recovery.record_result(result)
 
 
 def _authority_health(recovery: _OutboxRecoveryMonitor | None) -> dict[str, Any]:

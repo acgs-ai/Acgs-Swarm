@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from constitutional_swarm import authority_child, authority_service
+from constitutional_swarm.apcc.ports import OutboxRecoveryResult
 from constitutional_swarm.governance_errors import GovernanceBypassDenied
 from tests.authority_harness import (
     OutsideWriter,
@@ -198,13 +199,15 @@ class _ScriptedStore:
         self.busy = busy
         self.failure: BaseException | None = busy
         self.timeouts: list[int] = []
+        self.result = OutboxRecoveryResult("0", "0", "audit")
 
-    def recover_outbox(self, _request) -> None:
+    def recover_outbox(self, _request) -> OutboxRecoveryResult:
         from constitutional_swarm.apcc import sqlite_store
 
         self.timeouts.append(sqlite_store._BUSY_TIMEOUT_MS.get())
         if self.failure is not None:
             raise self.failure
+        return self.result
 
 
 def _monitor_case(tmp_path):
