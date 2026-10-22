@@ -3004,7 +3004,14 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
 
 
 class _SwarmExecutionHandle:
-    """Supervisor-facing typed scheduler RPC; no authority endpoint is exposed."""
+    """Supervisor-facing typed scheduler RPC; no authority endpoint is exposed.
+
+    ``on_close`` must be idempotent. It runs outside the handle lock on the
+    thread whose failed RPC closed the handle, and on every thread that calls
+    ``close()``, so ``close()`` returns only after an invocation has completed
+    on its own thread, even when an interrupted RPC is still running its copy.
+    An exception from aborting the scheduler process never skips it.
+    """
 
     __slots__ = (
         "_socket",
@@ -3043,38 +3050,44 @@ class _SwarmExecutionHandle:
         failure: BaseException | None = None
         callback: Any | None = None
         body: dict[str, Any] | None = None
-        with self._lock:
-            if self._closed:
-                raise GovernanceBypassDenied("authority_unavailable")
-            self._sequence += 1
-            try:
-                send_authenticated_frame(
-                    self._socket,
-                    {
-                        "sequence": self._sequence,
-                        "operation": operation,
-                        "request": dict(request),
-                    },
-                    self._max_frame_bytes,
-                )
-                response = recv_authenticated_frame(self._socket, self._max_frame_bytes)
-                body = _exact_object(
-                    response, {"sequence", "result", "error"}, "scheduler_response"
-                )
-                if body["sequence"] != self._sequence:
-                    raise ValueError("invalid_scheduler_sequence")
-            except (
-                ConnectionError,
-                OSError,
-                TimeoutError,
-                ValueError,
-                TypeError,
-            ) as exc:
-                callback = self._close_locked()
-                failure = exc
-        if failure is not None:
+        try:
+            with self._lock:
+                if self._closed:
+                    raise GovernanceBypassDenied("authority_unavailable")
+                self._sequence += 1
+                try:
+                    send_authenticated_frame(
+                        self._socket,
+                        {
+                            "sequence": self._sequence,
+                            "operation": operation,
+                            "request": dict(request),
+                        },
+                        self._max_frame_bytes,
+                    )
+                    response = recv_authenticated_frame(
+                        self._socket, self._max_frame_bytes
+                    )
+                    body = _exact_object(
+                        response, {"sequence", "result", "error"}, "scheduler_response"
+                    )
+                    if body["sequence"] != self._sequence:
+                        raise ValueError("invalid_scheduler_sequence")
+                except (
+                    ConnectionError,
+                    OSError,
+                    TimeoutError,
+                    ValueError,
+                    TypeError,
+                ) as exc:
+                    failure = exc
+                    callback = self._on_close
+                    self._close_locked()
+        finally:
+            # Outside the lock, and even if aborting the process raised.
             if callback is not None:
                 callback()
+        if failure is not None:
             raise GovernanceBypassDenied("authority_unavailable") from failure
         if body is None:
             raise GovernanceBypassDenied("authority_unavailable")
@@ -3091,13 +3104,14 @@ class _SwarmExecutionHandle:
             raise RuntimeError(detail["message"])
         return body["result"]
 
-    def _close_locked(self) -> Any | None:
+    def _close_locked(self) -> None:
         if self._closed:
-            return None
+            return
         self._closed = True
-        self._socket.close()
-        _abort_process(self._process)
-        return self._on_close
+        try:
+            self._socket.close()
+        finally:
+            _abort_process(self._process)
 
     def health(self) -> dict[str, int]:
         body = _exact_object(
@@ -3202,14 +3216,19 @@ class _SwarmExecutionHandle:
         return dict(result)
 
     def close(self) -> None:
-        callback: Any | None
-        _acquire_interrupting(self._lock, lambda: self._socket)
+        callback = self._on_close
         try:
-            callback = self._close_locked()
+            _acquire_interrupting(self._lock, lambda: self._socket)
+            try:
+                self._close_locked()
+            finally:
+                self._lock.release()
         finally:
-            self._lock.release()
-        if callback is not None:
-            callback()
+            # Every closer runs the idempotent callback itself instead of
+            # waiting on an interrupted RPC thread, which may need a lock the
+            # caller holds.
+            if callback is not None:
+                callback()
 
     def __enter__(self) -> _SwarmExecutionHandle:
         return self

@@ -428,6 +428,13 @@ or data changes.
   likewise returns a `COMMITTED` decision when the follow-up node-state
   refresh fails, and resynchronizes its projection on the next read; it still
   raises when a successful refresh reply is inconsistent with the commit.
+- Closing a scheduler executor handle now returns only after its close
+  callback has finished. Before, when `close()` interrupted an in-flight
+  call, the interrupted call's thread ran the callback and `close()` could
+  return first, so the supervisor could observe a closed executor whose
+  lifecycle had not yet been marked failed. The callback is now idempotent
+  and every closer runs it itself, and a failure while stopping the
+  scheduler process can no longer skip it.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.

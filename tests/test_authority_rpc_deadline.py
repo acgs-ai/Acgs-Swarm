@@ -163,7 +163,91 @@ def test_scheduler_handle_close_interrupts_rpc_to_hung_scheduler() -> None:
         )
         _assert_close_interrupts_hung_rpc(handle, handle.health, peer)
         handle.close()
-        assert len(closed) == 1
+        assert len(closed) >= 1  # on_close is idempotent and may run per closer
+    finally:
+        left.close()
+        peer.close()
+
+
+def _race_close_against_rpc(on_close, *, hold: threading.RLock | None = None):
+    """Close a scheduler handle while an RPC is blocked on a silent peer."""
+    left, peer = socket.socketpair()
+    handle = authority_service._SwarmExecutionHandle(
+        left, SimpleNamespace(pid=None), max_frame_bytes=1 << 16, on_close=on_close
+    )
+    outcome: list[BaseException | None] = []
+
+    def call() -> None:
+        try:
+            handle.health()
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    caller = threading.Thread(target=call)
+    try:
+        caller.start()
+        peer.settimeout(5.0)
+        assert peer.recv(1)
+        if hold is None:
+            handle.close()
+        else:
+            with hold:  # like AuthorityServiceHandle cleanup under _lifecycle_lock
+                handle.close()
+        returned = time.monotonic()
+        caller.join(timeout=5.0)
+        assert not caller.is_alive()
+        assert len(outcome) == 1 and isinstance(outcome[0], GovernanceBypassDenied)
+        return returned
+    finally:
+        left.close()
+        peer.close()
+
+
+def test_scheduler_handle_close_returns_after_on_close_completed() -> None:
+    completed: list[float] = []
+
+    def slow_on_close() -> None:
+        time.sleep(0.3)
+        completed.append(time.monotonic())
+
+    returned = _race_close_against_rpc(slow_on_close)
+    assert completed, "close() returned before any on_close invocation"
+    assert min(completed) <= returned
+
+
+def test_scheduler_handle_close_races_rpc_without_deadlock() -> None:
+    lifecycle = threading.RLock()
+    for _ in range(50):
+        completed: list[float] = []
+
+        def on_close(completed: list[float] = completed) -> None:
+            with lifecycle:  # the real callback takes the supervisor lifecycle lock
+                completed.append(time.monotonic())
+
+        returned = _race_close_against_rpc(on_close, hold=lifecycle)
+        assert completed and min(completed) <= returned
+
+
+def test_scheduler_handle_abort_failure_still_runs_on_close() -> None:
+    class BrokenProcess:
+        pid = 2**22 + 1
+
+        def is_alive(self) -> bool:
+            raise RuntimeError("process table unavailable")
+
+    left, peer = socket.socketpair()
+    closed: list[None] = []
+    try:
+        handle = authority_service._SwarmExecutionHandle(
+            left, BrokenProcess(), max_frame_bytes=1 << 16, on_close=lambda: closed.append(None)
+        )
+        with pytest.raises(RuntimeError, match="process table unavailable"):
+            handle.close()
+        assert closed == [None]
+        with pytest.raises(GovernanceBypassDenied):
+            handle.health()
     finally:
         left.close()
         peer.close()
