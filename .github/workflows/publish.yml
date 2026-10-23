@@ -1,8 +1,16 @@
 name: Publish to PyPI
 
+# Publishing ANY GitHub Release uploads to PyPI, including releases marked
+# pre-release; a PyPI release can be yanked, but a filename can never be
+# re-uploaded. A push to a release/** branch or a manual dispatch is a
+# rehearsal: it runs ci and package (build, twine check, isolated wheel gate)
+# and skips publish.
 on:
   release:
     types: [published]
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,8 +39,8 @@ jobs:
       - name: Validate
         run: twine check dist/*
       - name: Isolated wheel gate
-        # Same checks as `make verify-wheel`, run against the wheel that is
-        # uploaded and published (not a rebuild).
+        # Same checks as `make verify-wheel`, run against the wheel uploaded as
+        # the artifact the publish job releases (not a rebuild).
         run: |
           set -- dist/*.whl
           test "$#" -eq 1
@@ -47,6 +55,8 @@ jobs:
 
   publish:
     needs: [ci, package]
+    # Only a published Release uploads. Rehearsal triggers stop after package.
+    if: github.event_name == 'release'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: pypi
     permissions:
