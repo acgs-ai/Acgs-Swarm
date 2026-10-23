@@ -413,10 +413,10 @@ def authority_child_main(
     try:
         harden_current_process()
         from constitutional_swarm.authority_service import (
+            _OutboxRecoveryMonitor,
             _handle_admin_request,
             _handle_execution_request,
             _handle_status_sign_request,
-            _recover_outbox,
         )
 
         readiness.send({"stage": "HARDENED_READY", "pid": os.getpid(), "dumpable": 0})
@@ -435,7 +435,10 @@ def authority_child_main(
             if config.provision
             else bootstrap.open_admin(path)
         )
-        _recover_outbox(admin)
+        # A lock wait at boot is recorded and retried by the loop; any other
+        # recovery failure still aborts startup before readiness.
+        recovery = _OutboxRecoveryMonitor()
+        recovery.run(admin)
         ephemeral = Ed25519PrivateKey.generate()
         session = secrets.token_urlsafe(24)
         ready_body = {
@@ -461,7 +464,6 @@ def authority_child_main(
             status_channel: "status-signing",
         }
         sequences = {"execution": 0, "admin": 0, "status-signing": 0}
-        last_recovery = time.monotonic()
         while channels:
             readable, _, _ = select.select(list(channels), [], [], 0.25)
             for connection in readable:
@@ -504,9 +506,9 @@ def authority_child_main(
                 request_digest = digest(request)
                 try:
                     if channel == "execution":
-                        result = _handle_execution_request(admin, request)
+                        result = _handle_execution_request(admin, request, recovery)
                     elif channel == "admin":
-                        result = _handle_admin_request(admin, request)
+                        result = _handle_admin_request(admin, request, recovery)
                     else:
                         result = _handle_status_sign_request(request, admin)
                 except Exception as exc:
@@ -563,9 +565,13 @@ def authority_child_main(
                 except (ConnectionError, OSError):
                     channels.pop(connection, None)
                     connection.close()
-            if time.monotonic() - last_recovery >= 1:
-                _recover_outbox(admin)
-                last_recovery = time.monotonic()
+                # A commit asks for publication only now that its reply is sent,
+                # so a fatal publication failure stops the authority before it
+                # serves another request without turning the reply into an error.
+                if recovery.due():
+                    recovery.run(admin)
+            if recovery.due():
+                recovery.run(admin)
     except BaseException as exc:
         logger.error(
             "authority child terminated with %s: %s", type(exc).__name__, exc

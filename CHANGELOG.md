@@ -387,6 +387,68 @@ or data changes.
   - Publishing grants OIDC only to the publish job.
 
 ### Fixed
+- A database lock held for 2–5 s by another process no longer kills the
+  authority. Authority calls now wait 10 s for a reply (above the store's 5 s
+  SQLite `busy_timeout`) and scheduler calls 30 s (above two chained authority
+  calls), instead of 2 s each. Before, a commit stalled on the lock failed with
+  `authority_unavailable` and the controlled boot moved to `failed`. Closing
+  a client or executor handle now interrupts any in-flight call, which fails
+  with `authority_unavailable`, so teardown against a hung peer does not wait
+  out these longer deadlines.
+- The APCC observer and dormant-scheduler children no longer exit after 2 s
+  without a request, which failed the controlled boot. They now wait for the
+  next request without a deadline (`authority_ipc.wait_for_frame`); the 2 s
+  socket timeout still bounds each read once a frame has started. Request
+  freshness comes from signed nonces and sequence numbers, not connection age.
+- An outside SQLite writer that holds the lock past the store's `busy_timeout`
+  no longer kills an idle authority. Before, the once-a-second outbox
+  recovery waited out the lock, raised, and the authority process exited.
+  A recovery failure that is only `SQLITE_BUSY` now backs off (1 s doubling
+  to 30 s, back to 1 s on success) and is reported as `escalated` after 10
+  failures in a row. Any other failure, including a sink error later masked
+  by `SQLITE_BUSY`, still stops the authority as before. Only SQLite errors
+  are classified, because the authority child opens only the SQLite store.
+  Startup recovery and the background ticks wait at most 250 ms for the
+  lock, so a contended tick holds the single serving loop for a fraction of
+  a second rather than up to 5 s against the 10 s client deadline. Requests
+  keep the 5 s default `busy_timeout`, because a request that can wait out a
+  short outside lock should still succeed. Authority health replies (execution
+  and admin channels) gain `outbox_recovery` (`ok`, `stalled`, `backing_off`
+  or `escalated`) and `outbox_recovery_failures`, so a stuck outbox is visible
+  to the supervisor instead of only in the child's log. `stalled` means the
+  oldest pending event is held by an unexpired delivery lease, so nothing can
+  be delivered until it expires. Both clients parse the new fields strictly
+  and fail closed on a malformed reply. Once an event has reached the sink,
+  the write that marks it delivered waits the full 5 s default rather than
+  250 ms, so a short outside write no longer strands the lease (a 30 s stall,
+  then redelivery). The SQLite store now writes one `outbox_delivered` audit
+  per event, in the same transaction that marks it delivered, instead of one
+  per batch after the batch; a failure later in the run can no longer leave a
+  delivery unaudited. The audit id format is unchanged (a one-event batch
+  already produced the same id), and existing batch audits remain valid. The
+  PostgreSQL store, which the authority child does not open, still writes the
+  per-batch audit.
+- A commit that is already durable is no longer reported as failed when
+  publishing its outbox event fails. The decision and its pending outbox row
+  are written in one transaction, so the caller now always receives the true
+  decision; before, it received `internal_error` and a retry returned
+  `COMMITTED` for a commit that had already happened. Publication now runs
+  right after the reply is sent, so it can no longer delay the reply past the
+  client deadline. A lock wait during publication backs off like any other
+  recovery run. Any other publication failure still stops the authority
+  before it serves another request. `SwarmExecutor.commit`
+  likewise returns a `COMMITTED` decision when the follow-up node-state
+  refresh fails or shows the node revoked or superseded (with the same commit
+  id) in the meantime, and
+  resynchronizes its projection on the next read; it still raises when a
+  successful refresh reply is otherwise inconsistent with the commit.
+- Closing a scheduler executor handle now returns only after its close
+  callback has finished. Before, when `close()` interrupted an in-flight
+  call, the interrupted call's thread ran the callback and `close()` could
+  return first, so the supervisor could observe a closed executor whose
+  lifecycle had not yet been marked failed. The callback is now idempotent
+  and every closer runs it itself, and a failure while stopping the
+  scheduler process can no longer skip it.
 - The APCC store no longer bricks itself on a fresh-attempt `stage_result`
   whose expected version differs from the node version. It now raises
   `STAGED_RESULT_CONFLICT` and writes nothing.

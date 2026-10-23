@@ -155,8 +155,13 @@ def test_spawned_pathless_authority_is_authenticated_and_dies_closed(tmp_path) -
         assert libc.prctl(39, 0, 0, 0, 0) == 1
         assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
         assert handle.pid is not None and handle.pid != os.getpid()
-        assert handle.health() == {"authority_pid": handle.pid}
-        assert handle.admin_client.health() == {"authority_pid": handle.pid}
+        healthy = {
+            "authority_pid": handle.pid,
+            "outbox_recovery": "ok",
+            "outbox_recovery_failures": 0,
+        }
+        assert handle.health() == healthy
+        assert handle.admin_client.health() == healthy
     finally:
         handle.close()
     assert handle.controlled_boot.phase == "closed"

@@ -710,12 +710,24 @@ class SwarmExecutor:
                 decision.node_id,
                 *self._children.get(decision.node_id, ()),
             )
-            refreshed_states = self._authority_call(
-                "workflow_node_states", self._dag.dag_id, refreshed_ids
-            )
+            try:
+                refreshed_states = self._authority_call(
+                    "workflow_node_states", self._dag.dag_id, refreshed_ids
+                )
+            except GovernanceBypassDenied:
+                # The decision is durable; only the projection refresh failed.
+                # Indexes stay dirty, so the next read resynchronizes them.
+                return decision
             if len(refreshed_states) != len(refreshed_ids):
                 raise GovernanceBypassDenied("authority_status_batch_length_mismatch")
             authority_state = refreshed_states[0]
+            if (
+                authority_state.status in {"revoked", "superseded"}
+                and authority_state.commit_id == decision.commit_id
+            ):
+                # Revoked after this commit landed: the decision still stands.
+                # Indexes stay dirty, so the next read picks up the revocation.
+                return decision
             if authority_state.status != "governed_committed":
                 raise GovernanceBypassDenied("commit_projection_authority_mismatch")
             if node.status is not ExecutionStatus.GOVERNED_COMMITTED:

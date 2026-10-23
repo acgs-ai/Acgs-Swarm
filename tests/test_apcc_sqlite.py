@@ -1294,7 +1294,10 @@ def _only_outbox_delivery(before: AuthoritySnapshot, after: AuthoritySnapshot) -
     }
     assert changed == {"outbox", "audit_events"}
     assert len(after.tables["outbox"]) == len(before.tables["outbox"])
-    assert len(after.tables["audit_events"]) == len(before.tables["audit_events"]) + 1
+    # One outbox_delivered audit per delivered event, written with its row.
+    delivered = len(set(after.tables["outbox"]) - set(before.tables["outbox"]))
+    assert delivered >= 1
+    assert len(after.tables["audit_events"]) == len(before.tables["audit_events"]) + delivered
     assert before.current_pointers == after.current_pointers
 
 

@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import array
 import json
+import logging
 import math
 import multiprocessing
 import os
 import secrets
 import select
 import socket
+import sqlite3
 import struct
 import threading
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from enum import Enum
@@ -44,6 +46,7 @@ from constitutional_swarm.apcc.observation import (
 from constitutional_swarm.apcc.ports import (
     AuthorityObservationStore,
     OutboxRecoveryRequest,
+    OutboxRecoveryResult,
 )
 from constitutional_swarm.artifact import Artifact, ArtifactStore
 from constitutional_swarm.authority_isolation import (
@@ -71,6 +74,7 @@ from constitutional_swarm.authority_ipc import (
     signed_response,
     strict_loads,
     verify_response,
+    wait_for_frame,
 )
 from constitutional_swarm.governed_commit import (
     AttemptAuthorizationPayload,
@@ -86,6 +90,24 @@ from constitutional_swarm.governed_commit import (
     SignedAttemptAuthorization,
     VerdictDecision,
 )
+
+# Client response deadlines. An authority call must outlast one continuous
+# SQLite lock wait up to the store's busy_timeout (5 s), so a stall the store
+# survives does not poison the channel; repeated intermittent contention within
+# one request can still exceed it. A scheduler call chains up to two authority
+# calls and must outlast both, so an inner failure returns as a governance error.
+_AUTHORITY_RPC_TIMEOUT_S = 10.0
+_SCHEDULER_RPC_TIMEOUT_S = 30.0
+# Background outbox recovery runs on the authority's single serving loop. Its
+# lock waits are capped well below the store default so contention delays a
+# request by at most a fraction of a second; requests keep the 5 s default.
+_BACKGROUND_BUSY_TIMEOUT_MS = 250
+_OUTBOX_RECOVERY_INTERVAL_S = 1.0
+_OUTBOX_RECOVERY_MAX_BACKOFF_S = 30.0
+_OUTBOX_RECOVERY_ESCALATE_AFTER = 10
+_OUTBOX_RECOVERY_STATES = frozenset({"ok", "stalled", "backing_off", "escalated"})
+
+logger = logging.getLogger(__name__)
 
 _PREDECESSOR_FIELDS = {
     "node_id",
@@ -615,14 +637,216 @@ class AuthorityOutboxRecoveryError(RuntimeError):
     """Bounded authority-side outbox recovery failure."""
 
 
-def _recover_outbox(admin: Any) -> None:
+def _recover_outbox(admin: Any) -> OutboxRecoveryResult:
     try:
-        admin.commit_port._apcc_store.recover_outbox(OutboxRecoveryRequest("100"))
+        return admin.commit_port._apcc_store.recover_outbox(OutboxRecoveryRequest("100"))
     except Exception as exc:
         raise AuthorityOutboxRecoveryError("outbox_recovery_failed") from exc
 
 
-def _handle_execution_request(admin: Any, request: Any) -> Any:
+def _is_sqlite_busy(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and type(code) is int
+        and code & 0xFF == sqlite3.SQLITE_BUSY
+    )
+
+
+def _is_transient_contention(exc: BaseException) -> bool:
+    """Whether an outbox recovery failure is only a lock wait that timed out.
+
+    True only for SQLITE_BUSY (any extended code) with nothing else in the
+    chain: a sink or checkpoint failure that a later BUSY masked stays fatal.
+    SQLITE_LOCKED, I/O, corruption and errors without a SQLite code are fatal.
+    The authority child opens only SQLite, so no other backend is classified.
+    """
+    if not isinstance(exc, AuthorityOutboxRecoveryError):
+        return False
+    cause = exc.__cause__
+    if cause is None:
+        return False
+    pending: list[BaseException] = [cause]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if not _is_sqlite_busy(current):
+            return False
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return True
+
+
+def _background_recover_outbox(admin: Any) -> OutboxRecoveryResult:
+    from constitutional_swarm.apcc.sqlite_store import _scoped_busy_timeout
+
+    with _scoped_busy_timeout(_BACKGROUND_BUSY_TIMEOUT_MS):
+        return _recover_outbox(admin)
+
+
+class _OutboxRecoveryMonitor:
+    """Per-run outbox recovery cadence, contention backoff and health state.
+
+    A transient lock wait backs off (1 s doubling to 30 s) and never ends the
+    authority; ten in a row escalate to an operator-visible state. Any other
+    failure is re-raised so the caller fails closed exactly as before.
+    """
+
+    __slots__ = ("_clock", "_state", "_failures", "next_due")
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._state = "ok"
+        self._failures = 0
+        self.next_due = clock() + _OUTBOX_RECOVERY_INTERVAL_S
+
+    def request_run(self) -> None:
+        """Make the next run due now, ahead of any backoff."""
+        self.next_due = min(self.next_due, self._clock())
+
+    def due(self) -> bool:
+        return self._clock() >= self.next_due
+
+    def health_fields(self) -> dict[str, Any]:
+        return {
+            "outbox_recovery": self._state,
+            "outbox_recovery_failures": self._failures,
+        }
+
+    def run(self, admin: Any) -> None:
+        """Recover once under the background lock wait; re-raise if fatal."""
+        try:
+            result = _background_recover_outbox(admin)
+        except AuthorityOutboxRecoveryError as exc:
+            if not _is_transient_contention(exc):
+                raise
+            self.record_transient(exc)
+        else:
+            self.record_result(result)
+
+    def record_result(self, result: OutboxRecoveryResult) -> None:
+        """Record a run that raised nothing: ok, or stalled behind a live lease.
+
+        A run only stops with events pending and none delivered when the head
+        event is held by an unexpired lease, so nothing can move until it ends.
+        """
+        if result.delivered_count != "0" or result.pending_count == "0":
+            self.record_success()
+            return
+        if self._state != "stalled":
+            logger.warning(
+                "authority outbox recovery state=stalled previous=%s pending=%s",
+                self._state,
+                result.pending_count,
+                extra={
+                    "outbox_recovery": "stalled",
+                    "outbox_recovery_previous": self._state,
+                    "outbox_recovery_pending": result.pending_count,
+                },
+            )
+        # Lock-wait failures still count toward escalation across a stall.
+        self._state = "stalled"
+        self.next_due = self._clock() + _OUTBOX_RECOVERY_INTERVAL_S
+
+    def record_success(self) -> None:
+        if self._state != "ok":
+            logger.info(
+                "authority outbox recovery state=ok previous=%s consecutive_failures=0",
+                self._state,
+                extra={
+                    "outbox_recovery": "ok",
+                    "outbox_recovery_previous": self._state,
+                    "outbox_recovery_failures": 0,
+                },
+            )
+        self._state = "ok"
+        self._failures = 0
+        self.next_due = self._clock() + _OUTBOX_RECOVERY_INTERVAL_S
+
+    def record_transient(self, exc: BaseException) -> None:
+        self._failures += 1
+        delay = min(
+            _OUTBOX_RECOVERY_INTERVAL_S * 2 ** (self._failures - 1),
+            _OUTBOX_RECOVERY_MAX_BACKOFF_S,
+        )
+        self.next_due = self._clock() + delay
+        previous = self._state
+        self._state = (
+            "escalated"
+            if self._failures >= _OUTBOX_RECOVERY_ESCALATE_AFTER
+            else "backing_off"
+        )
+        if self._state == previous:
+            return
+        logger.log(
+            logging.ERROR if self._state == "escalated" else logging.WARNING,
+            "authority outbox recovery state=%s previous=%s consecutive_failures=%d "
+            "retry_in_s=%.0f cause=%s",
+            self._state,
+            previous,
+            self._failures,
+            delay,
+            type(exc.__cause__).__name__,
+            extra={
+                "outbox_recovery": self._state,
+                "outbox_recovery_previous": previous,
+                "outbox_recovery_failures": self._failures,
+                "outbox_recovery_retry_in_s": delay,
+            },
+        )
+
+
+def _publish_after_commit(admin: Any, recovery: _OutboxRecoveryMonitor | None) -> None:
+    """Publish outbox events once the commit transaction is durable.
+
+    The decision and its PENDING outbox row are already committed together,
+    so publication must not delay or replace the reply: the caller would
+    retry a commit that already happened. The serving loop runs recovery
+    right after the reply is sent, where a lock wait backs off and any other
+    failure stops the authority before it serves another request.
+    """
+    if recovery is None:
+        # No serving loop to run it after the reply: keep the old contract.
+        _recover_outbox(admin)
+        return
+    recovery.request_run()
+
+
+def _authority_health(recovery: _OutboxRecoveryMonitor | None) -> dict[str, Any]:
+    fields = (recovery or _OutboxRecoveryMonitor()).health_fields()
+    return {"authority_pid": os.getpid(), **fields}
+
+
+def _decode_authority_health(result: Any) -> dict[str, Any]:
+    """Strictly parse an authority health reply; malformed replies fail closed."""
+    body = _exact_object(
+        result,
+        {"authority_pid", "outbox_recovery", "outbox_recovery_failures"},
+        "health_response",
+    )
+    failures = body["outbox_recovery_failures"]
+    if (
+        type(body["authority_pid"]) is not int
+        or type(body["outbox_recovery"]) is not str
+        or body["outbox_recovery"] not in _OUTBOX_RECOVERY_STATES
+        or type(failures) is not int
+        or failures < 0
+    ):
+        raise GovernanceBypassDenied("authority_unavailable")
+    return {
+        "authority_pid": body["authority_pid"],
+        "outbox_recovery": body["outbox_recovery"],
+        "outbox_recovery_failures": failures,
+    }
+
+
+def _handle_execution_request(
+    admin: Any, request: Any, recovery: _OutboxRecoveryMonitor | None = None
+) -> Any:
     envelope = _exact_object(request, {"operation", "request"}, "request")
     operation = envelope["operation"]
     parameters = envelope["request"]
@@ -630,11 +854,11 @@ def _handle_execution_request(admin: Any, request: Any) -> Any:
         raise ValueError("invalid_request")
     if operation == "health":
         _exact_object(parameters, set(), "health_request")
-        return {"authority_pid": os.getpid()}
+        return _authority_health(recovery)
     if operation == "commit":
         body = _exact_object(parameters, {"commit_request"}, "commit_operation")
         decision = admin.commit(_decode_commit_request(body["commit_request"]))
-        _recover_outbox(admin)
+        _publish_after_commit(admin, recovery)
         return _encode_commit_decision(decision)
     if operation == "build_request":
         body = _exact_object(parameters, {"receipt"}, "build_request_operation")
@@ -817,7 +1041,9 @@ def _handle_execution_request(admin: Any, request: Any) -> Any:
     raise LookupError("unknown_operation")
 
 
-def _handle_admin_request(admin: Any, request: Any) -> Any:
+def _handle_admin_request(
+    admin: Any, request: Any, recovery: _OutboxRecoveryMonitor | None = None
+) -> Any:
     """Dispatch the exclusive supervisor channel without execution escalation."""
     envelope = _exact_object(request, {"operation", "request"}, "admin_request")
     operation = envelope["operation"]
@@ -826,7 +1052,7 @@ def _handle_admin_request(admin: Any, request: Any) -> Any:
         raise ValueError("invalid_admin_request")
     if operation == "health":
         _exact_object(parameters, set(), "health_request")
-        return {"authority_pid": os.getpid()}
+        return _authority_health(recovery)
     if operation == "create_workflow":
         fields = {
             "workflow_id",
@@ -921,7 +1147,7 @@ class _JSONClient:
             self._sequence += 1
             try:
                 # Spawn reduction preserves O_NONBLOCK but not the timeout.
-                connection.settimeout(2.0)
+                connection.settimeout(_AUTHORITY_RPC_TIMEOUT_S)
                 send_authenticated_frame(connection, envelope, self._max_frame_bytes)
                 response = recv_authenticated_frame(connection, self._max_frame_bytes)
                 result, error = verify_response(
@@ -952,8 +1178,11 @@ class _JSONClient:
         return result
 
     def close(self) -> None:
-        with self._rpc_lock:
+        _acquire_interrupting(self._rpc_lock, lambda: self._channel_socket)
+        try:
             self._poison()
+        finally:
+            self._rpc_lock.release()
 
     def _detach_socket(self) -> socket.socket:
         """Transfer the authenticated endpoint exactly once to a spawn child."""
@@ -992,7 +1221,7 @@ def _bind_verified_child_channel(
 ) -> _ClientT:
     """Bind a channel only after ``start_authority`` verifies readiness."""
     instance = client_type(max_frame_bytes)
-    connection.settimeout(2.0)
+    connection.settimeout(_AUTHORITY_RPC_TIMEOUT_S)
     instance._channel_socket = connection
     instance._channel_role = channel_role
     instance._session = session
@@ -1005,12 +1234,8 @@ def _bind_verified_child_channel(
 class _AuthorityExecutionChannel(_JSONClient):
     """Child-only authenticated authority channel; never a scheduler API."""
 
-    def health(self) -> dict[str, int]:
-        result = self._rpc("health", {})
-        body = _exact_object(result, {"authority_pid"}, "health_response")
-        if type(body["authority_pid"]) is not int:
-            raise GovernanceBypassDenied("authority_unavailable")
-        return {"authority_pid": body["authority_pid"]}
+    def health(self) -> dict[str, Any]:
+        return _decode_authority_health(self._rpc("health", {}))
 
     def commit(self, request: CommitRequest) -> CommitDecision:
         return _trusted_decode(
@@ -1439,6 +1664,7 @@ def _observer_child_main(
         sequence = 0
         while True:
             try:
+                wait_for_frame(connection)
                 request_envelope = recv_authenticated_frame(connection, max_frame_bytes)
             except (ConnectionError, OSError, TimeoutError, ValueError):
                 return
@@ -1532,6 +1758,26 @@ def _safe_close(resource: Any) -> None:
         resource.close()
     except (AttributeError, OSError):
         pass
+
+
+def _acquire_interrupting(
+    lock: Any, connection: Callable[[], socket.socket | None]
+) -> None:
+    """Take an RPC lock, first waking any in-flight RPC blocked on the connection.
+
+    The RPC holds the lock across its whole send and receive, so close() would
+    otherwise wait out the full response deadline against a hung peer. Shutdown
+    makes that receive fail at once and the RPC fails closed on its own path.
+    The connection is read only once the lock is known to be held by an RPC.
+    """
+    if lock.acquire(blocking=False):
+        return
+    if (endpoint := connection()) is not None:
+        try:
+            endpoint.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    lock.acquire()
 
 
 def _controlled_boot_result(
@@ -1928,12 +2174,8 @@ class AuthorityAdminClient:
     def __init__(self, client: _JSONClient) -> None:
         self._client = client
 
-    def health(self) -> dict[str, int]:
-        result = self._client._rpc("health", {})
-        body = _exact_object(result, {"authority_pid"}, "health_response")
-        if type(body["authority_pid"]) is not int:
-            raise GovernanceBypassDenied("authority_unavailable")
-        return {"authority_pid": body["authority_pid"]}
+    def health(self) -> dict[str, Any]:
+        return _decode_authority_health(self._client._rpc("health", {}))
 
     def create_workflow(
         self,
@@ -2485,6 +2727,7 @@ def _dormant_scheduler_child(
     sequence = 0
     try:
         while True:
+            wait_for_frame(scheduler_socket)
             envelope = recv_authenticated_frame(scheduler_socket, max_frame_bytes)
             request = _exact_object(
                 envelope, {"sequence", "operation", "request"}, "scheduler_envelope"
@@ -2762,7 +3005,14 @@ def _start_dormant_scheduler(max_frame_bytes: int) -> _DormantScheduler:
 
 
 class _SwarmExecutionHandle:
-    """Supervisor-facing typed scheduler RPC; no authority endpoint is exposed."""
+    """Supervisor-facing typed scheduler RPC; no authority endpoint is exposed.
+
+    ``on_close`` must be idempotent. It runs outside the handle lock on the
+    thread whose failed RPC closed the handle, and on every thread that calls
+    ``close()``, so ``close()`` returns only after an invocation has completed
+    on its own thread, even when an interrupted RPC is still running its copy.
+    An exception from aborting the scheduler process never skips it.
+    """
 
     __slots__ = (
         "_socket",
@@ -2782,7 +3032,7 @@ class _SwarmExecutionHandle:
         on_close: Any | None = None,
     ) -> None:
         self._socket = connection
-        self._socket.settimeout(2.0)
+        self._socket.settimeout(_SCHEDULER_RPC_TIMEOUT_S)
         self._process = process
         self._max_frame_bytes = max_frame_bytes
         self._sequence = 0
@@ -2801,38 +3051,44 @@ class _SwarmExecutionHandle:
         failure: BaseException | None = None
         callback: Any | None = None
         body: dict[str, Any] | None = None
-        with self._lock:
-            if self._closed:
-                raise GovernanceBypassDenied("authority_unavailable")
-            self._sequence += 1
-            try:
-                send_authenticated_frame(
-                    self._socket,
-                    {
-                        "sequence": self._sequence,
-                        "operation": operation,
-                        "request": dict(request),
-                    },
-                    self._max_frame_bytes,
-                )
-                response = recv_authenticated_frame(self._socket, self._max_frame_bytes)
-                body = _exact_object(
-                    response, {"sequence", "result", "error"}, "scheduler_response"
-                )
-                if body["sequence"] != self._sequence:
-                    raise ValueError("invalid_scheduler_sequence")
-            except (
-                ConnectionError,
-                OSError,
-                TimeoutError,
-                ValueError,
-                TypeError,
-            ) as exc:
-                callback = self._close_locked()
-                failure = exc
-        if failure is not None:
+        try:
+            with self._lock:
+                if self._closed:
+                    raise GovernanceBypassDenied("authority_unavailable")
+                self._sequence += 1
+                try:
+                    send_authenticated_frame(
+                        self._socket,
+                        {
+                            "sequence": self._sequence,
+                            "operation": operation,
+                            "request": dict(request),
+                        },
+                        self._max_frame_bytes,
+                    )
+                    response = recv_authenticated_frame(
+                        self._socket, self._max_frame_bytes
+                    )
+                    body = _exact_object(
+                        response, {"sequence", "result", "error"}, "scheduler_response"
+                    )
+                    if body["sequence"] != self._sequence:
+                        raise ValueError("invalid_scheduler_sequence")
+                except (
+                    ConnectionError,
+                    OSError,
+                    TimeoutError,
+                    ValueError,
+                    TypeError,
+                ) as exc:
+                    failure = exc
+                    callback = self._on_close
+                    self._close_locked()
+        finally:
+            # Outside the lock, and even if aborting the process raised.
             if callback is not None:
                 callback()
+        if failure is not None:
             raise GovernanceBypassDenied("authority_unavailable") from failure
         if body is None:
             raise GovernanceBypassDenied("authority_unavailable")
@@ -2849,13 +3105,14 @@ class _SwarmExecutionHandle:
             raise RuntimeError(detail["message"])
         return body["result"]
 
-    def _close_locked(self) -> Any | None:
+    def _close_locked(self) -> None:
         if self._closed:
-            return None
+            return
         self._closed = True
-        self._socket.close()
-        _abort_process(self._process)
-        return self._on_close
+        try:
+            self._socket.close()
+        finally:
+            _abort_process(self._process)
 
     def health(self) -> dict[str, int]:
         body = _exact_object(
@@ -2960,11 +3217,19 @@ class _SwarmExecutionHandle:
         return dict(result)
 
     def close(self) -> None:
-        callback: Any | None
-        with self._lock:
-            callback = self._close_locked()
-        if callback is not None:
-            callback()
+        callback = self._on_close
+        try:
+            _acquire_interrupting(self._lock, lambda: self._socket)
+            try:
+                self._close_locked()
+            finally:
+                self._lock.release()
+        finally:
+            # Every closer runs the idempotent callback itself instead of
+            # waiting on an interrupted RPC thread, which may need a lock the
+            # caller holds.
+            if callback is not None:
+                callback()
 
     def __enter__(self) -> _SwarmExecutionHandle:
         return self
@@ -3045,7 +3310,7 @@ class AuthorityServiceHandle:
         except ValueError:
             return False
 
-    def health(self) -> dict[str, int]:
+    def health(self) -> dict[str, Any]:
         with self._lifecycle_lock:
             self._refresh_liveness_locked()
             if self._closed:
