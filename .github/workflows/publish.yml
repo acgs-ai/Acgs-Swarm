@@ -12,17 +12,25 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
+        with:
+          # HistoricalGCBAdapter pins GCB-1 at 6e65db3 and git-archives it.
+          # The default depth-1 checkout cannot rev-parse that ancestor.
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,transport]"
       - name: Test
         env:
           OPENAI_API_KEY: test-key-for-unit-tests
           ANTHROPIC_API_KEY: test-key-for-unit-tests
         run: |
+          # Mirrors the 3.11 leg of the ci.yml `test` pytest step. Live PostgreSQL + psycopg are covered by the
+          # ci.yml test-postgres job; this job does not install that extra.
           python -m pytest tests/ \
+            --ignore=tests/test_apcc_postgres.py \
             --import-mode=importlib \
             -m "not slow and not benchmark and not e2e and not research and not bittensor" \
             -v --tb=short
@@ -40,8 +48,14 @@ jobs:
         run: python -m build --wheel --sdist
       - name: Validate
         run: twine check dist/*
-      - name: Smoke test wheel install
-        run: pip install dist/*.whl && python -c "import constitutional_swarm; print('import OK')"
+      - name: Isolated wheel gate
+        # Same checks as `make verify-wheel`, run against the wheel that is
+        # uploaded and published (not a rebuild).
+        run: |
+          set -- dist/*.whl
+          test "$#" -eq 1
+          test -f "$1"
+          python scripts/verify_isolated_wheel.py --wheel "$1" --python "$(command -v python)"
       - name: Upload validated distributions
         uses: actions/upload-artifact@v7
         with:
