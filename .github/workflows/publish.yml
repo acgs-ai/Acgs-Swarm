@@ -8,32 +8,14 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # HistoricalGCBAdapter pins GCB-1 at 6e65db3 and git-archives it.
-          # The default depth-1 checkout cannot rev-parse that ancestor.
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Install
-        run: pip install -e ".[dev,transport]"
-      - name: Test
-        env:
-          OPENAI_API_KEY: test-key-for-unit-tests
-          ANTHROPIC_API_KEY: test-key-for-unit-tests
-        run: |
-          # Mirrors the 3.11 leg of the ci.yml `test` pytest step. Live PostgreSQL + psycopg are covered by the
-          # ci.yml test-postgres job; this job does not install that extra.
-          python -m pytest tests/ \
-            --ignore=tests/test_apcc_postgres.py \
-            --import-mode=importlib \
-            -m "not slow and not benchmark and not e2e and not research and not bittensor" \
-            -v --tb=short
+  # Every ci.yml job (pytest legs, typecheck, live PostgreSQL 17, research,
+  # extras) on the exact release commit. ci.yml on push/PR to main never runs
+  # on a commit tagged from a release branch. agent-check, tla-check, security
+  # and verify-cites are not called here.
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
 
   package:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -64,7 +46,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [test, package]
+    needs: [ci, package]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: pypi
     permissions:
