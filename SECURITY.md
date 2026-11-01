@@ -16,7 +16,7 @@ For suspected vulnerabilities, please use GitHub private vulnerability reporting
 
 - <https://github.com/dislovelhl/Acgs-Swarm/security/advisories/new>
 
-If you cannot access that flow, contact the maintainers at `hello@acgs.dev` with:
+If you cannot access that flow, contact the maintainers at `hello@acgs.ai` with:
 
 - a description of the issue and affected component
 - reproduction steps or a proof of concept
