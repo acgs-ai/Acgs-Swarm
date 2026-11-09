@@ -73,11 +73,11 @@ _DIACRITIC_EVASIONS = {
 
 
 @pytest.mark.parametrize("name", sorted(_DIACRITIC_EVASIONS))
-def test_c51b_diacritic_decorated_keywords_are_caught(name):
+def test_c51b_diacritic_decorated_keywords_are_caught(name, assert_swarm_normalization_catches):
     caught, details = _caught(_DIACRITIC_EVASIONS[name])
 
     assert caught is True, details
-    assert details["normalization_added_catch"] is True
+    assert_swarm_normalization_catches(_DIACRITIC_EVASIONS[name], details)
 
 
 def test_c51b_governed_agent_rejects_diacritic_evasion():

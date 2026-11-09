@@ -489,7 +489,9 @@ _C40_BENIGN_CODE = [
 
 
 @pytest.mark.parametrize("name", sorted(_C40_UNICODE_EVASIONS))
-def test_c40_evaluate_payload_catches_unicode_and_separator_evasions(name):
+def test_c40_evaluate_payload_catches_unicode_and_separator_evasions(
+    name, assert_swarm_normalization_catches
+):
     from constitutional_swarm.eval.monotonic_mas.detectors import role
 
     caught, details = role.evaluate_payload(
@@ -497,7 +499,7 @@ def test_c40_evaluate_payload_catches_unicode_and_separator_evasions(name):
     )
 
     assert caught is True, details
-    assert details["normalization_added_catch"] is True
+    assert_swarm_normalization_catches(_C40_UNICODE_EVASIONS[name], details)
 
 
 @pytest.mark.parametrize("name", sorted(_C40_UNICODE_EVASIONS))
