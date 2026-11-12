@@ -388,10 +388,13 @@ def test_private_fd_rejects_wrong_owner_from_fstat_snapshot(
         st_uid=os.geteuid() + 1,
         st_nlink=info.st_nlink,
     )
-    monkeypatch.setattr(secure_files.os, "fstat", lambda candidate: spoofed)
     try:
-        with pytest.raises(PermissionError, match="owner"):
-            secure_files.require_private_fd(fd)
+        # Scope the patch: secure_files.os is the global os module, and pytest's own
+        # capture teardown calls os.fstat(...).st_size after the test body returns.
+        with monkeypatch.context() as patch:
+            patch.setattr(secure_files.os, "fstat", lambda candidate: spoofed)
+            with pytest.raises(PermissionError, match="owner"):
+                secure_files.require_private_fd(fd)
         assert real_fstat(fd).st_ino == info.st_ino
     finally:
         os.close(fd)
