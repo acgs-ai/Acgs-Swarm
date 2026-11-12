@@ -369,12 +369,15 @@ def test_secure_file_policy_rejections_share_exception_type(
                 "st_nlink": metadata.st_nlink,
                 **changes,
             }
-            monkeypatch.setattr(
-                secure_files.os,
-                "fstat",
-                lambda candidate, values=values: type("Stat", (), values)(),
-            )
-            with pytest.raises(secure_files.PrivateFileError):
-                secure_files.require_private_fd(fd)
+            # Scoped: secure_files.os is the global os module, and pytest's capture
+            # teardown calls os.fstat(...).st_size after the test body returns.
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    secure_files.os,
+                    "fstat",
+                    lambda candidate, values=values: type("Stat", (), values)(),
+                )
+                with pytest.raises(secure_files.PrivateFileError):
+                    secure_files.require_private_fd(fd)
     finally:
         os.close(fd)
