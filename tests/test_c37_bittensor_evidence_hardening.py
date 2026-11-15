@@ -14,7 +14,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from acgs_lite import CaseState
+from acgs_lite.constitution.claim_lifecycle import CaseState
 
 from constitutional_swarm.bittensor import precedent_store as precedent_store_module
 from constitutional_swarm.bittensor.governance_coordinator import (

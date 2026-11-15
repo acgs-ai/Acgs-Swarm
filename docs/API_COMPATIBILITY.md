@@ -65,6 +65,26 @@ paths outside reconcile may still label
 Default receipt signing keys are process-local. Restart verification
 requires the same `receipt_signing_private_key`.
 
+## acgs-lite compatibility
+
+Declared range: `acgs-lite>=2.8.1,<5`. Results below are from running the
+repo gates (ruff, mypy, `scripts/agent_check.py`,
+`scripts/check_typecheck_coverage.py`, CLI smoke, default pytest selection)
+with only acgs-lite varied; every other dependency was held at its `uv.lock`
+version, Python 3.13.
+
+| acgs-lite | Result |
+|-----------|--------|
+| 2.8.1 (declared floor) | All gates pass: 5978 passed, 195 skipped. |
+| 2.9.0 (locked) | All gates pass: 5978 passed, 195 skipped. |
+| 4.0.0 | All gates pass: 5978 passed, 195 skipped. No source changes needed. |
+
+Untested versions (2.10.x-2.12.0, 3.x, 4.0.1+) fall inside the declared range
+but have no recorded results. The 2.8.1 run depends on
+`tests/test_c37_bittensor_evidence_hardening.py` importing `CaseState` from
+`acgs_lite.constitution.claim_lifecycle`; 2.8.1 does not export it at the top
+level.
+
 ## Non-goals
 
 - Do not reintroduce eager optional dependencies to preserve import-star.
