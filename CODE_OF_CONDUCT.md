@@ -24,6 +24,6 @@ Maintainers may remove, edit, or reject contributions/comments that violate this
 For severe or repeated incidents, maintainers may temporarily or permanently restrict participation.
 
 ## Reporting
-Report conduct concerns to `hello@acgs.dev` with relevant context (links, timestamps, screenshots).
+Report conduct concerns to `hello@acgs.ai` with relevant context (links, timestamps, screenshots).
 
 Security vulnerabilities should be reported via [`SECURITY.md`](SECURITY.md), not through conduct channels.
