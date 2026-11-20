@@ -77,9 +77,10 @@ version, Python 3.13.
 |-----------|--------|
 | 2.8.1 (declared floor) | All gates pass: 5978 passed, 195 skipped. |
 | 2.9.0 (locked) | All gates pass: 5978 passed, 195 skipped. |
+| 3.0.1 (2026-11-15 run) | All gates pass: 5978 passed, 195 skipped. |
 | 4.0.0 | All gates pass: 5978 passed, 195 skipped. No source changes needed. |
 
-Untested versions (2.10.x-2.12.0, 3.x, 4.0.1+) fall inside the declared range
+Untested versions (2.10.x-2.12.0, 3.0.0, 4.0.1+) fall inside the declared range
 but have no recorded results. The 2.8.1 run depends on
 `tests/test_c37_bittensor_evidence_hardening.py` importing `CaseState` from
 `acgs_lite.constitution.claim_lifecycle`; 2.8.1 does not export it at the top

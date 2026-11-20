@@ -85,15 +85,27 @@ assert validation.valid
 
 # 2) Peer-validated settlement
 constitution = Constitution.default()
+# quorum is the accept threshold (2 of 3 peers). quorum_met also needs every
+# assigned peer to have voted, so the loop below votes with all of them.
 required_votes = 2
-mesh = ConstitutionalMesh(constitution, peers_per_validation=3, quorum=required_votes)
+# This demo holds every signing key in one process, so it must opt in to the
+# single-operator dev evidence mode. Evidence produced in this mode is labelled
+# "single_operator_dev" and is rejected by the default verifiers. Production
+# meshes keep the default ("independent") and register remote voters with
+# register_remote_agent.
+mesh = ConstitutionalMesh(
+    constitution,
+    peers_per_validation=3,
+    quorum=required_votes,
+    evidence_mode="single_operator_dev",
+)
 mesh.register_local_signer("producer", domain="writing")
 mesh.register_local_signer("peer-1", domain="writing")
 mesh.register_local_signer("peer-2", domain="writing")
 mesh.register_local_signer("peer-3", domain="writing")
 
 assignment = mesh.request_validation("producer", "safe draft content", "artifact-1")
-for voter_id in assignment.peers[:required_votes]:
+for voter_id in assignment.peers:
     mesh.submit_vote(
         assignment.assignment_id,
         voter_id,
