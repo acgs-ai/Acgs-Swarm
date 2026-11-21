@@ -10,6 +10,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 # Each past security-audit-report.md finding is encoded as a test in
 # tests/security/test_finding_*.py. The pytest exit code is the structural
 # regression gate — a finding that silently regresses will turn its test red.

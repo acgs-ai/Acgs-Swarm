@@ -15,6 +15,9 @@ on:
     # Weekly drift check — arXiv occasionally withdraws papers
     - cron: '0 7 * * 1'
 
+permissions:
+  contents: read
+
 concurrency:
   group: cite-verify-${{ github.ref }}
   cancel-in-progress: true
