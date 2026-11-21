@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,transport]"
       - name: Test
         env:
           OPENAI_API_KEY: test-key-for-unit-tests
