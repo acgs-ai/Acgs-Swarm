@@ -386,6 +386,21 @@ or data changes.
   - Ruff is pinned to 0.16.10.
   - Publishing grants OIDC only to the publish job.
 
+- **acgs-lite 4.x support.** The runtime dependency is now `acgs-lite>=2.8.1,<5`
+  (previously uncapped). `make verify` passes on the locked acgs-lite 2.9.0. The
+  same gate commands (ruff, mypy, agent-check, typecheck-coverage, CLI smoke,
+  tests), run directly in venvs built from the lock pins with only acgs-lite
+  changed, also pass on 2.8.1 and 4.0.0. No source changes were needed. One test
+  import changed:
+  `tests/test_c37_bittensor_evidence_hardening.py` now imports `CaseState` from
+  `acgs_lite.constitution.claim_lifecycle`, because 2.8.1 does not export it at
+  the top level. See `docs/API_COMPATIBILITY.md`.
+- `docs/quickstart.md` now runs as written: it opts in to
+  `evidence_mode="single_operator_dev"` (one process holds every signing key)
+  and votes with every assigned peer. Evidence from that mode is labelled
+  `single_operator_dev` and is rejected by the default vote-envelope verifier.
+  `tests/test_quickstart_smoke.py` executes the quickstart offline.
+
 ### Fixed
 - A database lock held for 2–5 s by another process no longer kills the
   authority. Authority calls now wait 10 s for a reply (above the store's 5 s

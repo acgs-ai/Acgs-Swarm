@@ -14,7 +14,7 @@ authors = [{name = "ACGS Team", email = "hello@acgs.ai"}]
 # symbols (CaseManager, SpotCheckAuditor, TrustScoreManager, ValidatorSelector,
 # and related). Shipped in acgs-lite v2.8.1 via PRs #9 and #10.
 dependencies = [
-  "acgs-lite>=2.8.1",
+  "acgs-lite>=2.8.1,<5",
   "cryptography>=44.0.2",
   "pydantic>=2,<3",
   "pyyaml>=6.0",

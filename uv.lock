@@ -771,7 +771,7 @@ vertex = [
 
 [package.metadata]
 requires-dist = [
-    { name = "acgs-lite", specifier = ">=2.8.1" },
+    { name = "acgs-lite", specifier = ">=2.8.1,<5" },
     { name = "anthropic", extras = ["vertex"], marker = "extra == 'vertex'", specifier = ">=0.84" },
     { name = "bittensor", marker = "extra == 'bittensor'", specifier = ">=7.0,<11" },
     { name = "braintrust", marker = "extra == 'braintrust'", specifier = "==0.37.0" },
