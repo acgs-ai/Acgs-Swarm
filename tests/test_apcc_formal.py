@@ -355,9 +355,11 @@ def test_every_apcc_cfg_on_disk_and_in_ci_workflow_matches_runner() -> None:
     assert isinstance(workflow, dict)
     on_triggers = workflow[True] if True in workflow else workflow["on"]
     for event_name in ("push", "pull_request"):
-        paths = set(on_triggers[event_name]["paths"])
-        assert "scripts/run_apcc_tlc.py" in paths
-        assert "tests/test_apcc_formal.py" in paths
+        event_cfg = on_triggers[event_name]
+        if isinstance(event_cfg, dict) and "paths" in event_cfg:
+            paths = set(event_cfg["paths"])
+            assert "scripts/run_apcc_tlc.py" in paths
+            assert "tests/test_apcc_formal.py" in paths
 
     apcc_job = workflow["jobs"]["apcc-tlc"]
     shards = apcc_job["strategy"]["matrix"]["shard"]

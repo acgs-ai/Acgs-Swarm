@@ -1,28 +1,14 @@
 name: TLA+ model check
 
 on:
+  # Always run on push/PR to main (instead of filtering only on specs/**,
+  # scripts/run_apcc_tlc.py, scripts/run_tlc_expected_witness.py, scripts/_tlc_common.py,
+  # tests/test_apcc_formal.py, tests/test_tlc_expected_witness.py, Makefile, and
+  # .github/workflows/tla-check.yml) so Required Status Checks on main never stall.
   push:
     branches: [main]
-    paths:
-      - 'specs/**'
-      - 'scripts/run_apcc_tlc.py'
-      - 'scripts/run_tlc_expected_witness.py'
-      - 'scripts/_tlc_common.py'
-      - 'tests/test_apcc_formal.py'
-      - 'tests/test_tlc_expected_witness.py'
-      - 'Makefile'
-      - '.github/workflows/tla-check.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'specs/**'
-      - 'scripts/run_apcc_tlc.py'
-      - 'scripts/run_tlc_expected_witness.py'
-      - 'scripts/_tlc_common.py'
-      - 'tests/test_apcc_formal.py'
-      - 'tests/test_tlc_expected_witness.py'
-      - 'Makefile'
-      - '.github/workflows/tla-check.yml'
   workflow_dispatch:
 
 permissions:
