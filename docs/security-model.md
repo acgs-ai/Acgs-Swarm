@@ -18,8 +18,10 @@ It does not claim complete end-to-end security for external systems that integra
 `AgentDNA.validate(...)` enforces local constitutional checks before downstream acceptance.
 
 ### 2) Peer validation boundary
-`ConstitutionalMesh.submit_vote(...)` requires signed votes.
-Quorum-based settlement governs acceptance/rejection finality.
+- **Strict-majority vs weighted-BFT vs stake vs APCC:**
+  - `ConstitutionalMesh` (`mesh/core.py`) enforces equal-weight assigned-peer **strict majority** (`> 1/2`) over a complete signed electorate (persistent `SettlementStore` requires `quorum >= 3`; non-persistent defaults to `2/3`). This differs from weighted 2/3 approval + fault-domain limits in `quorum_certificate.py`, the integer-stake `2F + 1` model in `specs/mesh.tla`, and logical-node exclusivity in `apcc/`.
+  - `ConstitutionalMesh.request_validation(...)` grants assignment-level uniqueness only (repeated submissions for the same logical task create distinct assignments), and there is no assignment expiry, automatic peer reassignment on RPC timeout, or late-vote protocol.
+  - `ConstitutionalMesh.submit_vote(...)` requires signed Ed25519 vote envelopes; `MeshResult.accepted` on an unsettled preview (`quorum_met=False`, `settled=False`) is **never authoritative**. Authoritative consumers must require `settled=True` and `quorum_met=True` alongside complete signed evidence.
 
 ### 3) Transport boundary (optional)
 Remote vote transport introduces network trust boundaries:

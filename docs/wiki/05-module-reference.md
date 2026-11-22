@@ -71,7 +71,7 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   `.find_by_domain`, `.find_best`, `.summary`).
 
 ### `mesh/` — Constitutional Mesh (Pattern C)
-- **Purpose:** Byzantine-tolerant peer validation with cryptographic proof.
+- **Purpose:** Equal-weight strict-majority peer validation with cryptographic proof (distinct from 2/3 weighted `quorum_certificate.py`, integer-stake `2F + 1` in `specs/mesh.tla`, and logical-node exclusivity in `apcc/`).
 - **Surface (`mesh/core.py`):** `ConstitutionalMesh` —
   `register_local_signer` / `register_remote_agent` / `sign_vote`,
   `sign_vote_envelope` / `submit_vote_envelope`,
@@ -155,11 +155,12 @@ The per-module map of *what the code does and how*. Organized by maturity tier
   authentication identifies the authorized selector but does not establish
   unbiased selection or independent host custody.
 - **⚠** Configured quorum must be a strict majority of
-  `peers_per_validation`; tie-capable configurations reject at construction.
-  Settlement requires the configured quorum and a strict majority of the
-  actual assigned peers, including peers added by risk expansion. Signed
-  envelopes are mandatory for proof-grade settlement — missing/bad signatures
-  or bindings fail closed.
+  `peers_per_validation` (NOT 1/3 BFT); tie-capable configurations reject at construction.
+  Persistent `SettlementStore` meshes additionally enforce `quorum >= 3` (non-persistent defaults to `2/3`).
+  Settlement requires the configured quorum, a strict majority of the
+  actual assigned peers (including risk expansion), and complete signed envelopes from all assigned peers.
+  Uniqueness in `ConstitutionalMesh` is **assignment-level** (duplicate submissions of the same logical task allocate distinct `assignment_id`s; logical-node exclusivity belongs to `apcc/`). There is no assignment expiry, automatic peer reassignment on RPC timeout, or late-vote protocol: a timed-out remote peer leaves the assignment unsettled without shrinking its roster.
+  `get_result()` returns an unsettled preview (`settled=False, quorum_met=False, proof=None`) while votes remain pending; `preview.accepted` can already be `True` once cast approvals reach `quorum`, which is **non-authoritative** — downstream consumers must require `settled=True` and `quorum_met=True`. Signed envelopes are mandatory for proof-grade settlement — missing/bad signatures or bindings fail closed.
   Settled = frozen (`AssignmentSettledError`); durable replay blocked
   (`RecoveredAssignmentError`); halted mesh blocks all ops (`MeshHaltedError`);
   persistence failure after freeze → `SettlementPersistenceError`. Recovered

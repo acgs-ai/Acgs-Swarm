@@ -206,6 +206,18 @@ Choose another tool first when you need:
 - Remote vote transport security mode should be configured explicitly for non-loopback use.
 - Treat optional research modules as experimental surfaces, not hardened defaults.
 
+### Guarantee layers and mesh consumer contract
+Four distinct guarantee mechanisms exist in this repository and should not be conflated:
+
+| Layer | Threshold / semantic rule | Uniqueness & scope | Notes |
+|---|---|---|---|
+| `ConstitutionalMesh` (`mesh/core.py`) | Equal-weight assigned-peer **strict majority** (`> 1/2`); persistent stores require `quorum >= 3`; non-persistent defaults to `2/3` | Assignment-level (`assignment_id` per request) | Requires full assigned roster's signed envelopes; no expiry/reassignment/late-vote protocol |
+| `quorum_certificate.py` | 2/3 weighted approval + optional fault-domain share caps | `(assignment_id, epoch)` conflict detection | Slashable equivocation evidence |
+| `specs/mesh.tla` (`MeshMC.cfg`) | Integer-stake `2F + 1` quorum intersection | Formal stake-intersection model | Does not mirror equal-weight runtime `ConstitutionalMesh` rules |
+| `apcc/` authority stores | Atomic commit + outbox + revocation/supersession | **Logical-node exclusivity** (`(workflow_id, node_id)`) | Enforces monotonic version & single-winner commit semantics |
+
+**Authoritative consumption rule:** `MeshResult.accepted` on an unsettled preview (`quorum_met=False`, `settled=False` from `get_result()` while votes remain pending) is **not authoritative**. Downstream consumers must require both `settled=True` and `quorum_met=True` (via `settle()`, verified `MeshProof`, and verified signed envelopes).
+
 ## Documentation map
 > **Maintainers & AI agents:** start at the consolidated wiki —
 > [`docs/wiki/`](docs/wiki/README.md). It ties these docs together with
