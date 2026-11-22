@@ -130,16 +130,20 @@ class GovernanceManifold:
     bounded influence, compositional closure, and trust conservation.
 
     .. warning::
-        **Research use only.**  The Birkhoff constraint causes Birkhoff Uniformity
-        Collapse: repeated composition drives the trust matrix toward the uniform
-        matrix J = (1/N)·11ᵀ (Perron-Frobenius theorem), destroying agent
-        specialization.  See ``test_manifold_degeneration.py`` for the empirical proof
-        and ``§3.1`` of the MCFS whitepaper for the theoretical derivation.
+        **Research use only.**  Repeated re-projected composition
+        ``B[k + 1] = Sinkhorn(B[k] @ B[0])`` causes Birkhoff Uniformity
+        Collapse: iterated Sinkhorn normalization (with ``exp``-clamping)
+        drives the iterates toward the uniform matrix J = (1/N)·11ᵀ
+        (Perron-Frobenius eigenvector), destroying agent specialization in
+        O(10) cycles. See ``test_manifold_degeneration.py`` for the empirical
+        baseline control and ``§3.1`` of the MCFS whitepaper.
 
         **For production swarms use**
         :class:`constitutional_swarm.spectral_sphere.SpectralSphereManifold`
-        instead.  It replaces the Birkhoff constraint with a spectral-sphere projection
-        that preserves variance in the source-backed regression tests.
+        instead.  It replaces the Birkhoff constraint with a certified
+        spectral-sphere projection that preserves variance across tested
+        empirical non-negative trust workloads (full rank is not universally
+        guaranteed for arbitrary signed inputs).
 
     Properties of M^gov:
       1. Bounded influence: ||P_M(H)||_2 ≤ 1
