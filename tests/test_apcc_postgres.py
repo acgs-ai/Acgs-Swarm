@@ -2009,7 +2009,7 @@ def test_postgres_provisions_the_native_schema_manifest(
             f'FROM "{schema}"."semantic_checkpoint" WHERE singleton=1'
         ).fetchone()
     assert fingerprint is not None and len(str(fingerprint[0])) == 43
-    assert schema_version == ("3",)
+    assert schema_version == ("4",)
     assert {
         "idx_apcc_outbox_pending",
         "idx_apcc_outbox_head",
@@ -2142,7 +2142,7 @@ def test_postgres_gcb_profile_provisions_exact_attached_catalog(
         }
     assert required <= tables
     assert len(tables) == 31
-    assert profile == ("gcb-attached-v1", "3", config.authority_store_id, 1)
+    assert profile == ("gcb-attached-v1", "4", config.authority_store_id, 1)
     assert material_types
     assert all(row[2] == "text" for row in material_types)
     assert "idx_gcb_outbox_pending" in indexes

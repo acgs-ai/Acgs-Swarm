@@ -248,13 +248,13 @@ def test_observation_request_v1_rejects_legacy_digest_field_and_non_cj1_ids() ->
         )
 
 
-def test_sqlite_schema_v3_binds_exact_conflicts_and_immutable_commit_outputs(
+def test_sqlite_schema_v4_binds_exact_conflicts_and_immutable_commit_outputs(
     tmp_path,
 ) -> None:
-    path = tmp_path / "observation-v3.db"
+    path = tmp_path / "observation-v4.db"
     _open_store(path, None)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         conflict_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(commit_conflicts)")
         }

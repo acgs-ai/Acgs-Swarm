@@ -993,7 +993,7 @@ _POSTGRES_GCB_SCHEMA_FINGERPRINT = sha256_digest(
 # relation flags, every user column/default, every constraint definition, all
 # indexes (including constraint indexes), triggers, and function bodies.
 _POSTGRES_CATALOG_FINGERPRINT = "s-gycb2MocWE-vCFg3fyKw9tSRPK0ayWSKxg9dMfU9w"
-_POSTGRES_GCB_CATALOG_FINGERPRINT = "I6wSWNo5hxurvso3xkof5pVhkbVtvPfUknuNu-qK3SE"
+_POSTGRES_GCB_CATALOG_FINGERPRINT = "boKYmnLfKZ0KaZ81HwsAJ6e8hURsyEkqGaIpg9E2lPc"
 
 
 def _validate_server_version_num(value: object) -> None:
