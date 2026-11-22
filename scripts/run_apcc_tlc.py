@@ -1,12 +1,16 @@
 """Run every bounded APCC model with the pinned TLC distribution."""
 
 from __future__ import annotations
+
 import argparse
+import json
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
@@ -134,38 +138,113 @@ def _stats(output: str) -> str:
     return " | ".join(lines) if lines else "state statistics unavailable"
 
 
-def run_config(
-    jar: Path, specs: Path, config: str, timeout: int, java: str = "java"
-) -> bool:
+def _run_config_detailed(
+    jar: Path,
+    specs: Path,
+    config: str,
+    timeout: int,
+    java: str = "java",
+    *,
+    work_dir: Path | None = None,
+    log_dir: Path | None = None,
+) -> dict[str, Any]:
     module = CONFIG_MODULE[config]
-    completed = subprocess.run(
-        [
-            java,
-            "-cp",
-            str(jar),
-            "tlc2.TLC",
-            "-cleanup",
-            "-config",
-            config,
-            module,
-        ],
-        cwd=specs,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    output = completed.stdout + completed.stderr
-    expected_witness = EXPECTED_WITNESS.get(config)
-    ok = TLC_VERSION_LINE in output and classify_result(
-        completed.returncode, output, expected_witness
-    )
-    print(
-        f"{'PASS' if ok else 'FAIL'} {config}: exit={completed.returncode}; {_stats(output)}"
-    )
+    stem = Path(config).stem
+    spec_path = specs / f"{module}.tla"
+    cfg_path = specs / config
+
+    def _execute(scratch_root: Path) -> tuple[bool, int, str, float]:
+        java_tmp = scratch_root / "java" / stem
+        metadir = scratch_root / "states" / stem
+        java_tmp.mkdir(parents=True, exist_ok=True)
+        metadir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        completed = subprocess.run(
+            [
+                java,
+                f"-Djava.io.tmpdir={java_tmp}",
+                "-cp",
+                str(jar),
+                "tlc2.TLC",
+                "-cleanup",
+                "-metadir",
+                str(metadir),
+                "-config",
+                config,
+                module,
+            ],
+            cwd=specs,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        elapsed_s = round(time.monotonic() - started, 3)
+        output = completed.stdout + completed.stderr
+        expected_witness = EXPECTED_WITNESS.get(config)
+        ok = TLC_VERSION_LINE in output and classify_result(
+            completed.returncode, output, expected_witness
+        )
+        return ok, completed.returncode, output, elapsed_s
+
+    if work_dir is not None:
+        ok, returncode, output, elapsed_s = _execute(work_dir)
+    else:
+        with tempfile.TemporaryDirectory(prefix=f"apcc-tlc-{stem}-") as scratch:
+            ok, returncode, output, elapsed_s = _execute(Path(scratch))
+
+    stats_text = _stats(output)
+    print(f"{'PASS' if ok else 'FAIL'} {config}: exit={returncode}; {stats_text}")
     if not ok:
         print(output, file=sys.stderr)
-    return ok
+
+    log_file: str | None = None
+    log_sha256: str | None = None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{stem}.log"
+        log_path.write_text(output, encoding="utf-8")
+        log_file = log_path.name
+        log_sha256 = _sha256(log_path)
+
+    expected_witness = EXPECTED_WITNESS.get(config)
+    return {
+        "config": config,
+        "module": f"{module}.tla",
+        "expected_witness": expected_witness,
+        "expected_exit": 12 if expected_witness is not None else 0,
+        "actual_exit": returncode,
+        "ok": ok,
+        "elapsed_s": elapsed_s,
+        "stats": stats_text,
+        "spec_sha256": _sha256(spec_path) if spec_path.is_file() else None,
+        "cfg_sha256": _sha256(cfg_path) if cfg_path.is_file() else None,
+        "jar_sha256": TLC_JAR_SHA256,
+        "log_file": log_file,
+        "log_sha256": log_sha256,
+    }
+
+
+def run_config(
+    jar: Path,
+    specs: Path,
+    config: str,
+    timeout: int,
+    java: str = "java",
+    *,
+    work_dir: Path | None = None,
+    log_dir: Path | None = None,
+) -> bool:
+    entry = _run_config_detailed(
+        jar,
+        specs,
+        config,
+        timeout,
+        java,
+        work_dir=work_dir,
+        log_dir=log_dir,
+    )
+    return bool(entry["ok"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,11 +255,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", action="append", choices=DEFAULT_CONFIGS)
     parser.add_argument("--timeout", type=int, default=360)
+    parser.add_argument("--log-dir", type=Path, default=None)
     args = parser.parse_args(argv)
+    selected_configs = tuple(args.config or DEFAULT_CONFIGS)
+    if args.log_dir is not None:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="apcc-tlc-") as private_dir:
+        private_root = Path(private_dir)
         # Hash and execute one private copy so the checked bytes are the run bytes.
         try:
-            jar = stage_jar(args.tlc_jar, Path(private_dir))
+            jar = stage_jar(args.tlc_jar, private_root)
             jar_valid = _sha256(jar) == TLC_JAR_SHA256
         except OSError:
             jar_valid = False
@@ -192,9 +276,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         java = resolve_java("java")
         try:
-            results = [
-                run_config(jar, args.specs, config, args.timeout, java)
-                for config in tuple(args.config or DEFAULT_CONFIGS)
+            records = [
+                _run_config_detailed(
+                    jar,
+                    args.specs,
+                    config,
+                    args.timeout,
+                    java,
+                    work_dir=private_root,
+                    log_dir=args.log_dir,
+                )
+                for config in selected_configs
             ]
         except subprocess.TimeoutExpired as exc:
             print(f"FAIL: TLC timeout after {exc.timeout}s", file=sys.stderr)
@@ -202,7 +294,20 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"FAIL: could not start Java ({java}): {exc}", file=sys.stderr)
             return 2
-    return 0 if all(results) else 1
+    if args.log_dir is not None:
+        summary = {
+            "tlc_version_line": TLC_VERSION_LINE,
+            "jar_sha256": TLC_JAR_SHA256,
+            "total": len(records),
+            "passed": sum(1 for item in records if item["ok"]),
+            "failed": sum(1 for item in records if not item["ok"]),
+            "runs": records,
+        }
+        (args.log_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return 0 if all(item["ok"] for item in records) else 1
 
 
 if __name__ == "__main__":
