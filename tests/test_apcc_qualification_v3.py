@@ -859,6 +859,7 @@ def test_spawned_scheduler_and_observer_survive_idle_then_verify(spawned_request
     launch = observer.launch_attestation
     verified = AuthorityObservationVerificationStream(launch.session_id).consume(
         response,
+        expected_request=target,
         launch=launch,
         pinned_controller_public_key=launch_config.controller_key_source.expected_public_key,
         expected_experiment_id=launch_config.experiment_id,

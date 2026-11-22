@@ -242,6 +242,7 @@ def test_spawned_w6_full_dag_order_and_three_signed_observed_commits(tmp_path):
             assert response.snapshot.request == target
             verified = stream.consume(
                 response,
+                expected_request=target,
                 launch=launch,
                 pinned_controller_public_key=launch_config.controller_key_source.expected_public_key,
                 expected_experiment_id=launch_config.experiment_id,

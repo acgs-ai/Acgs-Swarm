@@ -3646,52 +3646,6 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
                 return FailureCode.INVALID_PREDECESSOR
         return None
 
-    def _persisted_causal_error(
-        self, connection: _AuthorityConnection, digest: str
-    ) -> FailureCode | None:
-        resolver = _AuthorityPredecessorResolver(connection)
-        root_envelope = resolver.resolve_predecessor(digest)
-        if root_envelope is None:
-            return FailureCode.INVALID_PREDECESSOR
-        closure = verify_causal_closure(
-            root_envelope,
-            trust=_trust(self._config),
-            resolver=resolver,
-            limits=self._config.causal_limits,
-        )
-        if not closure.ok:
-            if closure.code in {
-                FailureCode.DEPTH_LIMIT_EXCEEDED,
-                FailureCode.SIZE_LIMIT_EXCEEDED,
-            }:
-                return closure.code
-            return FailureCode.INVALID_PREDECESSOR
-
-        pending = [digest]
-        seen: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            state = _latest_disposition(connection, current)
-            if state is None or state is CertificateDisposition.REVOKED:
-                return FailureCode.INVALID_PREDECESSOR
-            envelope = resolver.resolve_predecessor(current)
-            if envelope is None:
-                return FailureCode.INVALID_PREDECESSOR
-            try:
-                detached = decode_envelope(envelope)
-                certificate = decode_certificate(detached.payload)
-            except Exception:
-                return FailureCode.INVALID_PREDECESSOR
-            if _has_later_generation_revocation(connection, certificate):
-                return FailureCode.INVALID_PREDECESSOR
-            pending.extend(
-                predecessor.certificate_digest
-                for predecessor in certificate.bindings.predecessors
-            )
-        return None
     def recover(self, request: RecoveryRequest) -> CommitResult:
         with self._transaction() as connection:
             row = connection.execute(

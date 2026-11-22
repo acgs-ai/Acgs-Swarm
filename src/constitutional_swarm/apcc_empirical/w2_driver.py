@@ -264,6 +264,7 @@ def _verify_operation(
     launch = decode_observer_launch_attestation(b64u_decode(header["launch"]))
     result = stream.consume(
         response,
+        expected_request=target,
         launch=launch,
         pinned_controller_public_key=b64u_decode(
             header["controller_public_key"], expected_length=32

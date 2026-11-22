@@ -119,6 +119,7 @@ def test_spawned_rotation_preserves_signed_historical_observations_and_rejects_o
             response = observer.client.observe(target)
             verified = stream.consume(
                 response,
+                expected_request=target,
                 launch=launch,
                 pinned_controller_public_key=launch_config.controller_key_source.expected_public_key,
                 expected_experiment_id=launch_config.experiment_id,

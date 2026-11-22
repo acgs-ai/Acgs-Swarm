@@ -138,7 +138,10 @@ def test_signed_chain_admission_status_reopen_and_boundary(
     )[0]
     assert logical.status == status
     with store._read_transaction() as connection:
-        assert store._persisted_causal_error(connection, digest) is None
+        certificate = sql.decode_certificate(
+            sql.decode_envelope(last.certificate_envelope_bytes).payload
+        )
+        assert store._request_causal_error(connection, certificate) is None
         resolver = sql._AuthorityPredecessorResolver(connection)
         assert verify_causal_closure(
             last.certificate_envelope_bytes,
@@ -169,10 +172,6 @@ def test_signed_chain_admission_status_reopen_and_boundary(
                     property(lambda self: constrained),
                 )
                 with store._read_transaction() as connection:
-                    assert (
-                        store._persisted_causal_error(connection, digest)
-                        is FailureCode.SIZE_LIMIT_EXCEEDED
-                    )
                     certificate = sql.decode_certificate(
                         sql.decode_envelope(last.certificate_envelope_bytes).payload
                     )

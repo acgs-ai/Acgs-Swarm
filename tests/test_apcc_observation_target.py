@@ -113,9 +113,10 @@ def test_spawned_observation_target_reaches_signed_observer_and_exact_replay(
     assert [response.snapshot.request for response in responses] == [first, second]
     launch = observer.launch_attestation
     stream = AuthorityObservationVerificationStream(launch.session_id)
-    for response in responses:
+    for target, response in zip((first, second), responses, strict=True):
         verified = stream.consume(
             response,
+            expected_request=target,
             launch=launch,
             pinned_controller_public_key=(
                 launch_config.controller_key_source.expected_public_key

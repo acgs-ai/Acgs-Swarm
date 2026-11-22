@@ -129,6 +129,7 @@ def test_spawned_100_agent_chain_has_100_signed_consumable_observations(tmp_path
             response = observer.client.observe(target)
             verified = stream.consume(
                 response,
+                expected_request=target,
                 launch=observer.launch_attestation,
                 pinned_controller_public_key=launch_config.controller_key_source.expected_public_key,
                 expected_experiment_id=launch_config.experiment_id,
