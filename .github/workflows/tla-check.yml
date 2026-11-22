@@ -48,17 +48,17 @@ jobs:
             module: governed_commit
             config: governed_commit.cfg
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Cache tla2tools.jar
         id: cache-tla
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TLA2TOOLS_JAR }}
           key: tla2tools-${{ env.TLC_VERSION }}-${{ env.TLC_SHA256 }}
@@ -89,7 +89,7 @@ jobs:
 
       - name: Upload TLC log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tlc-${{ matrix.spec.name }}-log
           path: tlc-${{ matrix.spec.name }}.log
@@ -100,16 +100,16 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: Install locked test environment
         # make setup records .venv/.make-extras, which check-env requires.
@@ -117,7 +117,7 @@ jobs:
 
       - name: Cache tla2tools.jar
         id: cache-tla
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TLA2TOOLS_JAR }}
           key: tla2tools-${{ env.TLC_VERSION }}-${{ env.TLC_SHA256 }}
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload GCB witness log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tlc-gcb-witness-log
           path: tlc-gcb-witness.log
