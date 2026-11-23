@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence, Set
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Iterator, Protocol, cast
@@ -40,6 +41,7 @@ from .crypto import (
     COMMIT_DOMAIN,
     b64u_decode,
     b64u_encode,
+    domain_preimage,
     predecessor_root,
     sha256_digest,
     verify_detached,
@@ -139,6 +141,8 @@ from .verifier import (
     _verify_signature,
     verify_historical,
 )
+
+_ORIGINAL_VERIFY_DETACHED = verify_detached
 
 _APPLICATION_ID = 0x41504343  # ASCII "APCC"
 _AUTHORITY_SCHEMA_VERSION = "4"
@@ -277,7 +281,7 @@ def _verify_semantic_checkpoint(
         raise invalid
     try:
         signature = b64u_decode(signature_b64u, expected_length=64)
-        Ed25519PublicKey.from_public_bytes(config.commit_trust.public_key).verify(
+        _public_key_cached(config.commit_trust.public_key).verify(
             signature, _SEMANTIC_CHECKPOINT_DOMAIN + b"\x00" + body
         )
     except (InvalidSignature, ValueError) as error:
@@ -989,6 +993,16 @@ def _config_object(config: APCCAuthorityConfig) -> dict[str, object]:
             "issued_status_lifetime_ms": config.freshness.issued_status_lifetime_ms,
         },
     }
+
+
+@lru_cache(maxsize=64)
+def _config_json_cached(config: APCCAuthorityConfig) -> str:
+    return _json(_config_object(config))
+
+
+@lru_cache(maxsize=64)
+def _public_key_cached(public_key: bytes) -> Ed25519PublicKey:
+    return Ed25519PublicKey.from_public_bytes(public_key)
 
 
 def _config_from_object(value: object) -> APCCAuthorityConfig:
@@ -1802,7 +1816,7 @@ class _AuthorityReaderCore:
                 raise ValueError("committed observation certificate binding mismatch")
             payload = _row_bytes(certificate[0])
             envelope = _row_bytes(certificate[1])
-            decoded = decode_certificate(payload)
+            decoded = _decode_checkpoint_certificate(payload)
             disposition_row = connection.execute(
                 "SELECT disposition FROM certificate_dispositions "
                 "WHERE certificate_digest=? ORDER BY event_sequence DESC LIMIT 1",
@@ -1864,7 +1878,21 @@ class _AuthorityReaderCore:
                     "authority status snapshot changed during observation"
                 )
             body = encode_authority_status_body(signed_status)
-            if not verify_detached(
+            if verify_detached is _ORIGINAL_VERIFY_DETACHED:
+                try:
+                    raw_sig = b64u_decode(
+                        signed_status.signature.signature_b64u,
+                        expected_length=64,
+                    )
+                    _public_key_cached(self._config.status_trust.public_key).verify(
+                        raw_sig,
+                        domain_preimage(AUTHORITY_STATUS_DOMAIN, body),
+                    )
+                except (InvalidSignature, ValueError) as exc:
+                    raise ValueError(
+                        "authority observation status signature invalid"
+                    ) from exc
+            elif not verify_detached(
                 self._config.status_trust.public_key,
                 AUTHORITY_STATUS_DOMAIN,
                 body,
@@ -4228,7 +4256,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
 
     def _validate_mutation_checkpoint(self, connection: sqlite3.Connection) -> None:
         config_text = _validate_schema_manifest(connection, storage_checks=False)
-        if config_text != _json(_config_object(self._config)):
+        if config_text != _config_json_cached(self._config):
             raise ValueError(
                 "APCC authority configuration does not match provisioned store"
             )
@@ -4253,7 +4281,7 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         try:
             connection.execute("BEGIN IMMEDIATE")
             config_text = _validate_schema_manifest(connection, storage_checks=False)
-            if config_text != _json(_config_object(self._config)):
+            if config_text != _config_json_cached(self._config):
                 raise ValueError(
                     "APCC authority configuration does not match provisioned store"
                 )
@@ -4837,7 +4865,7 @@ def _attest_sqlite_read_connection(
     connection: _AuthorityConnection, config: APCCAuthorityConfig
 ) -> None:
     config_text = _validate_schema_manifest(connection, storage_checks=False)
-    if config_text != _json(_config_object(config)):
+    if config_text != _config_json_cached(config):
         raise ValueError(
             "APCC authority configuration does not match provisioned store"
         )

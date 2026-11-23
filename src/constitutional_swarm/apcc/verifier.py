@@ -14,6 +14,7 @@ from .codec import (
     CodecError,
     DetachedEnvelope,
     _decode_envelope_certificate,
+    _encode_json,
     canonical_statement,
     encode_authority_status_body,
     normalize_authority_status,
@@ -282,11 +283,21 @@ def _statement_types(certificate: CommitCertificate) -> FailureCode | None:
     return None
 
 
-def _evidence(certificate: CommitCertificate, trust: ScopedTrust) -> FailureCode | None:
+def _evidence(
+    certificate: CommitCertificate,
+    trust: ScopedTrust,
+    *,
+    validated: bool = False,
+) -> FailureCode | None:
     evidence = certificate.evidence
-    producer = canonical_statement(evidence.producer_statement)
-    policy = canonical_statement(evidence.policy_statement)
-    authority = canonical_statement(evidence.authority_statement)
+    if validated:
+        producer = _encode_json(dict(evidence.producer_statement))
+        policy = _encode_json(dict(evidence.policy_statement))
+        authority = _encode_json(dict(evidence.authority_statement))
+    else:
+        producer = canonical_statement(evidence.producer_statement)
+        policy = canonical_statement(evidence.policy_statement)
+        authority = canonical_statement(evidence.authority_statement)
     for body, claimed in (
         (producer, evidence.producer_statement_digest),
         (policy, evidence.policy_statement_digest),
@@ -484,7 +495,7 @@ def _verify_decoded_historical(
     )
     if seal_error is not None:
         return _failure(seal_error)
-    evidence_error = _evidence(certificate, trust)
+    evidence_error = _evidence(certificate, trust, validated=True)
     if evidence_error is not None:
         return _failure(evidence_error)
     binding_error = _bindings(certificate)
