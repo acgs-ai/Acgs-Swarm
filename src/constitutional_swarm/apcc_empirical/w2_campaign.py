@@ -52,7 +52,15 @@ from constitutional_swarm.governed_commit import (
 from constitutional_swarm.swarm import TaskDAG
 
 DOMAIN = b"APCC-1.w2-campaign-v1.ledger\0"
-_ORIGINAL_VERIFY_OPERATION = d._verify_operation
+
+
+def _unwrap_callable(fn: Any) -> Any:
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+_ORIGINAL_VERIFY_OPERATION = _unwrap_callable(d._verify_operation)
 
 
 def _closure_verifier_worker(
@@ -799,9 +807,9 @@ def _execute_window(
     next_published = 0
     publish_ordered = threading.Condition()
     ticket_count = 0
-    verify_fn = getattr(d._verify_operation, "__wrapped__", d._verify_operation)
     use_split_verifier = (
-        closure_verifier is not None and verify_fn is _ORIGINAL_VERIFY_OPERATION
+        closure_verifier is not None
+        and _unwrap_callable(d._verify_operation) is _ORIGINAL_VERIFY_OPERATION
     )
     ledger_path = directory / f"window-{window_index:03d}.jsonl"
     public_config = _config_object(child.authority)

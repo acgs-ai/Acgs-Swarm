@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass
+import functools
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -829,3 +830,116 @@ def test_handoff_split_closure_verifier_orders_publish_and_overlaps_locks(
     assert ends == sorted(ends)
     assert not snapshot_lock.locked()
     assert ordered.depth == 0
+
+
+def test_handoff_split_verifier_handles_wrapped_verify_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, _ = _install_stubs(monkeypatch)
+    prefix_calls = 0
+    closure_calls = 0
+    wrapped_calls = 0
+    plain_calls = 0
+
+    def _base_verify(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    @functools.wraps(_base_verify)
+    def _inner_wrapper(*args: Any, **kwargs: Any) -> None:
+        return _base_verify(*args, **kwargs)
+
+    @functools.wraps(_inner_wrapper)
+    def _outer_wrapper(*args: Any, **kwargs: Any) -> None:
+        nonlocal wrapped_calls
+        wrapped_calls += 1
+        return _inner_wrapper(*args, **kwargs)
+
+    def _stub_prefix(row: Any, *args: Any, **kwargs: Any) -> tuple[bytes, str]:
+        nonlocal prefix_calls
+        del args, kwargs
+        prefix_calls += 1
+        return b"env", f"workflow-{row['chain']}"
+
+    class _CountingClosureVerifier:
+        def verify_closure(
+            self,
+            *,
+            chain: int,
+            node_index: int,
+            workflow_id: str,
+            envelope: bytes,
+        ) -> None:
+            nonlocal closure_calls
+            del chain, node_index, workflow_id, envelope
+            closure_calls += 1
+
+    def _plain_monkeypatch(*args: Any, **kwargs: Any) -> None:
+        nonlocal plain_calls
+        del args, kwargs
+        plain_calls += 1
+
+    monkeypatch.setattr(d, "_verify_operation_prefix", _stub_prefix)
+    monkeypatch.setattr(c, "_ORIGINAL_VERIFY_OPERATION", _base_verify)
+
+    def _run_case(case_dir: Path) -> dict[str, Any]:
+        case_dir.mkdir()
+        snapshot_lock = _TrackingLock()
+        ordered = _TrackingCondition()
+        stop = threading.Event()
+        failed: list[BaseException] = []
+        pool = c.CampaignWorkerPool()
+        plan = WindowPlan(
+            duration_ns=1_000_000_000,
+            scheduled_operations=100,
+            admission_grace_ns=1_000_000_000,
+            operation_sla_ns=5_000_000_000,
+            drain_ns=2_000_000_000,
+            operation_floor=100,
+        )
+        payloads, dags = _make_payloads(100)
+        producers = [Ed25519PrivateKey.generate() for _ in range(100)]
+        try:
+            return c._execute_window(
+                case_dir,
+                plan=plan,
+                child=SimpleNamespace(authority=SimpleNamespace(trust_bindings=())),
+                controller=Ed25519PrivateKey.generate(),
+                source={"files": {}},
+                run_id=case_dir.name,
+                authority=SimpleNamespace(pid=1111),
+                observer=env["observer"],
+                execution=env["execution"],
+                pool=pool,
+                stop=stop,
+                ordered=ordered,
+                snapshot_lock=snapshot_lock,
+                failed=failed,
+                payloads=payloads,
+                dags=dags,
+                producers=producers,
+                stream=object(),
+                certificates={},
+                window_index=0,
+                chain_offset=0,
+                previous_ledger=None,
+                plans=(plan,),
+                closure_verifier=_CountingClosureVerifier(),  # type: ignore[arg-type]
+            )
+        finally:
+            pool.close()
+
+    monkeypatch.setattr(d, "_verify_operation", _outer_wrapper)
+    res_wrapped = _run_case(tmp_path / "wrapped")
+    assert res_wrapped["accounting"]["committed"] == 100
+    assert prefix_calls == 100
+    assert closure_calls == 100
+    assert wrapped_calls == 0
+
+    prefix_calls = 0
+    closure_calls = 0
+    monkeypatch.setattr(d, "_verify_operation", _plain_monkeypatch)
+    res_plain = _run_case(tmp_path / "plain")
+    assert res_plain["accounting"]["committed"] == 100
+    assert plain_calls == 100
+    assert prefix_calls == 0
+    assert closure_calls == 0
