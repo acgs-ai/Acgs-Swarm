@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Number of test-postgres shards; keep equal to the matrix length below.
+  POSTGRES_TEST_SHARDS: "4"
+
 jobs:
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -75,8 +79,21 @@ jobs:
       - name: Type-check
         run: mypy
 
-  test-postgres:
+  # The PostgreSQL contract suite runs serially because its tests assert on
+  # timing and lock ordering; pytest-xdist against one server would add CPU and
+  # catalog contention to exactly those tests.  Instead the collection is split
+  # into shards, each with its own runner and its own PostgreSQL 17 service.
+  # scripts/ci_pytest_shard.py assigns every collected test to exactly one
+  # shard, and the `test-postgres` job below fails unless the shards together
+  # ran the whole collection with nothing skipped.  To change the shard count,
+  # edit POSTGRES_TEST_SHARDS and the matrix together.
+  test-postgres-shard:
+    name: test-postgres-shard (${{ matrix.shard }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     services:
       postgres:
         image: postgres:17
@@ -124,20 +141,33 @@ jobs:
       - name: Install with PostgreSQL support
         run: pip install -e ".[dev,postgres]"
       # Production postgres_store.py only. tests/test_apcc_postgres.py is in the
-      # frozen B2 pair (test content 177d3137… since C32; was dff15b7f…); its test-local Protocols omit
+      # frozen B2 pair (its content hash is recorded in DECISIONS.md, not here);
+      # its test-local Protocols omit
       # psycopg.errors / Cursor.rowcount and fail mypy 2.x attr-defined/misc.
       # Default [tool.mypy] files already exclude tests/; do not type-check the
       # frozen pair here.
       - name: Type-check PostgreSQL backend
+        if: matrix.shard == 0
         run: mypy src/constitutional_swarm/apcc/postgres_store.py
+      - name: Select this shard's tests
+        run: |
+          python scripts/ci_pytest_shard.py select \
+            --shards "$POSTGRES_TEST_SHARDS" --index "${{ matrix.shard }}" \
+            --out shard-args.txt \
+            --manifest "shard-manifest-${{ matrix.shard }}.json" \
+            --pytest-arg=--import-mode=importlib \
+            tests/test_apcc_postgres.py tests/test_apcc_schema_v4_compat.py
       - name: Test PostgreSQL authority store without skips
         run: |
-          python -m pytest -q tests/test_apcc_postgres.py tests/test_apcc_schema_v4_compat.py \
-            --import-mode=importlib --junitxml=postgres-results.xml
+          python -m pytest -q @shard-args.txt \
+            --import-mode=importlib --durations=15 \
+            --junitxml="shard-results-${{ matrix.shard }}.xml"
           python - <<'PY'
+          import os
           import xml.etree.ElementTree as ET
 
-          root = ET.parse("postgres-results.xml").getroot()
+          report = f"shard-results-{os.environ['SHARD']}.xml"
+          root = ET.parse(report).getroot()
           skipped = sum(
               int(suite.attrib.get("skipped", "0"))
               for suite in root.iter("testsuite")
@@ -145,6 +175,37 @@ jobs:
           if skipped:
               raise SystemExit(f"PostgreSQL suite skipped {skipped} test(s)")
           PY
+        env:
+          SHARD: ${{ matrix.shard }}
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgres-shard-${{ matrix.shard }}
+          path: |
+            shard-manifest-${{ matrix.shard }}.json
+            shard-results-${{ matrix.shard }}.xml
+          if-no-files-found: error
+
+  # Keeps the required check name `test-postgres`.  It passes only when every
+  # shard succeeded and the shards provably covered the whole collection.
+  test-postgres:
+    needs: test-postgres-shard
+    if: always()
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: postgres-shard-*
+          path: postgres-shards
+      - name: Require every shard to pass
+        run: test "${{ needs.test-postgres-shard.result }}" = "success"
+      - name: Prove the shards covered the whole collection without skips
+        run: python scripts/ci_pytest_shard.py verify --shards "$POSTGRES_TEST_SHARDS" postgres-shards
 
   test-research:
     runs-on: blacksmith-4vcpu-ubuntu-2404

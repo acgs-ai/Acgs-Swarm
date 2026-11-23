@@ -727,3 +727,29 @@ above.
   tables. Future migration tooling must design explicit evidence continuity rather
   than altering `PRAGMA user_version` or `metadata.schema_version` in place,
   since semantic checkpoints sign `schema_fingerprint`.
+
+### 2026-11-23 — PostgreSQL contract suite: liveness deadline and CI shards
+
+- **Outbox SKIP LOCKED test deadline.**
+  `test_postgres_skip_locked_outbox_has_one_persisted_event_identity` waited
+  5 s for a worker that opens four serial attested connections (store open,
+  claim, finalize, audit). Each pays the catalog-fingerprint query, measured at
+  0.95–1.3 s locally on PostgreSQL 17.12, so the worker took 3.8–5.3 s with no
+  lock wait at all (0 `wait_event_type='Lock'` samples in 2,265 polls; no
+  `log_lock_waits` lines). The same timeout failed 15 of the last 60
+  `test-postgres` runs. The deadline is now 60 s. It was never a latency bound:
+  the locker holds the row for the whole wait, so a claim that blocks on it
+  cannot return under any deadline. Removing `SKIP LOCKED` from the claim query
+  still fails the test.
+- **Frozen B2 file hash.** `tests/test_apcc_postgres.py` moves from
+  `4103e5d1…` to `20c0af02…` for that one-line change. (`4103e5d1…` is the
+  content since the schema v4 cutover in `dc891b9`, which moved it from
+  `177d3137…` without a note here.) `postgres_store.py` is unchanged at
+  `7b40e072…`.
+- **`test-postgres` is an aggregate of shards.** The suite stays serial inside
+  each shard, because its tests assert on timing and lock order, and each shard
+  gets its own runner and PostgreSQL 17 service. `scripts/ci_pytest_shard.py`
+  assigns each collected node id to one shard by hash; the `test-postgres` job
+  keeps the required check name and fails unless the shards' JUnit reports sum
+  to the collected total with zero skips. No test was removed, skipped, or
+  marked.
