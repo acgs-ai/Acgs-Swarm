@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - perf/b8-w2-qual-10k-rebased
+      - perf/p3c-w2-10k-profile
   workflow_dispatch:
     inputs:
       scheduled_operations:
@@ -246,6 +247,9 @@ jobs:
       - name: Run W2 cold qualification campaign
         env:
           PYTHONUNBUFFERED: "1"
+          # Controller-side sidecar (GC pauses, heartbeat gaps, sub-phase stamps).
+          # It never feeds accounting or verification.
+          APCC_W2_DIAGNOSTICS: ${{ vars.APCC_W2_DIAGNOSTICS || '1' }}
           SCHEDULED_OPERATIONS: ${{ inputs.scheduled_operations || '10000' }}
           DURATION_NS: ${{ inputs.duration_ns || '1000000000000' }}
           ADMISSION_GRACE_NS: ${{ inputs.admission_grace_ns || '25000000' }}
@@ -290,6 +294,11 @@ jobs:
             fi
           done
           for w in "${CAMPAIGN_DIR}"/window-*.jsonl; do
+            if [ -f "$w" ]; then
+              cp "$w" "${BUNDLE_DIR}/w2-campaign/"
+            fi
+          done
+          for w in "${CAMPAIGN_DIR}"/window-*.diagnostics.json; do
             if [ -f "$w" ]; then
               cp "$w" "${BUNDLE_DIR}/w2-campaign/"
             fi
