@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Sequence
 
 MANIFEST_VERSION = 1
+_NODE_ID = re.compile(r"^[^\s:]+\.py::\S")
 
 
 def shard_of(node_id: str, shards: int) -> int:
@@ -50,7 +52,11 @@ def collect(paths: Sequence[str], pytest_args: Sequence[str]) -> list[str]:
         sys.stderr.write(completed.stdout)
         sys.stderr.write(completed.stderr)
         raise SystemExit(f"pytest collection failed with exit code {completed.returncode}")
-    node_ids = [line.strip() for line in completed.stdout.splitlines() if "::" in line]
+    # A node id starts with its test file path; a collection-time warning that
+    # merely mentions "::" does not.
+    node_ids = [
+        line.strip() for line in completed.stdout.splitlines() if _NODE_ID.match(line)
+    ]
     if not node_ids:
         raise SystemExit("pytest collected no tests")
     if len(set(node_ids)) != len(node_ids):
@@ -73,7 +79,6 @@ def select(arguments: argparse.Namespace) -> int:
         "collected": len(node_ids),
         "collection_sha256": collection_digest(node_ids),
         "selected": len(selected),
-        "selected_sha256": collection_digest(selected),
     }
     Path(arguments.manifest).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

@@ -182,6 +182,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: postgres-shard-${{ matrix.shard }}
+          # "Re-run failed jobs" uploads the same name again; replace the
+          # failed attempt's report instead of failing on the name conflict.
+          overwrite: true
           path: |
             shard-manifest-${{ matrix.shard }}.json
             shard-results-${{ matrix.shard }}.xml

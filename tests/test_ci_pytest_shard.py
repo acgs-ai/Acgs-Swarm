@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -38,9 +41,10 @@ def _write_shards(
     shards: int,
     *,
     drop_report: int | None = None,
-    skipped_in: int | None = None,
     short_by: int = 0,
+    **bad_counts: int,
 ) -> None:
+    """Write manifests and reports; ``bad_counts`` plants e.g. ``skipped=1`` in shard 1."""
     digest = shard.collection_digest(_NODE_IDS)
     for index in range(shards):
         selected = [node for node in _NODE_IDS if shard.shard_of(node, shards) == index]
@@ -51,7 +55,6 @@ def _write_shards(
             "collected": len(_NODE_IDS),
             "collection_sha256": digest,
             "selected": len(selected),
-            "selected_sha256": shard.collection_digest(selected),
         }
         (directory / f"shard-manifest-{index}.json").write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -59,37 +62,63 @@ def _write_shards(
         if index == drop_report:
             continue
         ran = len(selected) - (short_by if index == 0 else 0)
-        skipped = 1 if index == skipped_in else 0
+        counts = {"skipped": 0, "failures": 0, "errors": 0}
+        if index == 1:
+            counts.update(bad_counts)
+        attributes = " ".join(f'{key}="{value}"' for key, value in counts.items())
         (directory / f"shard-results-{index}.xml").write_text(
-            f'<testsuites><testsuite tests="{ran}" skipped="{skipped}" '
-            'failures="0" errors="0"/></testsuites>',
+            f'<testsuites><testsuite tests="{ran}" {attributes}/></testsuites>',
             encoding="utf-8",
         )
 
 
-def test_verify_accepts_complete_coverage(tmp_path: Path) -> None:
+def test_verify_accepts_complete_coverage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     _write_shards(tmp_path, 4)
     assert shard.main(["verify", "--shards", "4", str(tmp_path)]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["ok"] is True
+    assert summary["collected"] == summary["executed"] == len(_NODE_IDS)
 
 
 @pytest.mark.parametrize(
-    "fault",
+    ("fault", "message"),
     (
-        {"drop_report": 2},
-        {"skipped_in": 1},
-        {"short_by": 1},
+        ({"drop_report": 2}, "shard 2: JUnit report missing"),
+        ({"skipped": 1}, "shard 1: 1 skipped"),
+        ({"failures": 1}, "shard 1: 1 failures"),
+        ({"errors": 1}, "shard 1: 1 errors"),
+        ({"short_by": 1}, "shards ran 256 tests, collection has 257"),
     ),
 )
-def test_verify_rejects_lost_or_skipped_tests(tmp_path: Path, fault: dict[str, int]) -> None:
+def test_verify_rejects_lost_skipped_or_failed_tests(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    fault: dict[str, int],
+    message: str,
+) -> None:
     _write_shards(tmp_path, 4, **fault)
     assert shard.main(["verify", "--shards", "4", str(tmp_path)]) == 1
+    assert message in capsys.readouterr().err
 
 
-def test_verify_rejects_a_missing_shard(tmp_path: Path) -> None:
+def test_verify_rejects_a_missing_shard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     _write_shards(tmp_path, 4)
     (tmp_path / "shard-manifest-3.json").unlink()
     (tmp_path / "shard-results-3.xml").unlink()
     assert shard.main(["verify", "--shards", "4", str(tmp_path)]) == 1
+    assert "are not exactly 0..3" in capsys.readouterr().err
+
+
+def test_verify_rejects_an_unexpected_shard_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_shards(tmp_path, 2)
+    assert shard.main(["verify", "--shards", "4", str(tmp_path)]) == 1
+    assert "expected 4 shards, manifests say 2" in capsys.readouterr().err
 
 
 def test_verify_rejects_disagreeing_collections(tmp_path: Path) -> None:
@@ -98,5 +127,63 @@ def test_verify_rejects_disagreeing_collections(tmp_path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     manifest["collection_sha256"] = "0" * 64
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(SystemExit):
-        shard.main(["verify", str(tmp_path)])
+    with pytest.raises(SystemExit, match="shards disagree about the collection"):
+        shard.main(["verify", "--shards", "2", str(tmp_path)])
+
+
+_SAMPLE = '''\
+import warnings
+
+import pytest
+
+warnings.warn("see pkg.mod::Thing for details", UserWarning)
+
+
+@pytest.mark.parametrize("value", ["plain", "with space", "a::b", "caf\\u00e9"])
+def test_param(value):
+    assert value
+
+
+def test_single():
+    assert True
+'''
+
+
+def test_select_round_trips_through_a_pytest_args_file(tmp_path: Path) -> None:
+    """Real collection, selection, execution and verification for two shards."""
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(_SAMPLE, encoding="utf-8")
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    isolate = ["-p", "no:cacheprovider"]
+    ran: list[str] = []
+    for index in range(2):
+        args_file = tmp_path / f"args-{index}.txt"
+        command = [
+            sys.executable,
+            str(Path(shard.__file__)),
+            "select",
+            "--shards=2",
+            f"--index={index}",
+            f"--out={args_file}",
+            f"--manifest={reports / f'shard-manifest-{index}.json'}",
+            *(f"--pytest-arg={argument}" for argument in isolate),
+            "test_sample.py",
+        ]
+        subprocess.run(command, cwd=tmp_path, check=True, capture_output=True)
+        selected = args_file.read_text(encoding="utf-8").splitlines()
+        assert all(node.startswith("test_sample.py::") for node in selected)
+        report = reports / f"shard-results-{index}.xml"
+        subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", f"@{args_file}", *isolate,
+             f"--junitxml={report}"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        assert int(ET.parse(report).getroot().find("testsuite").attrib["tests"]) == len(selected)
+        ran.extend(selected)
+    # Five tests, each selected once; the warning text is not a node id.
+    assert len(ran) == len(set(ran)) == 5
+    assert shard.main(["verify", "--shards", "2", str(reports)]) == 0

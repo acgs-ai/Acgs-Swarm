@@ -744,8 +744,9 @@ above.
 - **Frozen B2 file hash.** `tests/test_apcc_postgres.py` moves from
   `4103e5d1…` to `20c0af02…` for that one-line change. (`4103e5d1…` is the
   content since the schema v4 cutover in `dc891b9`, which moved it from
-  `177d3137…` without a note here.) `postgres_store.py` is unchanged at
-  `7b40e072…`.
+  `aad0601c…`. Neither that move nor the earlier one away from `177d3137…`,
+  the last hash recorded here, was noted.) `postgres_store.py` is unchanged
+  at `7b40e072…`.
 - **`test-postgres` is an aggregate of shards.** The suite stays serial inside
   each shard, because its tests assert on timing and lock order, and each shard
   gets its own runner and PostgreSQL 17 service. `scripts/ci_pytest_shard.py`
