@@ -69,7 +69,7 @@ jobs:
         # Two repeats per arm, because one run per arm cannot separate the
         # change from run-to-run variance.
         gen2_gc: [default, deferred]
-        repeat: [3, 4, 5]
+        repeat: [1, 2]
     steps:
       - uses: actions/checkout@v7
         with:
