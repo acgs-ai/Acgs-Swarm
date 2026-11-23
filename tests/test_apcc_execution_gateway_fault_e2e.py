@@ -213,22 +213,31 @@ def _assert_applied_exactly_once(
 # --------------------------------------------------------------------------- #
 
 _AMBIGUOUS_FAULTS = {
-    # fault -> (gateway timeout, recorded exception type, cause type, message fragment)
+    # fault -> (gateway timeout, recorded exception type, allowed (cause type,
+    # message) pairs).  A message of None means "contains 'transport error'".
     # The reset surfaces in getresponse(), outside urllib's URLError wrapping.
+    # Python 3.13 reports it as ConnectionResetError, a local socket error whose
+    # cause the gateway keeps.  Python 3.11 and 3.12 report the same reset over
+    # TLS as RemoteDisconnected, a protocol error the gateway names by type only.
     "drop_before_response": (
         5.0,
         "ExecutionGatewayError",
-        "ConnectionResetError",
-        "transport error",
+        (
+            ("ConnectionResetError", None),
+            (None, "external target transport error: RemoteDisconnected"),
+        ),
     ),
-    "delay_past_client_timeout": (1.0, "ExecutionGatewayError", "TimeoutError", "transport error"),
+    "delay_past_client_timeout": (
+        1.0,
+        "ExecutionGatewayError",
+        (("TimeoutError", None),),
+    ),
     # The headers arrive (HTTP 201) and the body is cut.  The gateway reads a
     # bounded number of bytes, so the truncated body is an unparseable receipt.
     "close_mid_response": (
         5.0,
         "ExecutionGatewayError",
-        None,
-        "invalid JSON receipt",
+        ((None, "external target returned invalid JSON receipt"),),
     ),
 }
 
@@ -237,7 +246,7 @@ _AMBIGUOUS_FAULTS = {
 def test_a_ambiguous_outcome_is_replayed_exactly_once_after_restart(
     env: FaultEnv, fault: str
 ) -> None:
-    timeout_s, error_type, cause_type, fragment = _AMBIGUOUS_FAULTS[fault]
+    timeout_s, error_type, allowed = _AMBIGUOUS_FAULTS[fault]
     store = env.provision()
     _result, event = commit_effect(store, commit_id="a-ambiguous", nonce_byte=101)
     env.proxy.arm(fault)
@@ -247,8 +256,15 @@ def test_a_ambiguous_outcome_is_replayed_exactly_once_after_restart(
     [error] = first.errors
     assert error is not None
     assert error["type"] == error_type, error
-    assert error["cause_type"] == cause_type, error
-    assert fragment in error["message"], error
+    assert any(
+        error["cause_type"] == cause_type
+        and (
+            "transport error" in error["message"]
+            if message is None
+            else error["message"] == message
+        )
+        for cause_type, message in allowed
+    ), (error["cause_type"], error["message"])
     # Every lost-response shape stays inside the gateway's error contract,
     # including a response cut off after its headers.
     assert "ExecutionGatewayError" in error["mro"]
