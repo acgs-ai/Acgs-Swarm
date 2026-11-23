@@ -803,6 +803,8 @@ def _execute_window(
                     slot: Any = slot,
                 ) -> dict[str, Any]:
                     nonlocal next_verified
+                    holding_snapshot = False
+                    holding_ordered = False
                     try:
                         node, artifact = payloads[chain][node_index]
                         begin = clock()
@@ -810,7 +812,19 @@ def _execute_window(
                             execution.w2_lane(lane),
                             nullcontext() if epoch_context is None else epoch_context(),
                         ):
-                            with snapshot_lock:
+
+                            def _observe() -> tuple[str, Any, Any, int]:
+                                obs_nonce = b64u_encode(secrets.token_bytes(16))
+                                obs_target = execution.observation_target(
+                                    request, request_nonce=obs_nonce
+                                )
+                                obs_response = observer.client.observe(obs_target)
+                                return obs_nonce, obs_target, obs_response, clock()
+
+                            fast_observed = False
+                            snapshot_lock.acquire()
+                            holding_snapshot = True
+                            try:
                                 if stop.is_set() or failed:
                                     raise InterruptedError(
                                         "campaign stopped before mutation"
@@ -846,8 +860,28 @@ def _execute_window(
                                 commit_end = clock()
                                 if outcome.authoritative_outcome != "committed":
                                     raise ValueError("campaign commit rejected")
+                                if ordered.acquire(blocking=False):
+                                    holding_ordered = True
+                                    if (
+                                        next_verified == ticket
+                                        and not failed
+                                        and not stop.is_set()
+                                    ):
+                                        nonce, target, response, observe_end = (
+                                            _observe()
+                                        )
+                                        fast_observed = True
+                                    else:
+                                        holding_ordered = False
+                                        ordered.release()
+                            finally:
+                                if holding_snapshot:
+                                    holding_snapshot = False
+                                    snapshot_lock.release()
                             ack.set_result(None)
-                            with ordered:
+                            if not fast_observed:
+                                ordered.acquire()
+                                holding_ordered = True
                                 ordered.wait_for(
                                     lambda: (
                                         next_verified == ticket
@@ -860,108 +894,120 @@ def _execute_window(
                                     raise InterruptedError(
                                         "campaign ordered observation aborted"
                                     )
-                                nonce = b64u_encode(secrets.token_bytes(16))
-                                with snapshot_lock:
-                                    target = execution.observation_target(
-                                        request, request_nonce=nonce
-                                    )
-                                    response = observer.client.observe(target)
-                                observe_end = clock()
-                                row = {
-                                    "type": "operation",
-                                    "index": ticket,
-                                    "chain": chain,
-                                    "node_index": node_index,
-                                    "worker_id": threading.get_ident(),
-                                    "admit_ns": admit,
-                                    "start_ns": begin,
-                                    "commit_start_ns": commit_start,
-                                    "commit_end_ns": commit_end,
-                                    "observe_end_ns": observe_end,
-                                    "decision": outcome.authoritative_outcome,
-                                    "request": _encode_commit_request(request),
-                                    "request_hash": request.canonical_hash(),
-                                    "nonce": nonce,
-                                    "target": target.to_object(),
-                                    "observation": b64u_encode(
-                                        encode_signed_authority_observation(response)
-                                    ),
-                                    "verification_time_ms": int(time.time() * 1000),
-                                }
-                                d._verify_operation(
-                                    row,
-                                    header,
-                                    stream,
-                                    trust,
-                                    certificates,
-                                    expected_payload_builder=None
-                                    if numeric_context is None
-                                    else numeric_context.payload_builder,
-                                )
-                                row["end_ns"] = clock()
-                                pace = {
-                                    **asdict(slot),
-                                    "outcome": "committed",
-                                    "admitted_ns": admit,
-                                    "started_ns": begin,
-                                    "commit_end_ns": commit_end,
-                                    "end_ns": row["end_ns"],
-                                    "worker_id": row["worker_id"],
-                                }
-                                entry: dict[str, Any] = {
-                                    "type": "operation",
-                                    "proof": row,
-                                    "pacing": pace,
-                                }
+                                snapshot_lock.acquire()
+                                holding_snapshot = True
+                                try:
+                                    nonce, target, response, observe_end = _observe()
+                                finally:
+                                    if holding_snapshot:
+                                        holding_snapshot = False
+                                        snapshot_lock.release()
+                            row = {
+                                "type": "operation",
+                                "index": ticket,
+                                "chain": chain,
+                                "node_index": node_index,
+                                "worker_id": threading.get_ident(),
+                                "admit_ns": admit,
+                                "start_ns": begin,
+                                "commit_start_ns": commit_start,
+                                "commit_end_ns": commit_end,
+                                "observe_end_ns": observe_end,
+                                "decision": outcome.authoritative_outcome,
+                                "request": _encode_commit_request(request),
+                                "request_hash": request.canonical_hash(),
+                                "nonce": nonce,
+                                "target": target.to_object(),
+                                "observation": b64u_encode(
+                                    encode_signed_authority_observation(response)
+                                ),
+                                "verification_time_ms": int(time.time() * 1000),
+                            }
+                            d._verify_operation(
+                                row,
+                                header,
+                                stream,
+                                trust,
+                                certificates,
+                                expected_payload_builder=None
+                                if numeric_context is None
+                                else numeric_context.payload_builder,
+                            )
+                            row["end_ns"] = clock()
+                            pace = {
+                                **asdict(slot),
+                                "outcome": "committed",
+                                "admitted_ns": admit,
+                                "started_ns": begin,
+                                "commit_end_ns": commit_end,
+                                "end_ns": row["end_ns"],
+                                "worker_id": row["worker_id"],
+                            }
+                            entry: dict[str, Any] = {
+                                "type": "operation",
+                                "proof": row,
+                                "pacing": pace,
+                            }
 
-                                def publish(entry: dict[str, Any]) -> None:
-                                    nonlocal next_verified
-                                    with ordered:
-                                        if completion_after_release:
-                                            end = clock()
-                                            entry["proof"]["end_ns"] = end
-                                            entry["pacing"]["end_ns"] = end
-                                        append(entry)
-                                        entries.append(entry)
-                                        if numeric_context is not None:
-                                            numeric_context.progress[
-                                                "proofs_completed"
-                                            ] += 1
-                                        if (
-                                            numeric_context is not None
-                                            and numeric_context.is_late(
-                                                entry["pacing"], plan
-                                            )
-                                        ):
-                                            fatal.set()
-                                        completed[chain] = completed.get(chain, 0) + 1
-                                        next_verified += 1
-                                        ordered.notify_all()
+                            def publish(entry: dict[str, Any]) -> None:
+                                nonlocal next_verified
+                                with ordered:
+                                    if completion_after_release:
+                                        end = clock()
+                                        entry["proof"]["end_ns"] = end
+                                        entry["pacing"]["end_ns"] = end
+                                    append(entry)
+                                    entries.append(entry)
+                                    if numeric_context is not None:
+                                        numeric_context.progress["proofs_completed"] += (
+                                            1
+                                        )
+                                    if (
+                                        numeric_context is not None
+                                        and numeric_context.is_late(
+                                            entry["pacing"], plan
+                                        )
+                                    ):
+                                        fatal.set()
+                                    completed[chain] = completed.get(chain, 0) + 1
+                                    next_verified += 1
+                                    ordered.notify_all()
 
-                                if completion_after_release:
+                            if completion_after_release:
 
-                                    def after_release(entry: dict[str, Any]) -> None:
-                                        try:
-                                            publish(entry)
-                                        except BaseException as error:
-                                            stop.set()
-                                            with ordered:
-                                                failed.append(error)
-                                                ordered.notify_all()
-                                            raise
+                                def after_release(entry: dict[str, Any]) -> None:
+                                    try:
+                                        publish(entry)
+                                    except BaseException as error:
+                                        stop.set()
+                                        with ordered:
+                                            failed.append(error)
+                                            ordered.notify_all()
+                                        raise
 
-                                    entry["_after_release"] = after_release
-                                else:
-                                    publish(entry)
-                                return entry
+                                entry["_after_release"] = after_release
+                            else:
+                                publish(entry)
+                            return entry
                     except BaseException as error:
                         stop.set()
-                        with ordered:
+                        if holding_ordered:
                             failed.append(error)
                             ordered.notify_all()
+                        else:
+                            with ordered:
+                                failed.append(error)
+                                ordered.notify_all()
                         if not ack.done():
                             ack.set_exception(error)
                         raise
+                    finally:
+                        if holding_snapshot:
+                            holding_snapshot = False
+                            snapshot_lock.release()
+                        if holding_ordered:
+                            holding_ordered = False
+                            ordered.release()
 
                 future = pool.submit_before(
                     lambda admitted_ns, operation=operation: operation(

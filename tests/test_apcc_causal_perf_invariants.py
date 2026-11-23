@@ -332,7 +332,11 @@ def test_deep_chain_depth_64_boundary_and_limits_enforced(
         (CausalClosureLimits(max_total_bytes=20_000), FailureCode.SIZE_LIMIT_EXCEEDED),
     ):
         with monkeypatch.context() as patch:
-            patch.setattr(sqlite_store_module, "CausalClosureLimits", lambda _l=limits: _l)
+            patch.setattr(
+                sqlite_store_module.APCCAuthorityConfig,
+                "causal_limits",
+                property(lambda _self, _l=limits: _l),
+            )
             with sub_store._read_transaction() as conn:
                 cert = sqlite_store_module.decode_certificate(
                     sqlite_store_module.decode_envelope(sub_res_cert).payload
