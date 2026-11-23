@@ -39,9 +39,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from ..strict_json import StrictJSONError, loads as strict_loads
-from .codec import decode_certificate, decode_envelope
-from .crypto import COMMIT_DOMAIN, b64u_decode, sha256_digest
-from .model import CandidateLifecycle, FailureCode, Signature
+from .crypto import b64u_decode, sha256_digest
+from .model import Signature
 from .ports import (
     APCCAuthorityConfig,
     AuthorityRuntime,
@@ -52,7 +51,6 @@ from .sqlite_store import (
     _APCC_TABLES,
     _APPLICATION_ID,
     _AUTHORITY_SCHEMA_VERSION,
-    _CANDIDATE_ROW_COLUMNS,
     _MAX_SAFE_INTEGER,
     _REQUIRED_SCHEMA_OBJECTS,
     _SCHEMA_FINGERPRINT,
@@ -68,18 +66,14 @@ from .sqlite_store import (
     _json,
     _loads,
     _normalize_schema_sql,
-    _row_bytes,
     _schema,
     _seal_semantic_checkpoint,
     _semantic_checkpoint_row,
-    _trust,
-    _validate_candidate_row,
     _validate_schema,
     _validate_schema_manifest,
     _validate_semantic_integrity,
     _verify_semantic_checkpoint,
 )
-from .verifier import TrustRole, _bindings, _evidence, _header, _verify_signature
 
 _MIGRATION_RECEIPT_DOMAIN = b"APCC-MIGRATION-CONTINUITY-V1"
 _RECEIPT_PROTOCOL_VERSION = "APCC-1.0-draft"
@@ -448,96 +442,29 @@ def _check_ddl_and_storage(
     return (not diagnostics, tuple(diagnostics), has_gcb)
 
 
-def _diagnose_pre_c32_candidate_mismatch(
+def _pre_c32_audit_id(kind: str, *parts: str) -> str:
+    """Pre-C32 (schema v3 before framed_digest) NUL-joined audit/event identity."""
+    return sha256_digest((kind + "\x00" + "\x00".join(parts)).encode("utf-8"))
+
+
+def _diagnose_pre_c32_incompatibility(
     connection: sqlite3.Connection,
     config: APCCAuthorityConfig,
 ) -> tuple[bool, str]:
-    """Check whether failure is strictly candidate audit_event_id derivation."""
-    trust = _trust(config)
-    for (
-        digest,
-        commit_id,
-        payload,
-        envelope,
-        workflow_id,
-        node_id,
-        sequence,
-    ) in connection.execute(
-        "SELECT certificate_digest, commit_id, certificate_json, envelope, "
-        "workflow_id, node_id, sequence FROM certificates"
-    ):
-        if isinstance(sequence, bool) or not isinstance(sequence, int):
-            return False, "certificate row contains invalid sequence"
-        try:
-            payload_bytes = _row_bytes(payload)
-            detached = decode_envelope(_row_bytes(envelope))
-            if (
-                detached.payload != payload_bytes
-                or detached.payload_sha256 != digest
-                or sha256_digest(payload_bytes) != digest
-            ):
-                return False, "certificate digest or envelope mismatch"
-            cert = decode_certificate(payload_bytes)
-            if (
-                _header(cert) is not None
-                or _verify_signature(
-                    detached.seal,
-                    cert.header.commit_authority_key_id,
-                    trust,
-                    TrustRole.COMMIT,
-                    (cert.header.authority_store_id,),
-                    COMMIT_DOMAIN,
-                    payload_bytes,
-                    FailureCode.INVALID_COMMIT_SEAL,
-                )
-                is not None
-                or _evidence(cert, trust) is not None
-                or _bindings(cert) is not None
-                or cert.decision.commit_id != commit_id
-                or cert.subject.workflow_id != workflow_id
-                or cert.subject.node_id != node_id
-                or cert.header.certificate_sequence != str(sequence)
-            ):
-                return False, "certificate verification failed"
-        except Exception:
-            return False, "certificate verification failed"
-
-    logical_keys = {
-        (str(wf), str(node))
-        for wf, node in connection.execute(
-            "SELECT workflow_id, node_id FROM logical_nodes"
-        ).fetchall()
-    }
-    rows = connection.execute(
-        f"SELECT {_CANDIDATE_ROW_COLUMNS} FROM candidates"
-    ).fetchall()
-    bad_audit_count = 0
-    for row in rows:
-        try:
-            _validate_candidate_row(row, logical_keys, config, trust)
-        except ValueError:
-            lifecycle = CandidateLifecycle(str(row[4]))
-            if lifecycle not in {
-                CandidateLifecycle.RESULT_STAGED,
-                CandidateLifecycle.EVIDENCE_ASSEMBLED,
-                CandidateLifecycle.COMMIT_PENDING,
-            }:
-                return False, "candidate validation failed outside C32 audit states"
-            if row[6] is None:
-                return False, "non-executing candidate missing result bytes"
-            subj_obj = _loads(str(row[7]))
-            if (
-                not isinstance(subj_obj, Mapping)
-                or sha256_digest(bytes(row[6])) != subj_obj.get("output_digest")
-            ):
-                return False, "candidate result digest mismatch"
-            bad_audit_count += 1
-    if bad_audit_count == 0:
-        return False, "semantic integrity failure occurred outside candidate rows"
+    """Return True iff the store passes full semantic validation under pre-C32 audit IDs."""
+    try:
+        _validate_semantic_integrity(
+            connection, config, audit_id_fn=_pre_c32_audit_id
+        )
+    except ValueError:
+        return (
+            False,
+            "semantic integrity validation failed under both post-C32 and pre-C32 rules",
+        )
     return (
         True,
-        f"pre_c32_candidate_audit_mismatch: {bad_audit_count} of {len(rows)} "
-        "candidate rows fail C32 audit_event_id derivation",
+        "pre_c32_legacy_audit_ids: store passes full semantic validation only "
+        "under pre-C32 NUL-joined audit_event_id derivation",
     )
 
 
@@ -833,7 +760,7 @@ def _inspect_temp_copy(
         try:
             _validate_semantic_integrity(conn, parsed_config)
         except ValueError:
-            is_pre_c32, detail = _diagnose_pre_c32_candidate_mismatch(conn, parsed_config)
+            is_pre_c32, detail = _diagnose_pre_c32_incompatibility(conn, parsed_config)
             classification = (
                 StoreClassification.V3_PRE_C32_INCOMPATIBLE
                 if is_pre_c32
@@ -1026,6 +953,9 @@ def verify_migration_receipt(
         source_file = Path(source_path)
         if not source_file.is_file():
             raise APCCMigrationError(f"source path does not exist: {source_file}")
+        source_wal = Path(f"{source_file}-wal")
+        if source_wal.exists() and source_wal.stat().st_size > 0:
+            raise APCCMigrationError("source store has uncheckpointed WAL sidecar")
         if _sha256_file_hex(source_file) != parsed.source_sha256:
             raise APCCMigrationError("migration receipt source SHA-256 mismatch")
 

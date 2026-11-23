@@ -16,7 +16,7 @@ Empirical comparison of authentic v3 artifacts against schema v4 shows two disti
 1. **Authentic pre-C32 v3 stores** (exemplified by `tests/fixtures/apcc/apcc_pre_c32_v3.sqlite`):
    - SQLite DDL matches v4 (`0` DDL diffs across tables, indexes, and triggers).
    - `metadata.schema_fingerprint` matches the canonical v3 fingerprint (`1qM32kCg6RpbrXemVDsaSsUCbgR9glpRKfDQJMym02Y`) and the v3 `semantic_checkpoint` Ed25519 signature verifies.
-   - However, C32 candidate rows fail `_validate_candidate_row` because pre-C32 candidate `audit_event_id` values were derived under the pre-C32 format rather than the C32 `_audit_id(state.value, proposal.commit_id, _proposal_identity(proposal))` / `_audit_id("stage", ...)` derivation.
+   - However, pre-C32 stores fail `_validate_semantic_integrity` because pre-C32 derived non-decision audit/event IDs via legacy NUL-joined `sha256(kind + "\x00" + "\x00".join(parts))` rather than C32 length-prefixed `b64u(framed_digest(b"apcc.audit-id.v2", kind, *parts))` across `candidates`, `supersession_edges`, `control_events`/`audit_events`/`trust_log`, and `apcc_outbox`.
 2. **Authentic post-C32 v3 stores:**
    - Identical DDL to v4 (`0` DDL diffs), valid v3 `metadata` + signed v3 `semantic_checkpoint`, and 100% compliant with C32 `_validate_semantic_integrity`.
 
@@ -26,7 +26,7 @@ Empirical comparison of authentic v3 artifacts against schema v4 shows two disti
 2. **No in-place metadata or `PRAGMA user_version` rewriting:** Rewriting `PRAGMA user_version=4` and `metadata.schema_version='4'` in place violates evidence immutability because:
    - `semantic_checkpoint` signs `schema_fingerprint` (which binds the schema version).
    - Re-sealing a pre-C32 database as v4 would either immediately fail v4 open (`APCC SQLite store semantic validation failed`) or, worse, encourage mutating signed/hashed historical rows.
-3. **No silent re-signing of pre-C32 candidate rows:** Recomputing `candidates.audit_event_id` on pre-C32 databases destroys forensic correspondence with pre-C32 audit evidence and is forbidden.
+3. **No silent re-signing/rewriting of pre-C32 audit/event IDs:** Recomputing `candidates.audit_event_id`, `control_events`, `trust_log`, or `apcc_outbox` IDs on pre-C32 databases destroys forensic correspondence with pre-C32 audit evidence and is forbidden.
 
 ## 3. Decision: Offline Read-Only-Source -> Fresh-v4-Target Migration + Continuity Receipt
 

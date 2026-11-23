@@ -20,6 +20,7 @@ from constitutional_swarm.apcc.crypto import b64u_encode
 from constitutional_swarm.apcc.migration_v3_to_v4 import (
     APCCMigrationError,
     StoreClassification,
+    _pre_c32_audit_id,
     inspect_sqlite_store,
     migrate_sqlite_v3_to_v4,
     verify_migration_receipt,
@@ -190,7 +191,7 @@ def test_pre_c32_fixture_inspected_read_only_and_classified_incompatible(
     assert report.metadata_schema_version == "3"
     assert report.authority_store_id == "store-1"
     assert report.source_sha256 == before_sha
-    assert any("pre_c32_candidate_audit_mismatch: 1 of 72" in d for d in report.diagnostics)
+    assert any("pre_c32_legacy_audit_ids" in d for d in report.diagnostics)
     assert report.table_counts["certificates"] == 1
     assert report.table_counts["candidates"] == 72
 
@@ -562,6 +563,64 @@ def test_partial_gcb_extra_tables_and_broken_metadata_classified_corrupt(
     rep_broken = inspect_sqlite_store(broken_meta)
     assert rep_broken.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
     assert any("metadata table is corrupt" in d for d in rep_broken.diagnostics)
+
+    # Candidate row with tampered context_json + re-sealed checkpoint must be
+    # classified as V3_TAMPERED_OR_CORRUPT, never V3_PRE_C32_INCOMPATIBLE.
+    tampered_ctx = tmp_path / "tampered-context.sqlite"
+    store_ctx = _open_store(tampered_ctx, None)
+    req_ctx = _request(commit_id="ctx-1", nonce_byte=62)
+    _advance_candidate(store_ctx, req_ctx)
+    assert store_ctx.atomic_commit(req_ctx).decision.outcome is RequestOutcome.COMMITTED
+    with closing(sqlite3.connect(tampered_ctx)) as conn:
+        conn.execute("UPDATE candidates SET context_json='{}'")
+        conn.commit()
+    _rewrite_sqlite_to_authentic_post_c32_v3(tampered_ctx)
+    _cleanup_helper_sidecars(tampered_ctx)
+    rep_ctx = inspect_sqlite_store(tampered_ctx)
+    assert rep_ctx.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+
+    # Mixed pre/post-C32 store (valid pre-C32 candidate audit ID alongside
+    # post-C32 outbox ID) must fail both validators -> V3_TAMPERED_OR_CORRUPT.
+    mixed_c32 = tmp_path / "mixed-c32.sqlite"
+    store_mix = _open_store(mixed_c32, None)
+    req_mix = _request(commit_id="mix-1", nonce_byte=63)
+    _advance_candidate(store_mix, req_mix)
+    assert store_mix.atomic_commit(req_mix).decision.outcome is RequestOutcome.COMMITTED
+    with closing(sqlite3.connect(mixed_c32)) as conn:
+        legacy_audit = _pre_c32_audit_id(
+            "COMMIT_PENDING",
+            req_mix.commit_id,
+            sqlite_store_module._proposal_identity(req_mix),
+        )
+        conn.execute("UPDATE candidates SET audit_event_id = ?", (legacy_audit,))
+        conn.commit()
+    _rewrite_sqlite_to_authentic_post_c32_v3(mixed_c32)
+    _cleanup_helper_sidecars(mixed_c32)
+    rep_mix = inspect_sqlite_store(mixed_c32)
+    assert rep_mix.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+
+
+def test_continuity_receipt_rejects_source_wal_sidecar(tmp_path: Path) -> None:
+    v3_path = tmp_path / "v3-wal.sqlite"
+    _populate_rich_post_c32_v3(v3_path)
+    target_path = tmp_path / "v4-wal.sqlite"
+    receipt_path = tmp_path / "receipt-wal.json"
+    migrate_sqlite_v3_to_v4(
+        v3_path,
+        target_path,
+        config=_config(),
+        runtime=_runtime(),
+        receipt_path=receipt_path,
+    )
+    wal_sidecar = Path(f"{v3_path}-wal")
+    wal_sidecar.write_bytes(b"post-migration-source-wal-frames")
+    with pytest.raises(APCCMigrationError, match="uncheckpointed WAL sidecar"):
+        verify_migration_receipt(
+            receipt_path.read_bytes(),
+            config=_config(),
+            target_path=target_path,
+            source_path=v3_path,
+        )
 
 
 def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
