@@ -25,6 +25,7 @@ import json
 import secrets
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -217,6 +218,51 @@ def derive_effect_idempotency_key(
     )
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail-closed redirect handler that never forwards credentials cross-origin."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        del msg, newurl
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "external target HTTP redirect refused",
+            headers,
+            fp,
+        )
+
+
+def _validate_target_endpoint_url(
+    endpoint_url: str, *, allow_insecure_http: bool
+) -> None:
+    if not isinstance(endpoint_url, str) or not endpoint_url:
+        raise ValueError("endpoint URL must be a non-empty URL string")
+    parsed = urllib.parse.urlsplit(endpoint_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("endpoint URL must use http:// or https://")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("endpoint URL must include a valid host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("endpoint URL must not embed basic-auth credentials")
+    if scheme == "http" and not allow_insecure_http and hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            "non-loopback HTTP endpoint rejected without explicit allow_insecure_http"
+        )
+
+
 class CredentialBoundHttpTarget:
     """External HTTP target carrying gateway-only bearer auth, fencing, and idempotency."""
 
@@ -226,12 +272,12 @@ class CredentialBoundHttpTarget:
         *,
         bearer_token: str,
         timeout_seconds: float = 5.0,
+        allow_insecure_http: bool = False,
         opener: Callable[..., Any] | None = None,
     ) -> None:
-        if not isinstance(endpoint_url, str) or not (
-            endpoint_url.startswith("http://") or endpoint_url.startswith("https://")
-        ):
-            raise ValueError("endpoint URL must use http:// or https://")
+        _validate_target_endpoint_url(
+            endpoint_url, allow_insecure_http=allow_insecure_http
+        )
         if not isinstance(bearer_token, str) or not bearer_token:
             raise ValueError("bearer token cannot be empty")
         if timeout_seconds <= 0:
@@ -239,7 +285,10 @@ class CredentialBoundHttpTarget:
         self._endpoint_url = endpoint_url
         self._bearer_token = bearer_token
         self._timeout_seconds = float(timeout_seconds)
-        self._opener = opener if opener is not None else urllib.request.urlopen
+        if opener is not None:
+            self._opener = opener
+        else:
+            self._opener = urllib.request.build_opener(_NoRedirectHandler()).open
 
     def __repr__(self) -> str:
         return (
@@ -286,6 +335,10 @@ class CredentialBoundHttpTarget:
                 raw = response.read()
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
+            if 300 <= error.code < 400:
+                raise ExecutionGatewayError(
+                    f"external target HTTP redirect refused ({error.code})"
+                ) from error
             if error.code in (401, 403):
                 raise TargetAuthorizationError(
                     f"external target rejected authorization ({error.code}): {detail}"

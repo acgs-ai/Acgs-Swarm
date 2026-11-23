@@ -1039,3 +1039,100 @@ def test_credential_isolation_executor_cannot_bypass_gateway(
         )
     # Still only the 1 gateway-authorized mutation exists on target.
     assert len(target_harness.applied_rows()) == 1
+
+
+def test_http_target_rejects_non_loopback_cleartext_by_default() -> None:
+    with pytest.raises(ValueError, match="allow_insecure_http"):
+        CredentialBoundHttpTarget(
+            "http://example.com/execute", bearer_token="gateway-secret"
+        )
+    with pytest.raises(ValueError, match="embed"):
+        CredentialBoundHttpTarget(
+            "https://user:pass@example.com/execute", bearer_token="gateway-secret"
+        )
+    assert CredentialBoundHttpTarget(
+        "https://example.com/execute", bearer_token="gateway-secret"
+    )
+    assert CredentialBoundHttpTarget(
+        "http://127.0.0.1:8080/execute", bearer_token="gateway-secret"
+    )
+    assert CredentialBoundHttpTarget(
+        "http://localhost:8080/execute", bearer_token="gateway-secret"
+    )
+    assert CredentialBoundHttpTarget(
+        "http://example.com/execute",
+        bearer_token="gateway-secret",
+        allow_insecure_http=True,
+    )
+
+
+def test_http_target_refuses_redirect_without_forwarding_credentials() -> None:
+    sink_received: list[tuple[dict[str, str], bytes]] = []
+
+    class _SinkHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length > 0 else b""
+            sink_received.append(({k: v for k, v in self.headers.items()}, body))
+            self.send_response(200)
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            self.do_POST()
+
+    sink_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SinkHandler)
+    sink_host, sink_port = sink_server.server_address[:2]
+    sink_url = f"http://{sink_host}:{sink_port}/exfil"
+
+    class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", sink_url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    redirect_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    red_host, red_port = redirect_server.server_address[:2]
+    redirect_url = f"http://{red_host}:{red_port}/execute"
+
+    t_sink = threading.Thread(target=sink_server.serve_forever, daemon=True)
+    t_red = threading.Thread(target=redirect_server.serve_forever, daemon=True)
+    t_sink.start()
+    t_red.start()
+    try:
+        http_target = CredentialBoundHttpTarget(
+            redirect_url, bearer_token="gateway-secret"
+        )
+        with pytest.raises(ExecutionGatewayError, match="redirect"):
+            http_target.execute(
+                SideEffectInvocation(
+                    authority_store_id="store-1",
+                    event_id="ev-redir",
+                    commit_id="c-redir",
+                    certificate_digest=sha256_digest(b"c"),
+                    workflow_id="workflow-1",
+                    node_id="node-1",
+                    attempt_id="attempt-1",
+                    agent_id="agent-1",
+                    output_digest=sha256_digest(b"o"),
+                    idempotency_key="idem-redir",
+                    fencing_token=1,
+                    certificate_envelope=b"{}",
+                    trust_log_sequence="1",
+                    trust_log_head=sha256_digest(b"h"),
+                )
+            )
+        assert sink_received == []
+    finally:
+        redirect_server.shutdown()
+        redirect_server.server_close()
+        sink_server.shutdown()
+        sink_server.server_close()
+        t_red.join(timeout=2.0)
+        t_sink.join(timeout=2.0)
