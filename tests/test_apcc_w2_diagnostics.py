@@ -107,3 +107,50 @@ def test_stamps_slots_and_sidecar_round_trip(tmp_path: Path) -> None:
         {"ticket": 3, "snapshot_acquired_ns": 100, "row_built_ns": 200, "fast_observed": 1},
     ]
     assert loaded["slots"] == [{"slot_index": 7, "woke_ns": 40, "decided_ns": 55}]
+
+
+def test_samples_cover_watched_processes_and_files(tmp_path: Path) -> None:
+    import os
+
+    present = tmp_path / "present.bin"
+    present.write_bytes(b"x" * 37)
+    diagnostics = W2Diagnostics(_clock)
+    diagnostics.watch(
+        processes={"self": os.getpid(), "gone": 2**22 + 1},
+        files={"present": str(present), "absent": str(tmp_path / "absent.bin")},
+    )
+    diagnostics._sample(123)
+    (sample,) = diagnostics.to_object()["samples"]
+    assert sample["at_ns"] == 123
+    assert sample["file_bytes"] == {"present": 37, "absent": None}
+    assert sample["process_cpu_ticks"]["gone"] is None
+    assert isinstance(sample["process_cpu_ticks"]["self"], int)
+    assert len(sample["host_cpu_ticks"]) == 8
+
+
+def test_durability_profile_reads_the_header_without_opening_the_store(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    database = tmp_path / "store.db"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE t (x)")
+    connection.commit()
+    connection.close()
+    before = sorted(path.name for path in tmp_path.iterdir())
+    profile = w2_diagnostics.sqlite_durability_profile(str(database))
+    assert profile["journal_mode_is_wal"] is True
+    assert profile["default_synchronous"] in (0, 1, 2, 3)
+    assert profile["default_wal_autocheckpoint"] >= 0
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+    rollback = tmp_path / "rollback.db"
+    connection = sqlite3.connect(rollback)
+    connection.execute("CREATE TABLE t (x)")
+    connection.commit()
+    connection.close()
+    assert w2_diagnostics.sqlite_durability_profile(str(rollback))["journal_mode_is_wal"] is False
+    missing = w2_diagnostics.sqlite_durability_profile(str(tmp_path / "missing.db"))
+    assert missing["journal_mode_is_wal"] is None

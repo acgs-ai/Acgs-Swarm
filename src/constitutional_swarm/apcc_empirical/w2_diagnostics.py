@@ -6,7 +6,7 @@ separate.  The sidecar never feeds accounting or verification, and with the
 variable unset :func:`from_env` returns ``None`` and the campaign runs exactly
 as before.
 
-Three independent signals are recorded so a stall can be attributed:
+Four independent signals are recorded so a stall can be attributed:
 
 * **GC pauses** from ``gc.callbacks``.  A collection holds the GIL, so it
   stalls the admission loop and every worker thread at once.
@@ -14,6 +14,10 @@ Three independent signals are recorded so a stall can be attributed:
   it wakes late.  Each gap carries the host's CPU steal and CPU pressure
   deltas, which separates "this process was not scheduled" (steal or pressure
   rose) from "this process held the GIL" (they did not).
+* **A once-a-second sample** of host CPU ticks, load average, CPU time of the
+  authority, executor, observer and closure-verifier processes, and the size of
+  the store's write-ahead log.  It separates a slow host (every process slows
+  together) from a slow store (the authority's CPU or its WAL moves alone).
 * **Per-operation sub-phase stamps** on the campaign clock: lock waits, the two
   observation RPCs, row encoding, prefix verification, closure verification and
   the wait for the ordered publish turn.
@@ -24,6 +28,8 @@ from __future__ import annotations
 import gc
 import json
 import os
+import sqlite3
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -31,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 ENV = "APCC_W2_DIAGNOSTICS"
-REVISION = "w2-diagnostics-v1"
+REVISION = "w2-diagnostics-v2"
 _HEARTBEAT_INTERVAL_S = 0.005
 _HEARTBEAT_GAP_NS = 20_000_000
 _GC_PAUSE_FLOOR_NS = 1_000_000
@@ -67,6 +73,82 @@ def _delta(after: int | None, before: int | None) -> int | None:
     return None if after is None or before is None else after - before
 
 
+def _host_cpu_ticks() -> list[int] | None:
+    """Host-wide [user, nice, system, idle, iowait, irq, softirq, steal] ticks."""
+    try:
+        with open("/proc/stat", encoding="ascii") as handle:
+            fields = handle.readline().split()
+    except OSError:
+        return None
+    if len(fields) < 9 or fields[0] != "cpu":
+        return None
+    return [int(value) for value in fields[1:9]]
+
+
+def _load_average() -> float | None:
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return None
+
+
+def _process_cpu_ticks(pid: int) -> int | None:
+    """utime + stime of ``pid`` in clock ticks, or None once it has exited."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            # The command name may contain spaces; fields are counted after it.
+            fields = handle.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    if len(fields) < 13:
+        return None
+    return int(fields[11]) + int(fields[12])
+
+
+def _file_size(path: str) -> int | None:
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
+def sqlite_durability_profile(database: str) -> dict[str, Any]:
+    """Report the durability settings a store at ``database`` runs with.
+
+    The store is not opened.  Its journal mode is read from the file header
+    (bytes 18 and 19 are both 2 for WAL).  ``synchronous`` and
+    ``wal_autocheckpoint`` are per-connection and the APCC store sets neither,
+    so its connections use this SQLite library's defaults; those are read from
+    a scratch WAL database opened with the same library.
+    """
+    profile: dict[str, Any] = {"sqlite_version": sqlite3.sqlite_version}
+    try:
+        with open(database, "rb") as handle:
+            header = handle.read(20)
+        profile["header_write_read_versions"] = [header[18], header[19]]
+        profile["journal_mode_is_wal"] = header[18] == 2 and header[19] == 2
+    except (OSError, IndexError):
+        profile["journal_mode_is_wal"] = None
+    with tempfile.TemporaryDirectory() as scratch:
+        connection = sqlite3.connect(os.path.join(scratch, "probe.db"))
+        try:
+            profile["scratch_journal_mode"] = connection.execute(
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            profile["default_synchronous"] = connection.execute("PRAGMA synchronous").fetchone()[0]
+            profile["default_wal_autocheckpoint"] = connection.execute(
+                "PRAGMA wal_autocheckpoint"
+            ).fetchone()[0]
+            profile["compile_options"] = sorted(
+                row[0]
+                for row in connection.execute("PRAGMA compile_options")
+                if "SYNCHRONOUS" in row[0] or "AUTOCHECKPOINT" in row[0]
+            )
+        finally:
+            connection.close()
+    return profile
+
+
 class W2Diagnostics:
     """Collects diagnostics for one window; all times are campaign-clock ns."""
 
@@ -78,6 +160,9 @@ class W2Diagnostics:
         self._gaps: list[dict[str, int | None]] = []
         self._operations: dict[int, dict[str, int]] = {}
         self._slots: list[tuple[int, int, int]] = []
+        self._processes: dict[str, int] = {}
+        self._files: dict[str, str] = {}
+        self._samples: list[dict[str, Any]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._heartbeat, name="w2-diagnostics-heartbeat", daemon=True
@@ -87,6 +172,24 @@ class W2Diagnostics:
     @classmethod
     def from_env(cls, clock: Callable[[], int]) -> W2Diagnostics | None:
         return cls(clock) if os.environ.get(ENV) == "1" else None
+
+    def watch(self, *, processes: dict[str, int], files: dict[str, str]) -> None:
+        """Name the processes and files the once-a-second sample should cover."""
+        self._processes = dict(processes)
+        self._files = dict(files)
+
+    def _sample(self, now: int) -> None:
+        self._samples.append(
+            {
+                "at_ns": now,
+                "host_cpu_ticks": _host_cpu_ticks(),
+                "load_average_1m": _load_average(),
+                "process_cpu_ticks": {
+                    name: _process_cpu_ticks(pid) for name, pid in self._processes.items()
+                },
+                "file_bytes": {name: _file_size(path) for name, path in self._files.items()},
+            }
+        )
 
     def start(self) -> None:
         gc.callbacks.append(self._on_gc)
@@ -130,9 +233,12 @@ class W2Diagnostics:
     def _heartbeat(self) -> None:
         previous = self._clock()
         steal, pressure = _cpu_steal_ticks(), _cpu_pressure_us()
+        self._sample(previous)
         while not self._stop.wait(_HEARTBEAT_INTERVAL_S):
             now = self._clock()
             gap = now - previous
+            if now // 1_000_000_000 != previous // 1_000_000_000:
+                self._sample(now)
             if gap >= _HEARTBEAT_GAP_NS:
                 new_steal, new_pressure = _cpu_steal_ticks(), _cpu_pressure_us()
                 self._gaps.append(
@@ -177,6 +283,12 @@ class W2Diagnostics:
             },
             "gc_pauses": self._gc_pauses,
             "heartbeat_gaps": self._gaps,
+            "watched_processes": self._processes,
+            "watched_files": self._files,
+            "samples": self._samples,
+            "sqlite_durability": sqlite_durability_profile(self._files["authority_db"])
+            if "authority_db" in self._files
+            else None,
             "slots": [
                 {"slot_index": index, "woke_ns": woke, "decided_ns": decided}
                 for index, woke, decided in self._slots

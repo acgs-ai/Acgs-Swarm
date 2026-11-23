@@ -58,8 +58,18 @@ permissions:
 
 jobs:
   w2-cold-cell:
+    name: w2-cold-cell (gen2_gc=${{ matrix.gen2_gc }}, repeat=${{ matrix.repeat }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same commit, separate runners: the two arms differ only in whether
+        # the controller defers full garbage collections during the window.
+        # Two repeats per arm, because one run per arm cannot separate the
+        # change from run-to-run variance.
+        gen2_gc: [default, deferred]
+        repeat: [1, 2]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -250,6 +260,7 @@ jobs:
           # Controller-side sidecar (GC pauses, heartbeat gaps, sub-phase stamps).
           # It never feeds accounting or verification.
           APCC_W2_DIAGNOSTICS: ${{ vars.APCC_W2_DIAGNOSTICS || '1' }}
+          APCC_W2_DEFER_GEN2_GC: ${{ matrix.gen2_gc == 'deferred' && '1' || '0' }}
           SCHEDULED_OPERATIONS: ${{ inputs.scheduled_operations || '10000' }}
           DURATION_NS: ${{ inputs.duration_ns || '1000000000000' }}
           ADMISSION_GRACE_NS: ${{ inputs.admission_grace_ns || '25000000' }}
@@ -418,6 +429,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: w2-qualification-evidence-${{ github.run_id }}
+          name: w2-qualification-evidence-${{ github.run_id }}-gen2-${{ matrix.gen2_gc }}-r${{ matrix.repeat }}
           path: ${{ env.W2_BUNDLE_DIR }}
           retention-days: 30

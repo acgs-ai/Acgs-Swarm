@@ -7,6 +7,7 @@ authority. Explicit timing parameters are required; local runs do not approve th
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import multiprocessing
@@ -53,6 +54,14 @@ from constitutional_swarm.governed_commit import (
 from constitutional_swarm.swarm import TaskDAG
 
 DOMAIN = b"APCC-1.w2-campaign-v1.ledger\0"
+
+# With APCC_W2_DEFER_GEN2_GC=1 the controller makes no full (generation 2)
+# collection inside a window.  The window keeps every published proof in
+# memory, so a full collection walks a heap that grows all window long and
+# holds the GIL while it does: 51, 81 and 95 ms in run 45173297499, each
+# longer than the 25 ms admission grace.  Young collections still run.
+DEFER_GEN2_GC_ENV = "APCC_W2_DEFER_GEN2_GC"
+_GEN2_DEFERRED_THRESHOLD = 1_000_000_000
 
 
 def _unwrap_callable(fn: Any) -> Any:
@@ -119,6 +128,9 @@ class _ClosureVerifierPool:
             child_conn.close()
             self._conns.append(parent_conn)
             self._procs.append(proc)
+
+    def worker_pids(self) -> dict[str, int]:
+        return {f"closure-{index}": int(proc.pid) for index, proc in enumerate(self._procs)}
 
     def verify_closure(
         self,
@@ -864,9 +876,29 @@ def _execute_window(
         return time.monotonic_ns() - started
 
     diagnostics = W2Diagnostics.from_env(clock)
+    if diagnostics is not None:
+        watched = {
+            "controller": os.getpid(),
+            "authority": int(authority.pid),
+            "executor": int(execution.pid),
+            "observer": int(launch.observer_pid),
+        }
+        if closure_verifier is not None:
+            watched.update(closure_verifier.worker_pids())
+        diagnostics.watch(
+            processes=watched,
+            files={
+                "authority_db": str(directory / "authority.db"),
+                "authority_wal": str(directory / "authority.db-wal"),
+            },
+        )
+    gc_threshold = gc.get_threshold()
+    defer_gen2_gc = os.environ.get(DEFER_GEN2_GC_ENV) == "1"
     prefix = hashlib.sha256()
     with ledger_path.open("xb") as ledger:
       try:
+        if defer_gen2_gc:
+            gc.set_threshold(gc_threshold[0], gc_threshold[1], _GEN2_DEFERRED_THRESHOLD)
         if diagnostics is not None:
             diagnostics.start()
 
@@ -1325,6 +1357,8 @@ def _execute_window(
             diagnostics.write(
                 directory / f"window-{window_index:03d}.diagnostics.json"
             )
+        if defer_gen2_gc:
+            gc.set_threshold(*gc_threshold)
     drain_violation = False
     if numeric_context is not None:
         drain_violation = numeric_context.seal_drain(
