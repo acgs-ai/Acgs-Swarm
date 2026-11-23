@@ -413,6 +413,18 @@ def _check_ddl_and_storage(
     ).fetchall()
     table_names = {str(name) for kind, name, _table, _sql in rows if kind == "table"}
     has_gcb = _GCB_MARKER_TABLES.issubset(table_names)
+    has_any_gcb = bool(table_names & _GCB_MARKER_TABLES)
+    extra_tables = (
+        table_names - _APCC_TABLES - _GCB_MARKER_TABLES
+        if has_gcb
+        else table_names - _APCC_TABLES
+    )
+    if has_any_gcb and not has_gcb:
+        diagnostics.append("partial GCB table set present alongside APCC store")
+    if extra_tables:
+        diagnostics.append(
+            f"unexpected non-APCC table(s) present: {', '.join(sorted(extra_tables))}"
+        )
     actual = {
         (str(kind), str(name)): _normalize_schema_sql(str(sql))
         for kind, name, _table, sql in rows
@@ -634,10 +646,27 @@ def _inspect_temp_copy(
                 table_counts=counts,
             )
 
-        meta = {
-            str(k): str(v)
-            for k, v in conn.execute("SELECT key, value FROM metadata ORDER BY key").fetchall()
-        }
+        try:
+            meta = {
+                str(k): str(v)
+                for k, v in conn.execute(
+                    "SELECT key, value FROM metadata ORDER BY key"
+                ).fetchall()
+            }
+        except sqlite3.DatabaseError as error:
+            return StoreInspectionReport(
+                source_path=source_path,
+                source_sha256=source_sha256,
+                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
+                user_version=user_version,
+                metadata_schema_version=None,
+                schema_fingerprint=None,
+                authority_store_id=None,
+                source_change_sequence=None,
+                source_checkpoint_digest=None,
+                diagnostics=("metadata table is corrupt or has unexpected columns", str(error)),
+                table_counts=counts,
+            )
         meta_ver = meta.get("schema_version")
         schema_fp = meta.get("schema_fingerprint")
         cfg_text = meta.get("config")
@@ -1548,7 +1577,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"ERROR: {error.reason}", file=sys.stderr)
         if error.classification is not None:
-            return _exit_code_for_classification(error.classification)
+            code = _exit_code_for_classification(error.classification)
+            if getattr(args, "command", None) != "inspect" and code == 0:
+                return 2
+            return code
         return 3
     return 3
 

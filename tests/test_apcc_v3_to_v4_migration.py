@@ -514,6 +514,56 @@ def test_non_sqlite_file_classified_cleanly_without_unhandled_error(tmp_path: Pa
     assert any("not a valid SQLite" in d for d in report.diagnostics)
 
 
+def test_partial_gcb_extra_tables_and_broken_metadata_classified_corrupt(
+    tmp_path: Path,
+) -> None:
+    # Partial GCB table set (missing store_seal) must fail closed, never drop GCB data.
+    partial_gcb = tmp_path / "partial-gcb.sqlite"
+    _open_store(partial_gcb, None)
+    _rewrite_sqlite_to_authentic_post_c32_v3(partial_gcb)
+    with closing(sqlite3.connect(partial_gcb)) as conn:
+        for tbl in (
+            "agents",
+            "decisions",
+            "nodes",
+            "outbox",
+            "receipt_evidence",
+            "staged_artifacts",
+            "workflows",
+        ):
+            conn.execute(f"CREATE TABLE {tbl}(id TEXT PRIMARY KEY)")
+        conn.commit()
+    _cleanup_helper_sidecars(partial_gcb)
+    rep_partial = inspect_sqlite_store(partial_gcb)
+    assert rep_partial.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+    assert any("partial GCB" in d for d in rep_partial.diagnostics)
+
+    # Extra arbitrary non-APCC table must fail closed as DDL tamper.
+    extra_tbl = tmp_path / "extra-tbl.sqlite"
+    _open_store(extra_tbl, None)
+    _rewrite_sqlite_to_authentic_post_c32_v3(extra_tbl)
+    with closing(sqlite3.connect(extra_tbl)) as conn:
+        conn.execute("CREATE TABLE rogue_table(id TEXT PRIMARY KEY)")
+        conn.commit()
+    _cleanup_helper_sidecars(extra_tbl)
+    rep_extra = inspect_sqlite_store(extra_tbl)
+    assert rep_extra.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+    assert any("rogue_table" in d for d in rep_extra.diagnostics)
+
+    # Malformed metadata table columns must return V3_TAMPERED_OR_CORRUPT cleanly.
+    broken_meta = tmp_path / "broken-meta.sqlite"
+    with closing(sqlite3.connect(broken_meta)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA application_id=0x41504343")
+        conn.execute("PRAGMA user_version=3")
+        conn.execute("CREATE TABLE metadata(broken TEXT)")
+        conn.commit()
+    _cleanup_helper_sidecars(broken_meta)
+    rep_broken = inspect_sqlite_store(broken_meta)
+    assert rep_broken.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+    assert any("metadata table is corrupt" in d for d in rep_broken.diagnostics)
+
+
 def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
     pre_c32 = _copy_pre_c32_fixture(tmp_path, "pre.sqlite")
     v3_src = tmp_path / "post.sqlite"
@@ -594,3 +644,15 @@ def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
         "--json",
     )
     assert bad_ver.returncode == 3
+
+    # CLI migrate on an already-v4 store must refuse with nonzero exit code (never 0).
+    already_v4 = _run_cli(
+        "migrate",
+        str(v4_dst),
+        str(tmp_path / "should-not-migrate-v4.sqlite"),
+        "--key-bundle",
+        str(key_bundle),
+        "--json",
+    )
+    assert already_v4.returncode != 0
+    assert not (tmp_path / "should-not-migrate-v4.sqlite").exists()
