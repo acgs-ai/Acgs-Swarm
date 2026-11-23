@@ -103,9 +103,7 @@ def test_verify_rejects_lost_skipped_or_failed_tests(
     assert message in capsys.readouterr().err
 
 
-def test_verify_rejects_a_missing_shard(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_verify_rejects_a_missing_shard(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _write_shards(tmp_path, 4)
     (tmp_path / "shard-manifest-3.json").unlink()
     (tmp_path / "shard-results-3.xml").unlink()
@@ -131,7 +129,7 @@ def test_verify_rejects_disagreeing_collections(tmp_path: Path) -> None:
         shard.main(["verify", "--shards", "2", str(tmp_path)])
 
 
-_SAMPLE = '''\
+_SAMPLE = """\
 import warnings
 
 import pytest
@@ -146,7 +144,7 @@ def test_param(value):
 
 def test_single():
     assert True
-'''
+"""
 
 
 def test_select_round_trips_through_a_pytest_args_file(tmp_path: Path) -> None:
@@ -176,8 +174,15 @@ def test_select_round_trips_through_a_pytest_args_file(tmp_path: Path) -> None:
         assert all(node.startswith("test_sample.py::") for node in selected)
         report = reports / f"shard-results-{index}.xml"
         subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", f"@{args_file}", *isolate,
-             f"--junitxml={report}"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"@{args_file}",
+                *isolate,
+                f"--junitxml={report}",
+            ],
             cwd=tmp_path,
             check=True,
             capture_output=True,

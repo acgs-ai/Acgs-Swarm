@@ -54,9 +54,7 @@ def collect(paths: Sequence[str], pytest_args: Sequence[str]) -> list[str]:
         raise SystemExit(f"pytest collection failed with exit code {completed.returncode}")
     # A node id starts with its test file path; a collection-time warning that
     # merely mentions "::" does not.
-    node_ids = [
-        line.strip() for line in completed.stdout.splitlines() if _NODE_ID.match(line)
-    ]
+    node_ids = [line.strip() for line in completed.stdout.splitlines() if _NODE_ID.match(line)]
     if not node_ids:
         raise SystemExit("pytest collected no tests")
     if len(set(node_ids)) != len(node_ids):
