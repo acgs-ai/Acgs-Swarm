@@ -1132,6 +1132,10 @@ _AUDIT_ID_DOMAIN = b"apcc.audit-id.v2"
 _LEGACY_DECISION_AUDIT_KINDS = frozenset({"commit", "DENIED", "CONFLICTED", "conflict"})
 
 
+class _AuditIdFn(Protocol):
+    def __call__(self, kind: str, *parts: str) -> str: ...
+
+
 def _audit_id(kind: str, *parts: str) -> str:
     """Return the persisted audit/event identity for ``kind`` over ``parts``.
 
@@ -4878,6 +4882,8 @@ def _validate_candidate_row(
     logical_keys: Set[tuple[str, str]],
     config: APCCAuthorityConfig,
     trust: ScopedTrust,
+    *,
+    audit_id_fn: _AuditIdFn = _audit_id,
 ) -> None:
     """Validate one persisted candidate row exactly as store reopen does.
 
@@ -4966,13 +4972,13 @@ def _validate_candidate_row(
             is not None
         ):
             raise invalid
-        expected_candidate_audit = _audit_id(
+        expected_candidate_audit = audit_id_fn(
             state.value, proposal.commit_id, _proposal_identity(proposal)
         )
         if audit_event_id != expected_candidate_audit:
             raise invalid
     elif state is CandidateLifecycle.RESULT_STAGED:
-        if audit_event_id != _audit_id(
+        if audit_event_id != audit_id_fn(
             "stage",
             _row_text(workflow),
             _row_text(node),
@@ -4986,7 +4992,10 @@ def _validate_candidate_row(
 
 
 def _validate_semantic_integrity(
-    connection: _AuthorityConnection, config: APCCAuthorityConfig
+    connection: _AuthorityConnection,
+    config: APCCAuthorityConfig,
+    *,
+    audit_id_fn: _AuditIdFn = _audit_id,
 ) -> _SemanticSnapshot:
     invalid = ValueError("APCC SQLite store semantic validation failed")
     certificates: dict[str, CommitCertificate] = {}
@@ -5108,7 +5117,9 @@ def _validate_semantic_integrity(
     for row in connection.execute(
         f"SELECT {_CANDIDATE_ROW_COLUMNS} FROM candidates"
     ):
-        _validate_candidate_row(row, logical_keys, config, trust)
+        _validate_candidate_row(
+            row, logical_keys, config, trust, audit_id_fn=audit_id_fn
+        )
 
     audits = {
         str(audit_id): str(event_json)
@@ -5250,7 +5261,7 @@ def _validate_semantic_integrity(
             reason == FailureCode.NODE_VERSION_CONFLICT.value
         ):
             raise invalid
-        expected_audit = _audit_id(
+        expected_audit = audit_id_fn(
             "commit" if expected_outcome is RequestOutcome.COMMITTED else outcome,
             commit_id,
             request_digest,
@@ -5397,7 +5408,7 @@ def _validate_semantic_integrity(
             raise invalid from error
         supersession_operation = commit_index[new.decision.commit_id]
         if (
-            edge_id != _audit_id("replace", str(old_digest), str(new_digest))
+            edge_id != audit_id_fn("replace", str(old_digest), str(new_digest))
             or nonce != new.decision.nonce
             or old.subject.workflow_id != new.subject.workflow_id
             or old.subject.node_id != new.subject.node_id
@@ -5456,7 +5467,7 @@ def _validate_semantic_integrity(
             "reason": control_reason,
             "audit_event_id": control_audit,
         }
-        expected_audit = _audit_id(
+        expected_audit = audit_id_fn(
             "revoke",
             control_scope,
             control_workflow,
@@ -5583,7 +5594,7 @@ def _validate_semantic_integrity(
                 or trust_kind != "commit"
                 or trust_subject != digest
                 or outbox_event_id
-                != _audit_id("outbox", "COMMIT", outbox_operation, digest)
+                != audit_id_fn("outbox", "COMMIT", outbox_operation, digest)
             ):
                 raise invalid
             seen_commits.add(outbox_operation)
@@ -5597,7 +5608,7 @@ def _validate_semantic_integrity(
                 or trust_kind != "control"
                 or trust_subject != outbox_operation
                 or outbox_event_id
-                != _audit_id("outbox", "CONTROL", outbox_operation, control[6])
+                != audit_id_fn("outbox", "CONTROL", outbox_operation, control[6])
             ):
                 raise invalid
             seen_controls.add(outbox_operation)
@@ -5698,7 +5709,7 @@ def _validate_semantic_integrity(
                 raise ValueError("invalid conflict claim")
         except Exception as error:
             raise invalid from error
-        expected_audit = _audit_id("conflict", str(commit_id), expected_conflicting)
+        expected_audit = audit_id_fn("conflict", str(commit_id), expected_conflicting)
         expected_audit_json = _json(
             {
                 "kind": FailureCode.COMMIT_ID_EQUIVOCATION.value,
