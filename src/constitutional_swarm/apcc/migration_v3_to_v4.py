@@ -38,6 +38,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from .._sqlite_connections import SQLiteConnection
 from ..strict_json import StrictJSONError, loads as strict_loads
 from .crypto import b64u_decode, sha256_digest
 from .model import Signature
@@ -366,7 +367,7 @@ def _atomic_write_new_file(destination: Path, content: bytes) -> None:
             pass
 
 
-def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
+def _table_counts(connection: SQLiteConnection) -> dict[str, int]:
     counts: dict[str, int] = {}
     existing = {
         str(row[0])
@@ -382,7 +383,7 @@ def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-def _certificate_set_digest(connection: sqlite3.Connection) -> tuple[str, int]:
+def _certificate_set_digest(connection: SQLiteConnection) -> tuple[str, int]:
     digests = sorted(
         str(row[0])
         for row in connection.execute(
@@ -829,7 +830,7 @@ def inspect_sqlite_store(source_path: Path) -> StoreInspectionReport:
 
 
 def _copy_all_apcc_tables(
-    src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection
+    src_conn: SQLiteConnection, dst_conn: SQLiteConnection
 ) -> None:
     expected = set(_ORDERED_DATA_TABLES) | {"metadata", "semantic_checkpoint"}
     if expected != _APCC_TABLES:

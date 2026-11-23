@@ -147,3 +147,42 @@ def test_permit_released_before_completion_callback_can_submit():
         finish.set()
         hold.set()
         pool.close()
+
+
+def test_source_provenance_fails_closed_by_default_and_allows_explicit_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from constitutional_swarm.apcc_empirical import w2_driver
+
+    fake_mod = tmp_path / "src" / "constitutional_swarm" / "apcc_empirical" / "w2_driver.py"
+    fake_mod.parent.mkdir(parents=True)
+    fake_mod.write_text("# stub\n", encoding="utf-8")
+    for rel in (
+        "pyproject.toml",
+        "uv.lock",
+        "docs/internal/APCC-1-Protocol-Spec.md",
+        "docs/internal/APCC-1-Qualification-Live-Protocol-v3.md",
+        "scripts/run_apcc_w2_diagnostic.py",
+    ):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# {rel}\n", encoding="utf-8")
+
+    monkeypatch.setattr(w2_driver, "__file__", str(fake_mod))
+    monkeypatch.delenv("ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE", raising=False)
+    with pytest.raises(FileNotFoundError):
+        w2_driver._source_provenance()
+
+    monkeypatch.setenv("ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE", "1")
+    prov = w2_driver._source_provenance()
+    assert prov["missing_upstream_provenance_files"] == [
+        "experiments/apcc-1/matrix.v2.json",
+        "experiments/apcc-1/qualification-live.v3.json",
+        "experiments/apcc-1/raw-result.v2.schema.json",
+    ]
+    assert "pyproject.toml" in prov["files"]
+
+    # Non-allowlisted missing file must still fail closed even with opt-in enabled.
+    (tmp_path / "uv.lock").unlink()
+    with pytest.raises(FileNotFoundError):
+        w2_driver._source_provenance()

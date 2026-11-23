@@ -354,30 +354,54 @@ def _verify_operation(
     )
 
 
+_OPTIONAL_UPSTREAM_PROVENANCE_FILES = frozenset(
+    {
+        "experiments/apcc-1/matrix.v2.json",
+        "experiments/apcc-1/raw-result.v2.schema.json",
+        "experiments/apcc-1/qualification-live.v3.json",
+    }
+)
+
+
 def _source_provenance() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[3]
     paths = sorted((root / "src" / "constitutional_swarm").rglob("*.py"))
-    paths += [
-        root / name
-        for name in (
-            "pyproject.toml",
-            "uv.lock",
-            "docs/internal/APCC-1-Protocol-Spec.md",
-            "docs/internal/APCC-1-Qualification-Live-Protocol-v3.md",
-            "experiments/apcc-1/matrix.v2.json",
-            "experiments/apcc-1/raw-result.v2.schema.json",
-            "experiments/apcc-1/qualification-live.v3.json",
-            "scripts/run_apcc_w2_diagnostic.py",
-        )
-    ]
-    return {
-        "files": {
-            str(path.relative_to(root)): _sha(path.read_bytes()) for path in paths
-        },
+    extra_relpaths = (
+        "pyproject.toml",
+        "uv.lock",
+        "docs/internal/APCC-1-Protocol-Spec.md",
+        "docs/internal/APCC-1-Qualification-Live-Protocol-v3.md",
+        "experiments/apcc-1/matrix.v2.json",
+        "experiments/apcc-1/raw-result.v2.schema.json",
+        "experiments/apcc-1/qualification-live.v3.json",
+        "scripts/run_apcc_w2_diagnostic.py",
+    )
+    allow_missing_upstream = (
+        os.environ.get("ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE") == "1"
+    )
+    files: dict[str, str] = {
+        str(path.relative_to(root)): _sha(path.read_bytes()) for path in paths
+    }
+    missing: list[str] = []
+    for name in extra_relpaths:
+        path = root / name
+        if (
+            allow_missing_upstream
+            and name in _OPTIONAL_UPSTREAM_PROVENANCE_FILES
+            and not path.is_file()
+        ):
+            missing.append(name)
+            continue
+        files[name] = _sha(path.read_bytes())
+    result: dict[str, Any] = {
+        "files": files,
         "python": sys.version,
         "sqlite": sqlite3.sqlite_version,
         "platform": platform.platform(),
     }
+    if missing:
+        result["missing_upstream_provenance_files"] = sorted(missing)
+    return result
 
 
 def verify_ledger(

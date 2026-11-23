@@ -97,6 +97,7 @@ _VERDICT_DOMAIN = b"ACGS-SWARM\x00GCB\x00VERDICT\x00V1\x00"
 _CONTROL_SIGNER_DOMAIN = b"ACGS-SWARM-GCB-CONTROL-V1"
 _ATTEMPT_DOMAIN = b"ACGS-SWARM\x00GCB\x00ATTEMPT\x00V1\x00"
 _LegacyTransaction = SQLiteConnection
+_MAX_WORKFLOW_NODES = 1000
 _GCB_ADMISSION_INDEX = "idx_gcb_admission_lookup"
 _GCB_ADMISSION_INDEX_SQL = (
     "CREATE INDEX idx_gcb_admission_lookup "
@@ -3228,7 +3229,7 @@ class GovernedCommitBoundary:
         return reached
 
     @staticmethod
-    def _revoked_roots(conn: sqlite3.Connection, workflow_id: str) -> set[str]:
+    def _revoked_roots(conn: SQLiteConnection, workflow_id: str) -> set[str]:
         return {
             row["root_node_id"]
             for row in conn.execute(
@@ -3238,7 +3239,7 @@ class GovernedCommitBoundary:
         }
 
     def _topology(
-        self, conn: sqlite3.Connection, workflow_id: str
+        self, conn: SQLiteConnection, workflow_id: str
     ) -> dict[str, list[str]]:
         return self._children_map(
             conn.execute(
@@ -3247,7 +3248,7 @@ class GovernedCommitBoundary:
             ).fetchall()
         )
 
-    def _revoked_nodes(self, conn: sqlite3.Connection, workflow_id: str) -> set[str]:
+    def _revoked_nodes(self, conn: SQLiteConnection, workflow_id: str) -> set[str]:
         """Every node in the revocation closure of one workflow."""
         roots = self._revoked_roots(conn, workflow_id)
         if not roots:
