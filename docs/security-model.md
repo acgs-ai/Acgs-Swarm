@@ -39,6 +39,16 @@ Persistence protects continuity and post-incident replay, but operators still ne
 Receipt verification checks payload integrity, hash-linking, and signature validity per receipt profile.
 This supports evidence replay, not universal attestation for every external process.
 
+### 6) External side-effect execution boundary (APCC Execution Gateway)
+APCC `atomic_commit` commits the governance decision, commit certificate, logical-node state, and outbox row inside one authority-store transaction, with **at-least-once** post-commit outbox delivery (`recover_outbox`). Store commit atomicity alone does not make arbitrary downstream targets idempotent or fenced against stale workers.
+
+`constitutional_swarm.apcc.execution_gateway.APCCExecutionGateway` bridges that gap as an `AuthorityOutboxSink` consumer:
+- **Pre-execution verification:** Decodes `COMMIT` outbox payloads, fetches the signed detached certificate envelope, verifies full digest-pinned `verify_causal_closure`, fetches atomic `AuthorityStatus` across every ancestor and leaf via `current_status_batch`, and enforces `verify_current` with a persistent anti-rollback `trust_log_sequence`/`trust_log_head` watermark.
+- **Durable idempotency & monotonic fencing:** `SQLiteExecutionLedger` (`WAL+FULL`) persists canonical `framed_digest`-derived `Idempotency-Key` records and allocates strictly monotonic `X-Fencing-Token` values across crashes, timeouts, and lease expiries.
+- **Credential isolation:** Downstream bearer credentials reside solely in `CredentialBoundHttpTarget` (redacted in `repr`), never inside the APCC store or producer/executor payloads.
+
+**Residual requirement:** External targets must independently enforce bearer authentication, `Idempotency-Key` deduplication, and monotonic `X-Fencing-Token` admission. APCC + the gateway cannot retrofit fencing onto unauthenticated, non-idempotent third-party APIs that ignore those headers.
+
 ## Threats addressed (high level)
 - Policy violations detectable at local enforcement points
 - Invalid or unsigned votes rejected by mesh vote workflow
