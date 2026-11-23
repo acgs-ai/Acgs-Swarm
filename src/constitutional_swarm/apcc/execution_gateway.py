@@ -21,6 +21,7 @@ execution safety:
 
 from __future__ import annotations
 
+import http.client
 import json
 import secrets
 import sqlite3
@@ -340,22 +341,35 @@ class CredentialBoundHttpTarget:
                 status_code = getattr(response, "status", 200)
                 raw = response.read()
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            if 300 <= error.code < 400:
+            # Everything the target sent back is untrusted, and a target can
+            # echo the request, bearer token included.  So the status line and
+            # body never reach an exception message, and ``from None`` keeps
+            # the HTTPError (whose text is the target's reason phrase) out of
+            # chained tracebacks.  Only the numeric status code is reported.
+            code = int(error.code)
+            error.close()
+            if 300 <= code < 400:
                 raise ExecutionGatewayError(
-                    f"external target HTTP redirect refused ({error.code})"
-                ) from error
-            if error.code in (401, 403):
+                    f"external target HTTP redirect refused ({code})"
+                ) from None
+            if code in (401, 403):
                 raise TargetAuthorizationError(
-                    f"external target rejected authorization ({error.code}): {detail}"
-                ) from error
-            if error.code == 409:
+                    f"external target rejected authorization ({code})"
+                ) from None
+            if code == 409:
                 raise StaleFencingTokenError(
-                    f"external target rejected stale fence or conflict (409): {detail}"
-                ) from error
+                    "external target rejected stale fence or conflict (409)"
+                ) from None
             raise ExecutionGatewayError(
-                f"external target HTTP error ({error.code}): {detail}"
-            ) from error
+                f"external target HTTP error ({code})"
+            ) from None
+        except http.client.HTTPException as error:
+            # A malformed or truncated response (BadStatusLine, IncompleteRead)
+            # is not an OSError, and its text can carry raw bytes from the
+            # target, so only the exception type is reported.
+            raise ExecutionGatewayError(
+                f"external target transport error: {type(error).__name__}"
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise ExecutionGatewayError(
                 f"external target transport error: {error}"
