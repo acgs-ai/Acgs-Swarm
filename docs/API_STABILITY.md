@@ -101,10 +101,10 @@ users yet, so names and signatures can still change in a minor release.
 | `authority_observer` | Launch configuration for the isolated observer. |
 | `authority_service` | IPC boundary and clients for the privileged authority process. |
 
-The execution gateway has limits you should know before relying on it. Each is
-pinned by a test in `tests/test_apcc_execution_gateway_fault_e2e.py`, which
-runs the gateway against a real HTTPS target process through a fault-injecting
-proxy:
+The execution gateway has limits you should know before relying on it. Unless
+noted, each is pinned by a test in
+`tests/test_apcc_execution_gateway_fault_e2e.py`, which runs the gateway
+against a real HTTPS target process through a fault-injecting proxy:
 
 - **It does not retry.** There is no backoff and no `Retry-After` handling. A
   failed delivery is tried again only when the authority store redelivers the
@@ -122,8 +122,14 @@ proxy:
   trust store. To trust a private CA, pass an `opener` built with your own
   `ssl.SSLContext`. An expired certificate, an untrusted issuer, and a
   hostname mismatch all fail before any request is sent.
-- **Errors carry the status code only.** Nothing the target sends back is
-  copied into an exception message, because a target can echo the bearer token.
+- **Target responses are treated as untrusted.** A target can echo the bearer
+  token, so an HTTP error is reported by status code alone: the target's body,
+  headers, and reason phrase are kept out of the message and out of the
+  exception chain. In a receipt, `target_reference` and `applied_digest` must
+  be at most 512 printable ASCII characters with no spaces and must not contain
+  the bearer token, and a receipt over 64 KiB is rejected. Local socket and TLS
+  errors keep their own text. (Pinned in
+  `tests/test_apcc_execution_gateway_untrusted_response.py`.)
 - **Key rotation is not supported.** A store refuses to reopen with different
   commit or status keys, and a verifier holds one key per role and scope. A
   certificate signed under other keys is rejected, and the gateway raises

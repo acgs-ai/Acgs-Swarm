@@ -222,14 +222,13 @@ _AMBIGUOUS_FAULTS = {
         "transport error",
     ),
     "delay_past_client_timeout": (1.0, "ExecutionGatewayError", "TimeoutError", "transport error"),
-    # The headers arrive (HTTP 201) and the body is cut: http.client raises
-    # IncompleteRead.  The gateway reports only the exception type and drops
-    # the cause, because a protocol error's text can carry bytes from the target.
+    # The headers arrive (HTTP 201) and the body is cut.  The gateway reads a
+    # bounded number of bytes, so the truncated body is an unparseable receipt.
     "close_mid_response": (
         5.0,
         "ExecutionGatewayError",
         None,
-        "transport error: IncompleteRead",
+        "invalid JSON receipt",
     ),
 }
 
@@ -531,8 +530,8 @@ def test_d_target_reflected_credential_must_not_reach_gateway_error(
 ) -> None:
     """A target that echoes the Authorization header must not leak the token.
 
-    The gateway reports the status code only: neither the target's body nor its
-    reason phrase reaches the exception message or the exception chain.
+    The gateway reports the status code only.  The target's body and reason
+    phrase reach neither the message nor ``__cause__`` nor ``__context__``.
     """
     store = env.provision()
     commit_effect(store, commit_id=f"d-reflect-{status}", nonce_byte=131)
@@ -544,6 +543,7 @@ def test_d_target_reflected_credential_must_not_reach_gateway_error(
     assert error is not None and error["type"] == expected_type, error
     assert error["message"] == expected_message
     assert error["cause_type"] is None
+    assert error["context_type"] is None
     assert TOKEN not in json.dumps(error)
     assert env.target.view.applied() == []
 

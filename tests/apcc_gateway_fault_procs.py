@@ -426,6 +426,8 @@ def _describe_error(error: BaseException) -> dict[str, Any]:
         "failure_code": None if failure_code is None else str(failure_code.value),
         "cause_type": None if error.__cause__ is None else type(error.__cause__).__name__,
         "cause_message": None if error.__cause__ is None else str(error.__cause__),
+        "context_type": None if error.__context__ is None else type(error.__context__).__name__,
+        "context_message": None if error.__context__ is None else str(error.__context__),
     }
 
 

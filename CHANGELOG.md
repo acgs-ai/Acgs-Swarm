@@ -12,14 +12,21 @@ The format is based on Keep a Changelog.
   `TargetAuthorizationError`, `StaleFencingTokenError`, and
   `ExecutionGatewayError` messages. A target that reflects request headers in
   its error body could therefore put the gateway's bearer token into exception
-  text and logs. Errors now carry the numeric status code only, and the
-  underlying `HTTPError` is no longer chained. Code that parsed the target's
-  body out of these messages must read the target's own logs instead.
+  text and logs. HTTP errors now carry the numeric status code only, and the
+  target's response is kept out of the exception chain. Code that parsed the
+  target's body out of these messages must read the target's own logs instead.
+- **Execution gateway validates receipt text before storing it.** A 2xx
+  receipt's `target_reference` and `applied_digest` were stored in the ledger
+  and passed to `on_outcome` unchecked. They must now be 1 to 512 printable
+  ASCII characters with no spaces and must not contain the bearer token, and a
+  receipt body over 64 KiB is rejected. A target that returns anything else
+  gets `ExecutionGatewayError` and the effect stays `IN_FLIGHT`.
 
 ### Fixed
-- A response cut off after its headers raised a bare
-  `http.client.IncompleteRead` from `CredentialBoundHttpTarget.execute`. It is
-  now an `ExecutionGatewayError`, like every other transport failure.
+- A response cut off after its headers, or with a malformed status line,
+  raised a bare `http.client` exception from
+  `CredentialBoundHttpTarget.execute`. It is now an `ExecutionGatewayError`,
+  like every other transport failure.
 
 ### Added
 - `docs/API_STABILITY.md` states which modules are stable, advanced,

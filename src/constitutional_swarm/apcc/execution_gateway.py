@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import secrets
 import sqlite3
 import urllib.error
@@ -223,6 +224,10 @@ def derive_effect_idempotency_key(
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A receipt is a small JSON object.  Its two free-text fields are stored in the
+# ledger and handed to callbacks, so they are bounded printable ASCII.
+_MAX_RECEIPT_BYTES = 64 * 1024
+_RECEIPT_TEXT = re.compile(r"[\x21-\x7e]{1,512}")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -303,6 +308,19 @@ class CredentialBoundHttpTarget:
             "bearer_token='<redacted>')"
         )
 
+    def _is_safe_receipt_text(self, value: object) -> bool:
+        """Whether a receipt string may be stored in the ledger and outcomes.
+
+        The target chooses these strings and they are persisted and logged, so
+        they must be short, printable ASCII without spaces (no control
+        characters, no line breaks) and must not contain this target's token.
+        """
+        return (
+            isinstance(value, str)
+            and _RECEIPT_TEXT.fullmatch(value) is not None
+            and (not self._bearer_token or self._bearer_token not in value)
+        )
+
     def execute(self, invocation: SideEffectInvocation) -> TargetExecutionReceipt:
         body = json.dumps(
             {
@@ -336,55 +354,62 @@ class CredentialBoundHttpTarget:
                 "X-APCC-Certificate-Digest": invocation.certificate_digest,
             },
         )
+        # Everything the target sends back is untrusted, and a target can echo
+        # the request, bearer token included.  Failures are therefore recorded
+        # here and raised after the ``except`` blocks have ended, so the
+        # original exception (reason phrase, headers, body, raw status line) is
+        # neither the new exception's ``__cause__`` nor its ``__context__``.
+        failure: ExecutionGatewayError | None = None
+        status_code = 0
+        raw = b""
         try:
             with self._opener(request, timeout=self._timeout_seconds) as response:
-                status_code = getattr(response, "status", 200)
-                raw = response.read()
+                status_code = int(getattr(response, "status", 200))
+                raw = response.read(_MAX_RECEIPT_BYTES + 1)
         except urllib.error.HTTPError as error:
-            # Everything the target sent back is untrusted, and a target can
-            # echo the request, bearer token included.  So the status line and
-            # body never reach an exception message, and ``from None`` keeps
-            # the HTTPError (whose text is the target's reason phrase) out of
-            # chained tracebacks.  Only the numeric status code is reported.
             code = int(error.code)
             error.close()
             if 300 <= code < 400:
-                raise ExecutionGatewayError(
-                    f"external target HTTP redirect refused ({code})"
-                ) from None
-            if code in (401, 403):
-                raise TargetAuthorizationError(
+                failure = ExecutionGatewayError(f"external target HTTP redirect refused ({code})")
+            elif code in (401, 403):
+                failure = TargetAuthorizationError(
                     f"external target rejected authorization ({code})"
-                ) from None
-            if code == 409:
-                raise StaleFencingTokenError(
+                )
+            elif code == 409:
+                failure = StaleFencingTokenError(
                     "external target rejected stale fence or conflict (409)"
-                ) from None
-            raise ExecutionGatewayError(
-                f"external target HTTP error ({code})"
-            ) from None
+                )
+            else:
+                failure = ExecutionGatewayError(f"external target HTTP error ({code})")
         except http.client.HTTPException as error:
             # A malformed or truncated response (BadStatusLine, IncompleteRead)
             # is not an OSError, and its text can carry raw bytes from the
             # target, so only the exception type is reported.
-            raise ExecutionGatewayError(
+            failure = ExecutionGatewayError(
                 f"external target transport error: {type(error).__name__}"
-            ) from None
+            )
         except (urllib.error.URLError, TimeoutError, OSError) as error:
+            # Raised before any response was parsed: the text is the local
+            # socket or TLS error, not content chosen by the target.
             raise ExecutionGatewayError(
                 f"external target transport error: {error}"
             ) from error
+        if failure is not None:
+            raise failure
 
         if status_code not in (200, 201):
             raise ExecutionGatewayError(
                 f"unexpected external target status code: {status_code}"
             )
+        if len(raw) > _MAX_RECEIPT_BYTES:
+            raise ExecutionGatewayError("external target receipt is too large")
+        parsed: object = None
         try:
             parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ExecutionGatewayError(
-                "external target returned invalid JSON receipt"
-            ) from error
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            failure = ExecutionGatewayError("external target returned invalid JSON receipt")
+        if failure is not None:
+            raise failure
         if not isinstance(parsed, Mapping):
             raise ExecutionGatewayError("external target receipt must be a JSON object")
 
@@ -397,13 +422,12 @@ class CredentialBoundHttpTarget:
             resp_key != invocation.idempotency_key
             or type(resp_token) is not int
             or resp_token < 1
-            or not isinstance(target_reference, str)
-            or not target_reference
-            or not isinstance(applied_digest, str)
-            or not applied_digest
+            or not self._is_safe_receipt_text(target_reference)
+            or not self._is_safe_receipt_text(applied_digest)
             or type(replayed) is not bool
         ):
             raise ExecutionGatewayError("external target receipt fields are invalid")
+        assert isinstance(target_reference, str) and isinstance(applied_digest, str)
         return TargetExecutionReceipt(
             idempotency_key=resp_key,
             fencing_token=resp_token,
