@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import secrets
 import threading
@@ -51,6 +52,105 @@ from constitutional_swarm.governed_commit import (
 from constitutional_swarm.swarm import TaskDAG
 
 DOMAIN = b"APCC-1.w2-campaign-v1.ledger\0"
+_ORIGINAL_VERIFY_OPERATION = d._verify_operation
+
+
+def _closure_verifier_worker(
+    connection: Any, trust_bindings: tuple[TrustBinding, ...]
+) -> None:
+    trust = ScopedTrust(trust_bindings)
+    certificates: dict[str, bytes] = {}
+    try:
+        while True:
+            item = connection.recv()
+            if item is None:
+                break
+            node_index, workflow_id, envelope = item
+            try:
+                d._verify_operation_closure(
+                    envelope,
+                    workflow_id=workflow_id,
+                    node_index=node_index,
+                    trust=trust,
+                    certificates=certificates,
+                )
+            except BaseException as exc:
+                connection.send((False, f"{type(exc).__name__}: {exc}"))
+            else:
+                connection.send((True, None))
+    except (EOFError, OSError):
+        pass
+    finally:
+        connection.close()
+
+
+class _ClosureVerifierPool:
+    """Off-GIL persistent worker pool for uncached W2 causal-closure replay."""
+
+    def __init__(
+        self, trust_bindings: tuple[TrustBinding, ...], *, workers: int = 4
+    ) -> None:
+        if workers <= 0:
+            raise ValueError("workers must be positive")
+        self._workers = workers
+        ctx = multiprocessing.get_context("spawn")
+        self._locks = [threading.Lock() for _ in range(workers)]
+        self._conns: list[Any] = []
+        self._procs: list[Any] = []
+        self._closed = False
+        for index in range(workers):
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(
+                target=_closure_verifier_worker,
+                args=(child_conn, trust_bindings),
+                name=f"w2-verifier-{index}",
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._conns.append(parent_conn)
+            self._procs.append(proc)
+
+    def verify_closure(
+        self,
+        *,
+        chain: int,
+        node_index: int,
+        workflow_id: str,
+        envelope: bytes,
+    ) -> None:
+        idx = chain % self._workers
+        with self._locks[idx]:
+            if self._closed:
+                raise InterruptedError("closure verifier closed")
+            self._conns[idx].send((node_index, workflow_id, envelope))
+            ok, err = self._conns[idx].recv()
+            if not ok:
+                raise ValueError(err or "closure verification failed")
+
+    def close(self) -> None:
+        self._closed = True
+        for lock, conn, proc in zip(
+            self._locks, self._conns, self._procs, strict=True
+        ):
+            if proc.is_alive() and lock.acquire(blocking=False):
+                try:
+                    conn.send(None)
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                finally:
+                    lock.release()
+                proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1.0)
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 class CampaignWorkerPool(d.WorkerPool):
@@ -526,7 +626,7 @@ def run_repetition(
         ),
     )
     observer_config = replace(observer_config, experiment_id=d._EXPERIMENT)
-    authority = observer = pool = None
+    authority = observer = pool = closure_verifier = None
     stop = cancel if cancel is not None else threading.Event()
     ordered = threading.Condition()
     snapshot_lock = threading.Lock()
@@ -534,6 +634,9 @@ def run_repetition(
     payloads: dict[int, Any] = {}
     dags: dict[int, TaskDAG] = {}
     try:
+        closure_verifier = _ClosureVerifierPool(
+            child.authority.trust_bindings, workers=4
+        )
         authority = start_authority(child)
         # Workflow registration precedes the measured clock; it is recorded as
         # setup, never counted as admitted workload or hidden in operation latency.
@@ -598,6 +701,7 @@ def run_repetition(
                 chain_offset=chain_offset,
                 previous_ledger=previous_ledger,
                 plans=plans,
+                closure_verifier=closure_verifier,
             )
             results.append(result)
             if (
@@ -634,6 +738,8 @@ def run_repetition(
         with ExitStack() as cleanup:
             for path in private_paths:
                 cleanup.callback(path.unlink, missing_ok=True)
+            if closure_verifier is not None:
+                cleanup.callback(closure_verifier.close)
             if authority is not None:
                 cleanup.callback(authority.close)
             if observer is not None:
@@ -673,6 +779,7 @@ def _execute_window(
     terminal_proof: Callable[[list[dict[str, Any]], dict[str, Any]], Any] | None = None,
     completion_after_release: bool = False,
     numeric_context: Any = None,
+    closure_verifier: _ClosureVerifierPool | None = None,
 ) -> dict[str, Any]:
     fatal = threading.Event()
     if numeric_context is not None:
@@ -689,7 +796,13 @@ def _execute_window(
     lane_owners: dict[int, int] = {}
     entries: list[dict[str, Any]] = []
     next_verified = 0
+    next_published = 0
+    publish_ordered = threading.Condition()
     ticket_count = 0
+    verify_fn = getattr(d._verify_operation, "__wrapped__", d._verify_operation)
+    use_split_verifier = (
+        closure_verifier is not None and verify_fn is _ORIGINAL_VERIFY_OPERATION
+    )
     ledger_path = directory / f"window-{window_index:03d}.jsonl"
     public_config = _config_object(child.authority)
     launch = observer.launch_attestation
@@ -743,6 +856,7 @@ def _execute_window(
 
     prefix = hashlib.sha256()
     with ledger_path.open("xb") as ledger:
+      try:
 
         def append(value: dict[str, Any]) -> None:
             encoded = d._json(value) + b"\n"
@@ -802,7 +916,7 @@ def _execute_window(
                     ticket: int = ticket,
                     slot: Any = slot,
                 ) -> dict[str, Any]:
-                    nonlocal next_verified
+                    nonlocal next_verified, next_published
                     holding_snapshot = False
                     holding_ordered = False
                     try:
@@ -923,16 +1037,38 @@ def _execute_window(
                                 ),
                                 "verification_time_ms": int(time.time() * 1000),
                             }
-                            d._verify_operation(
-                                row,
-                                header,
-                                stream,
-                                trust,
-                                certificates,
-                                expected_payload_builder=None
-                                if numeric_context is None
-                                else numeric_context.payload_builder,
-                            )
+                            if use_split_verifier:
+                                assert closure_verifier is not None
+                                envelope, workflow_id = d._verify_operation_prefix(
+                                    row,
+                                    header,
+                                    stream,
+                                    trust,
+                                    expected_payload_builder=None
+                                    if numeric_context is None
+                                    else numeric_context.payload_builder,
+                                )
+                                next_verified += 1
+                                ordered.notify_all()
+                                holding_ordered = False
+                                ordered.release()
+                                closure_verifier.verify_closure(
+                                    chain=chain,
+                                    node_index=node_index,
+                                    workflow_id=workflow_id,
+                                    envelope=envelope,
+                                )
+                            else:
+                                d._verify_operation(
+                                    row,
+                                    header,
+                                    stream,
+                                    trust,
+                                    certificates,
+                                    expected_payload_builder=None
+                                    if numeric_context is None
+                                    else numeric_context.payload_builder,
+                                )
                             row["end_ns"] = clock()
                             pace = {
                                 **asdict(slot),
@@ -949,29 +1085,60 @@ def _execute_window(
                                 "pacing": pace,
                             }
 
+                            def _append_published(target_entry: dict[str, Any]) -> None:
+                                nonlocal next_published
+                                append(target_entry)
+                                entries.append(target_entry)
+                                if numeric_context is not None:
+                                    numeric_context.progress["proofs_completed"] += (
+                                        1
+                                    )
+                                if (
+                                    numeric_context is not None
+                                    and numeric_context.is_late(
+                                        target_entry["pacing"], plan
+                                    )
+                                ):
+                                    fatal.set()
+                                completed[chain] = completed.get(chain, 0) + 1
+                                next_published += 1
+                                publish_ordered.notify_all()
+
                             def publish(entry: dict[str, Any]) -> None:
                                 nonlocal next_verified
-                                with ordered:
-                                    if completion_after_release:
+                                if use_split_verifier:
+                                    with publish_ordered:
+                                        publish_ordered.wait_for(
+                                            lambda: (
+                                                next_published == ticket
+                                                or bool(failed)
+                                                or stop.is_set()
+                                            ),
+                                            timeout=30,
+                                        )
+                                        if (
+                                            next_published != ticket
+                                            or failed
+                                            or stop.is_set()
+                                        ):
+                                            raise InterruptedError(
+                                                "campaign ordered publish aborted"
+                                            )
+                                        # Re-stamp end_ns under publish_ordered so ledger end_ns
+                                        # remains monotonic across parallel closure workers.
                                         end = clock()
                                         entry["proof"]["end_ns"] = end
                                         entry["pacing"]["end_ns"] = end
-                                    append(entry)
-                                    entries.append(entry)
-                                    if numeric_context is not None:
-                                        numeric_context.progress["proofs_completed"] += (
-                                            1
-                                        )
-                                    if (
-                                        numeric_context is not None
-                                        and numeric_context.is_late(
-                                            entry["pacing"], plan
-                                        )
-                                    ):
-                                        fatal.set()
-                                    completed[chain] = completed.get(chain, 0) + 1
-                                    next_verified += 1
-                                    ordered.notify_all()
+                                        _append_published(entry)
+                                else:
+                                    with ordered, publish_ordered:
+                                        if completion_after_release:
+                                            end = clock()
+                                            entry["proof"]["end_ns"] = end
+                                            entry["pacing"]["end_ns"] = end
+                                        _append_published(entry)
+                                        next_verified += 1
+                                        ordered.notify_all()
 
                             if completion_after_release:
 
@@ -983,6 +1150,8 @@ def _execute_window(
                                         with ordered:
                                             failed.append(error)
                                             ordered.notify_all()
+                                        with publish_ordered:
+                                            publish_ordered.notify_all()
                                         raise
 
                                 entry["_after_release"] = after_release
@@ -998,6 +1167,8 @@ def _execute_window(
                             with ordered:
                                 failed.append(error)
                                 ordered.notify_all()
+                        with publish_ordered:
+                            publish_ordered.notify_all()
                         if not ack.done():
                             ack.set_exception(error)
                         raise
@@ -1046,7 +1217,7 @@ def _execute_window(
                 }
                 with (
                     nullcontext() if numeric_context is None else pool._state_lock,
-                    ordered,
+                    publish_ordered,
                 ):
                     if fatal.is_set():
                         break
@@ -1107,6 +1278,11 @@ def _execute_window(
         append(footer)
         os.fsync(ledger.fileno())
         ledger_fsync_monotonic_ns = time.monotonic_ns()
+      finally:
+        with ordered:
+            ordered.notify_all()
+        with publish_ordered:
+            publish_ordered.notify_all()
     drain_violation = False
     if numeric_context is not None:
         drain_violation = numeric_context.seal_drain(

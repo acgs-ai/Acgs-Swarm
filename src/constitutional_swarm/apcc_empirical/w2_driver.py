@@ -196,15 +196,14 @@ def _expected_payload_bytes(
     return input_bytes, output_bytes
 
 
-def _verify_operation(
+def _verify_operation_prefix(
     row: Mapping[str, Any],
     header: Mapping[str, Any],
     stream: AuthorityObservationVerificationStream,
     trust: ScopedTrust,
-    certificates: dict[str, bytes],
     *,
     expected_payload_builder: Any = None,
-) -> None:
+) -> tuple[bytes, str]:
     request = _decode_commit_request(row["request"])
     response = decode_signed_authority_observation(b64u_decode(row["observation"]))
     target, payload = response.snapshot.request, request.receipt.payload
@@ -295,6 +294,17 @@ def _verify_operation(
 
     envelope = response.snapshot.certificate_envelope_bytes
     assert envelope is not None
+    return envelope, payload.workflow_id
+
+
+def _verify_operation_closure(
+    envelope: bytes,
+    *,
+    workflow_id: str,
+    node_index: int,
+    trust: ScopedTrust,
+    certificates: dict[str, bytes],
+) -> None:
     closure = verify_causal_closure(
         envelope,
         trust=trust,
@@ -304,7 +314,7 @@ def _verify_operation(
     if not closure.ok or closure.certificate is None:
         raise ValueError("invalid W2 causal closure")
     certificate = closure.certificate
-    previous = row["node_index"] - 1
+    previous = node_index - 1
     references = certificate.bindings.predecessors
     if previous < 0:
         if references:
@@ -312,11 +322,36 @@ def _verify_operation(
     else:
         if (
             len(references) != 1
-            or references[0].workflow_id != payload.workflow_id
+            or references[0].workflow_id != workflow_id
             or references[0].node_id != f"node-{previous:03d}"
         ):
             raise ValueError("W2 predecessor topology mismatch")
     certificates[decode_envelope(envelope).payload_sha256] = envelope
+
+
+def _verify_operation(
+    row: Mapping[str, Any],
+    header: Mapping[str, Any],
+    stream: AuthorityObservationVerificationStream,
+    trust: ScopedTrust,
+    certificates: dict[str, bytes],
+    *,
+    expected_payload_builder: Any = None,
+) -> None:
+    envelope, workflow_id = _verify_operation_prefix(
+        row,
+        header,
+        stream,
+        trust,
+        expected_payload_builder=expected_payload_builder,
+    )
+    _verify_operation_closure(
+        envelope,
+        workflow_id=workflow_id,
+        node_index=row["node_index"],
+        trust=trust,
+        certificates=certificates,
+    )
 
 
 def _source_provenance() -> dict[str, Any]:

@@ -630,3 +630,202 @@ def test_handoff_exceptions_release_snapshot_and_ordered_locks_without_deadlock(
         assert release_ordered.is_set()
     assert not snapshot_lock.locked()
     assert ordered.depth == 0
+
+
+def test_closure_verifier_pool_verifies_real_chain_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace as dc_replace
+    from tests import test_apcc_sqlite as sql_fixture
+
+    template = sql_fixture._initial_contexts()[0]
+    contexts = tuple(
+        dc_replace(
+            template,
+            subject=dc_replace(template.subject, workflow_id="workflow-1", node_id=nid),
+            candidate_state=dc_replace(
+                template.candidate_state, workflow_id="workflow-1", node_id=nid
+            ),
+            logical_node_state=dc_replace(
+                template.logical_node_state, workflow_id="workflow-1", node_id=nid
+            ),
+            audit_event_id=f"bootstrap-{nid}",
+        )
+        for nid in ("node-000", "node-001")
+    )
+    db_path = tmp_path / "pool.db"
+    cfg = sql_fixture._config()
+    rt = sql_fixture._runtime()
+    sql_fixture.SQLiteAuthorityStore.provision(
+        db_path, config=cfg, initial_contexts=contexts, runtime=rt
+    )
+    store = sql_fixture.SQLiteAuthorityStore.open(db_path, config=cfg, runtime=rt)
+    req0 = sql_fixture._request(
+        commit_id="c0",
+        nonce_byte=1,
+        node_id="node-000",
+        attempt_id="a0",
+        predecessors=[],
+    )
+    sql_fixture._advance_candidate(store, req0)
+    res0 = store.atomic_commit(req0)
+    assert res0.certificate_envelope_bytes is not None
+
+    req1 = sql_fixture._request(
+        commit_id="c1",
+        nonce_byte=2,
+        node_id="node-001",
+        attempt_id="a1",
+        predecessors=[sql_fixture._predecessor(req0, res0)],
+    )
+    sql_fixture._advance_candidate(store, req1)
+    res1 = store.atomic_commit(req1)
+    assert res1.certificate_envelope_bytes is not None
+
+    pool = c._ClosureVerifierPool(store._config.trust_bindings, workers=2)
+    try:
+        pool.verify_closure(
+            chain=0,
+            node_index=0,
+            workflow_id="workflow-1",
+            envelope=res0.certificate_envelope_bytes,
+        )
+        pool.verify_closure(
+            chain=0,
+            node_index=1,
+            workflow_id="workflow-1",
+            envelope=res1.certificate_envelope_bytes,
+        )
+        with pytest.raises(ValueError, match="W2 predecessor topology mismatch"):
+            pool.verify_closure(
+                chain=0,
+                node_index=2,
+                workflow_id="workflow-1",
+                envelope=res1.certificate_envelope_bytes,
+            )
+        tampered = bytearray(res1.certificate_envelope_bytes)
+        tampered[20] ^= 0x01
+        with pytest.raises(ValueError, match="invalid W2 causal closure"):
+            pool.verify_closure(
+                chain=0,
+                node_index=1,
+                workflow_id="workflow-1",
+                envelope=bytes(tampered),
+            )
+    finally:
+        pool.close()
+    assert all(not proc.is_alive() for proc in pool._procs)
+
+
+def test_handoff_split_closure_verifier_orders_publish_and_overlaps_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_lock = _TrackingLock()
+    ordered = _TrackingCondition()
+    stop = threading.Event()
+    failed: list[BaseException] = []
+    pool = c.CampaignWorkerPool()
+    env, _ = _install_stubs(monkeypatch)
+    prefix_states: list[tuple[int, bool]] = []
+    closure_states: list[bool] = []
+    chain0_entered = threading.Event()
+    chain0_release = threading.Event()
+
+    def _stub_prefix(row: Any, *args: Any, **kwargs: Any) -> tuple[bytes, str]:
+        del args, kwargs
+        prefix_states.append((ordered.depth, snapshot_lock.locked()))
+        return b"env", f"workflow-{row['chain']}"
+
+    class _StubClosureVerifier:
+        def verify_closure(
+            self,
+            *,
+            chain: int,
+            node_index: int,
+            workflow_id: str,
+            envelope: bytes,
+        ) -> None:
+            del workflow_id, envelope
+            # Neither snapshot_lock nor ordered is owned exclusively by this worker
+            # if a peer only acquires ordered & snapshot_lock briefly.
+            if chain == 0 and node_index == 0:
+                chain0_entered.set()
+                # Confirm ordered & snapshot_lock can be acquired from outside
+                # while closure verification runs in parallel.
+                probe_ok: list[bool] = []
+
+                def _probe() -> None:
+                    with ordered:
+                        with snapshot_lock:
+                            probe_ok.append(True)
+
+                t = threading.Thread(target=_probe)
+                t.start()
+                t.join(timeout=2.0)
+                closure_states.append(probe_ok == [True])
+                assert chain0_release.wait(timeout=2.0)
+            elif chain == 1 and node_index == 0:
+                # Let chain 1 finish verify_closure before chain 0 releases!
+                chain0_entered.wait(timeout=2.0)
+                threading.Timer(0.01, chain0_release.set).start()
+
+    monkeypatch.setattr(d, "_verify_operation_prefix", _stub_prefix)
+    # Trigger use_split_verifier=True by wrapping _ORIGINAL_VERIFY_OPERATION transparently.
+    monkeypatch.setattr(c, "_ORIGINAL_VERIFY_OPERATION", d._verify_operation)
+    plan = WindowPlan(
+        duration_ns=2_000_000_000,
+        scheduled_operations=200,
+        admission_grace_ns=2_000_000_000,
+        operation_sla_ns=5_000_000_000,
+        drain_ns=2_000_000_000,
+        operation_floor=200,
+    )
+    payloads, dags = _make_payloads(200)
+    producers = [Ed25519PrivateKey.generate() for _ in range(100)]
+    try:
+        res = c._execute_window(
+            tmp_path,
+            plan=plan,
+            child=SimpleNamespace(authority=SimpleNamespace(trust_bindings=())),
+            controller=Ed25519PrivateKey.generate(),
+            source={"files": {}},
+            run_id="split-publish",
+            authority=SimpleNamespace(pid=1111),
+            observer=env["observer"],
+            execution=env["execution"],
+            pool=pool,
+            stop=stop,
+            ordered=ordered,
+            snapshot_lock=snapshot_lock,
+            failed=failed,
+            payloads=payloads,
+            dags=dags,
+            producers=producers,
+            stream=object(),
+            certificates={},
+            window_index=0,
+            chain_offset=0,
+            previous_ledger=None,
+            plans=(plan,),
+            closure_verifier=_StubClosureVerifier(),  # type: ignore[arg-type]
+        )
+    finally:
+        chain0_release.set()
+        pool.close()
+
+    assert res["accounting"]["committed"] == 200
+    assert len(prefix_states) == 200
+    assert all(depth >= 1 and not snap for depth, snap in prefix_states)
+    assert closure_states == [True]
+    rows = [
+        line
+        for line in Path(res["ledger_path"]).read_bytes().splitlines()
+    ]
+    import json
+
+    op_rows = [json.loads(line) for line in rows if b'"type":"operation"' in line]
+    assert [r["proof"]["index"] for r in op_rows] == list(range(200))
+    ends = [r["proof"]["end_ns"] for r in op_rows]
+    assert ends == sorted(ends)
+    assert not snapshot_lock.locked()
+    assert ordered.depth == 0

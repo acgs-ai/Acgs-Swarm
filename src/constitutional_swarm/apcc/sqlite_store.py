@@ -226,9 +226,7 @@ def _semantic_checkpoint_body(
         "prior_digest": prior_digest,
     }
     if config.causal_profile is not AuthorityCausalProfile.DEFAULT:
-        body["authority_config_digest"] = sha256_digest(
-            _json(_config_object(config)).encode("utf-8")
-        )
+        body["authority_config_digest"] = _config_digest_cached(config)
     return _json(body).encode("utf-8")
 
 
@@ -1013,6 +1011,11 @@ def _config_object(config: APCCAuthorityConfig) -> dict[str, object]:
 @lru_cache(maxsize=64)
 def _config_json_cached(config: APCCAuthorityConfig) -> str:
     return _json(_config_object(config))
+
+
+@lru_cache(maxsize=64)
+def _config_digest_cached(config: APCCAuthorityConfig) -> str:
+    return sha256_digest(_config_json_cached(config).encode("utf-8"))
 
 
 @lru_cache(maxsize=64)
