@@ -419,3 +419,42 @@ def test_external_verifier_remains_uncached(monkeypatch: pytest.MonkeyPatch) -> 
     assert verify_causal_closure(leaf.envelope, trust=leaf.trust, resolver=resolver).ok
     assert verify_causal_closure(leaf.envelope, trust=leaf.trust, resolver=resolver).ok
     assert decodes == 4
+
+
+def test_certificate_decode_cache_supports_1600_active_wave_without_thrashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = sqlite_store_module._CERTIFICATE_DECODE_CACHE.info()
+    assert info.max_entries == 2048
+    assert info.max_payload_bytes == 16 * 1024 * 1024
+    assert sqlite_store_module._MAX_STATUS_BATCH_SIZE == 1000
+
+    decode_calls = 0
+
+    def _counting_stub(raw: bytes) -> object:
+        nonlocal decode_calls
+        decode_calls += 1
+        return (len(raw), raw[:8])
+
+    monkeypatch.setattr(sqlite_store_module, "decode_certificate", _counting_stub)
+    cache = sqlite_store_module._CertificateDecodeCache(
+        max_entries=sqlite_store_module._MAX_CERTIFICATE_CACHE_ENTRIES,
+        max_payload_bytes=sqlite_store_module._MAX_CERTIFICATE_CACHE_PAYLOAD_BYTES,
+    )
+    payloads = [f"{index:08x}".encode("ascii").ljust(4096, b"x") for index in range(2050)]
+
+    for _ in range(2):
+        for payload in payloads[:1600]:
+            cache.decode(payload)
+
+    assert decode_calls == 1600
+    wave_info = cache.info()
+    assert wave_info.entries == 1600
+    assert wave_info.payload_bytes == 1600 * 4096
+
+    for payload in payloads[1600:]:
+        cache.decode(payload)
+
+    bounded_info = cache.info()
+    assert bounded_info.entries == 2048
+    assert bounded_info.payload_bytes <= 16 * 1024 * 1024
