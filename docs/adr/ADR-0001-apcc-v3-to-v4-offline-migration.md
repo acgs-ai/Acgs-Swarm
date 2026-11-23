@@ -53,6 +53,7 @@ All SQLite `v3 -> v4` migration runs exclusively **offline** via `constitutional
    - Installs `_SEMANTIC_CHECKPOINT_TRIGGERS`, runs full v4 `_validate_schema_manifest` + `_validate_semantic_integrity`, seals the checkpoint with `AuthoritySigningRole.COMMIT`, validates `_validate_schema`, runs `PRAGMA wal_checkpoint(TRUNCATE)` (`(0, 0, 0)`), `os.fsync`, and atomically links into `target_path`.
    - Verifies a staging copy of the exact published target bytes via both `SQLiteAuthorityReader.open()` and `SQLiteAuthorityStore.open()`, and asserts `source_path` SHA-256 is bit-for-bit unchanged.
    - Emits an Ed25519-signed `MigrationContinuityReceipt` (`APCC-MIGRATION-CONTINUITY-V1`) binding `source_sha256`, `source_schema_fingerprint`, `source_checkpoint_digest`, `source_change_sequence`, `target_sha256`, `target_schema_fingerprint`, `target_checkpoint_digest`, `target_change_sequence`, `migrated_certificate_digests_sha256`, `migrated_counts`, and `migrated_at_ms`.
+   - Offline verification (`verify-receipt`) requires an externally pinned `--commit-public-key` trust root (never self-trusting the unverified target database's `metadata.config`) and re-verifies the Ed25519 signature, full target schema/semantic integrity, table counts, certificate digest set, and uncheckpointed WAL absence.
 
 ## 4. Operational Triage for Pre-C32 v3 Stores
 

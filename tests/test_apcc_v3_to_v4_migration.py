@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -66,6 +67,17 @@ def _dir_snapshot(directory: Path) -> dict[str, bytes]:
         for p in sorted(directory.iterdir())
         if p.is_file()
     }
+
+
+def _cleanup_helper_sidecars(db_path: Path) -> None:
+    # _rewrite_sqlite_to_authentic_post_c32_v3 leaves an unclosed sqlite3.Connection
+    # until GC; collect before unlinking empty sidecars so snapshots are deterministic.
+    gc.collect()
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+    gc.collect()
+    for sidecar in (Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        sidecar.unlink(missing_ok=True)
 
 
 def _copy_pre_c32_fixture(tmp_path: Path, name: str = "pre-c32.sqlite") -> Path:
@@ -145,9 +157,7 @@ def _populate_rich_post_c32_v3(v3_path: Path) -> dict[str, object]:
             "SELECT change_sequence, checkpoint_digest FROM semantic_checkpoint WHERE singleton=1"
         ).fetchone()
         assert downgraded_ck is not None
-        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
-    for sidecar in (Path(f"{v3_path}-wal"), Path(f"{v3_path}-shm")):
-        sidecar.unlink(missing_ok=True)
+    _cleanup_helper_sidecars(v3_path)
 
     return {
         "parent_commit_id": "v3-parent",
@@ -231,14 +241,13 @@ def test_post_c32_v3_empty_and_rich_migrate_cleanly_to_v4(
                 "SELECT change_sequence, checkpoint_digest FROM semantic_checkpoint WHERE singleton=1"
             ).fetchone()
             assert ck is not None
-            assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
-        for sidecar in (Path(f"{v3_path}-wal"), Path(f"{v3_path}-shm")):
-            sidecar.unlink(missing_ok=True)
+        _cleanup_helper_sidecars(v3_path)
         facts = {"v3_change_sequence": int(ck[0]), "v3_checkpoint_digest": str(ck[1])}
 
     # v4 runtime store must still reject source directly.
     with pytest.raises(ValueError, match="APCC authority schema version is incompatible"):
         SQLiteAuthorityStore.open(v3_path, _config(), _runtime())
+    _cleanup_helper_sidecars(v3_path)
 
     before_files = _dir_snapshot(src_dir)
     before_sha = _sha256_hex(v3_path)
@@ -471,6 +480,9 @@ def test_continuity_receipt_tamper_detection(tmp_path: Path) -> None:
     for field_name, bad_value in (
         ("target_sha256", "0" * 64),
         ("source_sha256", "f" * 64),
+        ("source_schema_fingerprint", b64u_encode(b"\x02" * 32)),
+        ("source_change_sequence", "01"),
+        ("source_change_sequence", "abc"),
         ("certificate_count", "999"),
         ("target_checkpoint_digest", b64u_encode(b"\x01" * 32)),
         ("signature", {"algorithm": "Ed25519", "key_id": "commit-key", "signature_b64u": b64u_encode(bytes(64))}),
@@ -481,6 +493,25 @@ def test_continuity_receipt_tamper_detection(tmp_path: Path) -> None:
             verify_migration_receipt(
                 tampered, config=_config(), target_path=target_path, source_path=v3_path
             )
+
+    # Duplicate JSON keys in serialized receipt must fail closed.
+    raw_text = receipt_path.read_text(encoding="utf-8").strip()
+    assert raw_text.endswith("}")
+    dup_bytes = (
+        raw_text[:-1] + f',"target_sha256":"{res.receipt.target_sha256}"}}'
+    ).encode("utf-8")
+    with pytest.raises(APCCMigrationError, match="strict JSON"):
+        verify_migration_receipt(
+            dup_bytes, config=_config(), target_path=target_path, source_path=v3_path
+        )
+
+
+def test_non_sqlite_file_classified_cleanly_without_unhandled_error(tmp_path: Path) -> None:
+    garbage = tmp_path / "not-a-db.sqlite"
+    garbage.write_bytes(b"not-a-sqlite-database" * 16)
+    report = inspect_sqlite_store(garbage)
+    assert report.classification is StoreClassification.V3_TAMPERED_OR_CORRUPT
+    assert any("not a valid SQLite" in d for d in report.diagnostics)
 
 
 def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
@@ -538,13 +569,28 @@ def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
     assert mig_proc.returncode == 0, mig_proc.stderr
     assert json.loads(mig_proc.stdout)["status"] == "migrated"
 
+    pinned_pk = b64u_encode(_config().commit_trust.public_key)
     ver_proc = _run_cli(
         "verify-receipt",
         str(receipt),
         str(v4_dst),
+        "--commit-public-key",
+        pinned_pk,
         "--source",
         str(v3_src),
         "--json",
     )
     assert ver_proc.returncode == 0, ver_proc.stderr
     assert json.loads(ver_proc.stdout)["verified"] is True
+
+    # Pinned key mismatch must fail closed with exit code 3.
+    wrong_pk = b64u_encode(b"\x7f" * 32)
+    bad_ver = _run_cli(
+        "verify-receipt",
+        str(receipt),
+        str(v4_dst),
+        "--commit-public-key",
+        wrong_pk,
+        "--json",
+    )
+    assert bad_ver.returncode == 3

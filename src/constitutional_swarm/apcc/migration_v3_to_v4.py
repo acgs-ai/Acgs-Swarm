@@ -38,8 +38,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from .crypto import b64u_decode, sha256_digest
-from .model import CandidateLifecycle, Signature
+from ..strict_json import StrictJSONError, loads as strict_loads
+from .codec import decode_certificate, decode_envelope
+from .crypto import COMMIT_DOMAIN, b64u_decode, sha256_digest
+from .model import CandidateLifecycle, FailureCode, Signature
 from .ports import (
     APCCAuthorityConfig,
     AuthorityRuntime,
@@ -51,6 +53,7 @@ from .sqlite_store import (
     _APPLICATION_ID,
     _AUTHORITY_SCHEMA_VERSION,
     _CANDIDATE_ROW_COLUMNS,
+    _MAX_SAFE_INTEGER,
     _REQUIRED_SCHEMA_OBJECTS,
     _SCHEMA_FINGERPRINT,
     _SCHEMA_STATEMENTS,
@@ -76,9 +79,6 @@ from .sqlite_store import (
     _validate_semantic_integrity,
     _verify_semantic_checkpoint,
 )
-from .codec import decode_certificate, decode_envelope
-from .crypto import COMMIT_DOMAIN
-from .model import FailureCode
 from .verifier import TrustRole, _bindings, _evidence, _header, _verify_signature
 
 _MIGRATION_RECEIPT_DOMAIN = b"APCC-MIGRATION-CONTINUITY-V1"
@@ -529,15 +529,44 @@ def _diagnose_pre_c32_candidate_mismatch(
     )
 
 
+def _parse_canonical_nonneg_decimal(value: str, label: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdigit()
+        or (len(value) > 1 and value.startswith("0"))
+    ):
+        raise APCCMigrationError(f"{label} is not a canonical decimal integer")
+    parsed = int(value)
+    if parsed < 0 or parsed > _MAX_SAFE_INTEGER:
+        raise APCCMigrationError(f"{label} exceeds safe integer bounds")
+    return parsed
+
+
 def _inspect_temp_copy(
     tmp_db: Path, *, source_path: Path, source_sha256: str
 ) -> StoreInspectionReport:
     conn = sqlite3.connect(str(tmp_db))
     try:
-        conn.execute("PRAGMA foreign_keys=ON")
-        journal_row = conn.execute("PRAGMA journal_mode").fetchone()
-        app_row = conn.execute("PRAGMA application_id").fetchone()
-        uv_row = conn.execute("PRAGMA user_version").fetchone()
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            journal_row = conn.execute("PRAGMA journal_mode").fetchone()
+            app_row = conn.execute("PRAGMA application_id").fetchone()
+            uv_row = conn.execute("PRAGMA user_version").fetchone()
+        except sqlite3.DatabaseError as error:
+            return StoreInspectionReport(
+                source_path=source_path,
+                source_sha256=source_sha256,
+                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
+                user_version=None,
+                metadata_schema_version=None,
+                schema_fingerprint=None,
+                authority_store_id=None,
+                source_change_sequence=None,
+                source_checkpoint_digest=None,
+                diagnostics=("file is not a valid SQLite database", str(error)),
+                table_counts={},
+            )
         user_version = int(uv_row[0]) if uv_row is not None else None
         if app_row is None or tuple(app_row) != (_APPLICATION_ID,):
             return StoreInspectionReport(
@@ -568,13 +597,28 @@ def _inspect_temp_copy(
                 table_counts={},
             )
 
-        counts = _table_counts(conn)
-        has_metadata = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
-            ).fetchone()
-            is not None
-        )
+        try:
+            counts = _table_counts(conn)
+            has_metadata = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
+                ).fetchone()
+                is not None
+            )
+        except sqlite3.DatabaseError as error:
+            return StoreInspectionReport(
+                source_path=source_path,
+                source_sha256=source_sha256,
+                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
+                user_version=user_version,
+                metadata_schema_version=None,
+                schema_fingerprint=None,
+                authority_store_id=None,
+                source_change_sequence=None,
+                source_checkpoint_digest=None,
+                diagnostics=("corrupt SQLite catalog in APCC store", str(error)),
+                table_counts={},
+            )
         if not has_metadata:
             return StoreInspectionReport(
                 source_path=source_path,
@@ -897,9 +941,9 @@ def verify_migration_receipt(
     """Verify the Ed25519 signature and optional source/target bindings of a receipt."""
     if isinstance(receipt, (bytes, bytearray)):
         try:
-            obj = json.loads(bytes(receipt).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise APCCMigrationError("migration receipt is not valid JSON") from error
+            obj = strict_loads(bytes(receipt), max_bytes=1_048_576, allow_float=False)
+        except (StrictJSONError, TypeError) as error:
+            raise APCCMigrationError("migration receipt is not valid strict JSON") from error
         if not isinstance(obj, Mapping):
             raise APCCMigrationError("migration receipt JSON must be an object")
         parsed = MigrationContinuityReceipt.from_object(cast("Mapping[str, object]", obj))
@@ -918,13 +962,23 @@ def verify_migration_receipt(
         raise APCCMigrationError("migration receipt authority store id mismatch")
     if parsed.source_schema_version != _V3_SCHEMA_VERSION:
         raise APCCMigrationError("migration receipt source schema version must be 3")
+    if parsed.source_schema_fingerprint != _V3_SCHEMA_FINGERPRINT:
+        raise APCCMigrationError("migration receipt source schema fingerprint mismatch")
     if parsed.target_schema_version != _AUTHORITY_SCHEMA_VERSION:
         raise APCCMigrationError("migration receipt target schema version must be 4")
     if parsed.target_schema_fingerprint != _SCHEMA_FINGERPRINT:
         raise APCCMigrationError("migration receipt target schema fingerprint mismatch")
+    src_seq = _parse_canonical_nonneg_decimal(
+        parsed.source_change_sequence, "source_change_sequence"
+    )
+    tgt_seq = _parse_canonical_nonneg_decimal(
+        parsed.target_change_sequence, "target_change_sequence"
+    )
+    _parse_canonical_nonneg_decimal(parsed.certificate_count, "certificate_count")
+    _parse_canonical_nonneg_decimal(parsed.migrated_at_ms, "migrated_at_ms")
     if parsed.target_prior_digest != parsed.source_checkpoint_digest:
         raise APCCMigrationError("migration receipt checkpoint chain prior_digest mismatch")
-    if int(parsed.target_change_sequence) != int(parsed.source_change_sequence) + 1:
+    if tgt_seq != src_seq + 1:
         raise APCCMigrationError("migration receipt change sequence increment mismatch")
     if parsed.signature.key_id != config.commit_trust.key_id:
         raise APCCMigrationError("migration receipt commit key id mismatch")
@@ -950,13 +1004,27 @@ def verify_migration_receipt(
         target_file = Path(target_path)
         if not target_file.is_file():
             raise APCCMigrationError(f"target path does not exist: {target_file}")
+        target_wal = Path(f"{target_file}-wal")
+        if target_wal.exists() and target_wal.stat().st_size > 0:
+            raise APCCMigrationError("target store has uncheckpointed WAL sidecar")
         if _sha256_file_hex(target_file) != parsed.target_sha256:
             raise APCCMigrationError("migration receipt target SHA-256 mismatch")
         with tempfile.TemporaryDirectory(prefix="apcc-verify-target-") as td:
             verify_copy = Path(td) / "target-verify.sqlite"
             shutil.copy2(target_file, verify_copy)
-            conn = _connect_reader(verify_copy)
             try:
+                conn = _connect_reader(verify_copy)
+            except (ValueError, sqlite3.DatabaseError) as error:
+                raise APCCMigrationError(
+                    "failed to open target store during receipt verification"
+                ) from error
+            try:
+                conn.execute("BEGIN")
+                cfg_text = _validate_schema(conn)
+                if cfg_text != _json(_config_object(config)):
+                    raise APCCMigrationError(
+                        "target store configuration does not match pinned config"
+                    )
                 seq, prior_dig, ck_dig, _kid, _sig = _semantic_checkpoint_row(conn)
                 fp = str(
                     conn.execute(
@@ -964,6 +1032,14 @@ def verify_migration_receipt(
                     ).fetchone()[0]
                 )
                 certs_digest, cert_count = _certificate_set_digest(conn)
+                actual_counts = _table_counts(conn)
+                conn.rollback()
+            except APCCMigrationError:
+                raise
+            except (ValueError, sqlite3.DatabaseError) as error:
+                raise APCCMigrationError(
+                    "target store schema or semantic validation failed"
+                ) from error
             finally:
                 conn.close()
         if (
@@ -973,6 +1049,7 @@ def verify_migration_receipt(
             or ck_dig != parsed.target_checkpoint_digest
             or certs_digest != parsed.migrated_certificate_digests_sha256
             or str(cert_count) != parsed.certificate_count
+            or actual_counts != dict(parsed.migrated_counts)
         ):
             raise APCCMigrationError("migration receipt target DB bindings mismatch")
 
@@ -991,6 +1068,8 @@ def migrate_sqlite_v3_to_v4(
     source = Path(source_path)
     target = Path(target_path)
     receipt_file = Path(receipt_path) if receipt_path is not None else None
+    if not source.is_file():
+        raise APCCMigrationError(f"source database file does not exist: {source}")
     if target.exists():
         raise APCCMigrationError(f"target database path already exists: {target}")
     if receipt_file is not None and receipt_file.exists():
@@ -998,18 +1077,22 @@ def migrate_sqlite_v3_to_v4(
     if target.resolve() == source.resolve():
         raise APCCMigrationError("in-place migration over source path is forbidden")
 
-    validate_runtime_signers(config, runtime)
-    inspection = inspect_sqlite_store(source)
-    if inspection.classification is not StoreClassification.V3_POST_C32_MIGRATABLE:
+    try:
+        validate_runtime_signers(config, runtime)
+    except ValueError as error:
+        raise APCCMigrationError(str(error)) from error
+
+    source_wal = Path(f"{source}-wal")
+    if source_wal.exists() and source_wal.stat().st_size > 0:
         raise APCCMigrationError(
-            f"cannot migrate store with classification {inspection.classification.value}",
-            classification=inspection.classification,
-            diagnostics=inspection.diagnostics,
+            "cannot migrate source store with uncheckpointed WAL sidecar",
+            classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
+            diagnostics=(
+                "uncheckpointed WAL sidecar present; checkpoint source database before offline migration",
+            ),
         )
 
-    assert inspection.source_change_sequence is not None
-    assert inspection.source_checkpoint_digest is not None
-
+    source_sha256_before = _sha256_file_hex(source)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(12)}.apcc-v4-tmp")
     target_published = False
@@ -1018,6 +1101,27 @@ def migrate_sqlite_v3_to_v4(
         with tempfile.TemporaryDirectory(prefix="apcc-migrate-src-") as src_td:
             src_copy = Path(src_td) / "source-copy.sqlite"
             shutil.copy2(source, src_copy)
+            staged_sha256 = _sha256_file_hex(src_copy)
+            if staged_sha256 != source_sha256_before:
+                raise APCCMigrationError(
+                    "source store changed while staging offline migration copy"
+                )
+            inspection = _inspect_temp_copy(
+                src_copy, source_path=source, source_sha256=staged_sha256
+            )
+            if inspection.classification is not StoreClassification.V3_POST_C32_MIGRATABLE:
+                raise APCCMigrationError(
+                    f"cannot migrate store with classification {inspection.classification.value}",
+                    classification=inspection.classification,
+                    diagnostics=inspection.diagnostics,
+                )
+            assert inspection.source_change_sequence is not None
+            assert inspection.source_checkpoint_digest is not None
+            if inspection.source_change_sequence >= _MAX_SAFE_INTEGER:
+                raise APCCMigrationError(
+                    "source semantic checkpoint change_sequence would overflow safe integer"
+                )
+
             src_conn = _connect_reader(src_copy)
             try:
                 src_cfg = src_conn.execute(
@@ -1229,9 +1333,11 @@ def _load_cli_runtime_and_config(
     if not key_bundle_path.is_file():
         raise APCCMigrationError(f"key bundle file does not exist: {key_bundle_path}")
     try:
-        bundle = json.loads(key_bundle_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise APCCMigrationError("failed to parse key bundle JSON") from error
+        bundle = strict_loads(
+            key_bundle_path.read_bytes(), max_bytes=1_048_576, allow_float=False
+        )
+    except (OSError, StrictJSONError, TypeError) as error:
+        raise APCCMigrationError("failed to parse strict key bundle JSON") from error
     if not isinstance(bundle, Mapping):
         raise APCCMigrationError("key bundle JSON must be an object")
 
@@ -1321,6 +1427,11 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("receipt", type=Path, help="Receipt JSON file")
     verify_p.add_argument("target", type=Path, help="Migrated v4 SQLite store")
     verify_p.add_argument(
+        "--commit-public-key",
+        required=True,
+        help="Pinned Ed25519 commit public key (canonical unpadded base64url, 32 bytes)",
+    )
+    verify_p.add_argument(
         "--source", type=Path, default=None, help="Optional v3 source SQLite store"
     )
     verify_p.add_argument("--json", action="store_true", help="Emit JSON output")
@@ -1371,8 +1482,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "verify-receipt":
+            try:
+                pinned_commit_pk = b64u_decode(
+                    args.commit_public_key, expected_length=32
+                )
+            except ValueError as error:
+                raise APCCMigrationError(
+                    "invalid pinned commit public key base64url"
+                ) from error
             config = _read_config_from_source(args.target)
-            raw_receipt = Path(args.receipt).read_bytes()
+            if config.commit_trust.public_key != pinned_commit_pk:
+                raise APCCMigrationError(
+                    "target store commit public key does not match pinned key"
+                )
+            if args.source is not None:
+                source_config = _read_config_from_source(args.source)
+                if source_config != config:
+                    raise APCCMigrationError(
+                        "source and target APCC authority configurations differ"
+                    )
+            receipt_file = Path(args.receipt)
+            if not receipt_file.is_file():
+                raise APCCMigrationError(f"receipt file does not exist: {receipt_file}")
+            raw_receipt = receipt_file.read_bytes()
             verified = verify_migration_receipt(
                 raw_receipt,
                 config=config,
