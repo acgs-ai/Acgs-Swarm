@@ -563,7 +563,7 @@ def test_workflow_is_yaml_valid_and_fail_closed() -> None:
     assert "tests/test_tlc_expected_witness.py" in source
     assert "Makefile" in source
     jobs = workflow["jobs"]
-    assert set(jobs) == {"safety", "gcb-witness"}
+    assert set(jobs) == {"safety", "gcb-witness", "apcc-tlc"}
     safety_configs = {
         entry["config"] for entry in jobs["safety"]["strategy"]["matrix"]["spec"]
     }

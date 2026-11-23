@@ -1,23 +1,29 @@
-"""Constitutional Mesh — Byzantine-tolerant peer validation with cryptographic proof.
+"""Constitutional Mesh — Equal-weight strict-majority peer validation with cryptographic proof.
 
 The defensible core of constitutional_swarm. Every agent's output is validated by randomly
-assigned peers using the ACGS constitutional engine. No single
-validator bottleneck. Tolerates up to 1/3 faulty/malicious agents.
+assigned peers using the ACGS constitutional engine.
 
-Cryptographic proof chain:
-  1. Producer creates output with constitutional hash
-  2. Mesh assigns random peers (producer excluded — MACI)
-  3. Each peer validates via embedded DNA (local acgs-lite engine)
-  4. Votes are signed with the peer's Ed25519 private key
-  5. Quorum result produces a Merkle proof linking:
-     - Producer's output hash
-     - Each peer's vote + constitutional hash
-     - Final acceptance/rejection decision
-  6. Anyone can verify the proof independently
+Guarantee layer separation (see ``README.md`` / ``ARCHITECTURE.md``):
+  - ``ConstitutionalMesh`` (this module): equal-weight assigned-peer **strict majority**
+    (``votes > len(peers) // 2``) requiring signed Ed25519 vote envelopes from the entire
+    assigned roster before settlement (``settled=True, quorum_met=True``). Enforces
+    ``quorum >= 3`` when a durable ``SettlementStore`` is attached (non-persistent default:
+    ``2`` of ``3``). Provides assignment-level uniqueness (duplicate task submissions produce
+    distinct ``assignment_id``s), not logical-task exclusivity and not 1/3 BFT agreement.
+  - ``quorum_certificate.py``: 2/3 weighted approval threshold with fault-domain caps and
+    slashable equivocation proofs.
+  - ``specs/mesh.tla`` (``MeshMC.cfg``): integer-stake ``2F + 1`` quorum intersection model.
+  - ``apcc/``: logical-node exclusivity, atomic authority commit + outbox, revocation/supersession.
 
-No competitor can replicate this: agents constitutionally validating
-each other's work, with cryptographic proof. There is no published
-sub-microsecond product latency claim.
+Protocol bounds & preview hazard:
+  - Assigning or collecting remote votes has no assignment expiry, automatic peer reassignment
+    on RPC timeout, or post-settlement late-vote protocol: unreachable/timed-out peers leave the
+    assignment unsettled without shrinking its assigned roster.
+  - ``get_result()`` before all assigned peers vote returns an **unsettled preview**
+    (``settled=False, quorum_met=False, proof=None``). If partial approvals already reach the
+    numeric quorum floor, ``preview.accepted`` may be ``True`` while ``quorum_met=False`` and
+    ``settled=False``. Preview ``accepted=True`` is NOT authoritative; downstream consumers
+    MUST require ``settled=True`` and ``quorum_met=True``.
 """
 
 from __future__ import annotations
@@ -128,19 +134,24 @@ _MAX_REMOTE_VOTE_NONCES_PER_SIGNER = 10_000
 
 
 class ConstitutionalMesh:
-    """Byzantine-tolerant peer validation mesh with cryptographic proof.
+    """Equal-weight strict-majority peer validation mesh with cryptographic proof.
 
     Every agent's output is validated by randomly assigned peers using
-    the ACGS constitutional engine. The mesh produces a Merkle proof
-    that anyone can independently verify.
+    the ACGS constitutional engine, collecting Ed25519-signed vote envelopes
+    across the complete assigned roster and producing a verifiable ``MeshProof``.
 
-    Properties:
-    - O(1) governance cost per agent (local DNA validation)
-    - Byzantine fault tolerant (tolerates < 1/3 faulty agents)
-    - No single validator bottleneck
-    - MACI-compliant (no self-validation)
-    - Cryptographic proof chain for auditability
-    - Local validation via AgentDNA (full pipeline tests bound average latency under 10ms)
+    Properties & contract boundaries:
+    - O(1) per-agent local DNA validation
+    - Equal-weight strict-majority quorum (``quorum > peers_per_validation // 2``;
+      ``quorum >= 3`` enforced for durable ``SettlementStore`` persistence; non-persistent
+      default ``2/3``). Distinct from weighted 2/3 ``quorum_certificate.py`` and
+      integer-stake ``2F + 1`` in ``specs/mesh.tla``.
+    - Assignment-level uniqueness (repeated task submissions allocate new
+      ``assignment_id``s; logical-node exclusivity lives in ``apcc/``).
+    - MACI-compliant (producer excluded from electorate) with complete signed electorate evidence.
+    - No assignment expiry, reassignment on RPC timeout, or late-vote protocol.
+    - Authoritative consumers MUST require ``settled=True`` and ``quorum_met=True`` (never
+      trust ``accepted=True`` on an unsettled preview from ``get_result()``).
     """
 
     def __init__(

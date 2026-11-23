@@ -339,3 +339,99 @@ def test_apcc_runner_pins_tlc_and_classifies_safety_and_witness_results() -> Non
         12, indented_unexpected_error, "WitnessRecoveryNotReached"
     )
     assert "-deadlock" not in Path(runner.__file__).read_text()
+
+
+def test_every_apcc_cfg_on_disk_and_in_ci_workflow_matches_runner() -> None:
+    import yaml
+
+    runner = _runner_module()
+    on_disk = {path.name for path in (ROOT / "specs").glob("apcc*.cfg")}
+    assert on_disk == set(runner.DEFAULT_CONFIGS) == set(CONFIGS)
+    assert len(runner.DEFAULT_CONFIGS) == 32
+
+    workflow_path = ROOT / ".github" / "workflows" / "tla-check.yml"
+    source = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(source)
+    assert isinstance(workflow, dict)
+    on_triggers = workflow[True] if True in workflow else workflow["on"]
+    for event_name in ("push", "pull_request"):
+        event_cfg = on_triggers[event_name]
+        if isinstance(event_cfg, dict) and "paths" in event_cfg:
+            paths = set(event_cfg["paths"])
+            assert "scripts/run_apcc_tlc.py" in paths
+            assert "tests/test_apcc_formal.py" in paths
+
+    apcc_job = workflow["jobs"]["apcc-tlc"]
+    shards = apcc_job["strategy"]["matrix"]["shard"]
+    seen: list[str] = []
+    for shard in shards:
+        seen.extend(shard["configs"])
+    assert len(seen) == len(set(seen)), "duplicate APCC TLC configs across CI shards"
+    assert set(seen) == set(runner.DEFAULT_CONFIGS), (
+        f"missing/extra workflow configs: missing={set(runner.DEFAULT_CONFIGS) - set(seen)}, "
+        f"extra={set(seen) - set(runner.DEFAULT_CONFIGS)}"
+    )
+    steps = apcc_job["steps"]
+    assert any(
+        step.get("if") == "always()" and "upload-artifact" in step.get("uses", "")
+        for step in steps
+    )
+
+
+def test_apcc_runner_isolates_metadir_and_writes_log_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import json
+    import subprocess
+
+    runner = _runner_module()
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        recorded_cmds.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                f"{runner.TLC_VERSION_LINE}\n"
+                "Model checking completed. No error has been found.\n"
+                "42 states generated, 10 distinct states found, 0 states left on queue.\n"
+            ),
+            stderr="",
+        )
+
+    fake_jar = tmp_path / "fake.jar"
+    fake_jar.write_bytes(b"jar-bytes")
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_sha256", lambda p: runner.TLC_JAR_SHA256)
+    monkeypatch.setattr(runner, "resolve_java", lambda cmd: "java")
+
+    exit_code = runner.main(
+        [
+            "--tlc-jar",
+            str(fake_jar),
+            "--config",
+            "apcc_safety.cfg",
+            "--log-dir",
+            str(log_dir),
+        ]
+    )
+    assert exit_code == 0
+    assert len(recorded_cmds) == 1
+    cmd = recorded_cmds[0]
+    assert any(arg.startswith("-Djava.io.tmpdir=") for arg in cmd)
+    assert "-metadir" in cmd
+    metadir_val = Path(cmd[cmd.index("-metadir") + 1])
+    assert not str(metadir_val).startswith(str(ROOT / "specs"))
+    assert (log_dir / "apcc_safety.log").is_file()
+    summary = json.loads((log_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["total"] == 1
+    assert summary["passed"] == 1
+    assert summary["failed"] == 0
+    assert summary["runs"][0]["config"] == "apcc_safety.cfg"
+    assert summary["runs"][0]["actual_exit"] == 0
+    assert summary["runs"][0]["expected_exit"] == 0
+    assert summary["runs"][0]["log_file"] == "apcc_safety.log"
+

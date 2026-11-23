@@ -1,24 +1,14 @@
 name: TLA+ model check
 
 on:
+  # Always run on push/PR to main (instead of filtering only on specs/**,
+  # scripts/run_apcc_tlc.py, scripts/run_tlc_expected_witness.py, scripts/_tlc_common.py,
+  # tests/test_apcc_formal.py, tests/test_tlc_expected_witness.py, Makefile, and
+  # .github/workflows/tla-check.yml) so Required Status Checks on main never stall.
   push:
     branches: [main]
-    paths:
-      - 'specs/**'
-      - 'scripts/run_tlc_expected_witness.py'
-      - 'scripts/_tlc_common.py'
-      - 'tests/test_tlc_expected_witness.py'
-      - 'Makefile'
-      - '.github/workflows/tla-check.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'specs/**'
-      - 'scripts/run_tlc_expected_witness.py'
-      - 'scripts/_tlc_common.py'
-      - 'tests/test_tlc_expected_witness.py'
-      - 'Makefile'
-      - '.github/workflows/tla-check.yml'
   workflow_dispatch:
 
 permissions:
@@ -146,5 +136,110 @@ jobs:
         with:
           name: tlc-gcb-witness-log
           path: tlc-gcb-witness.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  apcc-tlc:
+    name: APCC TLC — ${{ matrix.shard.name }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: core-safety-and-witness
+            configs:
+              - apcc_safety.cfg
+              - apcc_liveness.cfg
+              - apcc_witness_valid_chain.cfg
+              - apcc_witness_exact_replay.cfg
+              - apcc_witness_stale_rejection.cfg
+              - apcc_witness_revocation.cfg
+              - apcc_witness_recovery.cfg
+          - name: ablation-core
+            configs:
+              - apcc_ablation_guard_reread.cfg
+              - apcc_ablation_supersession.cfg
+              - apcc_ablation_status_window.cfg
+              - apcc_ablation_attempt_guard.cfg
+              - apcc_ablation_revocation_closure.cfg
+              - apcc_ablation_propagation_fence.cfg
+              - apcc_ablation_recovery_authority.cfg
+              - apcc_ablation_supersession_nonretroactivity.cfg
+          - name: evidence-and-legacy
+            configs:
+              - apcc_witness_invalid_authorization.cfg
+              - apcc_witness_invalid_receipt.cfg
+              - apcc_witness_status_binding.cfg
+              - apcc_ablation_authorization_evidence.cfg
+              - apcc_ablation_receipt_evidence.cfg
+              - apcc_ablation_status_binding.cfg
+              - apcc_witness_legacy_status.cfg
+              - apcc_ablation_legacy_status.cfg
+          - name: causal-and-multitenant
+            configs:
+              - apcc_causal_safety.cfg
+              - apcc_causal_witness.cfg
+              - apcc_causal_ablation.cfg
+              - apcc_multitenant_safety.cfg
+              - apcc_multitenant_witness.cfg
+              - apcc_multitenant_nonce_ablation.cfg
+              - apcc_multitenant_actor_ablation.cfg
+              - apcc_multitenant_target_witness.cfg
+              - apcc_multitenant_target_ablation.cfg
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install locked test environment
+        run: make setup EXTRAS=dev
+
+      - name: Cache tla2tools.jar
+        id: cache-tla
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TLA2TOOLS_JAR }}
+          key: tla2tools-${{ env.TLC_VERSION }}-${{ env.TLC_SHA256 }}
+
+      - name: Download tla2tools.jar
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "${TLA2TOOLS_JAR}" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+
+      - name: Verify immutable TLC jar
+        run: echo "${TLC_SHA256}  ${TLA2TOOLS_JAR}" | sha256sum -c -
+
+      - name: Run APCC formal & workflow contract tests
+        run: uv run --no-sync pytest tests/test_apcc_formal.py --import-mode=importlib -q
+
+      - name: Run APCC TLC shard (${{ matrix.shard.name }})
+        env:
+          SHARD_CONFIGS: ${{ join(matrix.shard.configs, ' ') }}
+        run: |
+          set -euo pipefail
+          cfgs=()
+          for cfg in ${SHARD_CONFIGS}; do
+            cfgs+=(--config "${cfg}")
+          done
+          uv run --no-sync python scripts/run_apcc_tlc.py \
+            --tlc-jar "${TLA2TOOLS_JAR}" \
+            --log-dir "${GITHUB_WORKSPACE}/apcc-tlc-${{ matrix.shard.name }}" \
+            "${cfgs[@]}"
+
+      - name: Upload APCC TLC shard logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: apcc-tlc-${{ matrix.shard.name }}-logs
+          path: apcc-tlc-${{ matrix.shard.name }}/
           if-no-files-found: warn
           retention-days: 14

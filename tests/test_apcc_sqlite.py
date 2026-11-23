@@ -2069,10 +2069,10 @@ def test_sqlite_open_validates_v3_schema_without_mutating_failed_store(
     )
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA application_id").fetchone() == (0x41504343,)
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone() == ("3",)
+        ).fetchone() == ("4",)
         fingerprint = connection.execute(
             "SELECT value FROM metadata WHERE key='schema_fingerprint'"
         ).fetchone()

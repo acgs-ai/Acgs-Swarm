@@ -64,9 +64,15 @@ def test_project_rejects_invalid_radius(bad_r: float) -> None:
 
 
 def test_project_rejects_overflowing_matrix_instead_of_zeroing_it() -> None:
-    """Finite entries whose power iteration overflows must not yield a silent zero matrix."""
+    """Scaled projection handles 1e200*I accurately while extreme float64 overflow fails closed."""
+    scaled = spectral_sphere_project([[1e200, 0.0], [0.0, 1e200]], r=1.0)
+    assert scaled.clipped is True
+    assert scaled.spectral_norm_upper_bound <= 1.0
+    assert scaled.matrix[0][0] == pytest.approx(1.0)
+    assert scaled.matrix[1][1] == pytest.approx(1.0)
+
     with pytest.raises(ValueError, match="finite"):
-        spectral_sphere_project([[1e200, 0.0], [0.0, 1e200]])
+        spectral_sphere_project([[1e308, 1e308], [1e308, 1e308]])
 
 
 def test_unconverged_verification_raises_instead_of_claiming_radius(

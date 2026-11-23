@@ -14,22 +14,20 @@ Rationale for each batch is in `DECISIONS.md`. These notes cover the campaign
 only. They do not cover the APCC-1 / GCB feature work that also landed after
 1.1.0.
 
-> **Breaking, data: APCC SQLite and PostgreSQL authority stores written before
-> C32 may not reopen.** C32 changed how non-decision audit and event ids are
-> encoded (stage, candidate, `EVIDENCE_ASSEMBLED`/`COMMIT_PENDING`, revoke,
-> replace, outbox, outbox-delivered, missing, recovery-missing) to a framed,
-> length-prefixed digest. The PostgreSQL store imports the same id function and
-> semantic validator from the SQLite store. C32 did **not** bump the authority
-> schema version, which both backends still write as `3`. A v3 store containing
-> such rows written by pre-C32 code fails to open with a generic error, not
-> with the explicit "schema version is incompatible" error:
-> - SQLite: `ValueError: APCC SQLite store semantic validation failed`
-> - PostgreSQL: `ValueError: APCC authority store semantic validation failed`
->
-> There is no in-place migration. Rebuild affected stores, or wait for the deferred schema
-> v4 bump, which needs the PostgreSQL 17 GCB catalog fingerprint
-> (`_POSTGRES_GCB_CATALOG_FINGERPRINT`) regenerated in the same change. Until
-> v4 lands, do not run mixed-version writers against one store.
+> **Breaking, data: APCC authority schema bumped from `3` to `4` (C32 format boundary).**
+> C32 changed how non-decision audit and event ids are encoded (stage, candidate,
+> `EVIDENCE_ASSEMBLED`/`COMMIT_PENDING`, revoke, replace, outbox, outbox-delivered,
+> missing, recovery-missing) to a framed, length-prefixed digest. The PostgreSQL
+> store imports the same id function and semantic validator from the SQLite store.
+> `_AUTHORITY_SCHEMA_VERSION` is now `"4"`, and `_POSTGRES_GCB_CATALOG_FINGERPRINT`
+> has been regenerated on live PostgreSQL 17.12 for the updated
+> `gcb_store_meta_schema_version_check` constraint (`_POSTGRES_CATALOG_FINGERPRINT`
+> for the base profile is unchanged). Both SQLite and PostgreSQL stores/readers now
+> reject every schema `3` store (pre-C32 or post-C32, empty or populated) fail-closed
+> with `ValueError: APCC authority schema version is incompatible` without modifying
+> existing data or performing automatic migration. Rebuild legacy v3 stores offline
+> rather than rewriting metadata or `PRAGMA user_version`, because semantic
+> checkpoints bind `schema_fingerprint`.
 
 ### Security
 - **Consensus and certificates.** `quorum_certificate`, `epoch_reconfig` and

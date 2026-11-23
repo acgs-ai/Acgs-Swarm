@@ -177,7 +177,9 @@ def _spectral_fixture() -> dict[str, Any]:
         "num_agents": manifold.num_agents,
         "power_iterations": projected.power_iterations,
         "radius": manifold.radius,
-        "spectral_norm": canonical_timestamp(projected.spectral_norm),
+        # Preserve frozen v1 historical fixture bytes (power-iteration estimate) while live
+        # projected.spectral_norm / spectral_norm_upper_bound report the certified upper bound.
+        "spectral_norm": canonical_timestamp(projected.spectral_norm_estimate),
         "trust_updates": [
             {"delta": "0.75", "from_agent": 0, "to_agent": 1},
             {"delta": "-0.25", "from_agent": 1, "to_agent": 2},

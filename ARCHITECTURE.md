@@ -44,6 +44,11 @@ Agent call / input
 ## Key invariants
 
 - Constitutional hash: `608508a9bd224290`
+- **Four guarantee layers (not interchangeable):**
+  - `ConstitutionalMesh` (`mesh/core.py`): equal-weight assigned-peer **strict majority** (`quorum > peers // 2`; persistent `SettlementStore` requires `quorum >= 3`, non-persistent defaults to `2/3`), complete signed roster envelopes, assignment-level uniqueness, and no expiry/reassignment/late-vote recovery on RPC timeout. Downstream consumers must treat unsettled `MeshResult` previews (`settled=False, quorum_met=False`) as **non-authoritative** even if `accepted=True`, requiring `settled=True` and `quorum_met=True`.
+  - `quorum_certificate.py`: 2/3 weighted approval + fault-domain constraints + slashable equivocation.
+  - `specs/mesh.tla`: integer-stake `2F + 1` quorum intersection formal model.
+  - `apcc/`: logical-node exclusivity, atomic authority commit + outbox, revocation/supersession.
 - Precedent quorum: 3/5 super-majority (`min_total_validators=5, min_votes_for_precedent=3`)
 - `EvolutionLog` enforces strict monotonicity + acceleration at write time (SQLite, append-only)
 - ArweaveAuditLogger two-phase commit: cache Phase 1 in `_retry_state`, clear only on Phase 2 success

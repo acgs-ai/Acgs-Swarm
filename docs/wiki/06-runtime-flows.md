@@ -73,10 +73,17 @@ This is the flow the quickstart in `README.md` demonstrates.
    mesh.submit_vote(assignment.assignment_id, voter_id, approved=True, reason=..., signature=sig)
    ```
    A missing/wrong signature raises `InvalidVoteSignatureError`.
-4. **Settle on quorum:** once enough votes arrive,
-   `result = mesh.get_result(assignment.assignment_id)` →
-   `MeshResult(accepted, quorum_met, settled)` carrying a `MeshProof`
-   (`proof.verify()` re-checks it).
+4. **Settle on full signed electorate:** while votes remain pending,
+   `mesh.get_result(assignment.assignment_id)` returns a non-authoritative preview
+   with `settled=False`, `quorum_met=False`, and `proof=None` (note `preview.accepted`
+   may already be `True` if cast approvals hit `quorum`; consumers must NEVER treat
+   `accepted=True` as authoritative unless `settled=True` and `quorum_met=True`).
+   Once all assigned peers vote and quorum holds (`3/5` strict majority, persistent
+   `quorum >= 3`, vs non-persistent `2/3`), `result` freezes with `MeshProof`.
+   Uniqueness here is assignment-level (duplicate requests allocate new
+   `assignment_id`s; logical-node exclusivity lives in `apcc/`), and there is no
+   assignment expiry, peer reassignment on RPC timeout (timeouts leave the assignment
+   unsettled without shrinking the roster), or late-vote protocol after settlement.
 5. **Freeze + persist:** a settled assignment is frozen
    (further votes → `AssignmentSettledError`). If a `SettlementStore` is attached,
    the result is appended; a failure after freeze raises

@@ -716,3 +716,14 @@ above.
   security-relevant JSON with the shared strict loader, and packet JSON that
   only a lenient parser accepts is reported as `ambiguous_packet_json`. TLC
   runners hash and run a private copy of the jar.
+- **APCC authority schema v4 cutover (C32 format boundary).**
+  `_AUTHORITY_SCHEMA_VERSION` in `src/constitutional_swarm/apcc/sqlite_store.py`
+  is bumped from `"3"` to `"4"` (shared by `postgres_store.py` and
+  `authority_service.py`), and `_POSTGRES_GCB_CATALOG_FINGERPRINT` is
+  regenerated against live PostgreSQL 17.12 while `_POSTGRES_CATALOG_FINGERPRINT`
+  (base profile) remains unchanged. Opening any schema `3` store (pre-C32 or
+  post-C32) fails closed with `ValueError("APCC authority schema version is
+  incompatible")` with zero auto-migration and zero mutation of stored bytes or
+  tables. Future migration tooling must design explicit evidence continuity rather
+  than altering `PRAGMA user_version` or `metadata.schema_version` in place,
+  since semantic checkpoints sign `schema_fingerprint`.
