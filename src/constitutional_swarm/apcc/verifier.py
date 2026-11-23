@@ -7,10 +7,14 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from .codec import (
     CodecError,
     DetachedEnvelope,
     _decode_envelope_certificate,
+    _encode_json,
     canonical_statement,
     encode_authority_status_body,
     normalize_authority_status,
@@ -22,6 +26,7 @@ from .crypto import (
     POLICY_DOMAIN,
     PROPOSAL_DOMAIN,
     b64u_decode,
+    domain_preimage,
     predecessor_root,
     sha256_digest,
     verify_detached,
@@ -33,6 +38,8 @@ from .model import (
     PredecessorRef,
     Signature,
 )
+
+_ORIGINAL_VERIFY_DETACHED = verify_detached
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,10 +120,14 @@ class ScopedTrust:
     _index: Mapping[tuple[TrustRole, tuple[str, ...]], TrustBinding] = field(
         init=False, repr=False, compare=False
     )
+    _public_keys: Mapping[tuple[TrustRole, tuple[str, ...]], Ed25519PublicKey] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         bindings = tuple(self.bindings)
         index: dict[tuple[TrustRole, tuple[str, ...]], TrustBinding] = {}
+        public_keys: dict[tuple[TrustRole, tuple[str, ...]], Ed25519PublicKey] = {}
         key_roles: dict[str, TrustRole] = {}
         material_roles: dict[bytes, TrustRole] = {}
         for binding in bindings:
@@ -135,14 +146,28 @@ class ScopedTrust:
             ):
                 raise ValueError("APCC public keys cannot be reused across trust roles")
             index[identity] = binding
+            public_keys[identity] = Ed25519PublicKey.from_public_bytes(
+                binding.public_key
+            )
             key_roles[binding.key_id] = binding.role
             material_roles[binding.public_key] = binding.role
         object.__setattr__(self, "bindings", bindings)
         object.__setattr__(self, "_index", MappingProxyType(index))
+        object.__setattr__(self, "_public_keys", MappingProxyType(public_keys))
 
     def resolve(self, role: TrustRole, scope: tuple[str, ...]) -> TrustBinding | None:
         """Resolve exactly one role/scope tuple without fallback."""
         return self._index.get((role, tuple(scope)))
+
+    def _resolve_public_key(
+        self, role: TrustRole, scope: tuple[str, ...]
+    ) -> tuple[TrustBinding, Ed25519PublicKey] | None:
+        """Resolve a trust binding and pre-constructed Ed25519 key without fallback."""
+        key = (role, tuple(scope))
+        binding = self._index.get(key)
+        if binding is None:
+            return None
+        return binding, self._public_keys[key]
 
 
 def _failure(code: FailureCode) -> VerificationResult:
@@ -183,6 +208,25 @@ def _verify_signature(
     body: bytes,
     invalid_code: FailureCode,
 ) -> FailureCode | None:
+    resolve_public_key = getattr(trust, "_resolve_public_key", None)
+    if verify_detached is _ORIGINAL_VERIFY_DETACHED and resolve_public_key is not None:
+        if signature.algorithm != "Ed25519":
+            return FailureCode.UNSUPPORTED_SIGNATURE_ALGORITHM
+        if signature.key_id != body_key_id:
+            return FailureCode.KEY_ID_MISMATCH
+        try:
+            resolved = resolve_public_key(role, scope)
+            if resolved is None or resolved[0].key_id != body_key_id:
+                return FailureCode.UNKNOWN_KEY
+            public_key_obj = resolved[1]
+        except Exception:
+            return FailureCode.UNKNOWN_KEY
+        try:
+            raw_sig = b64u_decode(signature.signature_b64u, expected_length=64)
+            public_key_obj.verify(raw_sig, domain_preimage(domain, body))
+        except (InvalidSignature, ValueError):
+            return invalid_code
+        return None
     public_key, error = _key(signature, body_key_id, trust, role, scope)
     if error is not None:
         return error
@@ -239,11 +283,21 @@ def _statement_types(certificate: CommitCertificate) -> FailureCode | None:
     return None
 
 
-def _evidence(certificate: CommitCertificate, trust: ScopedTrust) -> FailureCode | None:
+def _evidence(
+    certificate: CommitCertificate,
+    trust: ScopedTrust,
+    *,
+    validated: bool = False,
+) -> FailureCode | None:
     evidence = certificate.evidence
-    producer = canonical_statement(evidence.producer_statement)
-    policy = canonical_statement(evidence.policy_statement)
-    authority = canonical_statement(evidence.authority_statement)
+    if validated:
+        producer = _encode_json(dict(evidence.producer_statement))
+        policy = _encode_json(dict(evidence.policy_statement))
+        authority = _encode_json(dict(evidence.authority_statement))
+    else:
+        producer = canonical_statement(evidence.producer_statement)
+        policy = canonical_statement(evidence.policy_statement)
+        authority = canonical_statement(evidence.authority_statement)
     for body, claimed in (
         (producer, evidence.producer_statement_digest),
         (policy, evidence.policy_statement_digest),
@@ -441,7 +495,7 @@ def _verify_decoded_historical(
     )
     if seal_error is not None:
         return _failure(seal_error)
-    evidence_error = _evidence(certificate, trust)
+    evidence_error = _evidence(certificate, trust, validated=True)
     if evidence_error is not None:
         return _failure(evidence_error)
     binding_error = _bindings(certificate)
