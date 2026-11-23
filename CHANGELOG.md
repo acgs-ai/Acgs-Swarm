@@ -6,7 +6,30 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Security
+- **Execution gateway no longer echoes target responses in errors.**
+  `CredentialBoundHttpTarget` copied the target's error body into
+  `TargetAuthorizationError`, `StaleFencingTokenError`, and
+  `ExecutionGatewayError` messages. A target that reflects request headers in
+  its error body could therefore put the gateway's bearer token into exception
+  text and logs. Errors now carry the numeric status code only, and the
+  underlying `HTTPError` is no longer chained. Code that parsed the target's
+  body out of these messages must read the target's own logs instead.
+
+### Fixed
+- A response cut off after its headers raised a bare
+  `http.client.IncompleteRead` from `CredentialBoundHttpTarget.execute`. It is
+  now an `ExecutionGatewayError`, like every other transport failure.
+
 ### Added
+- `docs/API_STABILITY.md` states which modules are stable, advanced,
+  provisional, experimental, or internal in 1.2.x, and
+  `tests/test_api_stability_surface.py` checks it against the package.
+- `tests/test_apcc_execution_gateway_fault_e2e.py` runs the execution gateway
+  against a real HTTPS target process through a fault-injecting proxy: lost
+  responses, `SIGKILL` at four points around the ledger write and the HTTP
+  call, stale fencing tokens, wrong credentials, bad certificates, cross-store
+  replay, 429 and 5xx storms, and mismatched signing keys.
 - **APCC migration receipts:** `verify_migration_receipt_with_pinned_key` in
   `constitutional_swarm.apcc.migration_v3_to_v4` verifies a continuity receipt
   against a commit public key pinned outside the store, reading the rest of the
