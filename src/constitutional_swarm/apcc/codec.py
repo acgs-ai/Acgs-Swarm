@@ -289,16 +289,35 @@ def _tree(value: object, depth: int = 1) -> None:
         raise CodecError(FailureCode.WRONG_JSON_TYPE)
 
 
+def _validate_ascii_tree(value: object, depth: int = 1) -> None:
+    if depth > MAX_DEPTH:
+        raise CodecError(FailureCode.DEPTH_LIMIT_EXCEEDED)
+    if isinstance(value, str):
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_ascii_tree(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_ascii_tree(item, depth + 1)
+    else:
+        raise CodecError(FailureCode.WRONG_JSON_TYPE)
+
+
+def _encode_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def _canonical(value: object) -> bytes:
     try:
         _tree(value)
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return _encode_json(value)
     except RecursionError as exc:
         raise CodecError(FailureCode.DEPTH_LIMIT_EXCEEDED) from exc
 
@@ -308,27 +327,31 @@ def encode_payload(value: object) -> bytes:
     return _canonical(value)
 
 
+_DEPTH_SCAN = re.compile(r'["\[\]{}]')
+_STRING_TAIL = re.compile(r'(?:[^"\\]+|\\.)*"', re.DOTALL)
+
+
 def _scan_depth(text: str) -> None:
     """Enforce structural nesting before invoking the recursive JSON decoder."""
     depth = 0
-    in_string = False
-    escaped = False
-    for char in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
+    pos = 0
+    length = len(text)
+    while pos < length:
+        match = _DEPTH_SCAN.search(text, pos)
+        if match is None:
+            return
+        char = match.group()
+        pos = match.end()
         if char == '"':
-            in_string = True
+            tail = _STRING_TAIL.match(text, pos)
+            if tail is None:
+                return
+            pos = tail.end()
         elif char in "[{":
             depth += 1
             if depth > MAX_DEPTH:
                 raise CodecError(FailureCode.DEPTH_LIMIT_EXCEEDED)
-        elif char in "]}" and depth > 0:
+        elif depth > 0:
             depth -= 1
 
 
@@ -359,7 +382,10 @@ def _parse(raw: bytes, max_bytes: int = MAX_PAYLOAD_BYTES) -> object:
     if end != len(text):
         raise CodecError(FailureCode.TRAILING_BYTES)
     try:
-        _tree(value)
+        if text.isascii() and "\\u" not in text:
+            _validate_ascii_tree(value)
+        else:
+            _tree(value)
     except RecursionError as exc:
         raise CodecError(FailureCode.DEPTH_LIMIT_EXCEEDED) from exc
     return value
@@ -410,26 +436,44 @@ def _schema(value: object, schema: object) -> None:
         raise AssertionError("invalid internal schema")
 
 
+_B64U_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_B64U_INDEX = {char: idx for idx, char in enumerate(_B64U_ALPHABET)}
+
+
 def _decode_b64u(value: str, length: int | None = None) -> bytes:
-    if "=" in value or not _B64U.fullmatch(value):
+    if not value:
+        if length is not None and length != 0:
+            raise CodecError(FailureCode.INVALID_BASE64URL)
+        return b""
+    rem = len(value) & 3
+    if rem == 1 or _B64U.fullmatch(value) is None:
+        raise CodecError(FailureCode.INVALID_BASE64URL)
+    if rem == 2 and (_B64U_INDEX[value[-1]] & 0x0F) != 0:
+        raise CodecError(FailureCode.INVALID_BASE64URL)
+    if rem == 3 and (_B64U_INDEX[value[-1]] & 0x03) != 0:
         raise CodecError(FailureCode.INVALID_BASE64URL)
     try:
-        result = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        result = base64.urlsafe_b64decode(
+            value + ("==" if rem == 2 else "=" if rem == 3 else "")
+        )
     except (ValueError, binascii.Error) as exc:
         raise CodecError(FailureCode.INVALID_BASE64URL) from exc
-    canonical = base64.urlsafe_b64encode(result).rstrip(b"=").decode("ascii")
-    if canonical != value or (length is not None and len(result) != length):
+    if length is not None and len(result) != length:
         raise CodecError(FailureCode.INVALID_BASE64URL)
     return result
 
 
-def _scalars(value: object, name: str | None = None) -> None:
+def _scalars(
+    value: object,
+    name: str | None = None,
+    decoded_payload: list[bytes] | None = None,
+) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            _scalars(item, key)
+            _scalars(item, key, decoded_payload)
     elif isinstance(value, list):
         for item in value:
-            _scalars(item, name)
+            _scalars(item, name, decoded_payload)
     elif not isinstance(value, str):
         raise CodecError(FailureCode.WRONG_JSON_TYPE)
     elif name in _DECIMALS:
@@ -442,7 +486,9 @@ def _scalars(value: object, name: str | None = None) -> None:
     elif name == "signature_b64u":
         _decode_b64u(value, 64)
     elif name == "payload_b64u":
-        _decode_b64u(value)
+        decoded = _decode_b64u(value)
+        if decoded_payload is not None:
+            decoded_payload.append(decoded)
     elif name == "actor_authority" and not _AUTHORITY.fullmatch(value):
         raise CodecError(FailureCode.NONCANONICAL_ENCODING, name)
     elif name in _IDS and not _IDENTIFIER.fullmatch(value):
@@ -450,13 +496,20 @@ def _scalars(value: object, name: str | None = None) -> None:
 
 
 def _decode(
-    raw: bytes, schema: object, max_bytes: int = MAX_PAYLOAD_BYTES
+    raw: bytes,
+    schema: object,
+    max_bytes: int = MAX_PAYLOAD_BYTES,
+    decoded_payload: list[bytes] | None = None,
 ) -> dict[str, Any]:
     value = _object(_parse(raw, max_bytes))
-    if _canonical(value) != raw:
+    try:
+        encoded = _encode_json(value)
+    except RecursionError as exc:
+        raise CodecError(FailureCode.DEPTH_LIMIT_EXCEEDED) from exc
+    if encoded != raw:
         raise CodecError(FailureCode.NONCANONICAL_ENCODING)
     _schema(value, schema)
-    _scalars(value)
+    _scalars(value, decoded_payload=decoded_payload)
     return value
 
 
@@ -622,7 +675,8 @@ def _decode_envelope_certificate(
     raw: bytes,
 ) -> tuple[DetachedEnvelope, CommitCertificate]:
     """Decode an envelope once and return it with its decoded certificate."""
-    value = _decode(raw, _ENVELOPE, MAX_ENVELOPE_BYTES)
+    decoded_payload: list[bytes] = []
+    value = _decode(raw, _ENVELOPE, MAX_ENVELOPE_BYTES, decoded_payload=decoded_payload)
     if value["envelope_type"] != "apcc.detached-certificate-envelope":
         raise CodecError(FailureCode.UNSUPPORTED_CERTIFICATE_TYPE)
     seal = cast("dict[str, str]", value["seal"])
@@ -631,7 +685,7 @@ def _decode_envelope_certificate(
         "Ed25519",
         FailureCode.UNSUPPORTED_SIGNATURE_ALGORITHM,
     )
-    payload = _decode_b64u(value["payload_b64u"])
+    payload = decoded_payload[0]
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise CodecError(FailureCode.SIZE_LIMIT_EXCEEDED)
     certificate = decode_certificate(payload)

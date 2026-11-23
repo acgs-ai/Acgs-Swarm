@@ -135,6 +135,7 @@ from .verifier import (
     _bindings,
     _evidence,
     _header,
+    _verify_historical_detached,
     _verify_signature,
     verify_historical,
 )
@@ -144,6 +145,8 @@ _AUTHORITY_SCHEMA_VERSION = "4"
 _SCHEMA_VERSION = int(_AUTHORITY_SCHEMA_VERSION)
 _MAX_STATUS_BATCH_SIZE = 1000
 _MAX_CERTIFICATE_CACHE_PAYLOAD_BYTES = 4 * 1024 * 1024
+_MAX_VERIFIED_ENVELOPE_CACHE_ENTRIES = 2048
+_MAX_VERIFIED_ENVELOPE_CACHE_BYTES = 16 * 1024 * 1024
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _SEMANTIC_CHECKPOINT_DOMAIN = b"APCC-SEMANTIC-CHECKPOINT-V1"
 _SEMANTIC_CHECKPOINT_GENESIS = sha256_digest(b"APCC-1/semantic-checkpoint/genesis")
@@ -398,6 +401,67 @@ def _decode_checkpoint_certificate(payload: bytes) -> CommitCertificate:
     return _CERTIFICATE_DECODE_CACHE.decode(payload)
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedEnvelopeEntry:
+    payload: bytes
+    payload_sha256: str
+    certificate: CommitCertificate
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedEnvelopeCacheInfo:
+    entries: int
+    envelope_bytes: int
+    max_entries: int
+    max_envelope_bytes: int
+
+
+class _VerifiedEnvelopeCache:
+    """Store-local LRU cache of cryptographically verified detached envelopes."""
+
+    def __init__(self, *, max_entries: int, max_envelope_bytes: int) -> None:
+        if max_entries <= 0 or max_envelope_bytes <= 0:
+            raise ValueError("verified envelope cache limits must be positive")
+        self._max_entries = max_entries
+        self._max_envelope_bytes = max_envelope_bytes
+        self._entries: OrderedDict[bytes, _VerifiedEnvelopeEntry] = OrderedDict()
+        self._envelope_bytes = 0
+        self._lock = Lock()
+
+    def get(self, envelope: bytes) -> _VerifiedEnvelopeEntry | None:
+        with self._lock:
+            cached = self._entries.get(envelope)
+            if cached is not None:
+                self._entries.move_to_end(envelope)
+            return cached
+
+    def put(self, envelope: bytes, entry: _VerifiedEnvelopeEntry) -> None:
+        size = len(envelope)
+        if size > self._max_envelope_bytes:
+            return
+        with self._lock:
+            if envelope in self._entries:
+                self._entries.move_to_end(envelope)
+                return
+            while self._entries and (
+                len(self._entries) >= self._max_entries
+                or self._envelope_bytes + size > self._max_envelope_bytes
+            ):
+                evicted_envelope, _ = self._entries.popitem(last=False)
+                self._envelope_bytes -= len(evicted_envelope)
+            self._entries[envelope] = entry
+            self._envelope_bytes += size
+
+    def info(self) -> _VerifiedEnvelopeCacheInfo:
+        with self._lock:
+            return _VerifiedEnvelopeCacheInfo(
+                entries=len(self._entries),
+                envelope_bytes=self._envelope_bytes,
+                max_entries=self._max_entries,
+                max_envelope_bytes=self._max_envelope_bytes,
+            )
+
+
 def _checkpoint_semantic_snapshot(
     connection: _AuthorityConnection,
     certificate_digests: Sequence[str],
@@ -408,19 +472,12 @@ def _checkpoint_semantic_snapshot(
     envelope_sizes: dict[str, int] = {}
     attempted: set[str] = set()
     pending = set(certificate_digests)
-    while pending:
-        batch = tuple(sorted(pending)[:400])
-        pending.difference_update(batch)
-        attempted.update(batch)
-        placeholders = ",".join("?" for _ in batch)
-        rows = connection.execute(
-            "SELECT certificate_digest,commit_id,certificate_json,envelope,"
-            "workflow_id,node_id,sequence FROM certificates "
-            f"WHERE certificate_digest IN ({placeholders})",
-            batch,
-        ).fetchall()
+
+    def ingest_rows(rows: Sequence[tuple[object, ...]]) -> None:
         for row in rows:
             digest = _row_text(row[0])
+            if digest in certificates:
+                continue
             try:
                 payload = _row_bytes(row[2])
                 sequence = _row_int(row[6])
@@ -440,6 +497,8 @@ def _checkpoint_semantic_snapshot(
                 or certificate.header.certificate_sequence != str(sequence)
             ):
                 raise ValueError("APCC semantic checkpoint protected row is invalid")
+            attempted.add(digest)
+            pending.discard(digest)
             certificates[digest] = certificate
             envelope_sizes[digest] = len(_row_bytes(row[3]))
             pending.update(
@@ -448,6 +507,47 @@ def _checkpoint_semantic_snapshot(
                 if reference.certificate_digest not in attempted
                 and reference.certificate_digest not in certificates
             )
+
+    if pending:
+        initial_roots = tuple(sorted(pending))
+        for offset in range(0, len(initial_roots), 400):
+            seed_batch = tuple(d for d in initial_roots[offset : offset + 400] if d not in attempted)
+            if not seed_batch:
+                continue
+            pending.difference_update(seed_batch)
+            attempted.update(seed_batch)
+            placeholders = ",".join("?" for _ in seed_batch)
+            rows = connection.execute(
+                "WITH RECURSIVE reach(digest, depth) AS ("
+                "SELECT certificate_digest, 0 FROM certificates "
+                f"WHERE certificate_digest IN ({placeholders}) "
+                "UNION "
+                "SELECT pe.predecessor_digest, r.depth + 1 "
+                "FROM reach r "
+                "JOIN certificates c ON c.certificate_digest = r.digest "
+                "JOIN predecessor_edges pe ON pe.child_commit_id = c.commit_id "
+                "WHERE r.depth < ?"
+                ") "
+                "SELECT DISTINCT c.certificate_digest,c.commit_id,c.certificate_json,"
+                "c.envelope,c.workflow_id,c.node_id,c.sequence "
+                "FROM reach r JOIN certificates c ON c.certificate_digest = r.digest "
+                "LIMIT ?",
+                (*seed_batch, 100, 4096),
+            ).fetchall()
+            ingest_rows(rows)
+
+    while pending:
+        batch = tuple(sorted(pending)[:400])
+        pending.difference_update(batch)
+        attempted.update(batch)
+        placeholders = ",".join("?" for _ in batch)
+        rows = connection.execute(
+            "SELECT certificate_digest,commit_id,certificate_json,envelope,"
+            "workflow_id,node_id,sequence FROM certificates "
+            f"WHERE certificate_digest IN ({placeholders})",
+            batch,
+        ).fetchall()
+        ingest_rows(rows)
 
     dispositions: dict[str, CertificateDisposition] = {}
     digests = tuple(sorted(certificates))
@@ -576,6 +676,8 @@ def _gcb_revoked_closure(
             (workflow_id,),
         ).fetchall()
     }
+    if not roots:
+        return False
     pending = [node_id]
     seen: set[str] = set()
     while pending:
@@ -1243,46 +1345,151 @@ def _observation_effective_revoked(
     cache: dict[str, bool] | None = None,
 ) -> bool:
     """Resolve guarded transitive revocation inside an observation snapshot."""
+    limits = CausalClosureLimits()
+    limit_certs = limits.max_certificates
     active_digests = set() if active is None else active
     resolved = {} if cache is None else cache
-    cached = resolved.get(certificate_digest)
-    if cached is not None:
-        return cached
+    if certificate_digest in resolved:
+        return resolved[certificate_digest]
     if (
         certificate_digest in active_digests
-        or len(active_digests) + len(resolved) >= CausalClosureLimits().max_certificates
+        or len(active_digests) + len(resolved) >= limit_certs
     ):
         return True
-    active_digests.add(certificate_digest)
-    row = connection.execute(
-        "SELECT certificate_json FROM certificates WHERE certificate_digest=?",
-        (certificate_digest,),
-    ).fetchone()
-    disposition = _latest_disposition(connection, certificate_digest)
-    if row is None or disposition is None:
-        active_digests.remove(certificate_digest)
-        resolved[certificate_digest] = True
-        return True
-    certificate = decode_certificate(_row_bytes(row[0]))
-    if (
-        disposition is CertificateDisposition.REVOKED
-        or _has_later_generation_revocation(connection, certificate)
-    ):
-        active_digests.remove(certificate_digest)
-        resolved[certificate_digest] = True
-        return True
-    revoked = any(
-        _observation_effective_revoked(
-            connection,
-            predecessor.certificate_digest,
-            active=active_digests,
-            cache=resolved,
+
+    preloaded_payloads: dict[str, bytes] = {}
+    preloaded_dispositions: dict[str, CertificateDisposition] = {}
+    preloaded_wf_rev: dict[str, int] = {}
+    preloaded_actor_rev: dict[tuple[str, str], int] = {}
+    preloaded_wf_set: set[str] = set()
+    preloaded_actor_set: set[tuple[str, str]] = set()
+
+    preload_rows = connection.execute(
+        "WITH RECURSIVE reach(digest, depth) AS ("
+        "SELECT certificate_digest, 0 FROM certificates WHERE certificate_digest = ? "
+        "UNION "
+        "SELECT pe.predecessor_digest, r.depth + 1 "
+        "FROM reach r "
+        "JOIN certificates c ON c.certificate_digest = r.digest "
+        "JOIN predecessor_edges pe ON pe.child_commit_id = c.commit_id "
+        "WHERE r.depth < ?"
+        ") "
+        "SELECT DISTINCT c.certificate_digest, c.certificate_json "
+        "FROM reach r JOIN certificates c ON c.certificate_digest = r.digest "
+        "LIMIT ?",
+        (certificate_digest, limits.max_depth, limit_certs + 1),
+    ).fetchall()
+    for row in preload_rows:
+        preloaded_payloads[_row_text(row[0])] = _row_bytes(row[1])
+
+    if preloaded_payloads:
+        preloaded_digests = tuple(preloaded_payloads)
+        for offset in range(0, len(preloaded_digests), 400):
+            batch = preloaded_digests[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for row_digest, _seq, raw_disp in connection.execute(
+                "SELECT certificate_digest, event_sequence, disposition "
+                "FROM certificate_dispositions "
+                f"WHERE certificate_digest IN ({placeholders}) "
+                "ORDER BY certificate_digest, event_sequence",
+                batch,
+            ):
+                preloaded_dispositions[_row_text(row_digest)] = CertificateDisposition(
+                    _row_text(raw_disp)
+                )
+
+        decoded_preloaded: dict[str, CommitCertificate] = {}
+        for digest, payload in preloaded_payloads.items():
+            try:
+                decoded = _decode_checkpoint_certificate(payload)
+            except Exception:
+                continue
+            decoded_preloaded[digest] = decoded
+            preloaded_wf_set.add(decoded.subject.workflow_id)
+            preloaded_actor_set.add(
+                (decoded.subject.workflow_id, decoded.subject.agent_id)
+            )
+
+        wf_list = tuple(sorted(preloaded_wf_set))
+        for offset in range(0, len(wf_list), 400):
+            batch = wf_list[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for wf_id, gen in connection.execute(
+                "SELECT workflow_id, generation FROM workflow_revocations "
+                f"WHERE workflow_id IN ({placeholders})",
+                batch,
+            ):
+                preloaded_wf_rev[_row_text(wf_id)] = _row_int(gen)
+
+        actor_list = tuple(sorted(preloaded_actor_set))
+        for offset in range(0, len(actor_list), 400):
+            batch_pairs = actor_list[offset : offset + 400]
+            placeholders = ",".join("(?,?)" for _ in batch_pairs)
+            params = tuple(value for pair in batch_pairs for value in pair)
+            for wf_id, actor_id, gen in connection.execute(
+                "SELECT workflow_id, actor_id, generation FROM actor_revocations "
+                f"WHERE (workflow_id, actor_id) IN (VALUES {placeholders})",
+                params,
+            ):
+                preloaded_actor_rev[(_row_text(wf_id), _row_text(actor_id))] = _row_int(
+                    gen
+                )
+    else:
+        decoded_preloaded = {}
+
+    def visit(digest: str) -> bool:
+        cached = resolved.get(digest)
+        if cached is not None:
+            return cached
+        if digest in active_digests or len(active_digests) + len(resolved) >= limit_certs:
+            return True
+        active_digests.add(digest)
+        payload = preloaded_payloads.get(digest)
+        if payload is not None:
+            disposition = preloaded_dispositions.get(digest)
+        else:
+            row = connection.execute(
+                "SELECT certificate_json FROM certificates WHERE certificate_digest=?",
+                (digest,),
+            ).fetchone()
+            disposition = _latest_disposition(connection, digest)
+            payload = None if row is None else _row_bytes(row[0])
+        if payload is None or disposition is None:
+            active_digests.remove(digest)
+            resolved[digest] = True
+            return True
+        certificate = decoded_preloaded.get(digest)
+        if certificate is None:
+            certificate = _decode_checkpoint_certificate(payload)
+        if disposition is CertificateDisposition.REVOKED:
+            active_digests.remove(digest)
+            resolved[digest] = True
+            return True
+        wf_id = certificate.subject.workflow_id
+        actor_key = (wf_id, certificate.subject.agent_id)
+        if wf_id in preloaded_wf_set and actor_key in preloaded_actor_set:
+            gen_revoked = (
+                preloaded_actor_rev.get(actor_key, 0)
+                > int(certificate.context.agent_revocation_generation)
+            ) or (
+                preloaded_wf_rev.get(wf_id, 0)
+                > int(certificate.context.workflow_revocation_generation)
+            )
+        else:
+            gen_revoked = _has_later_generation_revocation(connection, certificate)
+        if gen_revoked:
+            active_digests.remove(digest)
+            resolved[digest] = True
+            return True
+        revoked = any(
+            visit(predecessor.certificate_digest)
+            for predecessor in certificate.bindings.predecessors
         )
-        for predecessor in certificate.bindings.predecessors
-    )
-    active_digests.remove(certificate_digest)
-    resolved[certificate_digest] = revoked
-    return revoked
+        active_digests.remove(digest)
+        resolved[digest] = revoked
+        return revoked
+
+    return visit(certificate_digest)
 
 
 class _AuthorityReaderCore:
@@ -2508,6 +2715,15 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             request.signatures,
         )
 
+    def _record_verified_envelope(
+        self,
+        envelope: bytes,
+        payload: bytes,
+        digest: str,
+        certificate: CommitCertificate,
+    ) -> None:
+        del envelope, payload, digest, certificate
+
     def _seal(self, certificate: CommitCertificate) -> tuple[bytes, bytes, str]:
         payload = encode_certificate(certificate)
         seal = self._runtime.key_provider.sign(
@@ -2520,10 +2736,12 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
             payload, seal_key_id=seal.key_id, seal_signature_b64u=seal.signature_b64u
         )
         verdict = verify_historical(envelope, trust=self._scoped_trust)
-        if not verdict.ok:
+        if not verdict.ok or verdict.certificate is None:
             code = verdict.code or FailureCode.TRANSACTION_ABORTED
             raise ValueError(code.value)
-        return payload, envelope, sha256_digest(payload)
+        digest = verdict.certificate_digest or sha256_digest(payload)
+        self._record_verified_envelope(envelope, payload, digest, verdict.certificate)
+        return payload, envelope, digest
 
     def _negative(
         self,
@@ -2922,6 +3140,10 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         facts = self._causal_batch_facts(
             request.certificate_digest, semantic_snapshot, causal_cache, set()
         )
+        if facts.error is None:
+            self._preload_generation_revocations(
+                connection, facts.closure, semantic_snapshot, generation_cache
+            )
         if facts.error is not None or any(
             semantic_snapshot.dispositions.get(digest) is CertificateDisposition.REVOKED
             or self._later_generation_revoked(
@@ -2978,6 +3200,62 @@ class _AuthorityStoreCore(_AuthorityReaderCore):
         ):
             raise ValueError(FailureCode.AUTHORITY_STATUS_INVALID_SIGNATURE.value)
         return replace(unsigned, signature=signature), certificate.decision.commit_id
+
+    def _preload_generation_revocations(
+        self,
+        connection: _AuthorityConnection,
+        digests: Set[str],
+        semantic_snapshot: _SemanticSnapshot,
+        cache: dict[str, bool],
+    ) -> None:
+        uncached = [d for d in digests if d not in cache]
+        if len(uncached) <= 1:
+            return
+        targets: list[tuple[str, CommitCertificate]] = []
+        workflows: set[str] = set()
+        actors: set[tuple[str, str]] = set()
+        for digest in uncached:
+            cert = semantic_snapshot.certificates.get(digest)
+            if cert is None:
+                cache[digest] = True
+                continue
+            targets.append((digest, cert))
+            workflows.add(cert.subject.workflow_id)
+            actors.add((cert.subject.workflow_id, cert.subject.agent_id))
+        if not targets:
+            return
+        wf_rev: dict[str, int] = {}
+        wf_list = tuple(sorted(workflows))
+        for offset in range(0, len(wf_list), 400):
+            batch = wf_list[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for wf_id, gen in connection.execute(
+                "SELECT workflow_id, generation FROM workflow_revocations "
+                f"WHERE workflow_id IN ({placeholders})",
+                batch,
+            ):
+                wf_rev[_row_text(wf_id)] = _row_int(gen)
+        actor_rev: dict[tuple[str, str], int] = {}
+        actor_list = tuple(sorted(actors))
+        for offset in range(0, len(actor_list), 400):
+            batch_pairs = actor_list[offset : offset + 400]
+            placeholders = ",".join("(?,?)" for _ in batch_pairs)
+            params = tuple(value for pair in batch_pairs for value in pair)
+            for wf_id, actor_id, gen in connection.execute(
+                "SELECT workflow_id, actor_id, generation FROM actor_revocations "
+                f"WHERE (workflow_id, actor_id) IN (VALUES {placeholders})",
+                params,
+            ):
+                actor_rev[(_row_text(wf_id), _row_text(actor_id))] = _row_int(gen)
+        for digest, cert in targets:
+            wf_id = cert.subject.workflow_id
+            cache[digest] = (
+                actor_rev.get((wf_id, cert.subject.agent_id), 0)
+                > int(cert.context.agent_revocation_generation)
+            ) or (
+                wf_rev.get(wf_id, 0)
+                > int(cert.context.workflow_revocation_generation)
+            )
 
     def _later_generation_revoked(
         self,
@@ -3359,6 +3637,11 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         self._gcb_projection_fault: _GCBProjectionCheckpoint | None = None
         self._gcb_projection_fault_fired = False
         self._attested_read_connections: set[sqlite3.Connection] = set()
+        self._verified_envelopes = _VerifiedEnvelopeCache(
+            max_entries=_MAX_VERIFIED_ENVELOPE_CACHE_ENTRIES,
+            max_envelope_bytes=_MAX_VERIFIED_ENVELOPE_CACHE_BYTES,
+        )
+        self._verified_envelopes_trust = self._scoped_trust
         raise ValueError("use SQLiteAuthorityStore.open on a provisioned store")
 
     @classmethod
@@ -3595,8 +3878,275 @@ class SQLiteAuthorityStore(_AuthorityStoreCore):
         store._gcb_projection_fault = projection_fault
         store._gcb_projection_fault_fired = False
         store._attested_read_connections = set()
+        store._verified_envelopes = _VerifiedEnvelopeCache(
+            max_entries=_MAX_VERIFIED_ENVELOPE_CACHE_ENTRIES,
+            max_envelope_bytes=_MAX_VERIFIED_ENVELOPE_CACHE_BYTES,
+        )
+        store._verified_envelopes_trust = store._scoped_trust
         store._ensure_semantic_checkpoint()
         return store
+
+    def _record_verified_envelope(
+        self,
+        envelope: bytes,
+        payload: bytes,
+        digest: str,
+        certificate: CommitCertificate,
+    ) -> None:
+        if self._verified_envelopes_trust is self._scoped_trust:
+            self._verified_envelopes.put(
+                envelope,
+                _VerifiedEnvelopeEntry(payload, digest, certificate),
+            )
+
+    def _verify_stored_envelope(
+        self, envelope: bytes
+    ) -> _VerifiedEnvelopeEntry | None:
+        trust_matches = self._verified_envelopes_trust is self._scoped_trust
+        if trust_matches:
+            cached = self._verified_envelopes.get(envelope)
+            if cached is not None:
+                return cached
+        verdict, detached = _verify_historical_detached(
+            envelope, trust=self._scoped_trust
+        )
+        if not verdict.ok or verdict.certificate is None or detached is None:
+            return None
+        entry = _VerifiedEnvelopeEntry(
+            detached.payload, detached.payload_sha256, verdict.certificate
+        )
+        if trust_matches:
+            self._verified_envelopes.put(envelope, entry)
+        return entry
+
+    def _request_causal_error(
+        self, connection: _AuthorityConnection, root: CommitCertificate
+    ) -> FailureCode | None:
+        limits = CausalClosureLimits()
+        root_payload = encode_certificate(root)
+        root_envelope = encode_envelope(
+            root_payload,
+            seal_key_id=self._config.commit_trust.key_id,
+            seal_signature_b64u=b64u_encode(bytes(64)),
+        )
+        if len(root_envelope) > limits.max_total_bytes:
+            return FailureCode.SIZE_LIMIT_EXCEEDED
+        if not root.bindings.predecessors:
+            return None
+        if limits.max_depth < 1:
+            return FailureCode.DEPTH_LIMIT_EXCEEDED
+
+        cte_limit = max(limits.max_certificates * 4, 256)
+        row_limit = limits.max_certificates + 2
+        root_preds = tuple(
+            dict.fromkeys(ref.certificate_digest for ref in root.bindings.predecessors)
+        )
+        preloaded_certs: dict[str, tuple[str, bytes, bytes]] = {}
+        edges_by_commit: dict[str, tuple[str, ...]] = {}
+        commit_ids: list[str] = []
+        for offset in range(0, len(root_preds), 400):
+            batch = root_preds[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                "WITH RECURSIVE reach(digest, depth) AS ("
+                "SELECT certificate_digest, 1 FROM certificates "
+                f"WHERE certificate_digest IN ({placeholders}) "
+                "UNION "
+                "SELECT pe.predecessor_digest, r.depth + 1 "
+                "FROM reach r "
+                "JOIN certificates c ON c.certificate_digest = r.digest "
+                "JOIN predecessor_edges pe ON pe.child_commit_id = c.commit_id "
+                "WHERE r.depth < ? "
+                f"LIMIT {cte_limit}"
+                ") "
+                "SELECT DISTINCT c.certificate_digest, c.commit_id, "
+                "c.certificate_json, c.envelope "
+                "FROM reach r JOIN certificates c ON c.certificate_digest = r.digest "
+                "LIMIT ?",
+                (*batch, limits.max_depth + 1, row_limit),
+            ).fetchall():
+                d_val = _row_text(row[0])
+                cid_val = _row_text(row[1])
+                if d_val not in preloaded_certs:
+                    preloaded_certs[d_val] = (
+                        cid_val,
+                        _row_bytes(row[2]),
+                        _row_bytes(row[3]),
+                    )
+                    commit_ids.append(cid_val)
+        for offset in range(0, len(commit_ids), 400):
+            batch_cids = tuple(dict.fromkeys(commit_ids[offset : offset + 400]))
+            placeholders = ",".join("?" for _ in batch_cids)
+            grouped: dict[str, list[str]] = {cid: [] for cid in batch_cids}
+            for cid_raw, pred_raw in connection.execute(
+                "SELECT child_commit_id, predecessor_digest FROM predecessor_edges "
+                f"WHERE child_commit_id IN ({placeholders}) "
+                "ORDER BY child_commit_id, predecessor_digest",
+                batch_cids,
+            ):
+                grouped[_row_text(cid_raw)].append(_row_text(pred_raw))
+            for cid, preds in grouped.items():
+                edges_by_commit[cid] = tuple(preds)
+
+        def resolve_verified(digest: str) -> tuple[CommitCertificate, bytes] | None:
+            preloaded = preloaded_certs.get(digest)
+            if preloaded is not None:
+                commit_id, payload, envelope = preloaded
+                stored_edges = edges_by_commit.get(commit_id)
+            else:
+                row = connection.execute(
+                    "SELECT commit_id, certificate_json, envelope FROM certificates "
+                    "WHERE certificate_digest=?",
+                    (digest,),
+                ).fetchone()
+                if row is None:
+                    return None
+                commit_id = _row_text(row[0])
+                payload = _row_bytes(row[1])
+                envelope = _row_bytes(row[2])
+                stored_edges = None
+            if stored_edges is None:
+                stored_edges = tuple(
+                    _row_text(edge[0])
+                    for edge in connection.execute(
+                        "SELECT predecessor_digest FROM predecessor_edges "
+                        "WHERE child_commit_id=? ORDER BY predecessor_digest",
+                        (commit_id,),
+                    )
+                )
+            entry = self._verify_stored_envelope(envelope)
+            if (
+                entry is None
+                or entry.payload != payload
+                or entry.payload_sha256 != digest
+            ):
+                return None
+            signed_edges = tuple(
+                sorted(
+                    item.certificate_digest
+                    for item in entry.certificate.bindings.predecessors
+                )
+            )
+            if stored_edges != signed_edges:
+                return None
+            return entry.certificate, envelope
+
+        cache: dict[str, CommitCertificate] = {}
+        active: set[str] = {sha256_digest(root_payload)}
+        complete: set[str] = set()
+        total_bytes = len(root_envelope)
+
+        def visit(certificate: CommitCertificate, depth: int) -> FailureCode | None:
+            nonlocal total_bytes
+            for reference in certificate.bindings.predecessors:
+                digest = reference.certificate_digest
+                if depth + 1 > limits.max_depth:
+                    return FailureCode.DEPTH_LIMIT_EXCEEDED
+                if digest in active:
+                    return FailureCode.INVALID_PREDECESSOR
+                resolved = cache.get(digest)
+                if resolved is None:
+                    if len(cache) + 1 >= limits.max_certificates:
+                        return FailureCode.SIZE_LIMIT_EXCEEDED
+                    verified = resolve_verified(digest)
+                    if verified is None:
+                        return FailureCode.INVALID_PREDECESSOR
+                    resolved, envelope = verified
+                    if total_bytes + len(envelope) > limits.max_total_bytes:
+                        return FailureCode.SIZE_LIMIT_EXCEEDED
+                    cache[digest] = resolved
+                    total_bytes += len(envelope)
+                if (
+                    resolved.subject.workflow_id,
+                    resolved.subject.node_id,
+                    resolved.bindings.committed_node_version,
+                    resolved.decision.commit_id,
+                    digest,
+                    resolved.subject.output_digest,
+                ) != (
+                    reference.workflow_id,
+                    reference.node_id,
+                    reference.committed_node_version,
+                    reference.commit_id,
+                    reference.certificate_digest,
+                    reference.output_digest,
+                ):
+                    return FailureCode.INVALID_PREDECESSOR
+                if digest in complete:
+                    continue
+                active.add(digest)
+                error = visit(resolved, depth + 1)
+                active.remove(digest)
+                if error is not None:
+                    return error
+                complete.add(digest)
+            return None
+
+        try:
+            error = visit(root, 0)
+        except Exception:
+            return FailureCode.INVALID_PREDECESSOR
+        if error is not None:
+            return error
+        if not cache:
+            return None
+
+        dispositions: dict[str, CertificateDisposition] = {}
+        all_digests = tuple(cache)
+        for offset in range(0, len(all_digests), 400):
+            batch = all_digests[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for row_digest, _seq, raw_disp in connection.execute(
+                "SELECT certificate_digest, event_sequence, disposition "
+                "FROM certificate_dispositions "
+                f"WHERE certificate_digest IN ({placeholders}) "
+                "ORDER BY certificate_digest, event_sequence",
+                batch,
+            ):
+                dispositions[_row_text(row_digest)] = CertificateDisposition(
+                    _row_text(raw_disp)
+                )
+        for digest in all_digests:
+            disposition = dispositions.get(digest)
+            if disposition is None or disposition is CertificateDisposition.REVOKED:
+                return FailureCode.INVALID_PREDECESSOR
+
+        wf_rev: dict[str, int] = {}
+        workflows = tuple(dict.fromkeys(c.subject.workflow_id for c in cache.values()))
+        for offset in range(0, len(workflows), 400):
+            batch = workflows[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for wf_id, gen in connection.execute(
+                "SELECT workflow_id, generation FROM workflow_revocations "
+                f"WHERE workflow_id IN ({placeholders})",
+                batch,
+            ):
+                wf_rev[_row_text(wf_id)] = _row_int(gen)
+
+        actor_rev: dict[tuple[str, str], int] = {}
+        actor_keys = tuple(
+            dict.fromkeys((c.subject.workflow_id, c.subject.agent_id) for c in cache.values())
+        )
+        for offset in range(0, len(actor_keys), 400):
+            batch_pairs = actor_keys[offset : offset + 400]
+            placeholders = ",".join("(?,?)" for _ in batch_pairs)
+            params = tuple(value for pair in batch_pairs for value in pair)
+            for wf_id, actor_id, gen in connection.execute(
+                "SELECT workflow_id, actor_id, generation FROM actor_revocations "
+                f"WHERE (workflow_id, actor_id) IN (VALUES {placeholders})",
+                params,
+            ):
+                actor_rev[(_row_text(wf_id), _row_text(actor_id))] = _row_int(gen)
+
+        for certificate in cache.values():
+            wf_id = certificate.subject.workflow_id
+            if wf_rev.get(wf_id, 0) > int(
+                certificate.context.workflow_revocation_generation
+            ) or actor_rev.get((wf_id, certificate.subject.agent_id), 0) > int(
+                certificate.context.agent_revocation_generation
+            ):
+                return FailureCode.INVALID_PREDECESSOR
+        return None
 
     def atomic_commit(self, request: AtomicCommitRequest) -> CommitResult:
         if self._gcb_attached:
