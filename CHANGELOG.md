@@ -6,13 +6,40 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+Releases the post-`1.1.0` security-hardening campaign (C1–C51b), APCC schema v4
+boundary, external side-effect execution gateway, and offline v3-to-v4 migration
+tooling (`v1.1.0@d10c8687` remains immutable on GitHub with no PyPI upload;
+`0.1.1` is the previous PyPI release).
+
+### Added & Hardened (PRs #185–#188)
+- **External Side-Effect Execution Gateway (`#187`):** Added
+  `APCCExecutionGateway`, `SQLiteExecutionLedger` (WAL+FULL), and
+  `CredentialBoundHttpTarget` (`src/constitutional_swarm/apcc/execution_gateway.py`)
+  enforcing `verify_causal_closure` + `verify_current`, monotonic fencing tokens,
+  idempotency replay cache, no-redirect/loopback-TLS credential isolation, and
+  trust-log watermark monotonicity across `docs/security-model.md`.
+- **Offline APCC v3-to-v4 Migration & Continuity Receipts (`#188`):** Added
+  `src/constitutional_swarm/apcc/migration_v3_to_v4.py`, CLI (`python -m
+  constitutional_swarm.apcc.migration_v3_to_v4`), and
+  `docs/adr/ADR-0001-apcc-v3-to-v4-offline-migration.md` for read-only-source
+  inspection, clean fail-closed refusal of pre-C32 NUL-joined audit-ID stores,
+  offline migration of authentic post-C32 v3 SQLite stores into fresh v4
+  databases, and Ed25519-signed `MigrationContinuityReceipt` verification.
+- **APCC SQLite & Codec Performance (`#186`):** Eliminated quadratic causal-closure
+  re-verification, expanded `_CERTIFICATE_DECODE_CACHE`, cached config
+  serialization/public keys/statement encoding, and batched outbox recovery in
+  `sqlite_store.py`.
+- **Phase 1 Hardening (`#185`):** Hardened schema v4 refusal paths and PG17
+  catalog fingerprints, fixed spectral sphere projection UB, wired APCC TLC
+  model checking into CI, and clarified Mesh guarantee bounds.
+
 Security-fix campaign (batches C1–C48, C25b, C35b, C42b, C51a, C51b). Verifiers now take
 their trust anchors (keys, roots, rosters, thresholds) from their own
 configuration rather than from the object they verify, and insecure modes need
 an explicit opt-in. Many changes are breaking: read **Migration** first.
-Rationale for each batch is in `DECISIONS.md`. These notes cover the campaign
-only. They do not cover the APCC-1 / GCB feature work that also landed after
-1.1.0.
+Rationale for each batch is in `DECISIONS.md`.
 
 > **Breaking, data: APCC authority schema bumped from `3` to `4` (C32 format boundary).**
 > C32 changed how non-decision audit and event ids are encoded (stage, candidate,
