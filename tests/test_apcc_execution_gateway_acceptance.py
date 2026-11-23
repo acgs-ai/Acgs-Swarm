@@ -49,9 +49,13 @@ from constitutional_swarm.apcc.execution_gateway import (
     TargetExecutionReceipt,
 )
 from constitutional_swarm.apcc.model import (
+    AuthorityStatus,
+    AuthorityStatusValue,
     CommitCertificate,
     FailureCode,
     RequestOutcome,
+    Signature,
+    SupersessionValue,
 )
 from constitutional_swarm.apcc.ports import (
     APCCAuthorityConfig,
@@ -60,6 +64,7 @@ from constitutional_swarm.apcc.ports import (
     CurrentStatusRequest,
     CurrentStatusResult,
     OutboxRecoveryRequest,
+    PersistedOutboxEvent,
     RevocationRequest,
     RevocationScope,
     SupersessionCommitted,
@@ -860,6 +865,9 @@ def test_status_rollback_and_expired_status_fail_closed(
         def get_certificate(self, commit_id: str) -> bytes | None:
             return self._inner.get_certificate(commit_id)
 
+        def get_outbox_event(self, commit_id: str) -> PersistedOutboxEvent:
+            return self._inner.get_outbox_event(commit_id)
+
         def current_status_batch(
             self, requests: list[CurrentStatusRequest]
         ) -> tuple[CurrentStatusResult, ...]:
@@ -1136,3 +1144,300 @@ def test_http_target_refuses_redirect_without_forwarding_credentials() -> None:
         sink_server.server_close()
         t_red.join(timeout=2.0)
         t_sink.join(timeout=2.0)
+
+
+def test_http_target_ignores_environment_proxy_settings(
+    tmp_path: Path,
+    target_harness: _DurableHttpTargetHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy_hits: list[str] = []
+
+    class _ProxyTrapHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            proxy_hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def do_CONNECT(self) -> None:  # noqa: N802
+            proxy_hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+    proxy_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ProxyTrapHandler)
+    p_host, p_port = proxy_server.server_address[:2]
+    proxy_url = f"http://{p_host}:{p_port}"
+    t_proxy = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+    t_proxy.start()
+    try:
+        monkeypatch.setenv("HTTP_PROXY", proxy_url)
+        monkeypatch.setenv("HTTPS_PROXY", proxy_url)
+        monkeypatch.setenv("http_proxy", proxy_url)
+        monkeypatch.setenv("https_proxy", proxy_url)
+
+        http_target = CredentialBoundHttpTarget(
+            target_harness.url, bearer_token=target_harness.expected_token
+        )
+        store, _gateway, _ledger, _sink, _clock, _config_obj, _runtime = (
+            _provision_and_wire(tmp_path, http_target)
+        )
+        req = _request(commit_id="m3-proxy-bypass", nonce_byte=28)
+        _advance_candidate(store, req)
+        assert store.atomic_commit(req).decision.outcome is RequestOutcome.COMMITTED
+        store.recover_outbox(OutboxRecoveryRequest("10"))
+
+        assert proxy_hits == []
+        assert len(target_harness.applied_rows()) == 1
+    finally:
+        proxy_server.shutdown()
+        proxy_server.server_close()
+        t_proxy.join(timeout=2.0)
+
+
+def test_ledger_reopens_in_wal_mode_across_gateway_restarts(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "restart_ledger.sqlite"
+    ledger1 = SQLiteExecutionLedger(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+    rec1, should1 = ledger1.begin_verified_attempt(
+        authority_store_id="store-1",
+        trust_log_sequence="1",
+        trust_log_head=sha256_digest(b"h1"),
+        idempotency_key="idem-restart-1",
+        event_id="ev-1",
+        commit_id="c-1",
+        certificate_digest=sha256_digest(b"cert-1"),
+        workflow_id="workflow-1",
+        node_id="node-1",
+        now_ms=1_760_000_001_000,
+    )
+    assert should1 and rec1.fencing_token == 1
+
+    # Constructing a second ledger instance on the same file must succeed in WAL mode
+    # without raising "cannot change into wal mode from within a transaction".
+    ledger2 = SQLiteExecutionLedger(ledger_path)
+    assert ledger2.get_watermark("store-1") == ("1", sha256_digest(b"h1"))
+    rec2, should2 = ledger2.begin_verified_attempt(
+        authority_store_id="store-1",
+        trust_log_sequence="2",
+        trust_log_head=sha256_digest(b"h2"),
+        idempotency_key="idem-restart-2",
+        event_id="ev-2",
+        commit_id="c-2",
+        certificate_digest=sha256_digest(b"cert-2"),
+        workflow_id="workflow-1",
+        node_id="root",
+        now_ms=1_760_000_002_000,
+    )
+    assert should2 and rec2.fencing_token == 2
+
+
+def test_resubmitted_cert_with_spoofed_event_id_rejected_fail_closed(
+    tmp_path: Path, target_harness: _DurableHttpTargetHarness
+) -> None:
+    http_target = CredentialBoundHttpTarget(
+        target_harness.url, bearer_token=target_harness.expected_token
+    )
+    store, gateway, _ledger, _sink, _clock, _config_obj, _runtime = _provision_and_wire(
+        tmp_path, http_target
+    )
+    req = _request(commit_id="m3-spoof-ev", nonce_byte=29)
+    _advance_candidate(store, req)
+    res = store.atomic_commit(req)
+    assert res.certificate_payload_bytes is not None
+
+    with pytest.raises(ExecutionGatewayError) as caught:
+        gateway.execute_event("spoofed-alternate-event-id", res.certificate_payload_bytes)
+    assert caught.value.failure_code is FailureCode.AUTHORITY_FROM_OUTBOX_DENIED
+    assert target_harness.applied_rows() == []
+
+    # Genuine persisted outbox event executes once.
+    store.recover_outbox(OutboxRecoveryRequest("10"))
+    assert len(target_harness.applied_rows()) == 1
+
+
+def test_concurrent_watermark_advancement_blocks_stale_fencing_allocation(
+    tmp_path: Path, target_harness: _DurableHttpTargetHarness
+) -> None:
+    http_target = CredentialBoundHttpTarget(
+        target_harness.url, bearer_token=target_harness.expected_token
+    )
+    store, gw_b, ledger, _sink, clock, config_obj, _runtime = _provision_and_wire(
+        tmp_path, http_target
+    )
+    req_a = _request(commit_id="m3-race-a", nonce_byte=30, node_id="node-1")
+    req_b = _request(commit_id="m3-race-b", nonce_byte=31, node_id="root")
+    _advance_candidate(store, req_a)
+    res_a = store.atomic_commit(req_a)
+    assert res_a.certificate_digest is not None
+    _advance_candidate(store, req_b)
+    assert store.atomic_commit(req_b).decision.outcome is RequestOutcome.COMMITTED
+    ev_a = store.get_outbox_event("m3-race-a")
+    ev_b = store.get_outbox_event("m3-race-b")
+
+    class _PausingInterleavedStore:
+        def __init__(self, inner: SQLiteAuthorityStore) -> None:
+            self._inner = inner
+            self._raced = False
+
+        def get_outbox_event(self, commit_id: str) -> PersistedOutboxEvent:
+            return self._inner.get_outbox_event(commit_id)
+
+        def get_certificate(self, commit_id: str) -> bytes | None:
+            return self._inner.get_certificate(commit_id)
+
+        def current_status_batch(
+            self, requests: list[CurrentStatusRequest]
+        ) -> tuple[CurrentStatusResult, ...]:
+            results = self._inner.current_status_batch(requests)
+            if not self._raced:
+                self._raced = True
+                # While Worker A holds seq=2 "current" status, revoke A (seq=3) and let
+                # Worker B execute req_b, advancing the shared gateway watermark to seq=3!
+                assert res_a.certificate_digest is not None
+                store.revoke(
+                    RevocationRequest(
+                        scope=RevocationScope.CERTIFICATE,
+                        workflow_id="workflow-1",
+                        target_id=res_a.certificate_digest,
+                        next_generation="1",
+                        reason="raced-revocation-before-token",
+                    )
+                )
+                out_b = gw_b.execute_event(ev_b.event_id, ev_b.payload)
+                assert out_b.disposition is EffectDisposition.APPLIED
+            return results
+
+    gw_a = APCCExecutionGateway(
+        store=_PausingInterleavedStore(store),  # type: ignore[arg-type]
+        trust=store._scoped_trust,
+        freshness=config_obj.freshness,
+        clock=clock,
+        ledger=ledger,
+        target=http_target,
+    )
+    with pytest.raises(ExecutionGatewayError) as race_err:
+        gw_a.execute_event(ev_a.event_id, ev_a.payload)
+    assert race_err.value.failure_code is FailureCode.AUTHORITY_STATUS_ROLLBACK
+    # Revoked req_a NEVER allocated an IN_FLIGHT record and NEVER hit external target.
+    assert [r["commit_id"] for r in target_harness.applied_rows()] == ["m3-race-b"]
+
+    # Re-draining outbox fetches fresh status -> sees REVOKED -> blocks cleanly.
+    store.recover_outbox(OutboxRecoveryRequest("10"))
+    assert [r["commit_id"] for r in target_harness.applied_rows()] == ["m3-race-b"]
+
+
+def test_chunked_status_batch_exceeding_1000_enforces_snapshot_consistency(
+    tmp_path: Path, target_harness: _DurableHttpTargetHarness
+) -> None:
+    http_target = CredentialBoundHttpTarget(
+        target_harness.url, bearer_token=target_harness.expected_token
+    )
+    store, gateway, _ledger, _sink, clock, config_obj, _runtime = _provision_and_wire(
+        tmp_path, http_target
+    )
+
+    def _status_for(digest: str, nonce: str, seq: str, head: str) -> AuthorityStatus:
+        return AuthorityStatus(
+            protocol_version="APCC-1.0-draft",
+            statement_type="apcc.authority-status",
+            authority_store_id=config_obj.authority_store_id,
+            status_key_id=config_obj.status_trust.key_id,
+            request_nonce=nonce,
+            certificate_digest=digest,
+            certificate_sequence="1",
+            trust_log_sequence=seq,
+            trust_log_head=head,
+            status=AuthorityStatusValue.CURRENT,
+            actor_revocation_generation="3",
+            workflow_revocation_generation="4",
+            superseded=SupersessionValue.NO,
+            this_update_ms="1760000001000",
+            next_update_ms="1760000002000",
+            signature=Signature("Ed25519", config_obj.status_trust.key_id, b64u_encode(bytes(64))),
+        )
+
+    class _LimitedBatchStore:
+        def __init__(self, *, diverge: bool) -> None:
+            self.diverge = diverge
+            self.batch_sizes: list[int] = []
+
+        def current_status_batch(
+            self, requests: list[CurrentStatusRequest]
+        ) -> tuple[CurrentStatusResult, ...]:
+            assert len(requests) <= 1000
+            self.batch_sizes.append(len(requests))
+            if self.diverge and len(self.batch_sizes) % 2 == 0:
+                seq, head = "2", sha256_digest(b"head-2")
+            else:
+                seq, head = "1", sha256_digest(b"head-1")
+            return tuple(
+                CurrentStatusResult(req, _status_for(req.certificate_digest, req.request_nonce, seq, head))
+                for req in requests
+            )
+
+    digests = [sha256_digest(f"cert-{i}".encode("utf-8")) for i in range(1050)]
+    consistent_store = _LimitedBatchStore(diverge=False)
+    gw_ok = APCCExecutionGateway(
+        store=consistent_store,  # type: ignore[arg-type]
+        trust=store._scoped_trust,
+        freshness=config_obj.freshness,
+        clock=clock,
+        ledger=gateway.ledger,
+        target=http_target,
+    )
+    reqs, resps = gw_ok._fetch_consistent_status_batch(digests)
+    assert len(reqs) == 1050
+    assert len(resps) == 1050
+    assert consistent_store.batch_sizes == [1000, 50]
+
+    divergent_store = _LimitedBatchStore(diverge=True)
+    gw_div = APCCExecutionGateway(
+        store=divergent_store,  # type: ignore[arg-type]
+        trust=store._scoped_trust,
+        freshness=config_obj.freshness,
+        clock=clock,
+        ledger=gateway.ledger,
+        target=http_target,
+    )
+    with pytest.raises(ExecutionGatewayError) as div_err:
+        gw_div._fetch_consistent_status_batch(digests)
+    assert div_err.value.failure_code is FailureCode.AUTHORITY_STATUS_ROLLBACK
+
+
+def test_bounded_outcome_history_and_on_outcome_callback(
+    tmp_path: Path, target_harness: _DurableHttpTargetHarness
+) -> None:
+    http_target = CredentialBoundHttpTarget(
+        target_harness.url, bearer_token=target_harness.expected_token
+    )
+    store, _gw, ledger, sink, clock, config_obj, _runtime = _provision_and_wire(
+        tmp_path, http_target
+    )
+    observed: list[EffectDisposition] = []
+    bounded_gw = APCCExecutionGateway(
+        store=store,
+        trust=store._scoped_trust,
+        freshness=config_obj.freshness,
+        clock=clock,
+        ledger=ledger,
+        target=http_target,
+        on_outcome=lambda out: observed.append(out.disposition),
+        max_outcome_history=2,
+    )
+    sink.attach(bounded_gw)
+
+    for idx, node_id in enumerate(("node-1", "root", "middle", "leaf"), start=40):
+        req = _request(commit_id=f"m3-hist-{idx}", nonce_byte=idx, node_id=node_id)
+        _advance_candidate(store, req)
+        assert store.atomic_commit(req).decision.outcome is RequestOutcome.COMMITTED
+
+    store.recover_outbox(OutboxRecoveryRequest("10"))
+    assert len(observed) == 4
+    assert observed == [EffectDisposition.APPLIED] * 4
+    assert len(bounded_gw.outcomes) == 2
+    assert len(target_harness.applied_rows()) == 4

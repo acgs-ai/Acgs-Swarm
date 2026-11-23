@@ -27,6 +27,7 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from .ports import (
     AuthorityExecutionStore,
     AuthorityOutboxSink,
     CurrentStatusRequest,
+    CurrentStatusResult,
     StatusFreshnessPolicy,
 )
 from .verifier import (
@@ -56,6 +58,7 @@ from .verifier import (
 
 _IDEMPOTENCY_DOMAIN = b"APCC-EFFECT-IDEMPOTENCY-V1"
 _TRUST_LOG_GENESIS = sha256_digest(b"APCC-1/trust-log/genesis")
+_STATUS_BATCH_CHUNK_SIZE = 1000
 _GATEWAY_SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS gateway_sequence (
@@ -288,7 +291,10 @@ class CredentialBoundHttpTarget:
         if opener is not None:
             self._opener = opener
         else:
-            self._opener = urllib.request.build_opener(_NoRedirectHandler()).open
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _NoRedirectHandler(),
+            ).open
 
     def __repr__(self) -> str:
         return (
@@ -400,8 +406,18 @@ class SQLiteExecutionLedger:
         self._path = Path(database_path)
         self._lock = Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Enable WAL outside any transaction so fresh creation persists WAL on disk.
+        with self._lock:
+            init_conn = self._connect()
+            try:
+                mode_row = init_conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                if mode_row != ("wal",):
+                    raise ExecutionGatewayError(
+                        "execution ledger requires SQLite WAL journal mode"
+                    )
+            finally:
+                init_conn.close()
         with self._write_connection() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
             for stmt in _GATEWAY_SCHEMA_STATEMENTS:
                 conn.execute(stmt)
             conn.execute(
@@ -477,40 +493,51 @@ class SQLiteExecutionLedger:
             return ("0", _TRUST_LOG_GENESIS)
         return (str(row[0]), str(row[1]))
 
-    def advance_watermark(
-        self, authority_store_id: str, trust_log_sequence: str, trust_log_head: str
+    def _advance_watermark_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        authority_store_id: str,
+        trust_log_sequence: str,
+        trust_log_head: str,
     ) -> None:
         seq_int = int(trust_log_sequence)
         if seq_int < 0:
             raise ExecutionGatewayError("trust log sequence cannot be negative")
-        with self._write_connection() as conn:
-            row = conn.execute(
-                "SELECT highest_trust_log_sequence, highest_trust_log_head "
-                "FROM gateway_watermarks WHERE authority_store_id = ?",
-                (authority_store_id,),
-            ).fetchone()
-            if row is not None:
-                cur_seq = int(row[0])
-                cur_head = str(row[1])
-                if seq_int < cur_seq or (
-                    seq_int == cur_seq and trust_log_head != cur_head
-                ):
-                    raise ExecutionGatewayError(
-                        "authority trust log watermark regression detected",
-                        failure_code=FailureCode.AUTHORITY_STATUS_ROLLBACK,
-                    )
-                if seq_int == cur_seq:
-                    return
-                conn.execute(
-                    "UPDATE gateway_watermarks SET highest_trust_log_sequence = ?, "
-                    "highest_trust_log_head = ? WHERE authority_store_id = ?",
-                    (trust_log_sequence, trust_log_head, authority_store_id),
+        row = conn.execute(
+            "SELECT highest_trust_log_sequence, highest_trust_log_head "
+            "FROM gateway_watermarks WHERE authority_store_id = ?",
+            (authority_store_id,),
+        ).fetchone()
+        if row is not None:
+            cur_seq = int(row[0])
+            cur_head = str(row[1])
+            if seq_int < cur_seq or (
+                seq_int == cur_seq and trust_log_head != cur_head
+            ):
+                raise ExecutionGatewayError(
+                    "authority trust log watermark regression detected",
+                    failure_code=FailureCode.AUTHORITY_STATUS_ROLLBACK,
                 )
+            if seq_int == cur_seq:
                 return
             conn.execute(
-                "INSERT INTO gateway_watermarks(authority_store_id, "
-                "highest_trust_log_sequence, highest_trust_log_head) VALUES (?, ?, ?)",
-                (authority_store_id, trust_log_sequence, trust_log_head),
+                "UPDATE gateway_watermarks SET highest_trust_log_sequence = ?, "
+                "highest_trust_log_head = ? WHERE authority_store_id = ?",
+                (trust_log_sequence, trust_log_head, authority_store_id),
+            )
+            return
+        conn.execute(
+            "INSERT INTO gateway_watermarks(authority_store_id, "
+            "highest_trust_log_sequence, highest_trust_log_head) VALUES (?, ?, ?)",
+            (authority_store_id, trust_log_sequence, trust_log_head),
+        )
+
+    def advance_watermark(
+        self, authority_store_id: str, trust_log_sequence: str, trust_log_head: str
+    ) -> None:
+        with self._write_connection() as conn:
+            self._advance_watermark_on_conn(
+                conn, authority_store_id, trust_log_sequence, trust_log_head
             )
 
     def get_effect(self, idempotency_key: str) -> GatewayEffectRecord | None:
@@ -524,6 +551,92 @@ class SQLiteExecutionLedger:
             ).fetchone()
         return self._row_to_record(row) if row is not None else None
 
+    def _begin_attempt_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        authority_store_id: str | None,
+        trust_log_sequence: str | None,
+        trust_log_head: str | None,
+        idempotency_key: str,
+        event_id: str,
+        commit_id: str,
+        certificate_digest: str,
+        workflow_id: str,
+        node_id: str,
+        now_ms: int,
+    ) -> tuple[GatewayEffectRecord, bool]:
+        existing = conn.execute(
+            "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
+            "workflow_id, node_id, state, fencing_token, attempt_count, "
+            "target_reference, applied_digest, failure_code, updated_at_ms "
+            "FROM gateway_effects WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            record = self._row_to_record(existing)
+            if (
+                record.event_id != event_id
+                or record.commit_id != commit_id
+                or record.certificate_digest != certificate_digest
+            ):
+                raise ExecutionGatewayError(
+                    "idempotency key collision with mismatched effect identity"
+                )
+            if record.state in ("APPLIED", "BLOCKED"):
+                return (record, False)
+
+        if authority_store_id is not None:
+            assert trust_log_sequence is not None and trust_log_head is not None
+            self._advance_watermark_on_conn(
+                conn, authority_store_id, trust_log_sequence, trust_log_head
+            )
+
+        seq_row = conn.execute(
+            "SELECT next_fencing_token FROM gateway_sequence WHERE singleton = 1"
+        ).fetchone()
+        if seq_row is None:
+            raise ExecutionGatewayError("gateway sequence row missing from ledger")
+        token = int(seq_row[0])
+        conn.execute(
+            "UPDATE gateway_sequence SET next_fencing_token = ? WHERE singleton = 1",
+            (token + 1,),
+        )
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gateway_effects(idempotency_key, event_id, commit_id, "
+                "certificate_digest, workflow_id, node_id, state, fencing_token, "
+                "attempt_count, target_reference, applied_digest, failure_code, "
+                "updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'IN_FLIGHT', ?, 1, NULL, "
+                "NULL, NULL, ?)",
+                (
+                    idempotency_key,
+                    event_id,
+                    commit_id,
+                    certificate_digest,
+                    workflow_id,
+                    node_id,
+                    token,
+                    now_ms,
+                ),
+            )
+        else:
+            conn.execute(
+                "UPDATE gateway_effects SET state = 'IN_FLIGHT', fencing_token = ?, "
+                "attempt_count = attempt_count + 1, updated_at_ms = ? "
+                "WHERE idempotency_key = ?",
+                (token, now_ms, idempotency_key),
+            )
+        updated = conn.execute(
+            "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
+            "workflow_id, node_id, state, fencing_token, attempt_count, "
+            "target_reference, applied_digest, failure_code, updated_at_ms "
+            "FROM gateway_effects WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        assert updated is not None
+        return (self._row_to_record(updated), True)
+
     def begin_attempt(
         self,
         *,
@@ -536,70 +649,49 @@ class SQLiteExecutionLedger:
         now_ms: int,
     ) -> tuple[GatewayEffectRecord, bool]:
         with self._write_connection() as conn:
-            existing = conn.execute(
-                "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
-                "workflow_id, node_id, state, fencing_token, attempt_count, "
-                "target_reference, applied_digest, failure_code, updated_at_ms "
-                "FROM gateway_effects WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if existing is not None:
-                record = self._row_to_record(existing)
-                if (
-                    record.event_id != event_id
-                    or record.commit_id != commit_id
-                    or record.certificate_digest != certificate_digest
-                ):
-                    raise ExecutionGatewayError(
-                        "idempotency key collision with mismatched effect identity"
-                    )
-                if record.state in ("APPLIED", "BLOCKED"):
-                    return (record, False)
-
-            seq_row = conn.execute(
-                "SELECT next_fencing_token FROM gateway_sequence WHERE singleton = 1"
-            ).fetchone()
-            if seq_row is None:
-                raise ExecutionGatewayError("gateway sequence row missing from ledger")
-            token = int(seq_row[0])
-            conn.execute(
-                "UPDATE gateway_sequence SET next_fencing_token = ? WHERE singleton = 1",
-                (token + 1,),
+            return self._begin_attempt_on_conn(
+                conn,
+                authority_store_id=None,
+                trust_log_sequence=None,
+                trust_log_head=None,
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                commit_id=commit_id,
+                certificate_digest=certificate_digest,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                now_ms=now_ms,
             )
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO gateway_effects(idempotency_key, event_id, commit_id, "
-                    "certificate_digest, workflow_id, node_id, state, fencing_token, "
-                    "attempt_count, target_reference, applied_digest, failure_code, "
-                    "updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'IN_FLIGHT', ?, 1, NULL, "
-                    "NULL, NULL, ?)",
-                    (
-                        idempotency_key,
-                        event_id,
-                        commit_id,
-                        certificate_digest,
-                        workflow_id,
-                        node_id,
-                        token,
-                        now_ms,
-                    ),
-                )
-            else:
-                conn.execute(
-                    "UPDATE gateway_effects SET state = 'IN_FLIGHT', fencing_token = ?, "
-                    "attempt_count = attempt_count + 1, updated_at_ms = ? "
-                    "WHERE idempotency_key = ?",
-                    (token, now_ms, idempotency_key),
-                )
-            updated = conn.execute(
-                "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
-                "workflow_id, node_id, state, fencing_token, attempt_count, "
-                "target_reference, applied_digest, failure_code, updated_at_ms "
-                "FROM gateway_effects WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            assert updated is not None
-            return (self._row_to_record(updated), True)
+
+    def begin_verified_attempt(
+        self,
+        *,
+        authority_store_id: str,
+        trust_log_sequence: str,
+        trust_log_head: str,
+        idempotency_key: str,
+        event_id: str,
+        commit_id: str,
+        certificate_digest: str,
+        workflow_id: str,
+        node_id: str,
+        now_ms: int,
+    ) -> tuple[GatewayEffectRecord, bool]:
+        """Atomically verify/advance the watermark and allocate a fencing token."""
+        with self._write_connection() as conn:
+            return self._begin_attempt_on_conn(
+                conn,
+                authority_store_id=authority_store_id,
+                trust_log_sequence=trust_log_sequence,
+                trust_log_head=trust_log_head,
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                commit_id=commit_id,
+                certificate_digest=certificate_digest,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                now_ms=now_ms,
+            )
 
     def mark_applied(
         self,
@@ -636,6 +728,69 @@ class SQLiteExecutionLedger:
             assert row is not None
             return self._row_to_record(row)
 
+    def _mark_blocked_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        authority_store_id: str | None,
+        trust_log_sequence: str | None,
+        trust_log_head: str | None,
+        idempotency_key: str,
+        event_id: str,
+        commit_id: str,
+        certificate_digest: str,
+        workflow_id: str,
+        node_id: str,
+        failure_code: FailureCode,
+        now_ms: int,
+    ) -> GatewayEffectRecord:
+        if authority_store_id is not None:
+            assert trust_log_sequence is not None and trust_log_head is not None
+            self._advance_watermark_on_conn(
+                conn, authority_store_id, trust_log_sequence, trust_log_head
+            )
+        existing = conn.execute(
+            "SELECT state FROM gateway_effects WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] == "APPLIED":
+                raise ExecutionGatewayError(
+                    "cannot block an effect that was already applied"
+                )
+            conn.execute(
+                "UPDATE gateway_effects SET state = 'BLOCKED', failure_code = ?, "
+                "updated_at_ms = ? WHERE idempotency_key = ?",
+                (failure_code.value, now_ms, idempotency_key),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO gateway_effects(idempotency_key, event_id, commit_id, "
+                "certificate_digest, workflow_id, node_id, state, fencing_token, "
+                "attempt_count, target_reference, applied_digest, failure_code, "
+                "updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'BLOCKED', 0, 0, NULL, "
+                "NULL, ?, ?)",
+                (
+                    idempotency_key,
+                    event_id,
+                    commit_id,
+                    certificate_digest,
+                    workflow_id,
+                    node_id,
+                    failure_code.value,
+                    now_ms,
+                ),
+            )
+        row = conn.execute(
+            "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
+            "workflow_id, node_id, state, fencing_token, attempt_count, "
+            "target_reference, applied_digest, failure_code, updated_at_ms "
+            "FROM gateway_effects WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        assert row is not None
+        return self._row_to_record(row)
+
     def mark_blocked(
         self,
         *,
@@ -649,47 +804,52 @@ class SQLiteExecutionLedger:
         now_ms: int,
     ) -> GatewayEffectRecord:
         with self._write_connection() as conn:
-            existing = conn.execute(
-                "SELECT state FROM gateway_effects WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] == "APPLIED":
-                    raise ExecutionGatewayError(
-                        "cannot block an effect that was already applied"
-                    )
-                conn.execute(
-                    "UPDATE gateway_effects SET state = 'BLOCKED', failure_code = ?, "
-                    "updated_at_ms = ? WHERE idempotency_key = ?",
-                    (failure_code.value, now_ms, idempotency_key),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO gateway_effects(idempotency_key, event_id, commit_id, "
-                    "certificate_digest, workflow_id, node_id, state, fencing_token, "
-                    "attempt_count, target_reference, applied_digest, failure_code, "
-                    "updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'BLOCKED', 0, 0, NULL, "
-                    "NULL, ?, ?)",
-                    (
-                        idempotency_key,
-                        event_id,
-                        commit_id,
-                        certificate_digest,
-                        workflow_id,
-                        node_id,
-                        failure_code.value,
-                        now_ms,
-                    ),
-                )
-            row = conn.execute(
-                "SELECT idempotency_key, event_id, commit_id, certificate_digest, "
-                "workflow_id, node_id, state, fencing_token, attempt_count, "
-                "target_reference, applied_digest, failure_code, updated_at_ms "
-                "FROM gateway_effects WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            assert row is not None
-            return self._row_to_record(row)
+            return self._mark_blocked_on_conn(
+                conn,
+                authority_store_id=None,
+                trust_log_sequence=None,
+                trust_log_head=None,
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                commit_id=commit_id,
+                certificate_digest=certificate_digest,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                failure_code=failure_code,
+                now_ms=now_ms,
+            )
+
+    def record_verified_block(
+        self,
+        *,
+        authority_store_id: str,
+        trust_log_sequence: str,
+        trust_log_head: str,
+        idempotency_key: str,
+        event_id: str,
+        commit_id: str,
+        certificate_digest: str,
+        workflow_id: str,
+        node_id: str,
+        failure_code: FailureCode,
+        now_ms: int,
+    ) -> GatewayEffectRecord:
+        """Atomically verify/advance the watermark and mark an effect BLOCKED."""
+        with self._write_connection() as conn:
+            return self._mark_blocked_on_conn(
+                conn,
+                authority_store_id=authority_store_id,
+                trust_log_sequence=trust_log_sequence,
+                trust_log_head=trust_log_head,
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                commit_id=commit_id,
+                certificate_digest=certificate_digest,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                failure_code=failure_code,
+                now_ms=now_ms,
+            )
 
 
 class _StorePredecessorResolver(PredecessorResolver):
@@ -812,7 +972,11 @@ class APCCExecutionGateway(AuthorityOutboxSink):
         target: ExternalSideEffectTarget,
         causal_limits: CausalClosureLimits = CausalClosureLimits(),
         on_control_event: Callable[[str, Mapping[str, object]], None] | None = None,
+        on_outcome: Callable[[GatewayExecutionOutcome], None] | None = None,
+        max_outcome_history: int = 1024,
     ) -> None:
+        if type(max_outcome_history) is not int or max_outcome_history < 0:
+            raise ValueError("max outcome history must be a non-negative integer")
         self._store = store
         self._trust = trust
         self._freshness = freshness
@@ -821,7 +985,8 @@ class APCCExecutionGateway(AuthorityOutboxSink):
         self._target = target
         self._causal_limits = causal_limits
         self._on_control_event = on_control_event
-        self.outcomes: list[GatewayExecutionOutcome] = []
+        self._on_outcome = on_outcome
+        self.outcomes: deque[GatewayExecutionOutcome] = deque(maxlen=max_outcome_history)
 
     @property
     def ledger(self) -> SQLiteExecutionLedger:
@@ -831,6 +996,59 @@ class APCCExecutionGateway(AuthorityOutboxSink):
         """Execute or fail closed on one persisted APCC outbox event."""
         outcome = self.execute_event(event_id, payload)
         self.outcomes.append(outcome)
+        if self._on_outcome is not None:
+            self._on_outcome(outcome)
+
+    def _fetch_consistent_status_batch(
+        self, digests: list[str]
+    ) -> tuple[list[CurrentStatusRequest], list[CurrentStatusResult]]:
+        """Query fresh statuses within store batch limits from one snapshot."""
+        if not digests:
+            raise ExecutionGatewayError("causal closure digest list cannot be empty")
+        if len(digests) <= _STATUS_BATCH_CHUNK_SIZE:
+            requests = [
+                CurrentStatusRequest(
+                    certificate_digest=digest,
+                    request_nonce=b64u_encode(secrets.token_bytes(16)),
+                )
+                for digest in digests
+            ]
+            results = list(self._store.current_status_batch(requests))
+            if len(results) != len(requests):
+                raise ExecutionGatewayError(
+                    "authority status batch length mismatch",
+                    failure_code=FailureCode.AUTHORITY_STATUS_REQUIRED,
+                )
+            return requests, results
+
+        for _attempt in range(3):
+            requests = [
+                CurrentStatusRequest(
+                    certificate_digest=digest,
+                    request_nonce=b64u_encode(secrets.token_bytes(16)),
+                )
+                for digest in digests
+            ]
+            combined_results: list[CurrentStatusResult] = []
+            for offset in range(0, len(requests), _STATUS_BATCH_CHUNK_SIZE):
+                chunk = requests[offset : offset + _STATUS_BATCH_CHUNK_SIZE]
+                chunk_results = list(self._store.current_status_batch(chunk))
+                if len(chunk_results) != len(chunk):
+                    raise ExecutionGatewayError(
+                        "authority status batch length mismatch",
+                        failure_code=FailureCode.AUTHORITY_STATUS_REQUIRED,
+                    )
+                combined_results.extend(chunk_results)
+            snapshot_heads = {
+                (item.status.trust_log_sequence, item.status.trust_log_head)
+                for item in combined_results
+            }
+            if len(snapshot_heads) == 1:
+                return requests, combined_results
+        raise ExecutionGatewayError(
+            "authority trust log mutated concurrently across chunked status batch",
+            failure_code=FailureCode.AUTHORITY_STATUS_ROLLBACK,
+        )
 
     def execute_event(self, event_id: str, payload: bytes) -> GatewayExecutionOutcome:
         """Verify APCC closure & fresh current status, then invoke target with fencing."""
@@ -865,6 +1083,20 @@ class APCCExecutionGateway(AuthorityOutboxSink):
         payload_digest = sha256_digest(payload)
         authority_store_id = certificate.header.authority_store_id
         commit_id = certificate.decision.commit_id
+
+        try:
+            persisted_outbox = self._store.get_outbox_event(commit_id)
+        except ValueError as error:
+            raise ExecutionGatewayError(
+                "committed outbox event not found in authority store",
+                failure_code=FailureCode.AUTHORITY_FROM_OUTBOX_DENIED,
+            ) from error
+        if persisted_outbox.event_id != event_id or persisted_outbox.payload != payload:
+            raise ExecutionGatewayError(
+                "outbox event identity or payload does not match persisted authority event",
+                failure_code=FailureCode.AUTHORITY_FROM_OUTBOX_DENIED,
+            )
+
         idempotency_key = derive_effect_idempotency_key(
             authority_store_id, event_id, payload_digest, commit_id
         )
@@ -931,19 +1163,9 @@ class APCCExecutionGateway(AuthorityOutboxSink):
             )
 
         chain = resolver.closure_order(payload_digest)
-        status_requests = tuple(
-            CurrentStatusRequest(
-                certificate_digest=digest,
-                request_nonce=b64u_encode(secrets.token_bytes(16)),
-            )
-            for digest, _env in chain
+        status_requests, status_results = self._fetch_consistent_status_batch(
+            [digest for digest, _env in chain]
         )
-        status_results = self._store.current_status_batch(status_requests)
-        if len(status_results) != len(chain):
-            raise ExecutionGatewayError(
-                "authority status batch length mismatch",
-                failure_code=FailureCode.AUTHORITY_STATUS_REQUIRED,
-            )
 
         now_ms = int(self._clock.now_ms())
         if now_ms < 0:
@@ -991,12 +1213,10 @@ class APCCExecutionGateway(AuthorityOutboxSink):
                         highest_sequence=highest_seq,
                         highest_head=highest_head,
                     )
-                    self._ledger.advance_watermark(
-                        authority_store_id,
-                        status_result.status.trust_log_sequence,
-                        status_result.status.trust_log_head,
-                    )
-                    self._ledger.mark_blocked(
+                    self._ledger.record_verified_block(
+                        authority_store_id=authority_store_id,
+                        trust_log_sequence=status_result.status.trust_log_sequence,
+                        trust_log_head=status_result.status.trust_log_head,
                         idempotency_key=idempotency_key,
                         event_id=event_id,
                         commit_id=commit_id,
@@ -1026,11 +1246,10 @@ class APCCExecutionGateway(AuthorityOutboxSink):
         if max_seen_seq < 0:
             raise ExecutionGatewayError("no authority status verified")
         leaf_status = status_results[-1].status
-        self._ledger.advance_watermark(
-            authority_store_id, str(max_seen_seq), max_seen_head
-        )
-
-        record, should_execute = self._ledger.begin_attempt(
+        record, should_execute = self._ledger.begin_verified_attempt(
+            authority_store_id=authority_store_id,
+            trust_log_sequence=str(max_seen_seq),
+            trust_log_head=max_seen_head,
             idempotency_key=idempotency_key,
             event_id=event_id,
             commit_id=commit_id,
