@@ -1,0 +1,165 @@
+name: W2 Cold Cell (reusable)
+
+# One W2 cold qualification cell with host admission. Each attempt is a
+# separate job, so a replacement attempt gets a newly assigned runner. An
+# attempt whose host fails the CPU probe starts no campaign, uploads its probe
+# evidence, and concludes successfully as void; the next attempt then runs.
+# At most three attempts. See docs/internal/APCC-1-W2-Campaign-Protocol.md,
+# "Host admission".
+
+on:
+  workflow_call:
+    inputs:
+      gen2_gc:
+        required: true
+        type: string
+      repeat:
+        required: true
+        type: string
+      host_probe_max_cpu_ms:
+        required: false
+        type: string
+        default: ""
+      diagnostics:
+        required: true
+        type: string
+      allow_missing_upstream_provenance:
+        required: true
+        type: string
+      scheduled_operations:
+        required: true
+        type: string
+      duration_ns:
+        required: true
+        type: string
+      admission_grace_ns:
+        required: true
+        type: string
+      operation_sla_ns:
+        required: true
+        type: string
+      drain_ns:
+        required: true
+        type: string
+      operation_floor:
+        required: true
+        type: string
+      windows:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  attempt-1:
+    name: attempt 1
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    outputs:
+      void: ${{ steps.cell.outputs.void }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install package with dev and transport extras
+        run: pip install -e ".[dev,transport]"
+
+      - id: cell
+        uses: ./.github/actions/w2-cell
+        with:
+          gen2_gc: ${{ inputs.gen2_gc }}
+          repeat: ${{ inputs.repeat }}
+          attempt: "1"
+          final_attempt: "false"
+          host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms }}
+          diagnostics: ${{ inputs.diagnostics }}
+          allow_missing_upstream_provenance: ${{ inputs.allow_missing_upstream_provenance }}
+          scheduled_operations: ${{ inputs.scheduled_operations }}
+          duration_ns: ${{ inputs.duration_ns }}
+          admission_grace_ns: ${{ inputs.admission_grace_ns }}
+          operation_sla_ns: ${{ inputs.operation_sla_ns }}
+          drain_ns: ${{ inputs.drain_ns }}
+          operation_floor: ${{ inputs.operation_floor }}
+          windows: ${{ inputs.windows }}
+
+  attempt-2:
+    name: attempt 2 (after void)
+    needs: attempt-1
+    if: needs.attempt-1.outputs.void == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    outputs:
+      void: ${{ steps.cell.outputs.void }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install package with dev and transport extras
+        run: pip install -e ".[dev,transport]"
+
+      - id: cell
+        uses: ./.github/actions/w2-cell
+        with:
+          gen2_gc: ${{ inputs.gen2_gc }}
+          repeat: ${{ inputs.repeat }}
+          attempt: "2"
+          final_attempt: "false"
+          host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms }}
+          diagnostics: ${{ inputs.diagnostics }}
+          allow_missing_upstream_provenance: ${{ inputs.allow_missing_upstream_provenance }}
+          scheduled_operations: ${{ inputs.scheduled_operations }}
+          duration_ns: ${{ inputs.duration_ns }}
+          admission_grace_ns: ${{ inputs.admission_grace_ns }}
+          operation_sla_ns: ${{ inputs.operation_sla_ns }}
+          drain_ns: ${{ inputs.drain_ns }}
+          operation_floor: ${{ inputs.operation_floor }}
+          windows: ${{ inputs.windows }}
+
+  attempt-3:
+    name: attempt 3 (after void)
+    needs: attempt-2
+    if: needs.attempt-2.outputs.void == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    outputs:
+      void: ${{ steps.cell.outputs.void }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install package with dev and transport extras
+        run: pip install -e ".[dev,transport]"
+
+      - id: cell
+        uses: ./.github/actions/w2-cell
+        with:
+          gen2_gc: ${{ inputs.gen2_gc }}
+          repeat: ${{ inputs.repeat }}
+          attempt: "3"
+          final_attempt: "true"
+          host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms }}
+          diagnostics: ${{ inputs.diagnostics }}
+          allow_missing_upstream_provenance: ${{ inputs.allow_missing_upstream_provenance }}
+          scheduled_operations: ${{ inputs.scheduled_operations }}
+          duration_ns: ${{ inputs.duration_ns }}
+          admission_grace_ns: ${{ inputs.admission_grace_ns }}
+          operation_sla_ns: ${{ inputs.operation_sla_ns }}
+          drain_ns: ${{ inputs.drain_ns }}
+          operation_floor: ${{ inputs.operation_floor }}
+          windows: ${{ inputs.windows }}

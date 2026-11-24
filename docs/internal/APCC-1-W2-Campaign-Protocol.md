@@ -89,6 +89,37 @@ Preserve all12 prior bundles and589 sealed entries, including the W2 diagnostic
 bundle added after the earlier11-bundle/542-entry boundary. New evidence lives in
 separate directories; historical manifests and frozen matrices are not rewritten.
 
+## Host admission
+
+The qualification workflow measures the host before it starts a run.
+`scripts/w2_host_probe.py` times a fixed amount of single-thread work (JSON,
+SHA-256, in-memory SQLite, an interpreter loop) for seven rounds and takes the
+fastest round's CPU time. If that exceeds the committed limit, the attempt is
+void: no smoke run and no campaign start on that host.
+
+- The decision uses the probe alone and is taken before the window clock. A
+  campaign that has started is never voided on host grounds, whatever its
+  result. The probe runs again after the campaign, and that value is recorded
+  only.
+- A void attempt uploads its evidence bundle (`host-probe-before.json`,
+  `host-void.json`, host environment) under its own attempt number and notes
+  the void in the job summary. Whoever reports a run's results lists its void
+  attempts with them; they are never dropped.
+- A void attempt is replaced by a new job, which gets a newly assigned runner,
+  for at most three attempts per cell. Three void attempts are reported as "no
+  admissible host", which is not a campaign result.
+- The limit is committed in `.github/workflows/w2-qualification.yml`. An empty
+  limit records the probe and voids nothing. A manual dispatch may override
+  the limit; the limit in force is recorded in `host-probe-before.json`.
+- Runs made before this rule existed have no probe value and are not voided
+  retroactively.
+- Re-running a job by hand is not host admission. A manual re-run of an
+  attempt that started a campaign must be reported together with the attempt
+  it replaced.
+
+Host admission does not change pacing, accounting, the ledger, the verifier or
+`campaign_eligible`.
+
 ## Functional execution example
 
 These explicitly chosen local functional parameters are not approved campaign
