@@ -13,6 +13,7 @@ from scripts import w2_host_probe
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / ".github" / "actions" / "w2-cell" / "action.yml"
+WORKFLOW = ROOT / ".github" / "workflows" / "w2-qualification.yml"
 
 
 def test_no_limit_records_without_deciding() -> None:
@@ -84,3 +85,11 @@ def test_workflow_decides_before_any_w2_step_and_gates_them() -> None:
     assert "w2-smoke" not in steps[probe]["run"]
     after = next(step for step in steps if step["name"].startswith("Host CPU probe after"))
     assert "--max-cpu-ms" not in after["run"]
+
+
+def test_committed_limit_is_240_ms_and_usable() -> None:
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    expression = workflow["jobs"]["w2-cold-cell"]["with"]["host_probe_max_cpu_ms"]
+    assert expression == "${{ inputs.host_probe_max_cpu_ms || '240' }}"
+    assert w2_host_probe.parse_limit("240") == 240.0

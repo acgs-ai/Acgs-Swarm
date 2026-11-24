@@ -108,9 +108,13 @@ void: no smoke run and no campaign start on that host.
 - A void attempt is replaced by a new job, which gets a newly assigned runner,
   for at most three attempts per cell. Three void attempts are reported as "no
   admissible host", which is not a campaign result.
-- The limit is committed in `.github/workflows/w2-qualification.yml`. An empty
-  limit records the probe and voids nothing. A manual dispatch may override
-  the limit; the limit in force is recorded in `host-probe-before.json`.
+- The limit is committed in `.github/workflows/w2-qualification.yml` and is
+  240 ms. The four hosts of run 45324881058 measured 177.4 to 189.6 ms before
+  their windows (median about 183 ms); 240 ms is 1.3 times that median. The
+  value is provisional: no host that was slow before its window has been
+  probed yet. An empty limit records the probe and voids nothing. A manual
+  dispatch may override the limit; the limit in force is recorded in
+  `host-probe-before.json`.
 - Runs made before this rule existed have no probe value and are not voided
   retroactively.
 - Re-running a job by hand is not host admission. A manual re-run of an
