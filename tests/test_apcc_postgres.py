@@ -1757,7 +1757,12 @@ def test_postgres_skip_locked_outbox_has_one_persisted_event_identity(
                 (locked_request.commit_id,),
             ).fetchone()
             assert locked == (locked_event.event_id,)
-            skipped = pool.submit(recover, 0).result(timeout=5)
+            # Liveness backstop, not a latency bound: the locker holds the row
+            # for this whole wait, so a claim that blocks on it can never
+            # return, whatever the deadline.  The worker runs four serial
+            # attested transactions (open, claim, finalize, audit) at roughly
+            # one second each, which overran the previous 5 s on loaded CI.
+            skipped = pool.submit(recover, 0).result(timeout=60)
             assert skipped.delivered_count == "1"
             assert setup.get_outbox_event(locked_request.commit_id).pending
             assert not setup.get_outbox_event(available_request.commit_id).pending

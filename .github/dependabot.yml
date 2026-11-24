@@ -11,6 +11,12 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "build"
+    ignore:
+      # pyproject.toml bounds bittensor below 11: v11 removed the
+      # axon/dendrite/synapse stack the subnet integration builds on.
+      # Lift this together with that bound, not before.
+      - dependency-name: "bittensor"
+        versions: [">=11"]
     groups:
       python-minor-and-patch:
         patterns:
