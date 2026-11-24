@@ -80,10 +80,14 @@ jobs:
       # Host admission limit for scripts/w2_host_probe.py, in milliseconds of
       # CPU for the fastest probe round. The committed value is the literal
       # after "||". An empty value would record only and void no host.
-      # 240 ms is 1.3 times the median of the four hosts of run 45324881058
-      # (177.4 to 189.6 ms); see "Host admission" in
+      # Across the 8 hosts of runs 45324881058 and 45341730731, the 6
+      # clean-start hosts measured 167.5 to 189.6 ms before their windows,
+      # whereas run 45341730731 default r2 (216.6 ms, admitted under 240 ms)
+      # used 44.7 ms authority CPU/op (~2.1x slower than clean hosts) and lost
+      # 1,765 operations; 200 ms leaves >10 ms headroom above clean hosts while
+      # voiding hosts like 203.3 and 216.6 ms. See "Host admission" in
       # docs/internal/APCC-1-W2-Campaign-Protocol.md.
-      host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms || '240' }}
+      host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms || '200' }}
       diagnostics: ${{ vars.APCC_W2_DIAGNOSTICS || '1' }}
       allow_missing_upstream_provenance: ${{ (github.event_name == 'push' || inputs.allow_missing_upstream_provenance) && '1' || '0' }}
       scheduled_operations: ${{ inputs.scheduled_operations || '10000' }}

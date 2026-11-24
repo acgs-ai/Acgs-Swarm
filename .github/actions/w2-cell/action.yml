@@ -243,8 +243,9 @@ runs:
             echo "::warning::W2 attempt ${W2_ATTEMPT} VOID: host probe ${BEST} ms CPU exceeds limit ${HOST_PROBE_MAX_CPU_MS} ms; no campaign started on this host"
             echo "VOID attempt ${W2_ATTEMPT}: host probe ${BEST} ms > limit ${HOST_PROBE_MAX_CPU_MS} ms (no campaign started)" >> "$GITHUB_STEP_SUMMARY"
             if [ "$W2_FINAL_ATTEMPT" = "true" ]; then
-              echo "::warning::W2 cell has no admissible host after ${W2_ATTEMPT} attempts; this is not a campaign result"
-              echo "NO ADMISSIBLE HOST after ${W2_ATTEMPT} attempts" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::W2 cell has no admissible host after ${W2_ATTEMPT} attempts; failing cell (this is not a campaign result)"
+              echo "NO ADMISSIBLE HOST after ${W2_ATTEMPT} attempts (failing cell)" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
             ;;
           true|null)

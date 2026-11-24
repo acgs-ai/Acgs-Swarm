@@ -99,20 +99,31 @@ void: no smoke run and no campaign start on that host.
 
 - The decision uses the probe alone and is taken before the window clock. A
   campaign that has started is never voided on host grounds, whatever its
-  result. The probe runs again after the campaign, and that value is recorded
-  only.
+  result; there is no in-window host-probe voiding, and the post-campaign
+  probe remains record-only. Mid-window slowdown on shared multi-tenant
+  runners is recorded as an environment limit to be addressed via dedicated
+  hardware and serial-section reduction rather than post-start voiding.
 - A void attempt uploads its evidence bundle (`host-probe-before.json`,
   `host-void.json`, host environment) under its own attempt number and notes
   the void in the job summary. Whoever reports a run's results lists its void
   attempts with them; they are never dropped.
 - A void attempt is replaced by a new job, which gets a newly assigned runner,
-  for at most three attempts per cell. Three void attempts are reported as "no
-  admissible host", which is not a campaign result.
+  for at most three attempts per cell. Void attempts 1 and 2 end green as void
+  so the workflow chains the next attempt onto a fresh runner. A third
+  consecutive void attempt is reported as "no admissible host" (which is not a
+  campaign result) and fails the cell (red) while still uploading its
+  attempt-3 probe evidence bundle; the matrix keeps `fail-fast: false` so
+  other cells continue.
 - The limit is committed in `.github/workflows/w2-qualification.yml` and is
-  240 ms. The four hosts of run 45324881058 measured 177.4 to 189.6 ms before
-  their windows (median about 183 ms); 240 ms is 1.3 times that median. The
-  value is provisional: no host that was slow before its window has been
-  probed yet. An empty limit records the probe and voids nothing. A manual
+  200 ms. Across the eight hosts probed in runs 45324881058 and 45341730731,
+  the six clean-start hosts measured 167.5 to 189.6 ms before their windows,
+  while run 45341730731 default r2 (216.6 ms best, 228.4 ms median, 307.0 ms
+  worst; admitted under the earlier 240 ms limit) ran at 44.7 ms authority
+  CPU/commit (~2.1x slower than clean hosts) and lost 1,765 operations. The
+  single-thread `v1` probe ranks hosts in the right order but understates
+  multi-process workload slowdown; 200 ms preserves >10 ms headroom above
+  clean-start hosts while voiding slow-start hosts such as 203.3 ms and
+  216.6 ms. An empty limit records the probe and voids nothing. A manual
   dispatch may override the limit; the limit in force is recorded in
   `host-probe-before.json`.
 - Runs made before this rule existed have no probe value and are not voided

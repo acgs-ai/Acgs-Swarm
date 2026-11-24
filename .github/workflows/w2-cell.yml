@@ -2,10 +2,11 @@ name: W2 Cold Cell (reusable)
 
 # One W2 cold qualification cell with host admission. Each attempt is a
 # separate job, so a replacement attempt gets a newly assigned runner. An
-# attempt whose host fails the CPU probe starts no campaign, uploads its probe
-# evidence, and concludes successfully as void; the next attempt then runs.
-# At most three attempts. See docs/internal/APCC-1-W2-Campaign-Protocol.md,
-# "Host admission".
+# attempt whose host fails the CPU probe starts no campaign and uploads its
+# probe evidence: void attempts 1 and 2 conclude green to trigger a replacement
+# job, whereas a void final attempt (attempt 3) fails red after uploading its
+# probe evidence. At most three attempts. See
+# docs/internal/APCC-1-W2-Campaign-Protocol.md, "Host admission".
 
 on:
   workflow_call:
