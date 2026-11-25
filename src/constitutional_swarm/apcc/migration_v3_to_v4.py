@@ -612,7 +612,9 @@ def _inspect_temp_copy(
         except Exception:
             pass
 
-        # Every identifying field is final from here on; bind them once.
+        # Bind the identifying fields once. Do not reassign any of them below:
+        # the partial captures their current values, so a later change would
+        # silently not reach the report.
         full_report = partial(
             StoreInspectionReport,
             source_path=source_path,
