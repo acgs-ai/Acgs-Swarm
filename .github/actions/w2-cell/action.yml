@@ -293,6 +293,14 @@ runs:
       run: |
         set -euo pipefail
         CAMPAIGN_DIR="${W2_OUT_ROOT}/w2-campaign"
+        # Record-only host monitor beside the campaign: one round of the host
+        # probe's fixed work every 10 s. Nothing reads it to admit, void,
+        # account or verify, and its failure never fails this step.
+        python scripts/w2_host_monitor.py \
+          --output "${W2_BUNDLE_DIR}/host-probe-window.jsonl" \
+          --interval-seconds 10 &
+        MONITOR_PID=$!
+        CAMPAIGN_RC=0
         python scripts/run_apcc_w2_campaign.py run \
           --output "$CAMPAIGN_DIR" \
           --duration-ns "$DURATION_NS" \
@@ -301,7 +309,16 @@ runs:
           --operation-sla-ns "$OPERATION_SLA_NS" \
           --drain-ns "$DRAIN_NS" \
           --operation-floor "$OPERATION_FLOOR" \
-          --windows "$WINDOWS"
+          --windows "$WINDOWS" || CAMPAIGN_RC=$?
+        kill -TERM "$MONITOR_PID" 2>/dev/null || true
+        # A monitor that does not stop is killed, so it cannot hold this step.
+        ( sleep 10; kill -KILL "$MONITOR_PID" 2>/dev/null ) >/dev/null 2>&1 &
+        WATCHDOG_PID=$!
+        wait "$MONITOR_PID" 2>/dev/null \
+          || echo "::warning::in-window host monitor did not exit cleanly; it is record-only"
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+        exit "$CAMPAIGN_RC"
 
     - name: Host CPU probe after the campaign (record only)
       if: always() && steps.probe.outputs.void == 'false'

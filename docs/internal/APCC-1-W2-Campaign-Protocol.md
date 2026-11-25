@@ -100,9 +100,23 @@ void: no smoke run and no campaign start on that host.
 - The decision uses the probe alone and is taken before the window clock. A
   campaign that has started is never voided on host grounds, whatever its
   result; there is no in-window host-probe voiding, and the post-campaign
-  probe remains record-only. Mid-window slowdown on shared multi-tenant
-  runners is recorded as an environment limit to be addressed via dedicated
-  hardware and serial-section reduction rather than post-start voiding.
+  probe remains record-only. Windows on these runners have slowed part-way
+  through (authority CPU per commit roughly doubling for a minute or more).
+  The cause is not established; it is recorded as a limit of the evidence and
+  is not handled by voiding after the start.
+- While the campaign runs, `scripts/w2_host_monitor.py` runs beside it as a
+  separate process and repeats one round of the probe's fixed work every 10
+  seconds, writing `host-probe-window.jsonl` into the evidence bundle. It is
+  record-only: it takes no limit, and nothing reads it to admit, void, account
+  or verify a run. Its purpose is to show whether work unrelated to the
+  campaign slows on the same host at the same time as the window does. It
+  adds about 0.2 s of CPU on one core every 10 seconds to every run made from
+  this revision on, so such runs are not strictly like-for-like with earlier
+  ones. Each sample carries the host-wide `/proc/stat` tick counters. When
+  the diagnostics sidecar is enabled it samples the same counters, so a
+  sample can be placed in the window without a shared clock. The step stops
+  the monitor when the campaign ends and kills it if it has not exited within
+  10 seconds; the step's result is always the campaign's.
 - A void attempt uploads its evidence bundle (`host-probe-before.json`,
   `host-void.json`, host environment) under its own attempt number and notes
   the void in the job summary. Whoever reports a run's results lists its void
