@@ -26,8 +26,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -39,7 +40,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from ..strict_json import StrictJSONError, loads as strict_loads
-from .crypto import b64u_decode, sha256_digest
+from .crypto import b64u_decode, b64u_encode, sha256_digest
 from .model import Signature
 from .ports import (
     APCCAuthorityConfig,
@@ -78,6 +79,9 @@ from .sqlite_store import (
 _MIGRATION_RECEIPT_DOMAIN = b"APCC-MIGRATION-CONTINUITY-V1"
 _RECEIPT_PROTOCOL_VERSION = "APCC-1.0-draft"
 _RECEIPT_TYPE = "apcc.migration-continuity-receipt"
+_LIVE_WAL_DIAGNOSTIC = (
+    "uncheckpointed WAL sidecar present; checkpoint source database before offline migration"
+)
 _V3_SCHEMA_VERSION = "3"
 _V3_SCHEMA_INT = 3
 _V3_SCHEMA_FINGERPRINT = sha256_digest(
@@ -337,6 +341,12 @@ def _sha256_file_hex(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _has_live_wal(database: Path) -> bool:
+    """True when ``database`` has a non-empty ``-wal`` sidecar (uncheckpointed writes)."""
+    sidecar = Path(f"{database}-wal")
+    return sidecar.exists() and sidecar.stat().st_size > 0
+
+
 def _fsync_directory(directory: Path) -> None:
     fd = os.open(directory, os.O_RDONLY)
     try:
@@ -360,10 +370,7 @@ def _atomic_write_new_file(destination: Path, content: bytes) -> None:
         os.link(temporary, destination)
         _fsync_directory(destination.parent)
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        temporary.unlink(missing_ok=True)
 
 
 def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
@@ -394,8 +401,8 @@ def _certificate_set_digest(connection: sqlite3.Connection) -> tuple[str, int]:
 
 def _check_ddl_and_storage(
     connection: sqlite3.Connection,
-) -> tuple[bool, tuple[str, ...], bool]:
-    """Return ``(ddl_ok, diagnostics, has_gcb_tables)`` for an offline copy."""
+) -> tuple[tuple[str, ...], bool]:
+    """Return ``(diagnostics, has_gcb_tables)`` for an offline copy; no diagnostics means OK."""
     diagnostics: list[str] = []
     if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
         diagnostics.append("sqlite quick_check failed")
@@ -439,7 +446,7 @@ def _check_ddl_and_storage(
         for kind, name, table, _sql in rows
     ):
         diagnostics.append("unexpected extra trigger or APCC table index present")
-    return (not diagnostics, tuple(diagnostics), has_gcb)
+    return (tuple(diagnostics), has_gcb)
 
 
 def _pre_c32_audit_id(kind: str, *parts: str) -> str:
@@ -482,6 +489,31 @@ def _parse_canonical_nonneg_decimal(value: str, label: str) -> int:
     return parsed
 
 
+def _early_reject_report(
+    source_path: Path,
+    source_sha256: str,
+    classification: StoreClassification,
+    *,
+    diagnostics: tuple[str, ...],
+    user_version: int | None = None,
+    table_counts: Mapping[str, int] | None = None,
+) -> StoreInspectionReport:
+    """Report for a store rejected before its metadata and checkpoint were read."""
+    return StoreInspectionReport(
+        source_path=source_path,
+        source_sha256=source_sha256,
+        classification=classification,
+        user_version=user_version,
+        metadata_schema_version=None,
+        schema_fingerprint=None,
+        authority_store_id=None,
+        source_change_sequence=None,
+        source_checkpoint_digest=None,
+        diagnostics=diagnostics,
+        table_counts={} if table_counts is None else table_counts,
+    )
+
+
 def _inspect_temp_copy(
     tmp_db: Path, *, source_path: Path, source_sha256: str
 ) -> StoreInspectionReport:
@@ -493,47 +525,28 @@ def _inspect_temp_copy(
             app_row = conn.execute("PRAGMA application_id").fetchone()
             uv_row = conn.execute("PRAGMA user_version").fetchone()
         except sqlite3.DatabaseError as error:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=None,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.V3_TAMPERED_OR_CORRUPT,
                 diagnostics=("file is not a valid SQLite database", str(error)),
-                table_counts={},
             )
         user_version = int(uv_row[0]) if uv_row is not None else None
         if app_row is None or tuple(app_row) != (_APPLICATION_ID,):
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.UNSUPPORTED_SCHEMA,
-                user_version=user_version,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.UNSUPPORTED_SCHEMA,
                 diagnostics=("SQLite application_id does not match APCC (0x41504343)",),
-                table_counts={},
+                user_version=user_version,
             )
         if journal_row is None or tuple(journal_row) != ("wal",):
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.V3_TAMPERED_OR_CORRUPT,
                 diagnostics=("APCC SQLite store requires WAL journal mode",),
-                table_counts={},
+                user_version=user_version,
             )
 
         try:
@@ -545,31 +558,20 @@ def _inspect_temp_copy(
                 is not None
             )
         except sqlite3.DatabaseError as error:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.V3_TAMPERED_OR_CORRUPT,
                 diagnostics=("corrupt SQLite catalog in APCC store", str(error)),
-                table_counts={},
+                user_version=user_version,
             )
         if not has_metadata:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.UNSUPPORTED_SCHEMA,
-                user_version=user_version,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.UNSUPPORTED_SCHEMA,
                 diagnostics=("missing APCC metadata table",),
+                user_version=user_version,
                 table_counts=counts,
             )
 
@@ -581,17 +583,12 @@ def _inspect_temp_copy(
                 ).fetchall()
             }
         except sqlite3.DatabaseError as error:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
-                classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=None,
-                schema_fingerprint=None,
-                authority_store_id=None,
-                source_change_sequence=None,
-                source_checkpoint_digest=None,
+            return _early_reject_report(
+                source_path,
+                source_sha256,
+                StoreClassification.V3_TAMPERED_OR_CORRUPT,
                 diagnostics=("metadata table is corrupt or has unexpected columns", str(error)),
+                user_version=user_version,
                 table_counts=counts,
             )
         meta_ver = meta.get("schema_version")
@@ -615,108 +612,70 @@ def _inspect_temp_copy(
         except Exception:
             pass
 
-        ddl_ok, ddl_diagnostics, has_gcb = _check_ddl_and_storage(conn)
+        # Bind the identifying fields once. Do not reassign any of them below:
+        # the partial captures their current values, so a later change would
+        # silently not reach the report.
+        full_report = partial(
+            StoreInspectionReport,
+            source_path=source_path,
+            source_sha256=source_sha256,
+            user_version=user_version,
+            metadata_schema_version=meta_ver,
+            schema_fingerprint=schema_fp,
+            authority_store_id=store_id,
+            source_change_sequence=change_seq,
+            source_checkpoint_digest=checkpoint_digest,
+            table_counts=counts,
+        )
+
+        ddl_diagnostics, has_gcb = _check_ddl_and_storage(conn)
         if user_version == _SCHEMA_VERSION and meta_ver == _AUTHORITY_SCHEMA_VERSION:
             try:
                 conn.execute("BEGIN")
                 _validate_schema(conn)
                 conn.rollback()
-                return StoreInspectionReport(
-                    source_path=source_path,
-                    source_sha256=source_sha256,
+                return full_report(
                     classification=StoreClassification.V4_CURRENT,
-                    user_version=user_version,
-                    metadata_schema_version=meta_ver,
-                    schema_fingerprint=schema_fp,
-                    authority_store_id=store_id,
-                    source_change_sequence=change_seq,
-                    source_checkpoint_digest=checkpoint_digest,
                     diagnostics=("store already validates cleanly under schema v4",),
-                    table_counts=counts,
                 )
             except Exception as error:
                 conn.rollback()
-                return StoreInspectionReport(
-                    source_path=source_path,
-                    source_sha256=source_sha256,
+                return full_report(
                     classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                    user_version=user_version,
-                    metadata_schema_version=meta_ver,
-                    schema_fingerprint=schema_fp,
-                    authority_store_id=store_id,
-                    source_change_sequence=change_seq,
-                    source_checkpoint_digest=checkpoint_digest,
                     diagnostics=(
                         "store claims schema v4 metadata/user_version but failed v4 validation",
                         str(error),
                     ),
-                    table_counts=counts,
                 )
 
         if user_version != _V3_SCHEMA_INT or meta_ver != _V3_SCHEMA_VERSION:
             if {user_version, meta_ver} & {_V3_SCHEMA_INT, _V3_SCHEMA_VERSION}:
-                return StoreInspectionReport(
-                    source_path=source_path,
-                    source_sha256=source_sha256,
+                return full_report(
                     classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                    user_version=user_version,
-                    metadata_schema_version=meta_ver,
-                    schema_fingerprint=schema_fp,
-                    authority_store_id=store_id,
-                    source_change_sequence=change_seq,
-                    source_checkpoint_digest=checkpoint_digest,
                     diagnostics=(
                         f"PRAGMA user_version ({user_version}) and metadata.schema_version "
                         f"({meta_ver!r}) disagree",
                     ),
-                    table_counts=counts,
                 )
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+            return full_report(
                 classification=StoreClassification.UNSUPPORTED_SCHEMA,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=(
                     f"unsupported schema user_version={user_version} metadata={meta_ver!r}",
                 ),
-                table_counts=counts,
             )
 
         if has_gcb:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+            return full_report(
                 classification=StoreClassification.V3_GCB_UNSUPPORTED,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=(
                     "GCB-attached SQLite store migration is out of scope for flat APCC copy",
                 ),
-                table_counts=counts,
             )
 
-        if not ddl_ok:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+        if ddl_diagnostics:
+            return full_report(
                 classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=ddl_diagnostics,
-                table_counts=counts,
             )
 
         if (
@@ -724,18 +683,9 @@ def _inspect_temp_copy(
             or schema_fp != _V3_SCHEMA_FINGERPRINT
             or parsed_config is None
         ):
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+            return full_report(
                 classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=("v3 metadata, config, or schema_fingerprint is invalid",),
-                table_counts=counts,
             )
 
         try:
@@ -743,18 +693,9 @@ def _inspect_temp_copy(
             if not sealed:
                 raise APCCMigrationError("v3 semantic checkpoint is unsealed")
         except Exception as error:
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+            return full_report(
                 classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=("v3 semantic checkpoint verification failed", str(error)),
-                table_counts=counts,
             )
 
         try:
@@ -766,32 +707,14 @@ def _inspect_temp_copy(
                 if is_pre_c32
                 else StoreClassification.V3_TAMPERED_OR_CORRUPT
             )
-            return StoreInspectionReport(
-                source_path=source_path,
-                source_sha256=source_sha256,
+            return full_report(
                 classification=classification,
-                user_version=user_version,
-                metadata_schema_version=meta_ver,
-                schema_fingerprint=schema_fp,
-                authority_store_id=store_id,
-                source_change_sequence=change_seq,
-                source_checkpoint_digest=checkpoint_digest,
                 diagnostics=(detail,),
-                table_counts=counts,
             )
 
-        return StoreInspectionReport(
-            source_path=source_path,
-            source_sha256=source_sha256,
+        return full_report(
             classification=StoreClassification.V3_POST_C32_MIGRATABLE,
-            user_version=user_version,
-            metadata_schema_version=meta_ver,
-            schema_fingerprint=schema_fp,
-            authority_store_id=store_id,
-            source_change_sequence=change_seq,
-            source_checkpoint_digest=checkpoint_digest,
             diagnostics=("authentic post-C32 schema v3 store ready for offline v4 migration",),
-            table_counts=counts,
         )
     finally:
         conn.close()
@@ -803,22 +726,12 @@ def inspect_sqlite_store(source_path: Path) -> StoreInspectionReport:
     if not source.is_file():
         raise APCCMigrationError(f"source database file does not exist: {source}")
     source_sha256 = _sha256_file_hex(source)
-    wal_sidecar = Path(f"{source}-wal")
-    if wal_sidecar.exists() and wal_sidecar.stat().st_size > 0:
-        return StoreInspectionReport(
-            source_path=source,
-            source_sha256=source_sha256,
-            classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-            user_version=None,
-            metadata_schema_version=None,
-            schema_fingerprint=None,
-            authority_store_id=None,
-            source_change_sequence=None,
-            source_checkpoint_digest=None,
-            diagnostics=(
-                "uncheckpointed WAL sidecar present; checkpoint source database before offline migration",
-            ),
-            table_counts={},
+    if _has_live_wal(source):
+        return _early_reject_report(
+            source,
+            source_sha256,
+            StoreClassification.V3_TAMPERED_OR_CORRUPT,
+            diagnostics=(_LIVE_WAL_DIAGNOSTIC,),
         )
     with tempfile.TemporaryDirectory(prefix="apcc-inspect-") as td:
         tmp_db = Path(td) / "source-copy.sqlite"
@@ -845,12 +758,11 @@ def _copy_all_apcc_tables(
             raise APCCMigrationError(f"missing columns when copying table {table}")
         col_list = ",".join(f'"{col}"' for col in cols)
         placeholders = ",".join("?" for _ in cols)
-        rows = src_conn.execute(f'SELECT {col_list} FROM "{table}" ORDER BY rowid').fetchall()
-        if rows:
-            dst_conn.executemany(
-                f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})',
-                rows,
-            )
+        # Stream rows across the two connections instead of buffering a whole table.
+        dst_conn.executemany(
+            f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})',
+            src_conn.execute(f'SELECT {col_list} FROM "{table}" ORDER BY rowid'),
+        )
 
 
 def _sign_migration_receipt(
@@ -864,27 +776,17 @@ def _sign_migration_receipt(
     )
     if signature.algorithm != "Ed25519" or signature.key_id != body.signature.key_id:
         raise APCCMigrationError("migration continuity receipt signing failed")
-    return MigrationContinuityReceipt(
-        protocol_version=body.protocol_version,
-        receipt_type=body.receipt_type,
-        authority_store_id=body.authority_store_id,
-        source_sha256=body.source_sha256,
-        source_schema_version=body.source_schema_version,
-        source_schema_fingerprint=body.source_schema_fingerprint,
-        source_change_sequence=body.source_change_sequence,
-        source_checkpoint_digest=body.source_checkpoint_digest,
-        target_sha256=body.target_sha256,
-        target_schema_version=body.target_schema_version,
-        target_schema_fingerprint=body.target_schema_fingerprint,
-        target_change_sequence=body.target_change_sequence,
-        target_prior_digest=body.target_prior_digest,
-        target_checkpoint_digest=body.target_checkpoint_digest,
-        migrated_certificate_digests_sha256=body.migrated_certificate_digests_sha256,
-        certificate_count=body.certificate_count,
-        migrated_counts=body.migrated_counts,
-        migrated_at_ms=body.migrated_at_ms,
-        signature=signature,
-    )
+    return replace(body, signature=signature)
+
+
+def _check_receipt_bound_file(path: Path, label: str, expected_sha256: str) -> None:
+    """Fail closed unless ``path`` is a quiescent file matching the receipt hash."""
+    if not path.is_file():
+        raise APCCMigrationError(f"{label} path does not exist: {path}")
+    if _has_live_wal(path):
+        raise APCCMigrationError(f"{label} store has uncheckpointed WAL sidecar")
+    if _sha256_file_hex(path) != expected_sha256:
+        raise APCCMigrationError(f"migration receipt {label} SHA-256 mismatch")
 
 
 def verify_migration_receipt(
@@ -950,24 +852,11 @@ def verify_migration_receipt(
         ) from error
 
     if source_path is not None:
-        source_file = Path(source_path)
-        if not source_file.is_file():
-            raise APCCMigrationError(f"source path does not exist: {source_file}")
-        source_wal = Path(f"{source_file}-wal")
-        if source_wal.exists() and source_wal.stat().st_size > 0:
-            raise APCCMigrationError("source store has uncheckpointed WAL sidecar")
-        if _sha256_file_hex(source_file) != parsed.source_sha256:
-            raise APCCMigrationError("migration receipt source SHA-256 mismatch")
+        _check_receipt_bound_file(Path(source_path), "source", parsed.source_sha256)
 
     if target_path is not None:
         target_file = Path(target_path)
-        if not target_file.is_file():
-            raise APCCMigrationError(f"target path does not exist: {target_file}")
-        target_wal = Path(f"{target_file}-wal")
-        if target_wal.exists() and target_wal.stat().st_size > 0:
-            raise APCCMigrationError("target store has uncheckpointed WAL sidecar")
-        if _sha256_file_hex(target_file) != parsed.target_sha256:
-            raise APCCMigrationError("migration receipt target SHA-256 mismatch")
+        _check_receipt_bound_file(target_file, "target", parsed.target_sha256)
         with tempfile.TemporaryDirectory(prefix="apcc-verify-target-") as td:
             verify_copy = Path(td) / "target-verify.sqlite"
             shutil.copy2(target_file, verify_copy)
@@ -1041,14 +930,11 @@ def migrate_sqlite_v3_to_v4(
     except ValueError as error:
         raise APCCMigrationError(str(error)) from error
 
-    source_wal = Path(f"{source}-wal")
-    if source_wal.exists() and source_wal.stat().st_size > 0:
+    if _has_live_wal(source):
         raise APCCMigrationError(
             "cannot migrate source store with uncheckpointed WAL sidecar",
             classification=StoreClassification.V3_TAMPERED_OR_CORRUPT,
-            diagnostics=(
-                "uncheckpointed WAL sidecar present; checkpoint source database before offline migration",
-            ),
+            diagnostics=(_LIVE_WAL_DIAGNOSTIC,),
         )
 
     source_sha256_before = _sha256_file_hex(source)
@@ -1220,10 +1106,7 @@ def migrate_sqlite_v3_to_v4(
         )
     except Exception:
         if target_published:
-            try:
-                target.unlink()
-            except FileNotFoundError:
-                pass
+            target.unlink(missing_ok=True)
         raise
     finally:
         for leftover in (
@@ -1231,10 +1114,7 @@ def migrate_sqlite_v3_to_v4(
             Path(f"{temporary}-wal"),
             Path(f"{temporary}-shm"),
         ):
-            try:
-                leftover.unlink()
-            except FileNotFoundError:
-                pass
+            leftover.unlink(missing_ok=True)
 
 
 class _CliKeyProvider:
@@ -1262,8 +1142,7 @@ class _CliKeyProvider:
         canonical_body: bytes,
     ) -> Signature:
         raw_sig = self._keys[role].sign(domain + b"\x00" + canonical_body)
-        encoded = base64.urlsafe_b64encode(raw_sig).rstrip(b"=").decode("ascii")
-        return Signature("Ed25519", key_id, encoded)
+        return Signature("Ed25519", key_id, b64u_encode(raw_sig))
 
 
 class _CliClock:
@@ -1489,7 +1368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return 0
     except APCCMigrationError as error:
-        if getattr(args, "json", False):
+        if args.json:
             print(
                 json.dumps(
                     {
@@ -1508,7 +1387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: {error.reason}", file=sys.stderr)
         if error.classification is not None:
             code = _exit_code_for_classification(error.classification)
-            if getattr(args, "command", None) != "inspect" and code == 0:
+            if args.command != "inspect" and code == 0:
                 return 2
             return code
         return 3
