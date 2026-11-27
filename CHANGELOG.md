@@ -6,6 +6,15 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+- **APCC migration receipts:** `verify_migration_receipt_with_pinned_key` in
+  `constitutional_swarm.apcc.migration_v3_to_v4` verifies a continuity receipt
+  against a commit public key pinned outside the store, reading the rest of the
+  configuration from the target database. Previously only the `verify-receipt`
+  CLI made that comparison; the CLI now delegates to this function.
+  `verify_migration_receipt` is unchanged and its docstring now states that its
+  `config` argument is the trust root.
+
 ## [1.2.0] - 2026-11-23
 
 Releases the post-`1.1.0` security-hardening campaign (C1–C51b), APCC schema v4
