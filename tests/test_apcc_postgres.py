@@ -8210,6 +8210,11 @@ def test_postgres_attestation_latency_reports_linear_sibling_catalog_cost(
     postgres_environment: _PostgresEnvironment,
     sibling_count: int,
 ) -> None:
+    """Commit and read back with sibling schemas present; timing is informational.
+
+    The timings are printed, not asserted, so this test makes no claim about how
+    cost grows with the sibling count.
+    """
     schema, store = _single_store(postgres_environment, "sibling_latency_target")
     for sibling_number in range(sibling_count):
         if sibling_number % 2:
@@ -8237,11 +8242,12 @@ def test_postgres_attestation_latency_reports_linear_sibling_catalog_cost(
     reader.close()
     read_seconds = time.perf_counter() - read_started
     assert result.decision.outcome is RequestOutcome.COMMITTED
+    # Timing is reported, not asserted: a wall-clock bound fails on a loaded runner
+    # without any change in catalog cost.
     print(
         "linear sibling catalog attestation timing: "
         f"siblings={sibling_count} commit={commit_seconds:.6f}s read={read_seconds:.6f}s"
     )
-    assert commit_seconds < 5.0 and read_seconds < 5.0
 
 
 @pytest.mark.parametrize("grantee", ("runtime", "observer", "PUBLIC"))
