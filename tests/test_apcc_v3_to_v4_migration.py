@@ -872,3 +872,34 @@ def test_pinned_key_verification_accepts_genuine_migration_and_fails_closed(
             commit_public_key=genuine_public_key,
             source_path=other_source,
         )
+
+
+def test_pinned_key_verification_rejects_tampered_receipt(tmp_path: Path) -> None:
+    v3_path = tmp_path / "v3-tamper.sqlite"
+    _populate_rich_post_c32_v3(v3_path)
+    target_path = tmp_path / "v4-tamper.sqlite"
+    res = migrate_sqlite_v3_to_v4(
+        v3_path,
+        target_path,
+        config=_config(),
+        runtime=_runtime(),
+        receipt_path=tmp_path / "receipt-tamper.json",
+    )
+    genuine_public_key = _config().commit_trust.public_key
+    obj = res.receipt.to_object()
+
+    # The genuine store and the genuine pinned key do not rescue a receipt whose
+    # signed body was altered or whose signature was replaced.
+    altered_body = json.loads(json.dumps(obj))
+    altered_body["certificate_count"] = "999"
+    replaced_signature = json.loads(json.dumps(obj))
+    replaced_signature["signature"]["signature_b64u"] = b64u_encode(bytes(64))
+
+    for tampered in (altered_body, replaced_signature):
+        with pytest.raises(APCCMigrationError, match="signature invalid"):
+            verify_migration_receipt_with_pinned_key(
+                tampered,
+                target_path=target_path,
+                commit_public_key=genuine_public_key,
+                source_path=v3_path,
+            )
