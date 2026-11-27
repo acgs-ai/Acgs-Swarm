@@ -8210,6 +8210,11 @@ def test_postgres_attestation_latency_reports_linear_sibling_catalog_cost(
     postgres_environment: _PostgresEnvironment,
     sibling_count: int,
 ) -> None:
+    """Commit and read back with sibling schemas present; timing is informational.
+
+    The timings are printed, not asserted, so this test makes no claim about how
+    cost grows with the sibling count.
+    """
     schema, store = _single_store(postgres_environment, "sibling_latency_target")
     for sibling_number in range(sibling_count):
         if sibling_number % 2:
