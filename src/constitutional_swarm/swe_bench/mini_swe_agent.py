@@ -22,11 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from constitutional_swarm.swe_bench._diff import DIFF_MARKER, extract_unified_diff
-from constitutional_swarm.swe_bench._subprocess import (
-    _run_process,
-    _subprocess_env as _minimal_subprocess_env,
-    _terminate_process_tree as _terminate_shared_process_tree,
-)
+from constitutional_swarm.swe_bench._subprocess import _run_process, _subprocess_env
 from constitutional_swarm.swe_bench.agent import SWEBenchAgent, _validate_timeout_seconds
 
 BACKEND_MINI_EXTERNAL_BASELINE = "mini_external_baseline"
@@ -364,14 +360,6 @@ def _run_command(
         cwd=cwd,
         env=_subprocess_env(env),
     )
-
-
-def _subprocess_env(env: dict[str, str]) -> dict[str, str]:
-    return _minimal_subprocess_env(env)
-
-
-def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    _terminate_shared_process_tree(proc)
 
 
 def _as_list(value: Any) -> list[str]:
