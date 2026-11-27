@@ -11,22 +11,28 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from constitutional_swarm.apcc import sqlite_store as sqlite_store_module
-from constitutional_swarm.apcc.crypto import b64u_encode
+from constitutional_swarm.apcc.crypto import b64u_encode, public_key_from_seed
 from constitutional_swarm.apcc.migration_v3_to_v4 import (
     APCCMigrationError,
     StoreClassification,
     _pre_c32_audit_id,
+    _read_config_from_source,
     inspect_sqlite_store,
+    main,
     migrate_sqlite_v3_to_v4,
     verify_migration_receipt,
+    verify_migration_receipt_with_pinned_key,
 )
 from constitutional_swarm.apcc.model import AuthorityStatusValue, RequestOutcome, SupersessionValue
 from constitutional_swarm.apcc.ports import (
+    APCCAuthorityConfig,
+    AuthorityRuntime,
     OutboxRecoveryRequest,
     RevocationRequest,
     RevocationScope,
@@ -42,10 +48,12 @@ from tests.test_apcc_schema_v4_compat import (
     FIXTURE_PRE_C32_V3,
     _isolated_runtime,
     _rewrite_sqlite_to_authentic_post_c32_v3,
+    _sqlite_v3_fingerprint,
 )
 from tests.test_apcc_sqlite import (
     _advance_candidate,
     _config,
+    _initial_contexts,
     _open_store,
     _predecessor,
     _request,
@@ -715,3 +723,152 @@ def test_cli_inspect_migrate_verify_roundtrip(tmp_path: Path) -> None:
     )
     assert already_v4.returncode != 0
     assert not (tmp_path / "should-not-migrate-v4.sqlite").exists()
+
+
+_ATTACKER_COMMIT_SEED = b"\xa5" * 32
+
+
+def _forge_v3_source_under_attacker_key(
+    tmp_path: Path,
+) -> tuple[Path, APCCAuthorityConfig, AuthorityRuntime]:
+    """Build a valid v3 source whose stored configuration names an attacker commit key."""
+    genuine = _config()
+    forged_config = replace(
+        genuine,
+        commit_trust=replace(
+            genuine.commit_trust, public_key=public_key_from_seed(_ATTACKER_COMMIT_SEED)
+        ),
+    )
+    forged_runtime = _runtime(commit_seed=_ATTACKER_COMMIT_SEED)
+
+    v3_path = tmp_path / "forged-v3.sqlite"
+    SQLiteAuthorityStore.provision(
+        v3_path,
+        config=forged_config,
+        initial_contexts=_initial_contexts(),
+        runtime=forged_runtime,
+    )
+    v3_fingerprint = _sqlite_v3_fingerprint()
+    with closing(sqlite3.connect(v3_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("PRAGMA user_version=3")
+        conn.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='schema_fingerprint'",
+            (v3_fingerprint,),
+        )
+        sqlite_store_module._seal_semantic_checkpoint(
+            conn, forged_config, forged_runtime, v3_fingerprint
+        )
+        conn.commit()
+    _cleanup_helper_sidecars(v3_path)
+    return v3_path, forged_config, forged_runtime
+
+
+def _forge_migration_under_attacker_key(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Build a source, target, and receipt that verify against the forged store's own config.
+
+    Only a key pinned outside the database tells it apart from a genuine migration.
+    """
+    v3_path, forged_config, forged_runtime = _forge_v3_source_under_attacker_key(tmp_path)
+    target_path = tmp_path / "forged-v4.sqlite"
+    receipt_path = tmp_path / "forged-receipt.json"
+    migrate_sqlite_v3_to_v4(
+        v3_path,
+        target_path,
+        config=forged_config,
+        runtime=forged_runtime,
+        receipt_path=receipt_path,
+    )
+    return v3_path, target_path, receipt_path
+
+
+def test_pinned_key_verification_rejects_store_forged_under_another_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    v3_path, target_path, receipt_path = _forge_migration_under_attacker_key(tmp_path)
+    genuine_public_key = _config().commit_trust.public_key
+
+    # The forgery is internally consistent: trusting the configuration read
+    # from the target database accepts it. This is the self-trust the pinned
+    # key exists to prevent.
+    self_trusted = verify_migration_receipt(
+        receipt_path.read_bytes(),
+        config=_read_config_from_source(target_path),
+        target_path=target_path,
+        source_path=v3_path,
+    )
+    assert self_trusted.target_sha256 == _sha256_hex(target_path)
+
+    # Library entry point: the externally pinned key rejects it.
+    with pytest.raises(APCCMigrationError, match="does not match pinned key"):
+        verify_migration_receipt_with_pinned_key(
+            receipt_path.read_bytes(),
+            target_path=target_path,
+            commit_public_key=genuine_public_key,
+            source_path=v3_path,
+        )
+
+    # CLI entry point reaches the same rejection through main().
+    exit_code = main(
+        [
+            "verify-receipt",
+            str(receipt_path),
+            str(target_path),
+            "--commit-public-key",
+            b64u_encode(genuine_public_key),
+            "--source",
+            str(v3_path),
+            "--json",
+        ]
+    )
+    assert exit_code == 3
+    assert "does not match pinned key" in capsys.readouterr().err
+
+
+def test_pinned_key_verification_accepts_genuine_migration_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    v3_path = tmp_path / "v3-pinned.sqlite"
+    _populate_rich_post_c32_v3(v3_path)
+    target_path = tmp_path / "v4-pinned.sqlite"
+    receipt_path = tmp_path / "receipt-pinned.json"
+    migrate_sqlite_v3_to_v4(
+        v3_path,
+        target_path,
+        config=_config(),
+        runtime=_runtime(),
+        receipt_path=receipt_path,
+    )
+    genuine_public_key = _config().commit_trust.public_key
+
+    verified = verify_migration_receipt_with_pinned_key(
+        receipt_path.read_bytes(),
+        target_path=target_path,
+        commit_public_key=genuine_public_key,
+        source_path=v3_path,
+    )
+    assert verified.target_sha256 == _sha256_hex(target_path)
+    assert verified.source_sha256 == _sha256_hex(v3_path)
+
+    for bad_key in (b"\x7f" * 32, genuine_public_key[:31], genuine_public_key + b"\x00", b""):
+        with pytest.raises(APCCMigrationError, match="pinned"):
+            verify_migration_receipt_with_pinned_key(
+                receipt_path.read_bytes(),
+                target_path=target_path,
+                commit_public_key=bad_key,
+            )
+
+    # A source store with a valid but different configuration is refused. The
+    # forged source differs from the genuine target only in its commit key.
+    forged_dir = tmp_path / "forged"
+    forged_dir.mkdir()
+    other_source, _, _ = _forge_v3_source_under_attacker_key(forged_dir)
+    assert _read_config_from_source(other_source) != _read_config_from_source(target_path)
+    with pytest.raises(APCCMigrationError, match="configurations differ"):
+        verify_migration_receipt_with_pinned_key(
+            receipt_path.read_bytes(),
+            target_path=target_path,
+            commit_public_key=genuine_public_key,
+            source_path=other_source,
+        )

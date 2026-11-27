@@ -796,7 +796,14 @@ def verify_migration_receipt(
     target_path: Path | None = None,
     source_path: Path | None = None,
 ) -> MigrationContinuityReceipt:
-    """Verify the Ed25519 signature and optional source/target bindings of a receipt."""
+    """Verify the Ed25519 signature and optional source/target bindings of a receipt.
+
+    ``config`` is the trust root: the receipt is accepted if it is signed by
+    ``config.commit_trust.public_key``. Pass a configuration you already hold.
+    A configuration read from the store being verified proves nothing, because
+    whoever wrote the store also chose that key. For that case use
+    :func:`verify_migration_receipt_with_pinned_key`.
+    """
     if isinstance(receipt, (bytes, bytearray)):
         try:
             obj = strict_loads(bytes(receipt), max_bytes=1_048_576, allow_float=False)
@@ -902,6 +909,34 @@ def verify_migration_receipt(
             raise APCCMigrationError("migration receipt target DB bindings mismatch")
 
     return parsed
+
+
+def verify_migration_receipt_with_pinned_key(
+    receipt: MigrationContinuityReceipt | Mapping[str, object] | bytes,
+    *,
+    target_path: Path,
+    commit_public_key: bytes,
+    source_path: Path | None = None,
+) -> MigrationContinuityReceipt:
+    """Verify a receipt for a store whose configuration you do not already hold.
+
+    Use this when the only copy of the configuration is the one stored in the
+    target database. That copy is unverified, so it cannot vouch for itself:
+    ``commit_public_key`` must be the raw 32-byte Ed25519 commit public key
+    obtained from somewhere other than the files being checked. The target's
+    stored key is compared with it before any signature is checked, and a
+    mismatch fails closed.
+    """
+    if not isinstance(commit_public_key, (bytes, bytearray)) or len(commit_public_key) != 32:
+        raise APCCMigrationError("pinned commit public key must be 32 raw bytes")
+    config = _read_config_from_source(Path(target_path))
+    if config.commit_trust.public_key != bytes(commit_public_key):
+        raise APCCMigrationError("target store commit public key does not match pinned key")
+    if source_path is not None and _read_config_from_source(Path(source_path)) != config:
+        raise APCCMigrationError("source and target APCC authority configurations differ")
+    return verify_migration_receipt(
+        receipt, config=config, target_path=target_path, source_path=source_path
+    )
 
 
 def migrate_sqlite_v3_to_v4(
@@ -1328,25 +1363,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise APCCMigrationError(
                     "invalid pinned commit public key base64url"
                 ) from error
-            config = _read_config_from_source(args.target)
-            if config.commit_trust.public_key != pinned_commit_pk:
-                raise APCCMigrationError(
-                    "target store commit public key does not match pinned key"
-                )
-            if args.source is not None:
-                source_config = _read_config_from_source(args.source)
-                if source_config != config:
-                    raise APCCMigrationError(
-                        "source and target APCC authority configurations differ"
-                    )
             receipt_file = Path(args.receipt)
             if not receipt_file.is_file():
                 raise APCCMigrationError(f"receipt file does not exist: {receipt_file}")
-            raw_receipt = receipt_file.read_bytes()
-            verified = verify_migration_receipt(
-                raw_receipt,
-                config=config,
+            verified = verify_migration_receipt_with_pinned_key(
+                receipt_file.read_bytes(),
                 target_path=args.target,
+                commit_public_key=pinned_commit_pk,
                 source_path=args.source,
             )
             if args.json:
@@ -1404,6 +1427,7 @@ __all__ = [
     "main",
     "migrate_sqlite_v3_to_v4",
     "verify_migration_receipt",
+    "verify_migration_receipt_with_pinned_key",
 ]
 
 
