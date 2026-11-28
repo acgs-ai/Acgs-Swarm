@@ -46,7 +46,6 @@ and indexable layers — no hard transformers dependency at import time.
 
 from __future__ import annotations
 
-import importlib.util
 import threading
 import warnings
 from typing import Any, ClassVar, Protocol, runtime_checkable
@@ -57,11 +56,6 @@ try:
     from torch import Tensor
 except ImportError as exc:
     raise ImportError("latent_dna requires torch. Install with: pip install torch>=2.0") from exc
-
-
-def _transformers_available() -> bool:
-    """Return True if the transformers package is importable."""
-    return importlib.util.find_spec("transformers") is not None
 
 
 def _split_output(output: Any) -> tuple[Tensor, tuple[Any, ...] | None]:

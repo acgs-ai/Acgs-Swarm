@@ -1550,14 +1550,6 @@ def _handle_write_action(
     return {"blocked": False, "human_review_required": False}
 
 
-def _latest_payload(events: list[dict[str, Any]], event_type: str) -> dict[str, Any]:
-    for event in reversed(events):
-        if event.get("event_type") == event_type:
-            payload = event.get("payload")
-            return payload if isinstance(payload, dict) else {"value": payload}
-    return {}
-
-
 def _load_actions(swarm: dict[str, Any], task: TaskSpec) -> list[Action]:
     raw_adapters = swarm.get("adapters")
     adapters = raw_adapters if isinstance(raw_adapters, dict) else {}
@@ -1659,12 +1651,6 @@ def _parse_simple_yaml(text: str) -> dict[str, Any]:
         else:
             pending = (indent, container, key.strip())
     return root
-
-
-def _payloads(events: list[dict[str, Any]], event_type: str) -> list[dict[str, Any]]:
-    return [
-        event["payload"] for event in events if event.get("event_type") == event_type
-    ]
 
 
 def _record_decision(logger: AuditLogger, decision: PolicyDecision) -> None:
