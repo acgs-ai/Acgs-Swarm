@@ -237,10 +237,10 @@ class W2Diagnostics:
         while not self._stop.wait(_HEARTBEAT_INTERVAL_S):
             now = self._clock()
             gap = now - previous
+            new_steal, new_pressure = _cpu_steal_ticks(), _cpu_pressure_us()
             if now // 1_000_000_000 != previous // 1_000_000_000:
                 self._sample(now)
             if gap >= _HEARTBEAT_GAP_NS:
-                new_steal, new_pressure = _cpu_steal_ticks(), _cpu_pressure_us()
                 self._gaps.append(
                     {
                         "start_ns": previous,
@@ -249,12 +249,9 @@ class W2Diagnostics:
                         "cpu_pressure_us": _delta(new_pressure, pressure),
                     }
                 )
-                steal, pressure = new_steal, new_pressure
-            elif now // 1_000_000_000 != previous // 1_000_000_000:
-                # Rebase the counters once a second so a gap's deltas cover
-                # roughly the gap itself, not everything since the window began.
-                steal, pressure = _cpu_steal_ticks(), _cpu_pressure_us()
-            previous = now
+            # Always advance the counter baseline with the heartbeat so a late wakeup
+            # measures host contention during [previous, now], not earlier ticks.
+            previous, steal, pressure = now, new_steal, new_pressure
 
     def stamp(self, ticket: int, name: str) -> None:
         """Record ``name`` for operation ``ticket`` at the current clock."""

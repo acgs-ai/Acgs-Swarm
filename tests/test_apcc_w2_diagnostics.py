@@ -90,6 +90,30 @@ def test_heartbeat_records_only_the_tick_that_arrived_late() -> None:
     assert set(gaps[0]) == {"start_ns", "gap_ns", "steal_ticks", "cpu_pressure_us"}
 
 
+def test_heartbeat_gap_deltas_exclude_pre_gap_cpu_contention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter([0, 5_000_000, 10_000_000, 90_000_000, 95_000_000])
+    steals = iter([10, 15, 20, 21, 22])
+    pressures = iter([100, 500, 900, 925, 930])
+    monkeypatch.setattr(w2_diagnostics, "_cpu_steal_ticks", lambda: next(steals))
+    monkeypatch.setattr(w2_diagnostics, "_cpu_pressure_us", lambda: next(pressures))
+
+    diagnostics = W2Diagnostics(lambda: next(ticks))
+    waits = iter([False, False, False, False, True])
+    monkeypatch.setattr(diagnostics._stop, "wait", lambda _timeout: next(waits))
+    diagnostics._heartbeat()
+
+    assert diagnostics.to_object()["heartbeat_gaps"] == [
+        {
+            "start_ns": 10_000_000,
+            "gap_ns": 80_000_000,
+            "steal_ticks": 1,
+            "cpu_pressure_us": 25,
+        }
+    ]
+
+
 def test_stamps_slots_and_sidecar_round_trip(tmp_path: Path) -> None:
     ticks = iter(range(100, 1_000, 100))
     diagnostics = W2Diagnostics(lambda: next(ticks))
