@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - perf/b8-w2-qual-10k-rebased
+      - perf/p3c-w2-10k-profile
   workflow_dispatch:
     inputs:
       scheduled_operations:
@@ -51,364 +52,48 @@ on:
         required: true
         type: boolean
         default: false
+      host_probe_max_cpu_ms:
+        description: "Host admission limit in ms CPU for the probe's fastest round (empty = use the committed value)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   w2-cold-cell:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Install package with dev and transport extras
-        run: pip install -e ".[dev,transport]"
-
-      - name: Validate inputs, gate non-btrfs/tmpfs storage, and probe SQLite WAL+FULL fsync
-        env:
-          SCHEDULED_OPERATIONS: ${{ inputs.scheduled_operations || '10000' }}
-          DURATION_NS: ${{ inputs.duration_ns || '1000000000000' }}
-          ADMISSION_GRACE_NS: ${{ inputs.admission_grace_ns || '25000000' }}
-          OPERATION_SLA_NS: ${{ inputs.operation_sla_ns || '200000000' }}
-          DRAIN_NS: ${{ inputs.drain_ns || '1000000000' }}
-          OPERATION_FLOOR: ${{ inputs.operation_floor || '10000' }}
-          WINDOWS: ${{ inputs.windows || '1' }}
-        run: |
-          set -euo pipefail
-          OUT_ROOT="$(dirname "$GITHUB_WORKSPACE")/w2-qual-out-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          BUNDLE_DIR="${OUT_ROOT}/bundle"
-          rm -rf "$OUT_ROOT"
-          mkdir -p "$BUNDLE_DIR"
-          {
-            echo "W2_OUT_ROOT=${OUT_ROOT}"
-            echo "W2_BUNDLE_DIR=${BUNDLE_DIR}"
-          } >> "$GITHUB_ENV"
-
-          test -f scripts/run_apcc_w2_campaign.py || {
-            echo "Missing scripts/run_apcc_w2_campaign.py on checked-out ref" >&2
-            exit 1
-          }
-          test -f scripts/run_apcc_w2_diagnostic.py || {
-            echo "Missing scripts/run_apcc_w2_diagnostic.py on checked-out ref" >&2
-            exit 1
-          }
-
-          FSTYPE="$(findmnt -n -o FSTYPE -T "$OUT_ROOT")"
-          echo "Detected W2 output filesystem type: ${FSTYPE}"
-          case "$FSTYPE" in
-            tmpfs|ramfs|btrfs)
-              echo "FAIL CLOSED: unsupported filesystem for APCC W2 durability/latency qualification: ${FSTYPE}" >&2
-              exit 1
-              ;;
-          esac
-
-          python - <<'PY'
-          import json
-          import os
-          import platform
-          import shutil
-          import sqlite3
-          import statistics
-          import subprocess
-          import sys
-          import time
-          from pathlib import Path
-
-          def _parse_int(name: str, minimum: int, maximum: int) -> int:
-              raw = os.environ.get(name, "").strip()
-              if not raw or not raw.isdigit():
-                  raise SystemExit(f"Invalid non-negative integer for {name}: {raw!r}")
-              val = int(raw)
-              if not minimum <= val <= maximum:
-                  raise SystemExit(f"{name}={val} out of bounds [{minimum}, {maximum}]")
-              return val
-
-          scheduled_ops = _parse_int("SCHEDULED_OPERATIONS", 100, 10_000)
-          if scheduled_ops % 100 != 0:
-              raise SystemExit("SCHEDULED_OPERATIONS must be a multiple of 100")
-          duration_ns = _parse_int("DURATION_NS", 1_000_000_000, 3_600_000_000_000)
-          grace_ns = _parse_int("ADMISSION_GRACE_NS", 1_000_000, 60_000_000_000)
-          sla_ns = _parse_int("OPERATION_SLA_NS", 1_000_000, 60_000_000_000)
-          drain_ns = _parse_int("DRAIN_NS", 0, 120_000_000_000)
-          op_floor = _parse_int("OPERATION_FLOOR", 1, scheduled_ops)
-          windows = _parse_int("WINDOWS", 1, 4)
-
-          out_root = Path(os.environ["GITHUB_WORKSPACE"]).parent / f"w2-qual-out-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
-          bundle_dir = out_root / "bundle"
-          findmnt_raw = subprocess.check_output(
-              ["findmnt", "-J", "-T", str(out_root)], text=True
-          )
-          df_out = subprocess.check_output(["df", "-hT", str(out_root)], text=True)
-          lsblk_out = ""
-          if shutil.which("lsblk"):
-              lsblk_proc = subprocess.run(
-                  ["lsblk", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,MODEL"],
-                  capture_output=True,
-                  text=True,
-                  check=False,
-              )
-              lsblk_out = lsblk_proc.stdout
-          git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-
-          host_env = {
-              "git_sha": git_sha,
-              "git_ref": os.environ.get("GITHUB_REF", ""),
-              "runner_os": os.environ.get("RUNNER_OS", ""),
-              "runner_arch": os.environ.get("RUNNER_ARCH", ""),
-              "uname": platform.uname()._asdict(),
-              "python_version": sys.version,
-              "sqlite_version": sqlite3.sqlite_version,
-              "cpu_count": os.cpu_count(),
-              "findmnt": json.loads(findmnt_raw),
-              "df_ht": df_out,
-              "lsblk": lsblk_out,
-              "validated_inputs": {
-                  "scheduled_operations": scheduled_ops,
-                  "duration_ns": duration_ns,
-                  "admission_grace_ns": grace_ns,
-                  "operation_sla_ns": sla_ns,
-                  "drain_ns": drain_ns,
-                  "operation_floor": op_floor,
-                  "windows": windows,
-              },
-          }
-          (bundle_dir / "host-environment.json").write_text(
-              json.dumps(host_env, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-
-          probe_dir = out_root / "fsync-probe"
-          probe_dir.mkdir(parents=True, exist_ok=True)
-          db_path = probe_dir / "probe.sqlite"
-          conn = sqlite3.connect(db_path, isolation_level=None)
-          latencies_ms: list[float] = []
-          try:
-              mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-              if mode != ("wal",):
-                  raise SystemExit(f"Expected WAL mode, got {mode}")
-              conn.execute("PRAGMA synchronous=FULL")
-              conn.execute("PRAGMA wal_autocheckpoint=1000")
-              conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB NOT NULL)")
-              deadline = time.monotonic() + 5.0
-              seq = 0
-              while time.monotonic() < deadline and seq < 500:
-                  t0 = time.monotonic_ns()
-                  conn.execute("BEGIN IMMEDIATE")
-                  conn.execute("INSERT INTO t(k, v) VALUES (?, ?)", (seq, b"x" * 1024))
-                  conn.execute("COMMIT")
-                  t1 = time.monotonic_ns()
-                  latencies_ms.append((t1 - t0) / 1_000_000.0)
-                  seq += 1
-          finally:
-              conn.close()
-              shutil.rmtree(probe_dir, ignore_errors=True)
-
-          latencies_sorted = sorted(latencies_ms)
-          def _pct(p: float) -> float:
-              idx = min(len(latencies_sorted) - 1, int(p * (len(latencies_sorted) - 1)))
-              return round(latencies_sorted[idx], 4)
-
-          probe_summary = {
-              "commit_count": len(latencies_sorted),
-              "min_ms": round(latencies_sorted[0], 4),
-              "p50_ms": round(statistics.median(latencies_sorted), 4),
-              "p95_ms": _pct(0.95),
-              "p99_ms": _pct(0.99),
-              "max_ms": round(latencies_sorted[-1], 4),
-              "count_gt_50ms": sum(1 for x in latencies_sorted if x > 50.0),
-              "count_gt_100ms": sum(1 for x in latencies_sorted if x > 100.0),
-          }
-          (bundle_dir / "sqlite-fsync-probe.json").write_text(
-              json.dumps(probe_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          print("Host env and SQLite fsync probe:", json.dumps(probe_summary))
-          PY
-
-      - name: W2 smoke pre-flight
-        env:
-          PYTHONUNBUFFERED: "1"
-          ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE: ${{ (github.event_name == 'push' || inputs.allow_missing_upstream_provenance) && '1' || '0' }}
-        run: |
-          set -euo pipefail
-          SMOKE_DIR="${W2_OUT_ROOT}/w2-smoke"
-          python scripts/run_apcc_w2_diagnostic.py smoke --output "$SMOKE_DIR" --chains 1
-          SMOKE_SHA="$(sha256sum "${SMOKE_DIR}/ledger.jsonl" | awk '{print $1}')"
-          python scripts/run_apcc_w2_diagnostic.py verify \
-            --ledger "${SMOKE_DIR}/ledger.jsonl" \
-            --expected-sha256 "$SMOKE_SHA"
-
-      - name: Run W2 cold qualification campaign
-        env:
-          PYTHONUNBUFFERED: "1"
-          SCHEDULED_OPERATIONS: ${{ inputs.scheduled_operations || '10000' }}
-          DURATION_NS: ${{ inputs.duration_ns || '1000000000000' }}
-          ADMISSION_GRACE_NS: ${{ inputs.admission_grace_ns || '25000000' }}
-          OPERATION_SLA_NS: ${{ inputs.operation_sla_ns || '200000000' }}
-          DRAIN_NS: ${{ inputs.drain_ns || '1000000000' }}
-          OPERATION_FLOOR: ${{ inputs.operation_floor || '10000' }}
-          WINDOWS: ${{ inputs.windows || '1' }}
-          ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE: ${{ (github.event_name == 'push' || inputs.allow_missing_upstream_provenance) && '1' || '0' }}
-        run: |
-          set -euo pipefail
-          CAMPAIGN_DIR="${W2_OUT_ROOT}/w2-campaign"
-          python scripts/run_apcc_w2_campaign.py run \
-            --output "$CAMPAIGN_DIR" \
-            --duration-ns "$DURATION_NS" \
-            --scheduled-operations "$SCHEDULED_OPERATIONS" \
-            --admission-grace-ns "$ADMISSION_GRACE_NS" \
-            --operation-sla-ns "$OPERATION_SLA_NS" \
-            --drain-ns "$DRAIN_NS" \
-            --operation-floor "$OPERATION_FLOOR" \
-            --windows "$WINDOWS"
-
-      - name: Independent audit, summary generation, and sealed bundle staging
-        if: always()
-        env:
-          PYTHONUNBUFFERED: "1"
-          ACGS_ALLOW_MISSING_UPSTREAM_PROVENANCE: ${{ (github.event_name == 'push' || inputs.allow_missing_upstream_provenance) && '1' || '0' }}
-        run: |
-          set -euo pipefail
-          CAMPAIGN_DIR="${W2_OUT_ROOT}/w2-campaign"
-          SMOKE_DIR="${W2_OUT_ROOT}/w2-smoke"
-          BUNDLE_DIR="${W2_BUNDLE_DIR}"
-
-          mkdir -p "${BUNDLE_DIR}/w2-smoke" "${BUNDLE_DIR}/w2-campaign"
-          for f in result.json ledger.jsonl; do
-            if [ -f "${SMOKE_DIR}/${f}" ]; then
-              cp "${SMOKE_DIR}/${f}" "${BUNDLE_DIR}/w2-smoke/${f}"
-            fi
-          done
-          for f in result.json repetition.json; do
-            if [ -f "${CAMPAIGN_DIR}/${f}" ]; then
-              cp "${CAMPAIGN_DIR}/${f}" "${BUNDLE_DIR}/w2-campaign/${f}"
-            fi
-          done
-          for w in "${CAMPAIGN_DIR}"/window-*.jsonl; do
-            if [ -f "$w" ]; then
-              cp "$w" "${BUNDLE_DIR}/w2-campaign/"
-            fi
-          done
-
-          if [ -f "${CAMPAIGN_DIR}/repetition.json" ] && [ -f "${CAMPAIGN_DIR}/window-000.jsonl" ]; then
-            REP_SHA="$(sha256sum "${CAMPAIGN_DIR}/repetition.json" | awk '{print $1}')"
-            WIN0_SHA="$(sha256sum "${CAMPAIGN_DIR}/window-000.jsonl" | awk '{print $1}')"
-            RC_REP=0
-            python scripts/run_apcc_w2_campaign.py verify-repetition \
-              --manifest "${CAMPAIGN_DIR}/repetition.json" \
-              --expected-sha256 "$REP_SHA" \
-              > "${BUNDLE_DIR}/verify-repetition.json" || RC_REP=$?
-            RC_WIN0=0
-            python scripts/run_apcc_w2_campaign.py verify \
-              --ledger "${CAMPAIGN_DIR}/window-000.jsonl" \
-              --expected-sha256 "$WIN0_SHA" \
-              > "${BUNDLE_DIR}/verify-window-000.json" || RC_WIN0=$?
-
-            RC_REP="$RC_REP" RC_WIN0="$RC_WIN0" python - <<'PY'
-          import hashlib
-          import json
-          import os
-          import statistics
-          from pathlib import Path
-
-          out_root = Path(os.environ["W2_OUT_ROOT"])
-          bundle_dir = Path(os.environ["W2_BUNDLE_DIR"])
-          campaign_dir = out_root / "w2-campaign"
-          win0 = campaign_dir / "window-000.jsonl"
-          rep = campaign_dir / "repetition.json"
-          host_env = json.loads((bundle_dir / "host-environment.json").read_text(encoding="utf-8"))
-          def _load_opt(path: Path) -> dict[str, object]:
-              try:
-                  raw = path.read_text(encoding="utf-8").strip()
-                  return json.loads(raw) if raw else {}
-              except Exception:
-                  return {}
-
-          ver_rep = _load_opt(bundle_dir / "verify-repetition.json")
-          ver_win0 = _load_opt(bundle_dir / "verify-window-000.json")
-
-          lines = win0.read_bytes().splitlines()
-          header = json.loads(lines[0])
-          footer = json.loads(lines[-1])
-          admit_e2e_ms: list[float] = []
-          sched_e2e_ms: list[float] = []
-          commit_ms: list[float] = []
-          ceiling_violations = 0
-          for raw_line in lines[1:-1]:
-              row = json.loads(raw_line)
-              if row.get("type") == "operation":
-                  p = row["pacing"]
-                  admit_e2e_ms.append((p["end_ns"] - p["admitted_ns"]) / 1_000_000.0)
-                  sched_e2e_ms.append((p["end_ns"] - p["scheduled_ns"]) / 1_000_000.0)
-                  commit_ms.append((p["commit_end_ns"] - p["started_ns"]) / 1_000_000.0)
-                  if p["end_ns"] - p["scheduled_ns"] > 225_000_000:
-                      ceiling_violations += 1
-
-          def _stats(vals: list[float]) -> dict[str, float | int]:
-              if not vals:
-                  return {}
-              s = sorted(vals)
-              def _pct(p: float) -> float:
-                  return round(s[min(len(s) - 1, int(p * (len(s) - 1)))], 4)
-              return {
-                  "count": len(s),
-                  "min": round(s[0], 4),
-                  "p50": round(statistics.median(s), 4),
-                  "p95": _pct(0.95),
-                  "p99": _pct(0.99),
-                  "max": round(s[-1], 4),
-              }
-
-          fstype = host_env["findmnt"]["filesystems"][0]["fstype"]
-          summary = {
-              "git_sha": host_env["git_sha"],
-              "fstype": fstype,
-              "plan": header["plan"],
-              "missing_upstream_provenance_files": header.get("provenance", {}).get(
-                  "missing_upstream_provenance_files", []
-              ),
-              "accounting": footer["accounting"],
-              "slot_225ms_ceiling_violations": ceiling_violations,
-              "admit_e2e_ms": _stats(admit_e2e_ms),
-              "scheduled_e2e_ms": _stats(sched_e2e_ms),
-              "commit_ms": _stats(commit_ms),
-              "repetition_sha256": hashlib.sha256(rep.read_bytes()).hexdigest(),
-              "window_000_sha256": hashlib.sha256(win0.read_bytes()).hexdigest(),
-              "verify_repetition_rc": int(os.environ["RC_REP"]),
-              "verify_ledger_rc": int(os.environ["RC_WIN0"]),
-              "verify_repetition_ok": os.environ["RC_REP"] == "0" and ver_rep.get("status") == "verified",
-              "verify_ledger_ok": os.environ["RC_WIN0"] == "0" and ver_win0.get("status") == "verified",
-          }
-          (bundle_dir / "qualification-summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          print("Qualification summary:", json.dumps(summary, indent=2, sort_keys=True))
-          PY
-          fi
-
-          if find "$BUNDLE_DIR" -type f \( -name "*.sqlite*" -o -name "*-wal" -o -name "*-shm" -o -name "*.key" -o -name "*.pem" \) | grep -q .; then
-            echo "ERROR: unexpected sensitive/db artifact in bundle dir" >&2
-            exit 1
-          fi
-          find "$BUNDLE_DIR" -type s | grep -q . && {
-            echo "ERROR: unexpected socket in bundle dir" >&2
-            exit 1
-          } || true
-
-          if [ "${RC_REP:-0}" -ne 0 ] || [ "${RC_WIN0:-0}" -ne 0 ]; then
-            echo "Verification failed: verify-repetition=${RC_REP:-0}, verify=${RC_WIN0:-0}" >&2
-            exit 1
-          fi
-
-      - name: Upload sealed W2 qualification evidence bundle
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: w2-qualification-evidence-${{ github.run_id }}
-          path: ${{ env.W2_BUNDLE_DIR }}
-          retention-days: 30
+    name: w2-cold-cell (gen2_gc=${{ matrix.gen2_gc }}, repeat=${{ matrix.repeat }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same commit, separate runners: the two arms differ only in whether
+        # the controller defers full garbage collections during the window.
+        # Two repeats per arm, because one run per arm cannot separate the
+        # change from run-to-run variance.
+        gen2_gc: [default, deferred]
+        repeat: ["1", "2"]
+    uses: ./.github/workflows/w2-cell.yml
+    with:
+      gen2_gc: ${{ matrix.gen2_gc }}
+      repeat: ${{ matrix.repeat }}
+      # Host admission limit for scripts/w2_host_probe.py, in milliseconds of
+      # CPU for the fastest probe round. The committed value is the literal
+      # after "||". An empty value would record only and void no host.
+      # Across the 8 hosts of runs 45324881058 and 45341730731, the 6
+      # clean-start hosts measured 167.5 to 189.6 ms before their windows,
+      # whereas run 45341730731 default r2 (216.6 ms, admitted under 240 ms)
+      # used 44.7 ms authority CPU/op (~2.1x slower than clean hosts) and lost
+      # 1,765 operations; 200 ms leaves >10 ms headroom above clean hosts while
+      # voiding hosts like 203.3 and 216.6 ms. See "Host admission" in
+      # docs/internal/APCC-1-W2-Campaign-Protocol.md.
+      host_probe_max_cpu_ms: ${{ inputs.host_probe_max_cpu_ms || '200' }}
+      diagnostics: ${{ vars.APCC_W2_DIAGNOSTICS || '1' }}
+      allow_missing_upstream_provenance: ${{ (github.event_name == 'push' || inputs.allow_missing_upstream_provenance) && '1' || '0' }}
+      scheduled_operations: ${{ inputs.scheduled_operations || '10000' }}
+      duration_ns: ${{ inputs.duration_ns || '1000000000000' }}
+      admission_grace_ns: ${{ inputs.admission_grace_ns || '25000000' }}
+      operation_sla_ns: ${{ inputs.operation_sla_ns || '200000000' }}
+      drain_ns: ${{ inputs.drain_ns || '1000000000' }}
+      operation_floor: ${{ inputs.operation_floor || '10000' }}
+      windows: ${{ inputs.windows || '1' }}

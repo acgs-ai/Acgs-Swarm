@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, cast
 
 __all__ = ["StrictJSONError", "canonical_dumps", "loads", "reject_duplicate_keys"]
@@ -40,26 +41,25 @@ def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+# A string literal as the scanner sees it: an opening quote, then everything up
+# to the closing quote. An unterminated string runs to the end of the text.
+# Possessive quantifiers keep the match linear-time on every input.
+_STRING_LITERAL = re.compile(r'"(?:[^"\\]++|\\.)*+(?:"|\\?\Z)', re.DOTALL)
+_BRACKET = re.compile(r"[\[\]{}]")
+
+
 def _scan_depth(text: str, max_depth: int) -> None:
+    """Enforce structural nesting before invoking the recursive JSON decoder."""
+    structure = _STRING_LITERAL.sub("", text)
+    if structure.count("[") + structure.count("{") <= max_depth:
+        return
     depth = 0
-    in_string = False
-    escaped = False
-    for char in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char in "[{":
+    for match in _BRACKET.finditer(structure):
+        if match.group() in "[{":
             depth += 1
             if depth > max_depth:
                 raise StrictJSONError("JSON nesting depth exceeds max_depth")
-        elif char in "]}" and depth:
+        elif depth:
             depth -= 1
 
 

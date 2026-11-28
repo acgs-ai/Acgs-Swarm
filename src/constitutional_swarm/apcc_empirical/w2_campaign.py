@@ -7,6 +7,7 @@ authority. Explicit timing parameters are required; local runs do not approve th
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import multiprocessing
@@ -37,6 +38,7 @@ from constitutional_swarm.apcc.ports import AuthorityCausalProfile
 from constitutional_swarm.apcc.sqlite_store import _config_from_object, _config_object
 from constitutional_swarm.apcc.verifier import ScopedTrust, TrustBinding, TrustRole
 from constitutional_swarm.apcc_empirical import w2_driver as d
+from constitutional_swarm.apcc_empirical.w2_diagnostics import W2Diagnostics
 from constitutional_swarm.apcc_empirical.w2_pacing import WindowPlan, verify_accounting
 from constitutional_swarm.authority_service import (
     _decode_commit_request,
@@ -52,6 +54,14 @@ from constitutional_swarm.governed_commit import (
 from constitutional_swarm.swarm import TaskDAG
 
 DOMAIN = b"APCC-1.w2-campaign-v1.ledger\0"
+
+# With APCC_W2_DEFER_GEN2_GC=1 the controller makes no full (generation 2)
+# collection inside a window.  The window keeps every published proof in
+# memory, so a full collection walks a heap that grows all window long and
+# holds the GIL while it does: 51, 81 and 95 ms in run 45173297499, each
+# longer than the 25 ms admission grace.  Young collections still run.
+DEFER_GEN2_GC_ENV = "APCC_W2_DEFER_GEN2_GC"
+_GEN2_DEFERRED_THRESHOLD = 1_000_000_000
 
 
 def _unwrap_callable(fn: Any) -> Any:
@@ -118,6 +128,9 @@ class _ClosureVerifierPool:
             child_conn.close()
             self._conns.append(parent_conn)
             self._procs.append(proc)
+
+    def worker_pids(self) -> dict[str, int]:
+        return {f"closure-{index}": int(proc.pid) for index, proc in enumerate(self._procs)}
 
     def verify_closure(
         self,
@@ -862,9 +875,32 @@ def _execute_window(
     def clock() -> int:
         return time.monotonic_ns() - started
 
+    diagnostics = W2Diagnostics.from_env(clock)
+    if diagnostics is not None:
+        watched = {
+            "controller": os.getpid(),
+            "authority": int(authority.pid),
+            "executor": int(execution.pid),
+            "observer": int(launch.observer_pid),
+        }
+        if closure_verifier is not None:
+            watched.update(closure_verifier.worker_pids())
+        diagnostics.watch(
+            processes=watched,
+            files={
+                "authority_db": str(directory / "authority.db"),
+                "authority_wal": str(directory / "authority.db-wal"),
+            },
+        )
+    gc_threshold = gc.get_threshold()
+    defer_gen2_gc = os.environ.get(DEFER_GEN2_GC_ENV) == "1"
     prefix = hashlib.sha256()
     with ledger_path.open("xb") as ledger:
       try:
+        if defer_gen2_gc:
+            gc.set_threshold(gc_threshold[0], gc_threshold[1], _GEN2_DEFERRED_THRESHOLD)
+        if diagnostics is not None:
+            diagnostics.start()
 
         def append(value: dict[str, Any]) -> None:
             encoded = d._json(value) + b"\n"
@@ -888,6 +924,7 @@ def _execute_window(
                 raise InterruptedError("campaign cancelled or worker failed")
             if fatal.is_set():
                 break
+            slot_woke_ns = clock()
             chain, node_index = chain_offset + slot.chain_index, slot.node_index
             reason = "admission_deadline"
             future = None
@@ -940,12 +977,16 @@ def _execute_window(
                                 obs_target = execution.observation_target(
                                     request, request_nonce=obs_nonce
                                 )
+                                if diagnostics is not None:
+                                    diagnostics.stamp(ticket, "observe_target_ns")
                                 obs_response = observer.client.observe(obs_target)
                                 return obs_nonce, obs_target, obs_response, clock()
 
                             fast_observed = False
                             snapshot_lock.acquire()
                             holding_snapshot = True
+                            if diagnostics is not None:
+                                diagnostics.stamp(ticket, "snapshot_acquired_ns")
                             try:
                                 if stop.is_set() or failed:
                                     raise InterruptedError(
@@ -1001,6 +1042,10 @@ def _execute_window(
                                     holding_snapshot = False
                                     snapshot_lock.release()
                             ack.set_result(None)
+                            if diagnostics is not None:
+                                diagnostics.flag(
+                                    ticket, "fast_observed", int(fast_observed)
+                                )
                             if not fast_observed:
                                 ordered.acquire()
                                 holding_ordered = True
@@ -1016,8 +1061,14 @@ def _execute_window(
                                     raise InterruptedError(
                                         "campaign ordered observation aborted"
                                     )
+                                if diagnostics is not None:
+                                    diagnostics.stamp(ticket, "ordered_turn_ns")
                                 snapshot_lock.acquire()
                                 holding_snapshot = True
+                                if diagnostics is not None:
+                                    diagnostics.stamp(
+                                        ticket, "snapshot_reacquired_ns"
+                                    )
                                 try:
                                     nonce, target, response, observe_end = _observe()
                                 finally:
@@ -1045,6 +1096,8 @@ def _execute_window(
                                 ),
                                 "verification_time_ms": int(time.time() * 1000),
                             }
+                            if diagnostics is not None:
+                                diagnostics.stamp(ticket, "row_built_ns")
                             if use_split_verifier:
                                 assert closure_verifier is not None
                                 envelope, workflow_id = d._verify_operation_prefix(
@@ -1060,12 +1113,16 @@ def _execute_window(
                                 ordered.notify_all()
                                 holding_ordered = False
                                 ordered.release()
+                                if diagnostics is not None:
+                                    diagnostics.stamp(ticket, "prefix_verified_ns")
                                 closure_verifier.verify_closure(
                                     chain=chain,
                                     node_index=node_index,
                                     workflow_id=workflow_id,
                                     envelope=envelope,
                                 )
+                                if diagnostics is not None:
+                                    diagnostics.stamp(ticket, "closure_verified_ns")
                             else:
                                 d._verify_operation(
                                     row,
@@ -1202,6 +1259,8 @@ def _execute_window(
                     pending.append(future)
                     if numeric_context is not None:
                         numeric_context.progress["admitted"] += 1
+                    if diagnostics is not None:
+                        diagnostics.slot(index, slot_woke_ns, clock())
                     break
                 reason = "permit_exhausted"
                 stop.wait(0.001)
@@ -1215,6 +1274,8 @@ def _execute_window(
                     # Only a missing predecessor slot proves no admitted commit.
                     reason = "admission_deadline"
                 decision_ns = clock()
+                if diagnostics is not None:
+                    diagnostics.slot(index, slot_woke_ns, decision_ns)
                 pace = {
                     **asdict(slot),
                     "outcome": "overload",
@@ -1291,6 +1352,13 @@ def _execute_window(
             ordered.notify_all()
         with publish_ordered:
             publish_ordered.notify_all()
+        if diagnostics is not None:
+            diagnostics.stop()
+            diagnostics.write(
+                directory / f"window-{window_index:03d}.diagnostics.json"
+            )
+        if defer_gen2_gc:
+            gc.set_threshold(*gc_threshold)
     drain_violation = False
     if numeric_context is not None:
         drain_violation = numeric_context.seal_drain(
