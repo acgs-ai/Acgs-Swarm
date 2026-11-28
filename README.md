@@ -12,7 +12,8 @@ It combines local constitutional enforcement (`AgentDNA`), DAG-based swarm execu
 This package is **not** a generic agent framework and **not** an all-in-one orchestration platform.
 It is a governance runtime you can embed into your existing agent stack.
 
-Public import policy: `docs/API_COMPATIBILITY.md`. Hardcoded historical pins
+Public import policy: `docs/API_COMPATIBILITY.md`. Stability tiers for 1.2.x:
+`docs/API_STABILITY.md`. Hardcoded historical pins
 such as `443 ns`, `2,656%`, or official SWE-bench scores are **not** current
 product claims.
 
